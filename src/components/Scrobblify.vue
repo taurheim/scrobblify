@@ -1,11 +1,21 @@
 <template>
   <div class="scrobblify">
-    <textarea v-model="spotifyStreamingHistory">
+  <textarea v-model="spotifyStreamingHistory">
     </textarea>
     <br>
-    <button @click="scrobbleData">
+    <button @click="parseSpotifyData">
       Submit
     </button>
+    <hr>
+    Duplicates:
+    <div v-for="(track, i) in duplicatesFound" :key="`duplicate${i}`">
+      {{ track }}
+    </div>
+    <hr>
+    New tracks:
+    <div v-for="(track, i) in toBeScrobbled" :key="`new${i}`">
+      {{ track }}
+    </div>
   </div>
 </template>
 <style>
@@ -18,27 +28,37 @@
 import Vue from 'vue';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble from '@/models/Scrobble';
-import LastFmApi from '@/api/LastFm';
 import Bluebird from 'bluebird';
+import Scrobblify from '@/scrobblify';
 
 export default Vue.extend({
   data() {
     return {
-      lfmApi: new LastFmApi('27ca6b1a0750cf3fb3e1f0ec5b432b72'),
-      spotifyStreamingHistory: 'Put your history here',
+      scrobblify: new Scrobblify(),
+      spotifyStreamingHistory: JSON.stringify([{
+        artistName : 'Everett Bird, Everett Morris, Everett Morris',
+        trackName : 'Lizard',
+        time : '2018-06-23 16:45:27',
+      }]),
+      toBeScrobbled: [] as Scrobble[],
+      duplicatesFound: [] as Scrobble[],
     };
   },
   methods: {
-    async scrobbleData() {
-      const parsedData: SpotifyListen[] = JSON.parse(this.spotifyStreamingHistory);
-      await Bluebird.each(parsedData, async (listen) => {
-        const listenDate = new Date(`${listen.time} UTC`);
-        const scrobble = new Scrobble(listen.artistName, listen.trackName, listenDate);
+    async parseSpotifyData() {
+      const parsedData: SpotifyListen[] = this.scrobblify.spotifyJsonToListens(this.spotifyStreamingHistory);
+      const newData = this.scrobblify.removeOldListens(parsedData);
+      const validData: SpotifyListen[] = await this.scrobblify.removeInvalidListens(newData);
 
-        const isAlreadyScrobbled: boolean = await this.lfmApi.checkForConflict(scrobble);
+      await Bluebird.each(validData, async (listen) => {
+        const scrobble = new Scrobble(listen.artistName, listen.trackName, listen.time);
+
+        const isAlreadyScrobbled: boolean = await this.scrobblify.isAlreadyScrobbled(scrobble);
 
         if (!isAlreadyScrobbled) {
-          this.lfmApi.postScrobble(scrobble);
+          this.toBeScrobbled.push(scrobble);
+        } else {
+          this.duplicatesFound.push(scrobble);
         }
       });
     },
