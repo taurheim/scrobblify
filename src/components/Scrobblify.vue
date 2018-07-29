@@ -1,28 +1,41 @@
 <template>
   <div class="scrobblify">
-  <textarea v-model="spotifyStreamingHistory">
-    </textarea>
-    <br>
-    <button @click="parseSpotifyData">
-      Submit
-    </button>
-    <hr>
-    Duplicates:
-    <div v-for="(track, i) in duplicatesFound" :key="`duplicate${i}`">
-      {{ track }}
+    <div v-if="currentStep > 1">
+      Currently authenticated as: {{ this.$store.state.lfmApi.userName }}. <a @click="clearToken">Not you?</a>
     </div>
-    <hr>
-    New tracks:
-    <div v-for="(track, i) in toBeScrobbled" :key="`new${i}`">
-      {{ track }}
-    </div>
+    <v-stepper v-model="currentStep">
+      <v-stepper-header>
+        <v-stepper-step :complete="currentStep > 1" step="1">Authenticate with last.fm</v-stepper-step>
+        <v-divider></v-divider>
+        <v-stepper-step :complete="currentStep > 2" step="2">Upload your spotify play history</v-stepper-step>
+        <v-divider></v-divider>
+        <v-stepper-step :complete="currentStep > 3" step="3">Choose which tracks to scrobble</v-stepper-step>
+        <v-divider></v-divider>
+        <v-stepper-step :complete="currentStep > 4" step="4">Enjoy</v-stepper-step>
+        <v-divider></v-divider>
+        <v-stepper-step step="5">Complete</v-stepper-step>
+      </v-stepper-header>
+      <v-stepper-items>
+        <v-stepper-content step="1">
+          <authenticate-step v-on:complete="currentStep = 2"></authenticate-step>
+        </v-stepper-content>
+        <v-stepper-content step="2">
+          <upload-step v-on:complete="currentStep = 3"></upload-step>
+        </v-stepper-content>
+        <v-stepper-content step="3">
+          <select-step v-on:complete="currentStep = 4"></select-step>
+        </v-stepper-content>
+        <v-stepper-content step="4">
+          <scrobble-step v-on:complete="currentStep = 5"></scrobble-step>
+        </v-stepper-content>
+        <v-stepper-content step="5">
+          <complete-step></complete-step>
+        </v-stepper-content>
+      </v-stepper-items>
+    </v-stepper>
   </div>
 </template>
 <style>
-.scrobblify textarea {
-  height: 500px;
-  width: 1000px;
-}
 </style>
 <script lang="ts">
 import Vue from 'vue';
@@ -31,36 +44,40 @@ import Scrobble from '@/models/Scrobble';
 import Bluebird from 'bluebird';
 import Scrobblify from '@/scrobblify';
 
+// Steps
+import AuthenticateStepVue from '@/components/AuthenticateStep.vue';
+import SelectStepVue from '@/components/SelectStep.vue';
+import UploadStepVue from '@/components/UploadStep.vue';
+import LastFm from '@/api/LastFm';
+import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
+import CompleteStepVue from '@/components/CompleteStep.vue';
+
+
 export default Vue.extend({
+  components: {
+    'authenticate-step': AuthenticateStepVue,
+    'upload-step': UploadStepVue,
+    'select-step': SelectStepVue,
+    'scrobble-step': ScrobbleStepVue,
+    'complete-step': CompleteStepVue,
+  },
   data() {
     return {
-      scrobblify: new Scrobblify(),
-      spotifyStreamingHistory: JSON.stringify([{
-        artistName : 'Everett Bird, Everett Morris, Everett Morris',
-        trackName : 'Lizard',
-        time : '2018-06-23 16:45:27',
-      }]),
-      toBeScrobbled: [] as Scrobble[],
-      duplicatesFound: [] as Scrobble[],
+      currentStep: 1,
     };
   },
+  async created() {
+    const api = this.$store.state.lfmApi as LastFm;
+    await api.init(this.$route.query);
+    if (api.isAuthenticated()) {
+      this.currentStep = 2;
+    }
+  },
   methods: {
-    async parseSpotifyData() {
-      const parsedData: SpotifyListen[] = this.scrobblify.spotifyJsonToListens(this.spotifyStreamingHistory);
-      const newData = this.scrobblify.removeOldListens(parsedData);
-      const validData: SpotifyListen[] = await this.scrobblify.removeInvalidListens(newData);
-
-      await Bluebird.each(validData, async (listen) => {
-        const scrobble = new Scrobble(listen.artistName, listen.trackName, listen.time);
-
-        const isAlreadyScrobbled: boolean = await this.scrobblify.isAlreadyScrobbled(scrobble);
-
-        if (!isAlreadyScrobbled) {
-          this.toBeScrobbled.push(scrobble);
-        } else {
-          this.duplicatesFound.push(scrobble);
-        }
-      });
+    clearToken() {
+      const api = this.$store.state.lfmApi as LastFm;
+      this.currentStep = 1;
+      api.clearUser();
     },
   },
 });

@@ -3,6 +3,7 @@ import LastFm from '@/api/LastFm';
 import SpotifyListen from '@/models/SpotifyListen';
 import Bluebird from 'bluebird';
 import StringSimilarity from 'string-similarity';
+import store from '@/store';
 
 export default class Scrobblify {
   /*
@@ -14,8 +15,8 @@ export default class Scrobblify {
   private CONFLICT_BUFFER_TIME_MS = 7 * this.MINUTES_TO_MS;
   private lfmApi: LastFm;
 
-  constructor() {
-    this.lfmApi = new LastFm('taurheim', '27ca6b1a0750cf3fb3e1f0ec5b432b72');
+  constructor(api: LastFm) {
+    this.lfmApi = api;
   }
 
   public async isAlreadyScrobbled(proposedScrobble: Scrobble): Promise<boolean> {
@@ -65,13 +66,14 @@ export default class Scrobblify {
 
     While we don't know exactly how long the user listened to a song, we can guess because we have info about the song
   */
-  public async removeInvalidListens(listens: SpotifyListen[]): Promise<SpotifyListen[]> {
+  public async removeInvalidListens(listens: SpotifyListen[], progress: () => void): Promise<SpotifyListen[]> {
     const MINIMUM_LISTEN_PERCENT = 0.5;
     const MINIMUM_LISTEN_LENGTH_MS = 4 * this.MINUTES_TO_MS;
     const MINIMUM_TRACK_LENGTH_MS = 30 * this.SECONDS_TO_MS;
 
     // First get all the track lengths since we need to build a timeline
     const trackLengthsMs: number[] = await Bluebird.map(listens, (listen) => {
+      progress();
       try {
         return this.lfmApi.getTrackTimeMs(listen.trackName, listen.artistName);
       } catch (e) {
@@ -109,7 +111,9 @@ export default class Scrobblify {
       const isValid = nextTrackStartedAt > listenCountedAfter;
 
       if (!isValid) {
-        console.log(`INVALID: ${listen.toString()} - Only listened to the track for ${(nextTrackStartedAt - currentTrackStartedAt) / this.MINUTES_TO_MS} of ${minimumTimeListened / this.MINUTES_TO_MS} minutes`);
+        const minutes = (nextTrackStartedAt - currentTrackStartedAt) / this.MINUTES_TO_MS;
+        const total = minimumTimeListened / this.MINUTES_TO_MS;
+        console.log(`INVALID: ${listen.toString()} - Only listened to the track for ${minutes} of ${total} minutes`);
       }
 
       return isValid;

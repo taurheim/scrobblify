@@ -1,7 +1,7 @@
 export default class Scrobble {
   constructor(
-    public artist: string,
     public track: string,
+    public artist: string,
     public timestamp: Date,
   ) {
   }
