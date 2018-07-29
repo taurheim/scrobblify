@@ -3,8 +3,10 @@ import Router from 'vue-router';
 import Home from './views/Home.vue';
 
 Vue.use(Router);
-
 export default new Router({
+  // For some reason, recursive sock.js issues if I don't do this
+  mode: (process.env.NODE_ENV === 'production') ? 'history' : 'hash',
+  base: (process.env.NODE_ENV === 'production') ? '/scrobblify/' : '/',
   routes: [
     {
       path: '/',

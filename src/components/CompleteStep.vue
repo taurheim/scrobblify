@@ -1,7 +1,7 @@
 <template>
-  <div class="about">
-    Test!
-    <h1>This is an about page</h1>
+  <div>
+    <h1>Done!</h1>
+    We scrobbled
   </div>
 </template>
 <script lang="ts">
