@@ -8,6 +8,9 @@
     "lint": "vue-cli-service lint"
   },
   "dependencies": {
+    "@types/bluebird": "^3.5.23",
+    "request": "^2.87.0",
+    "request-promise": "^4.2.2",
     "vue": "^2.5.16",
     "vue-class-component": "^6.0.0",
     "vue-property-decorator": "^7.0.0",
