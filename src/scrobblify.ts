@@ -90,7 +90,7 @@ export default class Scrobblify {
 
       // Plays under the minimum are always invalid
       if (currentTrackDurationMs < MINIMUM_TRACK_LENGTH_MS) {
-        console.log(`Invalid due track duration: ${listen.toString()}`);
+        console.log(`Invalid due track duration: ${listen.toString()}: ${currentTrackDurationMs / this.MINUTES_TO_MS}`);
         return false;
       }
 

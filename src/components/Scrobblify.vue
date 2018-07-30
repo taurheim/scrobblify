@@ -11,7 +11,7 @@
         <v-divider></v-divider>
         <v-stepper-step :complete="currentStep > 3" step="3">Choose which tracks to scrobble</v-stepper-step>
         <v-divider></v-divider>
-        <v-stepper-step :complete="currentStep > 4" step="4">Enjoy</v-stepper-step>
+        <v-stepper-step :complete="currentStep > 4" step="4">Scrobble!</v-stepper-step>
         <v-divider></v-divider>
         <v-stepper-step step="5">Complete</v-stepper-step>
       </v-stepper-header>
