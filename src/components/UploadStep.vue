@@ -75,7 +75,7 @@ export default Vue.extend({
         validData = await this.scrobblify.removeInvalidListens(newData, () => {
           this.stepProgress += 1;
         });
-      } catch(e) {
+      } catch (e) {
         failedValidCheckCount += 1;
       }
       this.logs.push(`Found ${validData.length} valid scrobbles (${failedValidCheckCount} failed)`);

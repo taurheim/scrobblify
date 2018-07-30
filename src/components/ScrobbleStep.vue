@@ -54,7 +54,7 @@ export default Vue.extend({
         try {
           await api.scrobblePlay(track);
           this.$store.commit('trackScrobbled');
-        } catch(e) {
+        } catch (e) {
           this.$store.commit('trackFailed');
         }
         this.scrobbledTracks += 1;
