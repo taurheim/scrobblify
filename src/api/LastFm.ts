@@ -5,7 +5,7 @@ import md5 from 'blueimp-md5';
 
 export default class LastFm {
   private API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
-  private API_RATE_BUFFER_MS = 500;
+  private API_RATE_BUFFER_MS = 250;
   private USER_AUTH_TOKEN_LOCALSTORAGE_KEY = 'scrobblifyLfmAuthToken';
   private USER_AUTH_KEY_LOCALSTORAGE_KEY = 'scrobblifyLfmAuthKey';
   private USER_NAME_LOCALSTORAGE_KEY = 'scrobblifyLfmUserName';
@@ -56,6 +56,10 @@ export default class LastFm {
     }
     localStorage.setItem(this.USER_NAME_LOCALSTORAGE_KEY, userName);
     this.userName = userName;
+  }
+
+  public getUserName() {
+    return this.userName;
   }
 
   public clearUser() {
