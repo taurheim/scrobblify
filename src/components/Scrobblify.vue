@@ -66,8 +66,6 @@ export default Vue.extend({
       currentStep: 1,
     };
   },
-  async created() {
-  },
   methods: {
     clearToken() {
       const api = this.$store.state.lfmApi as LastFm;
