@@ -67,11 +67,6 @@ export default Vue.extend({
     };
   },
   async created() {
-    const api = this.$store.state.lfmApi as LastFm;
-    await api.init(this.$route.query);
-    if (api.isAuthenticated()) {
-      this.currentStep = 2;
-    }
   },
   methods: {
     clearToken() {

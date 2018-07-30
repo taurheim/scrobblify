@@ -24,6 +24,7 @@
   text-align: left;
   max-width: 1000px;
   margin: 0 auto;
+  padding: 0 5%;
 }
 
 .home h2 {

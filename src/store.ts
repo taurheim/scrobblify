@@ -27,7 +27,7 @@ export default new Vuex.Store({
     },
     trackFailed(state: any) {
       state.tracksFailed += 1;
-    }
+    },
   },
   actions: {
   },

@@ -5,7 +5,7 @@ import md5 from 'blueimp-md5';
 
 export default class LastFm {
   private API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
-  private API_RATE_BUFFER_MS = 150;
+  private API_RATE_BUFFER_MS = 500;
   private USER_AUTH_TOKEN_LOCALSTORAGE_KEY = 'scrobblifyLfmAuthToken';
   private USER_AUTH_KEY_LOCALSTORAGE_KEY = 'scrobblifyLfmAuthKey';
   private USER_NAME_LOCALSTORAGE_KEY = 'scrobblifyLfmUserName';
@@ -82,7 +82,7 @@ export default class LastFm {
       from: this.dateToSecondsString(from),
       to: this.dateToSecondsString(to),
     };
-    const response = await this.makeGetRequest(requestParams);
+    const response = await this.makeRequest('GET', requestParams);
     return response.recenttracks.track.map((track: any) => {
       return this.trackToScrobble(track);
     });
@@ -96,7 +96,7 @@ export default class LastFm {
       artist: trackArtist,
       track: trackName,
     };
-    const response = await this.makeGetRequest(requestParams);
+    const response = await this.makeRequest('GET', requestParams);
 
     const listenTime = parseInt(response.track.duration, 10);
 
@@ -110,9 +110,10 @@ export default class LastFm {
 
     const requestParams = {
       method: 'auth.getSession',
+      token: this.userAuthToken,
     };
 
-    const response = await this.makeGetRequest(requestParams, true, true);
+    const response = await this.makeRequest('GET', requestParams, true);
 
     return response.session;
   }
@@ -122,59 +123,41 @@ export default class LastFm {
     if (!this.userAuthToken ) {
       throw new Error('Not authenticated.');
     }
+    const params: {[key: string]: any} = {
+      'method': 'track.scrobble',
+      'artist[0]': play.artist,
+      'track[0]': play.track,
+      'timestamp[0]': play.timestamp.getTime() / 1000,
+    };
 
-    const lfmMethod = 'track.scrobble';
-    const response = await Request({
-      method: 'POST',
-      json: true,
-      uri: this.API_BASE_URL,
-      body: {
-        method: lfmMethod,
-        artist: [play.artist],
-        track: [play.track],
-        timestamp: [play.timestamp.getTime() / 1000],
-        api_key: this.lfmApiKey,
-        api_sig: this.getMethodSignature(lfmMethod, this.userAuthToken),
-        sk: this.userAuthKey,
-      },
-    });
-
-    console.log(response);
-
-    await new Promise((r) => setTimeout(r, this.API_RATE_BUFFER_MS));
-
-    return;
+    await this.makeRequest('POST', params, true);
   }
 
-  private async makeGetRequest(
+  private async makeRequest(
+    httpMethod: string,
     params: {[key: string]: string},
     authenticatedRequest: boolean = false,
-    useAppApiKey: boolean = false,
   ): Promise<any> {
     if (this.userAuthToken === null) {
       throw new Error('Not authenticated!');
     }
 
-    params.token = this.userAuthToken;
+    params.api_key = this.lfmApiKey;
 
     // Decide which api key to use
-    if (useAppApiKey) {
-      params.api_key = this.lfmApiKey;
-    } else if (this.userAuthKey !== null) {
-      params.api_key = this.lfmApiKey;
-      params.sk = this.userAuthKey;
-    } else {
-      throw new Error('User auth key not found.');
-    }
-
     if (authenticatedRequest) {
-      params.api_sig = this.getMethodSignature(params.method, this.userAuthToken);
+      if (this.userAuthKey) {
+        params.sk = this.userAuthKey;
+      }
+      const sig = this.getMethodSignature(params, this.userAuthToken);
+      params.api_sig = sig;
     }
 
     const paramsString = this.paramObjectToString(params);
     const requestURL = `${this.API_BASE_URL}?format=json&${paramsString}`;
 
     const response = await Request(requestURL, {
+      method: httpMethod,
       json: true,
     });
 
@@ -187,10 +170,18 @@ export default class LastFm {
     return response;
   }
 
-  private getMethodSignature(method: string, token: string) {
+  private getMethodSignature(params: {[key: string]: any}, token: string) {
+    const keys = Object.keys(params);
+    keys.sort();
+    let signature = '';
+    keys.forEach((key) => {
+      signature += `${key}${params[key]}`;
+    });
+
     // Signature format described here: https://www.last.fm/api/webauth
-    const signature = `api_key${this.lfmApiKey}method${method}token${token}`;
-    return md5(encodeURI(signature) + this.lfmSharedSecret);
+    const toHash = signature + this.lfmSharedSecret;
+    const hash = md5(toHash);
+    return hash;
   }
 
   private paramObjectToString(params: {[key: string]: string}) {
