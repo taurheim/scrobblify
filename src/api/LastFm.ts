@@ -62,6 +62,9 @@ export default class LastFm {
     this.userAuthKey = '';
     this.userAuthToken = '';
     this.userName = '';
+    localStorage.removeItem(this.USER_AUTH_KEY_LOCALSTORAGE_KEY);
+    localStorage.removeItem(this.USER_AUTH_TOKEN_LOCALSTORAGE_KEY);
+    localStorage.removeItem(this.USER_NAME_LOCALSTORAGE_KEY);
   }
 
   public isAuthenticated(): boolean {
@@ -79,7 +82,7 @@ export default class LastFm {
       from: this.dateToSecondsString(from),
       to: this.dateToSecondsString(to),
     };
-    const response = await this.makeRequest(requestParams);
+    const response = await this.makeGetRequest(requestParams);
     return response.recenttracks.track.map((track: any) => {
       return this.trackToScrobble(track);
     });
@@ -93,7 +96,7 @@ export default class LastFm {
       artist: trackArtist,
       track: trackName,
     };
-    const response = await this.makeRequest(requestParams);
+    const response = await this.makeGetRequest(requestParams);
 
     const listenTime = parseInt(response.track.duration, 10);
 
@@ -109,18 +112,41 @@ export default class LastFm {
       method: 'auth.getSession',
     };
 
-    const response = await this.makeRequest(requestParams, true, true);
+    const response = await this.makeGetRequest(requestParams, true, true);
 
     return response.session;
   }
 
+  // https://www.last.fm/api/show/track.scrobble
   public async scrobblePlay(play: Scrobble): Promise<void> {
-    console.log(`Scrobbling ${play.toString()}`);
-    await new Promise((r) => setTimeout(r, 1000));
+    if (!this.userAuthToken ) {
+      throw new Error('Not authenticated.');
+    }
+
+    const lfmMethod = 'track.scrobble';
+    const response = await Request({
+      method: 'POST',
+      json: true,
+      uri: this.API_BASE_URL,
+      body: {
+        method: lfmMethod,
+        artist: [play.artist],
+        track: [play.track],
+        timestamp: [play.timestamp.getTime() / 1000],
+        api_key: this.lfmApiKey,
+        api_sig: this.getMethodSignature(lfmMethod, this.userAuthToken),
+        sk: this.userAuthKey,
+      },
+    });
+
+    console.log(response);
+
+    await new Promise((r) => setTimeout(r, this.API_RATE_BUFFER_MS));
+
     return;
   }
 
-  private async makeRequest(
+  private async makeGetRequest(
     params: {[key: string]: string},
     authenticatedRequest: boolean = false,
     useAppApiKey: boolean = false,
@@ -138,7 +164,7 @@ export default class LastFm {
       params.api_key = this.lfmApiKey;
       params.sk = this.userAuthKey;
     } else {
-      throw new Error('Use auth key not found.');
+      throw new Error('User auth key not found.');
     }
 
     if (authenticatedRequest) {

@@ -14,7 +14,7 @@
       </textarea>
       <br>
       <v-btn color="primary" @click="parseSpotifyData">
-        Submit
+        Find tracks
       </v-btn>
     </div>
   </div>

@@ -11,6 +11,7 @@
     </div>
     <div v-else>
       Scrobbling...
+      <b>{{ currentTrackName }}</b>
       <v-progress-linear v-model="progress">
       </v-progress-linear>
     </div>
@@ -32,6 +33,7 @@ export default Vue.extend({
   data() {
     return {
       scrobbling: false,
+      currentTrackName: '',
       scrobbledTracks: 0,
     };
   },
@@ -48,7 +50,13 @@ export default Vue.extend({
       this.scrobbling = true;
       const api = this.$store.state.lfmApi as LastFm;
       await Bluebird.map(this.tracksToScrobble, async (track: Scrobble) => {
-        await api.scrobblePlay(track);
+        this.currentTrackName = track.toString();
+        try {
+          await api.scrobblePlay(track);
+          this.$store.commit('trackScrobbled');
+        } catch(e) {
+          this.$store.commit('trackFailed');
+        }
         this.scrobbledTracks += 1;
       }, {
         concurrency: 1,
