@@ -11,9 +11,10 @@
 </template>
 <style>
 .about {
-  width: 800px;
+  max-width: 800px;
   margin: 0 auto;
   text-align: left;
+  padding: 0 5%;
 }
 </style>
 <script lang="ts">
