@@ -4,9 +4,10 @@ export default class SpotifyListen {
   constructor(
     public artistName: string,
     public trackName: string,
-    public time: Date,
+    public listenDate: Date,
+    public msPlayed: number,
   ) {
-    this.key = time.getTime();
+    this.key = listenDate.getTime();
   }
 
   public toString() {

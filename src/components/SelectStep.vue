@@ -84,7 +84,7 @@ export default Vue.extend({
           value: false,
           track: scrob.trackName,
           artist: scrob.artistName,
-          time: scrob.time.getTime(),
+          time: scrob.listenDate.getTime(),
         };
       });
     },
