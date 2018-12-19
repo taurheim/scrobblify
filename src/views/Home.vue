@@ -1,7 +1,7 @@
 <template>
   <div class="home">
     <h1>So you want to start tracking your spotify plays...</h1>
-    You've come to the right place!
+    You've come to the right place! Last.fm is a free service that lets you track the music you listen to.
     <br>
     <h2>How to connect your last.fm and spotify accounts</h2>
     <ol>
@@ -28,6 +28,9 @@
     Unzip <code>my_spotify_data.zip</code> and open <code>StreamingHistory.json</code> in a text editor (notepad will work fine).<br>
     <b>5. Use scrobblify!</b><br>
     Go to <router-link to="/scrobble">Scrobble</router-link> and follow the steps there.
+
+    <h2>Why does scrobblify only backfill the last two weeks?</h2>
+    This is limitation that is enforced by last.fm. See community topic <a href="https://getsatisfaction.com/lastfm/topics/scrobbles-more-than-14-days">here</a>. Don't worry, 2 weeks of listening should be enough to get some neat stats - once you've connected your accounts all future plays will be kept forever!
   </div>
 </template>
 <style>

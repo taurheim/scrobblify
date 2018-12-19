@@ -69,16 +69,17 @@ export default Vue.extend({
       this.stepProgress = 0;
       this.stepTotal = newData.length;
       this.logs.push(`Replaying the listens to find plays that are valid scrobbles...`);
-      let failedValidCheckCount = 0;
       let validData: SpotifyListen[] = [];
       try {
         validData = await this.scrobblify.removeInvalidListens(newData, () => {
           this.stepProgress += 1;
         });
       } catch (e) {
-        failedValidCheckCount += 1;
+        this.logs.push(`Looks like we encountered an error. Please send an email to niko@savas.ca with your`);
+        this.logs.push(`last.fm username and StreamingHistory.json and I'll take care of it as soon as possibele!`);
+        return;
       }
-      this.logs.push(`Found ${validData.length} valid scrobbles (${failedValidCheckCount} failed)`);
+      this.logs.push(`Found ${validData.length} valid scrobbles`);
 
       // Scrobble each of the songs
       this.stepProgress = 0;
@@ -86,7 +87,7 @@ export default Vue.extend({
       this.logs.push(`Checking for songs that have already been scrobbled.`);
       let skippedFromError = 0;
       const toBeScrobbled = await Bluebird.filter(validData, async (listen) => {
-        const scrobble = new Scrobble(listen.trackName, listen.artistName, listen.time);
+        const scrobble = new Scrobble(listen.trackName, listen.artistName, listen.listenDate);
         try {
           const isAlreadyScrobbled: boolean = await this.scrobblify.isAlreadyScrobbled(scrobble);
           this.stepProgress += 1;

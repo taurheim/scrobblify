@@ -12,7 +12,7 @@ export default class Scrobblify {
   private MINUTES_TO_MS = 60000;
   private SECONDS_TO_MS = 1000;
   private DAYS_TO_MS = 86400000;
-  private CONFLICT_BUFFER_TIME_MS = 7 * this.MINUTES_TO_MS;
+  private CONFLICT_BUFFER_TIME_MS = 3.5 * this.MINUTES_TO_MS;
   private lfmApi: LastFm;
 
   constructor(api: LastFm) {
@@ -50,7 +50,8 @@ export default class Scrobblify {
       return new SpotifyListen(
         allArtists[0], // The first artist is the one we'll use to scrobble
         play.trackName,
-        new Date(`${play.time} UTC`),
+        new Date(`${play.endTime} UTC`),
+        play.msPlayed,
       );
     });
   }
@@ -72,12 +73,12 @@ export default class Scrobblify {
     const MINIMUM_TRACK_LENGTH_MS = 30 * this.SECONDS_TO_MS;
 
     // First get all the track lengths since we need to build a timeline
-    const trackLengthsMs: number[] = await Bluebird.map(listens, (listen) => {
+    const trackLengthsMs: number[] = await Bluebird.map(listens, async (listen: SpotifyListen) => {
       progress();
       try {
-        return this.lfmApi.getTrackTimeMs(listen.trackName, listen.artistName);
+        return await this.lfmApi.getTrackTimeMs(listen.trackName, listen.artistName);
       } catch (e) {
-        // If we can't find the track, just say it's length 0 and it won't be counted anyway
+        // Mark it as length 0
         return 0;
       }
     }, {
@@ -85,8 +86,16 @@ export default class Scrobblify {
     });
 
     return listens.filter((listen, i) => {
-      const currentTrackStartedAt: number = listen.time.getTime();
-      const currentTrackDurationMs: number = trackLengthsMs[i];
+      const msListened: number = listen.msPlayed;
+      let currentTrackDurationMs: number = trackLengthsMs[i];
+
+      // If the track reports as being length 0 pretend it's 2 minutes long
+      // This way if they've listened to more than a minute we count it.
+      // It's better to err on the side of giving them the scrobble as it will help populate their
+      // last.fm history
+      if (currentTrackDurationMs === 0) {
+        currentTrackDurationMs = 2 * this.MINUTES_TO_MS;
+      }
 
       // Plays under the minimum are always invalid
       if (currentTrackDurationMs < MINIMUM_TRACK_LENGTH_MS) {
@@ -94,25 +103,17 @@ export default class Scrobblify {
         return false;
       }
 
-      // Last play is always valid
-      if (i === listens.length - 1) {
-        return true;
+      let msListenedToBeValid = currentTrackDurationMs * MINIMUM_LISTEN_PERCENT;
+
+      if (msListenedToBeValid > MINIMUM_LISTEN_LENGTH_MS) {
+        msListenedToBeValid = MINIMUM_LISTEN_LENGTH_MS;
       }
 
-      let minimumTimeListened = currentTrackDurationMs * MINIMUM_LISTEN_PERCENT;
-
-      if (minimumTimeListened > MINIMUM_LISTEN_LENGTH_MS) {
-        minimumTimeListened = MINIMUM_LISTEN_LENGTH_MS;
-      }
-
-      const listenCountedAfter = currentTrackStartedAt + minimumTimeListened;
-
-      const nextTrackStartedAt: number = listens[i + 1].time.getTime();
-      const isValid = nextTrackStartedAt > listenCountedAfter;
+      const isValid = msListened > msListenedToBeValid;
 
       if (!isValid) {
-        const minutes = (nextTrackStartedAt - currentTrackStartedAt) / this.MINUTES_TO_MS;
-        const total = minimumTimeListened / this.MINUTES_TO_MS;
+        const minutes = msListened / this.MINUTES_TO_MS;
+        const total = msListenedToBeValid / this.MINUTES_TO_MS;
         console.log(`INVALID: ${listen.toString()} - Only listened to the track for ${minutes} of ${total} minutes`);
       }
 
@@ -127,7 +128,7 @@ export default class Scrobblify {
     const RETROACTIVE_SCROBBLE_LIMIT_MS = 14 * this.DAYS_TO_MS;
     const retroactiveScrobbleLimitDate = (new Date()).getTime() - RETROACTIVE_SCROBBLE_LIMIT_MS;
     return listens.filter((listen) => {
-      const currentTrackStartedAt = listen.time.getTime();
+      const currentTrackStartedAt = listen.listenDate.getTime();
       return (currentTrackStartedAt > retroactiveScrobbleLimitDate);
     });
   }
