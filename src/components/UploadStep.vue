@@ -93,7 +93,7 @@ export default Vue.extend({
         this.logs.push(`(Not Recommended) If you're impatient, this can be sped up by unchecking the "Follow last.fm rules" box.`);
 
         if (this.scrobbleOldPlays) {
-          const EXPECTED_MS_PER_REQUEST = 150;
+          const EXPECTED_MS_PER_REQUEST = 300;
           const expectedTime = newData.length * EXPECTED_MS_PER_REQUEST / 60000;
           this.logs.push(`While we don't recommend this, it could save you approx. ${expectedTime} minutes`);
         }
