@@ -15,7 +15,7 @@
       </textarea>
       <br>
       <v-checkbox color="primary" v-model="scrobbleOldPlays" :label="`Scrobble tracks older than 2 weeks (they will show as listened to today)`"></v-checkbox>
-      <v-checkbox color="primary" v-model="removeInvalidListens" :label="`Follow last.fm scrobble rules (Recommended: If this is disabled, you could end up scrobbling tracks you didn't listen to)`"></v-checkbox>
+      <v-checkbox color="primary" v-model="followLfmRules" :label="`Follow last.fm scrobble rules (This will take longer but be more accurate about which tracks you actually listened to)`"></v-checkbox>
       <br>
       <v-btn color="primary" @click="parseSpotifyData">
         Find tracks
@@ -37,7 +37,7 @@
 </style>
 <script lang="ts">
 import Vue from 'vue';
-import Bluebird,{ delay } from 'bluebird';
+import Bluebird, { delay } from 'bluebird';
 import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble from '@/models/Scrobble';
@@ -47,7 +47,7 @@ export default Vue.extend({
     return {
       spotifyStreamingHistory: '',
       scrobbleOldPlays: false,
-      removeInvalidListens: true,
+      followLfmRules: false,
       scrobblify: new Scrobblify(this.$store.state.lfmApi),
       logs: [] as string[],
       stepProgress: 0,
@@ -89,11 +89,11 @@ export default Vue.extend({
       this.stepProgress = 0;
       this.stepTotal = newData.length;
       this.logs.push(`Replaying the listens to find plays that are valid scrobbles...`);
-      if (this.removeInvalidListens) {
+      if (this.followLfmRules) {
         this.logs.push(`(Not Recommended) If you're impatient, this can be sped up by unchecking the "Follow last.fm rules" box.`);
 
         if (this.scrobbleOldPlays) {
-          const EXPECTED_MS_PER_REQUEST = 300;
+          const EXPECTED_MS_PER_REQUEST = 500;
           const expectedTime = newData.length * EXPECTED_MS_PER_REQUEST / 60000;
           this.logs.push(`While we don't recommend this, it could save you approx. ${expectedTime} minutes`);
         }
@@ -103,7 +103,7 @@ export default Vue.extend({
 
       let validData: SpotifyListen[] = [];
       try {
-        validData = await this.scrobblify.removeInvalidListens(newData, this.smartMoveProgress, !this.removeInvalidListens);
+        validData = await this.scrobblify.removeInvalidListens(newData, this.smartMoveProgress, !this.followLfmRules);
       } catch (e) {
         this.logs.push(`Looks like we encountered an error. Please send an email to niko@savas.ca with your`);
         this.logs.push(`last.fm username and StreamingHistory.json and I'll take care of it as soon as possibele!`);

@@ -101,7 +101,7 @@ export default Vue.extend({
       this.$store.commit('setSelectedScrobbles', tracks.map((track: any) => {
         return new Scrobble(track.track, track.artist, new Date(track.time));
       }));
-    }
+    },
   },
 });
 </script>
