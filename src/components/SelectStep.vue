@@ -16,7 +16,6 @@
       :headers="headers"
       :items="allScrobbleableTracks"
       :search="search"
-      item-key="time"
       select-all
       hide-actions
       class="elevation-1"

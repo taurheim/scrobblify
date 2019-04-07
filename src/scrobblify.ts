@@ -13,6 +13,8 @@ export default class Scrobblify {
   private SECONDS_TO_MS = 1000;
   private DAYS_TO_MS = 86400000;
   private CONFLICT_BUFFER_TIME_MS = 3.5 * this.MINUTES_TO_MS;
+  private RETROACTIVE_SCROBBLE_LIMIT_MS = 14 * this.DAYS_TO_MS;
+  private retroactiveScrobbleLimitDate = (new Date()).getTime() - this.RETROACTIVE_SCROBBLE_LIMIT_MS;
   private lfmApi: LastFm;
 
   constructor(api: LastFm) {
@@ -65,16 +67,27 @@ export default class Scrobblify {
     - The track must be longer than 30 seconds.
     - And the track has been played for at least half its duration, or for 4 minutes (whichever occurs earlier.)
 
-    While we don't know exactly how long the user listened to a song, we can guess because we have info about the song
+    Spotify tells us how long the user listened to the song so we can do this calculation.
+
+    If 'assumeTrackLength' is enabled, we effectively ignore the second requirement by assuming the song is one
+    minute long. This is not recommended but will speed up the uploads for users with a lot of songs to scrobble.
   */
-  public async removeInvalidListens(listens: SpotifyListen[], progress: () => void): Promise<SpotifyListen[]> {
+  public async removeInvalidListens(
+    listens: SpotifyListen[],
+    progress: () => Promise<void>,
+    assumeTrackLength: boolean,
+  ): Promise<SpotifyListen[]> {
     const MINIMUM_LISTEN_PERCENT = 0.5;
     const MINIMUM_LISTEN_LENGTH_MS = 4 * this.MINUTES_TO_MS;
     const MINIMUM_TRACK_LENGTH_MS = 30 * this.SECONDS_TO_MS;
+    const ASSUME_TRACK_LENGTH = 1 * this.MINUTES_TO_MS;
 
     // First get all the track lengths since we need to build a timeline
     const trackLengthsMs: number[] = await Bluebird.map(listens, async (listen: SpotifyListen) => {
-      progress();
+      await progress();
+      if (assumeTrackLength) {
+        return ASSUME_TRACK_LENGTH;
+      }
       try {
         return await this.lfmApi.getTrackTimeMs(listen.trackName, listen.artistName);
       } catch (e) {
@@ -99,7 +112,9 @@ export default class Scrobblify {
 
       // Plays under the minimum are always invalid
       if (currentTrackDurationMs < MINIMUM_TRACK_LENGTH_MS) {
-        console.log(`Invalid due track duration: ${listen.toString()}: ${currentTrackDurationMs / this.MINUTES_TO_MS}`);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`Invalid due track duration: ${listen.toString()}: ${currentTrackDurationMs / this.MINUTES_TO_MS}`);
+        }
         return false;
       }
 
@@ -114,7 +129,9 @@ export default class Scrobblify {
       if (!isValid) {
         const minutes = msListened / this.MINUTES_TO_MS;
         const total = msListenedToBeValid / this.MINUTES_TO_MS;
-        console.log(`INVALID: ${listen.toString()} - Only listened to the track for ${minutes} of ${total} minutes`);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`INVALID: ${listen.toString()} - Only listened to the track for ${minutes} of ${total} minutes`);
+        }
       }
 
       return isValid;
@@ -124,12 +141,20 @@ export default class Scrobblify {
     In addition, the last.fm scrobbling api only allows 14 days prior to be scrobbled:
     https://getsatisfaction.com/lastfm/topics/scrobbles-more-than-14-days
   */
-  public removeOldListens(listens: SpotifyListen[]): SpotifyListen[] {
-    const RETROACTIVE_SCROBBLE_LIMIT_MS = 14 * this.DAYS_TO_MS;
-    const retroactiveScrobbleLimitDate = (new Date()).getTime() - RETROACTIVE_SCROBBLE_LIMIT_MS;
+  public removeOldListens(listens: SpotifyListen[], reTagOldListens: boolean = false): SpotifyListen[] {
     return listens.filter((listen) => {
       const currentTrackStartedAt = listen.listenDate.getTime();
-      return (currentTrackStartedAt > retroactiveScrobbleLimitDate);
+      return (currentTrackStartedAt > this.retroactiveScrobbleLimitDate);
+    });
+  }
+
+  /*
+    The 14 day limit can be circumvented by changing the listen date to a day within the last two weeks
+  */
+  public reTagOldListens(listens: SpotifyListen[], newDate: Date): SpotifyListen[] {
+    return listens.map((listen) => {
+      listen.listenDate = newDate;
+      return listen;
     });
   }
 }
