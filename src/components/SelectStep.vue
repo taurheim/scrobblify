@@ -1,6 +1,7 @@
 <template>
   <div>
-    Choose which tracks you would like to scrobble:
+    Choose which tracks you would like to scrobble: <br/>
+    <v-btn class="primary" @click="scrobbleAllTracks">Just scrobble everything!</v-btn>
     <v-card>
       <v-card-title>
         <v-text-field
@@ -16,23 +17,13 @@
       :headers="headers"
       :items="allScrobbleableTracks"
       :search="search"
-      item-key="time"
+      :pagination.sync="pagination"
       select-all
-      hide-actions
       class="elevation-1"
+      item-key="id"
       v-model="selectedTracks"
     >
-      <template slot="headerCell" slot-scope="props">
-        <v-tooltip bottom>
-          <span slot="activator">
-            {{ props.header.text }}
-          </span>
-          <span>
-            {{ props.header.text }}
-          </span>
-        </v-tooltip>
-      </template>
-      <template slot="items" slot-scope="props">
+      <template v-slot:items="props">
         <td>
           <v-checkbox
             v-model="props.selected"
@@ -45,7 +36,7 @@
         <td>{{ prettyDate(new Date(props.item.time)).toLocaleString() }}</td>
       </template>
     </v-data-table>
-    <v-btn class="primary" @click="scrobbleTracks">Next</v-btn>
+    <v-btn class="primary" @click="scrobbleSelectedTracks">Scrobble selected tracks</v-btn>
   </div>
 </template>
 <style>
@@ -59,6 +50,10 @@ import SpotifyListen from '@/models/SpotifyListen';
 export default Vue.extend({
   data() {
     return {
+      pagination: {
+        sortBy: 'time',
+        rowsPerPage: 25,
+      },
       search: '',
       selectedTracks: [],
       headers: [
@@ -79,9 +74,10 @@ export default Vue.extend({
   },
   computed: {
     allScrobbleableTracks(): any[] {
-      return this.$store.state.validScrobbles.map((scrob: SpotifyListen) => {
+      return this.$store.state.validScrobbles.map((scrob: SpotifyListen, i: number) => {
         return {
           value: false,
+          id: i,
           track: scrob.trackName,
           artist: scrob.artistName,
           time: scrob.listenDate.getTime(),
@@ -93,11 +89,18 @@ export default Vue.extend({
     prettyDate(date: Date) {
       return date.toString();
     },
-    scrobbleTracks() {
-      this.$store.commit('setSelectedScrobbles', this.selectedTracks.map((track: any) => {
+    scrobbleSelectedTracks() {
+      this.commitTracksToStore(this.selectedTracks);
+      this.$emit('complete');
+    },
+    scrobbleAllTracks() {
+      this.commitTracksToStore(this.allScrobbleableTracks);
+      this.$emit('complete');
+    },
+    commitTracksToStore(tracks: any[]) {
+      this.$store.commit('setSelectedScrobbles', tracks.map((track: any) => {
         return new Scrobble(track.track, track.artist, new Date(track.time));
       }));
-      this.$emit('complete');
     },
   },
 });
