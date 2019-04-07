@@ -1,5 +1,5 @@
 module.exports = {
-  baseUrl: (process.env.NODE_ENV === 'production') ? '/scrobblify' : '/',
+  publicPath: (process.env.NODE_ENV === 'production') ? '/scrobblify' : '/',
   outputDir: undefined,
   assetsDir: undefined,
   runtimeCompiler: undefined,
