@@ -17,8 +17,7 @@
       :headers="headers"
       :items="allScrobbleableTracks"
       :search="search"
-      :pagination.sync="pagination"
-      select-all
+      show-select
       class="elevation-1"
       item-key="id"
       v-model="selectedTracks"
@@ -50,10 +49,6 @@ import SpotifyListen from '@/models/SpotifyListen';
 export default Vue.extend({
   data() {
     return {
-      pagination: {
-        sortBy: 'time',
-        rowsPerPage: 25,
-      },
       search: '',
       selectedTracks: [],
       headers: [
