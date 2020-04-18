@@ -52,7 +52,7 @@ export default class Scrobblify {
       return new SpotifyListen(
         allArtists[0], // The first artist is the one we'll use to scrobble
         play.trackName,
-        new Date(`${play.endTime} UTC`),
+        new Date(`${play.endTime}`),
         play.msPlayed,
       );
     });
