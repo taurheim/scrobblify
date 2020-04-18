@@ -46,13 +46,22 @@ export default class Scrobblify {
 
   public spotifyJsonToListens(jsonString: string): SpotifyListen[] {
     const parsedJson: any[] = JSON.parse(jsonString);
+    function parseSpotifyDateTime(spotifyDateTime: string) {
+
+      const match = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d)/.exec(spotifyDateTime);
+      return new Date(Date.UTC(Number(match![1]),
+                               Number(match![2]) - 1,
+                               Number(match![3]),
+                               Number(match![4]),
+                               Number(match![5])));
+  }
     return parsedJson.map((play) => {
       const allArtists: string[] = play.artistName.split(', ');
 
       return new SpotifyListen(
         allArtists[0], // The first artist is the one we'll use to scrobble
         play.trackName,
-        new Date(`${play.endTime}`),
+        parseSpotifyDateTime(play.endTime),
         play.msPlayed,
       );
     });
