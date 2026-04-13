@@ -36,7 +36,7 @@
       </div>
       <br>
       <v-checkbox color="primary" v-model="scrobbleOldPlays" :label="`Scrobble tracks older than 2 weeks (they will show as listened to today)`"></v-checkbox>
-      <v-checkbox color="primary" v-model="followLfmRules" :label="`Validate track lengths against last.fm rules (slower but more accurate — filters out tracks you didn't really listen to)`"></v-checkbox>
+      <v-checkbox color="primary" v-model="followLfmRules" :label="`Validate track lengths (filters out tracks shorter than 30s, or played for less than half their duration / 4 minutes)`"></v-checkbox>
       <v-checkbox color="primary" v-model="checkDuplicates" :label="`Check for duplicates (fetches your last.fm history and skips tracks already scrobbled)`"></v-checkbox>
       <br>
       <v-btn color="primary" @click="parseSpotifyData" :disabled="!selectedFile">
