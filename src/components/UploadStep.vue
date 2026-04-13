@@ -43,6 +43,7 @@
         Find tracks
       </v-btn>
     </div>
+    <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
   </div>
 </template>
 <style>
@@ -74,12 +75,14 @@ import Vue from 'vue';
 import JSZip from 'jszip';
 import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
+import ErrorDialog from '@/components/ErrorDialog.vue';
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 export default Vue.extend({
+  components: { 'error-dialog': ErrorDialog },
   data() {
     return {
       selectedFile: null as File | null,
@@ -93,6 +96,9 @@ export default Vue.extend({
       stepProgress: 0,
       stepTotal: 1,
       readyToScrobble: false,
+      showError: false,
+      errorMessage: '',
+      errorDetails: '',
     };
   },
   computed: {
@@ -141,24 +147,49 @@ export default Vue.extend({
       this.logs.push('Reading ZIP file...');
       await delay(100);
 
-      const zip = await JSZip.loadAsync(this.selectedFile);
+      let zip: JSZip;
+      try {
+        zip = await JSZip.loadAsync(this.selectedFile);
+      } catch (e) {
+        this.errorMessage = 'Failed to read the ZIP file. It may be corrupted or not a valid ZIP archive.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+        return;
+      }
       const audioFilePattern = /Streaming_History_Audio_.*\.json$/;
       const matchingFiles = Object.keys(zip.files).filter(
         (name) => audioFilePattern.test(name) && !zip.files[name].dir,
       );
 
       if (matchingFiles.length === 0) {
-        this.logs.push('No Streaming_History_Audio_*.json files found in the ZIP.');
+        this.errorMessage = 'No Streaming_History_Audio_*.json files found in the ZIP. Make sure you uploaded the correct Spotify Extended Streaming History export.';
+        this.showError = true;
         return;
       }
 
       this.logs.push(`Found ${matchingFiles.length} audio history file(s) in ZIP.`);
 
-      const jsonStrings: string[] = await Promise.all(
-        matchingFiles.map((name) => zip.files[name].async('string')),
-      );
+      let jsonStrings: string[];
+      try {
+        jsonStrings = await Promise.all(
+          matchingFiles.map((name) => zip.files[name].async('string')),
+        );
+      } catch (e) {
+        this.errorMessage = 'Failed to extract files from the ZIP archive.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+        return;
+      }
 
-      const parsedData: SpotifyListen[] = this.scrobblify.parseMultipleJsonFiles(jsonStrings);
+      let parsedData: SpotifyListen[];
+      try {
+        parsedData = this.scrobblify.parseMultipleJsonFiles(jsonStrings);
+      } catch (e) {
+        this.errorMessage = 'Failed to parse the Spotify listening history. The JSON data in the ZIP may be malformed.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+        return;
+      }
       this.logs.push(`Found ${parsedData.length} plays in your spotify listening history.`);
 
       let newData: SpotifyListen[] = [];
@@ -187,8 +218,9 @@ export default Vue.extend({
       try {
         validData = await this.scrobblify.removeInvalidListens(newData, this.smartMoveProgress, !this.followLfmRules);
       } catch (e) {
-        this.logs.push(`Looks like we encountered an error. Please send an email to niko@savas.ca with your`);
-        this.logs.push(`last.fm username and StreamingHistory.json and I'll take care of it as soon as possibele!`);
+        this.errorMessage = 'An error occurred while validating your listening history.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
         return;
       }
       this.logs.push(`Found ${validData.length} valid scrobbles`);
@@ -215,7 +247,9 @@ export default Vue.extend({
           toBeScrobbled = result.unique;
           this.logs.push(`Found ${result.duplicateCount} duplicates — ${toBeScrobbled.length} new tracks to scrobble.`);
         } catch (e) {
-          this.logs.push(`Error during duplicate check: ${e}. Proceeding with all ${validData.length} tracks.`);
+          this.errorMessage = 'An error occurred while checking for duplicates. Proceeding with all tracks.';
+          this.errorDetails = (e as Error).message || String(e);
+          this.showError = true;
           toBeScrobbled = validData;
         }
       }

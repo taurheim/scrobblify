@@ -8,6 +8,7 @@
       </v-progress-circular>
       Checking for authentication...
     </div>
+    <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
   </div>
 </template>
 <style>
@@ -16,10 +17,15 @@
 <script lang="ts">
 import Vue from 'vue';
 import LastFm from '@/api/LastFm';
+import ErrorDialog from '@/components/ErrorDialog.vue';
 export default Vue.extend({
+  components: { 'error-dialog': ErrorDialog },
   data() {
     return {
       checkingAuth: false,
+      showError: false,
+      errorMessage: '',
+      errorDetails: '',
     };
   },
   methods: {
@@ -30,7 +36,15 @@ export default Vue.extend({
   async mounted() {
     this.$data.checkingAuth = true;
     const api = this.$store.state.lfmApi as LastFm;
-    await api.init(this.$route.query);
+    try {
+      await api.init(this.$route.query);
+    } catch (e) {
+      this.$data.checkingAuth = false;
+      this.errorMessage = 'Failed to authenticate with Last.fm. Please try again.';
+      this.errorDetails = (e as Error).message || String(e);
+      this.showError = true;
+      return;
+    }
     if (api.isAuthenticated()) {
       setTimeout(() => {
         this.$emit('complete');

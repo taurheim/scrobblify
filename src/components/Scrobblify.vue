@@ -54,6 +54,7 @@
         </v-stepper-content>
       </v-stepper-items>
     </v-stepper>
+    <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
   </div>
 </template>
 <style>
@@ -72,6 +73,7 @@ import LastFm from '@/api/LastFm';
 import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
+import ErrorDialog from '@/components/ErrorDialog.vue';
 
 
 export default Vue.extend({
@@ -81,6 +83,7 @@ export default Vue.extend({
     'select-step': SelectStepVue,
     'scrobble-step': ScrobbleStepVue,
     'complete-step': CompleteStepVue,
+    'error-dialog': ErrorDialog,
   },
   data() {
     return {
@@ -88,10 +91,17 @@ export default Vue.extend({
       hasResumableState: false,
       hasRemainingTracks: false,
       stateManager: new StateManager(),
+      showError: false,
+      errorMessage: '',
+      errorDetails: '',
     };
   },
   async mounted() {
-    this.hasResumableState = await this.stateManager.hasSavedState();
+    try {
+      this.hasResumableState = await this.stateManager.hasSavedState();
+    } catch (e) {
+      // IndexedDB not available — not critical, just skip resume
+    }
   },
   methods: {
     clearToken() {
@@ -100,9 +110,15 @@ export default Vue.extend({
       api.clearUser();
     },
     async resumeFromSaved() {
-      const state = await this.stateManager.loadState();
-      if (!state) { return; }
-      this.restoreFromState(state);
+      try {
+        const state = await this.stateManager.loadState();
+        if (!state) { return; }
+        this.restoreFromState(state);
+      } catch (e) {
+        this.errorMessage = 'Failed to load your saved progress.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+      }
     },
     importStateFile() {
       (this.$refs.importFileInput as HTMLInputElement).click();
@@ -114,13 +130,16 @@ export default Vue.extend({
         const state = await this.stateManager.importFromFile(input.files[0]);
         this.restoreFromState(state);
       } catch (e) {
-        alert(`Invalid state file: ${(e as Error).message}`);
+        this.errorMessage = 'The selected file is not a valid Scrobblify progress file.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
       }
     },
     restoreFromState(state: ScrobbleState) {
       const api = this.$store.state.lfmApi as LastFm;
       if (api.getUserName() && api.getUserName() !== state.userName) {
-        alert(`This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`);
+        this.errorMessage = `This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`;
+        this.showError = true;
         return;
       }
 
@@ -136,11 +155,19 @@ export default Vue.extend({
       this.currentStep = 4;
     },
     async clearSavedState() {
-      await this.stateManager.clearState();
+      try {
+        await this.stateManager.clearState();
+      } catch (e) {
+        // Not critical — continue anyway
+      }
       this.hasResumableState = false;
     },
     async onScrobbleComplete() {
-      await this.stateManager.clearState();
+      try {
+        await this.stateManager.clearState();
+      } catch (e) {
+        // Not critical — continue anyway
+      }
       this.hasRemainingTracks = false;
       this.currentStep = 5;
     },
@@ -164,8 +191,15 @@ export default Vue.extend({
         savedAt: new Date().toISOString(),
       };
 
-      await this.stateManager.saveState(state);
-      this.stateManager.exportToFile(state);
+      try {
+        await this.stateManager.saveState(state);
+        this.stateManager.exportToFile(state);
+      } catch (e) {
+        this.errorMessage = 'Failed to save your scrobbling progress. You can try the "Save Progress" button again.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+        return;
+      }
       this.hasRemainingTracks = true;
       this.currentStep = 5;
     },

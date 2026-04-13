@@ -62,6 +62,8 @@
         </v-expansion-panel-content>
       </v-expansion-panel>
     </v-expansion-panels>
+
+    <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
   </div>
 </template>
 <style>
@@ -74,12 +76,14 @@
 import Vue from 'vue';
 import Scrobble from '@/models/Scrobble';
 import LastFm from '@/api/LastFm';
+import ErrorDialog from '@/components/ErrorDialog.vue';
 
 const BURST_LIMIT = 950;
 const DAILY_LIMIT = 2700;
 const BURST_COOLDOWN_MS = 10 * 60 * 1000;
 
 export default Vue.extend({
+  components: { 'error-dialog': ErrorDialog },
   data() {
     return {
       scrobbling: false,
@@ -93,6 +97,9 @@ export default Vue.extend({
       dailyCount: 0,
       failedTracks: [] as Array<{ track: Scrobble; error: string }>,
       completed: false,
+      showError: false,
+      errorMessage: '',
+      errorDetails: '',
     };
   },
   computed: {
@@ -120,6 +127,8 @@ export default Vue.extend({
       this.completed = false;
       const api = this.$store.state.lfmApi as LastFm;
       const tracks = this.tracksToScrobble;
+      let consecutiveFailures = 0;
+      const MAX_CONSECUTIVE_FAILURES = 10;
 
       for (let i = this.scrobbledTracks; i < tracks.length; i++) {
         // Check if manually paused
@@ -149,9 +158,20 @@ export default Vue.extend({
           this.$store.commit('trackScrobbled');
           this.burstCount++;
           this.dailyCount++;
+          consecutiveFailures = 0;
         } catch (e) {
           this.$store.commit('trackFailed');
           this.failedTracks.push({ track, error: (e as Error).message || 'Unknown error' });
+          consecutiveFailures++;
+
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} tracks failed in a row. There may be a problem with Last.fm or your authentication.`;
+            this.errorDetails = (e as Error).message || String(e);
+            this.showError = true;
+            this.pauseReason = 'Paused due to repeated failures.';
+            this.paused = true;
+            return;
+          }
         }
 
         this.scrobbledTracks += 1;
