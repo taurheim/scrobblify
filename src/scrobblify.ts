@@ -93,17 +93,19 @@ export default class Scrobblify {
     const MINIMUM_TRACK_LENGTH_MS = 30 * this.SECONDS_TO_MS;
     const ASSUME_TRACK_LENGTH = 1 * this.MINUTES_TO_MS;
 
-    // First get all the track lengths since we need to build a timeline
-    const trackLengthsMs: number[] = [];
-    for (const listen of listens) {
-      await progress();
-      if (assumeTrackLength) {
-        trackLengthsMs.push(ASSUME_TRACK_LENGTH);
-      } else {
+    let trackLengthsMs: number[];
+
+    if (assumeTrackLength) {
+      // Fast path: no API calls, just assume 1 minute per track
+      trackLengthsMs = listens.map(() => ASSUME_TRACK_LENGTH);
+    } else {
+      // Slow path: fetch actual track durations from Last.fm
+      trackLengthsMs = [];
+      for (const listen of listens) {
+        await progress();
         try {
           trackLengthsMs.push(await this.lfmApi.getTrackTimeMs(listen.trackName, listen.artistName));
         } catch (e) {
-          // Mark it as length 0
           trackLengthsMs.push(0);
         }
       }
