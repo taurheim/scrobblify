@@ -85,9 +85,84 @@ export default class LastFm {
       to: this.dateToSecondsString(to),
     };
     const response = await this.makeRequest('GET', requestParams);
-    return response.recenttracks.track.map((track: any) => {
-      return this.trackToScrobble(track);
-    });
+    const tracks = response.recenttracks.track;
+    if (!Array.isArray(tracks)) {
+      return [];
+    }
+    return tracks
+      .filter((track: any) => track.date)
+      .map((track: any) => this.trackToScrobble(track));
+  }
+
+  /**
+   * Fetch all scrobbles in a date range using paginated bulk requests.
+   * Uses limit=1000 per page for maximum efficiency.
+   * @param onProgress called with (fetchedSoFar, total) after each page
+   */
+  public async getAllScrobblesInRange(
+    from: Date,
+    to: Date,
+    onProgress?: (fetched: number, total: number) => void,
+  ): Promise<Scrobble[]> {
+    if (this.userName === null) {
+      throw new Error('Couldn\'t find username');
+    }
+
+    const PAGE_SIZE = 1000;
+    const allScrobbles: Scrobble[] = [];
+
+    // First request to get total count and first page
+    const firstParams: {[key: string]: string} = {
+      method: 'user.getrecenttracks',
+      user: this.userName,
+      from: this.dateToSecondsString(from),
+      to: this.dateToSecondsString(to),
+      limit: PAGE_SIZE.toString(),
+      page: '1',
+    };
+    const firstResponse = await this.makeRequest('GET', firstParams);
+    const attr = firstResponse.recenttracks['@attr'];
+    const totalPages = parseInt(attr.totalPages, 10);
+    const total = parseInt(attr.total, 10);
+
+    const firstTracks = firstResponse.recenttracks.track;
+    if (Array.isArray(firstTracks)) {
+      for (const track of firstTracks) {
+        if (track.date) {
+          allScrobbles.push(this.trackToScrobble(track));
+        }
+      }
+    }
+
+    if (onProgress) {
+      onProgress(allScrobbles.length, total);
+    }
+
+    // Fetch remaining pages sequentially (respects rate buffer in makeRequest)
+    for (let page = 2; page <= totalPages; page++) {
+      const params: {[key: string]: string} = {
+        method: 'user.getrecenttracks',
+        user: this.userName,
+        from: this.dateToSecondsString(from),
+        to: this.dateToSecondsString(to),
+        limit: PAGE_SIZE.toString(),
+        page: page.toString(),
+      };
+      const response = await this.makeRequest('GET', params);
+      const tracks = response.recenttracks.track;
+      if (Array.isArray(tracks)) {
+        for (const track of tracks) {
+          if (track.date) {
+            allScrobbles.push(this.trackToScrobble(track));
+          }
+        }
+      }
+      if (onProgress) {
+        onProgress(allScrobbles.length, total);
+      }
+    }
+
+    return allScrobbles;
   }
 
   public async getTrackTimeMs(trackName: string, trackArtist: string): Promise<number> {
@@ -142,6 +217,7 @@ export default class LastFm {
     httpMethod: string,
     params: {[key: string]: string},
     authenticatedRequest: boolean = false,
+    maxRetries: number = 3,
   ): Promise<any> {
     params.api_key = this.lfmApiKey;
 
@@ -156,27 +232,54 @@ export default class LastFm {
 
     const paramsString = this.paramObjectToString(params);
 
-    let response;
-    if (httpMethod === 'POST') {
-      const fetchResponse = await fetch(this.API_BASE_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `format=json&${paramsString}`,
-      });
-      response = await fetchResponse.json();
-    } else {
-      const requestURL = `${this.API_BASE_URL}?format=json&${paramsString}`;
-      const fetchResponse = await fetch(requestURL, { method: httpMethod });
-      response = await fetchResponse.json();
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        let fetchResponse;
+        if (httpMethod === 'POST') {
+          fetchResponse = await fetch(this.API_BASE_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `format=json&${paramsString}`,
+          });
+        } else {
+          const requestURL = `${this.API_BASE_URL}?format=json&${paramsString}`;
+          fetchResponse = await fetch(requestURL, { method: httpMethod });
+        }
+
+        // Retry on 429 (rate limited) or 5xx server errors
+        if (fetchResponse.status === 429 || fetchResponse.status >= 500) {
+          if (attempt < maxRetries) {
+            const backoff = Math.pow(2, attempt + 1) * 1000;
+            await new Promise((r) => setTimeout(r, backoff));
+            continue;
+          }
+        }
+
+        const response = await fetchResponse.json();
+
+        // Last.fm error code 29 = rate limit exceeded
+        if (response.error === 29 && attempt < maxRetries) {
+          const backoff = Math.pow(2, attempt + 1) * 1000;
+          await new Promise((r) => setTimeout(r, backoff));
+          continue;
+        }
+
+        if (response.error) {
+          throw new Error(`Last.fm error on request: ${JSON.stringify(params)}`);
+        }
+
+        await new Promise((r) => setTimeout(r, this.API_RATE_BUFFER_MS));
+
+        return response;
+      } catch (e) {
+        if (attempt < maxRetries && !(e instanceof Error && e.message.startsWith('Last.fm error'))) {
+          const backoff = Math.pow(2, attempt + 1) * 1000;
+          await new Promise((r) => setTimeout(r, backoff));
+          continue;
+        }
+        throw e;
+      }
     }
-
-    if (response.error) {
-      throw new Error(`Last.fm error on request: ${JSON.stringify(params)}`);
-    }
-
-    await new Promise((r) => setTimeout(r, this.API_RATE_BUFFER_MS));
-
-    return response;
   }
 
   private getMethodSignature(params: {[key: string]: any}, token: string) {

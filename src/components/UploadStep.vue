@@ -37,7 +37,7 @@
       <br>
       <v-checkbox color="primary" v-model="scrobbleOldPlays" :label="`Scrobble tracks older than 2 weeks (they will show as listened to today)`"></v-checkbox>
       <v-checkbox color="primary" v-model="followLfmRules" :label="`Validate track lengths against last.fm rules (slower but more accurate — filters out tracks you didn't really listen to)`"></v-checkbox>
-      <v-checkbox color="primary" v-model="checkDuplicates" :label="`Check for duplicates (~0.35s per track — skips tracks already in your last.fm history)`"></v-checkbox>
+      <v-checkbox color="primary" v-model="checkDuplicates" :label="`Check for duplicates (fetches your last.fm history and skips tracks already scrobbled)`"></v-checkbox>
       <br>
       <v-btn color="primary" @click="parseSpotifyData" :disabled="!selectedFile">
         Find tracks
@@ -74,7 +74,6 @@ import Vue from 'vue';
 import JSZip from 'jszip';
 import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
-import Scrobble from '@/models/Scrobble';
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -200,31 +199,24 @@ export default Vue.extend({
         toBeScrobbled = validData;
         this.logs.push(`Skipping duplicate check — ${validData.length} tracks ready.`);
       } else {
-        // Check each track against Last.fm history for duplicates
+        // Bulk-fetch Last.fm history and filter duplicates locally
         this.stepProgress = 0;
-        this.stepTotal = validData.length;
-        const estMinutes = Math.ceil(validData.length * 0.35 / 60);
-        const estStr = estMinutes < 60
-          ? `~${estMinutes} minute${estMinutes !== 1 ? 's' : ''}`
-          : `~${Math.floor(estMinutes / 60)}h ${estMinutes % 60}m`;
-        this.logs.push(`Checking for songs that have already been scrobbled (${validData.length} tracks, estimated ${estStr}).`);
-        let skippedFromError = 0;
-        for (const listen of validData) {
-          const scrobble = new Scrobble(listen.trackName, listen.artistName, listen.listenDate, listen.albumName);
-          try {
-            const isAlreadyScrobbled = await this.scrobblify.isAlreadyScrobbled(scrobble);
-            await this.smartMoveProgress();
-            if (!isAlreadyScrobbled) {
-              toBeScrobbled.push(listen);
-            }
-          } catch (e) {
-            skippedFromError += 1;
-          }
-        }
-        this.logs.push(`Found ${toBeScrobbled.length} songs that haven't been scrobbled yet`);
-        if (skippedFromError > 0) {
-          this.logs.push(`${skippedFromError} tracks skipped due to errors.
-          If this number is really high, let me know at niko@savas.ca`);
+        this.stepTotal = 1;
+        this.logs.push(`Fetching your Last.fm history to check for duplicates...`);
+        try {
+          const result = await this.scrobblify.filterDuplicates(
+            validData,
+            (message: string, pagesLoaded: number, totalPages: number) => {
+              this.stepProgress = pagesLoaded;
+              this.stepTotal = Math.max(totalPages, 1);
+              this.logs.splice(this.logs.length - 1, 1, message);
+            },
+          );
+          toBeScrobbled = result.unique;
+          this.logs.push(`Found ${result.duplicateCount} duplicates — ${toBeScrobbled.length} new tracks to scrobble.`);
+        } catch (e) {
+          this.logs.push(`Error during duplicate check: ${e}. Proceeding with all ${validData.length} tracks.`);
+          toBeScrobbled = validData;
         }
       }
 

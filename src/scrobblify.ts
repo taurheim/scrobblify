@@ -39,6 +39,83 @@ export default class Scrobblify {
     return wasScrobbled;
   }
 
+  /**
+   * Bulk duplicate filter: fetches the user's entire Last.fm history for the
+   * date range covered by the listens, then filters locally using the same
+   * artist + track-name similarity logic as isAlreadyScrobbled.
+   */
+  public async filterDuplicates(
+    listens: SpotifyListen[],
+    onProgress?: (message: string, pagesLoaded: number, totalPages: number) => void,
+  ): Promise<{ unique: SpotifyListen[], duplicateCount: number }> {
+    if (listens.length === 0) {
+      return { unique: [], duplicateCount: 0 };
+    }
+
+    const SAME_IF_COEFFICIENT_ABOVE = 0.9;
+
+    // Determine the date range of the Spotify data (with buffer)
+    const timestamps = listens.map((l) => l.listenDate.getTime());
+    const minTime = Math.min(...timestamps) - this.CONFLICT_BUFFER_TIME_MS;
+    const maxTime = Math.max(...timestamps) + this.CONFLICT_BUFFER_TIME_MS;
+
+    // Bulk-fetch all existing scrobbles in that range
+    const existingScrobbles = await this.lfmApi.getAllScrobblesInRange(
+      new Date(minTime),
+      new Date(maxTime),
+      (fetched, total) => {
+        if (onProgress) {
+          const totalPages = Math.ceil(total / 1000);
+          const currentPage = Math.ceil(fetched / 1000);
+          onProgress(
+            `Fetching Last.fm history: ${fetched.toLocaleString()} of ${total.toLocaleString()} scrobbles...`,
+            currentPage,
+            totalPages,
+          );
+        }
+      },
+    );
+
+    // Build a lookup index keyed by artist (lowercased) for fast matching
+    const scrobblesByArtist = new Map<string, Scrobble[]>();
+    for (const scrobble of existingScrobbles) {
+      const key = scrobble.artist.toLowerCase();
+      let list = scrobblesByArtist.get(key);
+      if (!list) {
+        list = [];
+        scrobblesByArtist.set(key, list);
+      }
+      list.push(scrobble);
+    }
+
+    // Filter locally
+    let duplicateCount = 0;
+    const unique = listens.filter((listen) => {
+      const artistKey = listen.artistName.toLowerCase();
+      const candidates = scrobblesByArtist.get(artistKey);
+      if (!candidates) {
+        return true;
+      }
+
+      const listenTime = listen.listenDate.getTime();
+      const isDuplicate = candidates.some((existing) => {
+        const timeDiff = Math.abs(existing.timestamp.getTime() - listenTime);
+        if (timeDiff > this.CONFLICT_BUFFER_TIME_MS) {
+          return false;
+        }
+        const similarity = StringSimilarity.compareTwoStrings(listen.trackName, existing.track);
+        return similarity > SAME_IF_COEFFICIENT_ABOVE;
+      });
+
+      if (isDuplicate) {
+        duplicateCount++;
+      }
+      return !isDuplicate;
+    });
+
+    return { unique, duplicateCount };
+  }
+
   public async postScrobble(scrobble: Scrobble): Promise<void> {
     return;
   }
