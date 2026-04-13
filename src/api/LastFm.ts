@@ -61,9 +61,9 @@ export default class LastFm {
   }
 
   public clearUser() {
-    this.userAuthKey = '';
-    this.userAuthToken = '';
-    this.userName = '';
+    this.userAuthKey = null;
+    this.userAuthToken = null;
+    this.userName = null;
     localStorage.removeItem(this.USER_AUTH_KEY_LOCALSTORAGE_KEY);
     localStorage.removeItem(this.USER_AUTH_TOKEN_LOCALSTORAGE_KEY);
     localStorage.removeItem(this.USER_NAME_LOCALSTORAGE_KEY);
@@ -143,10 +143,6 @@ export default class LastFm {
     params: {[key: string]: string},
     authenticatedRequest: boolean = false,
   ): Promise<any> {
-    if (this.userAuthToken === null) {
-      throw new Error('Not authenticated!');
-    }
-
     params.api_key = this.lfmApiKey;
 
     // Decide which api key to use
@@ -154,15 +150,25 @@ export default class LastFm {
       if (this.userAuthKey) {
         params.sk = this.userAuthKey;
       }
-      const sig = this.getMethodSignature(params, this.userAuthToken);
+      const sig = this.getMethodSignature(params, this.userAuthToken || '');
       params.api_sig = sig;
     }
 
     const paramsString = this.paramObjectToString(params);
-    const requestURL = `${this.API_BASE_URL}?format=json&${paramsString}`;
 
-    const fetchResponse = await fetch(requestURL, { method: httpMethod });
-    const response = await fetchResponse.json();
+    let response;
+    if (httpMethod === 'POST') {
+      const fetchResponse = await fetch(this.API_BASE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `format=json&${paramsString}`,
+      });
+      response = await fetchResponse.json();
+    } else {
+      const requestURL = `${this.API_BASE_URL}?format=json&${paramsString}`;
+      const fetchResponse = await fetch(requestURL, { method: httpMethod });
+      response = await fetchResponse.json();
+    }
 
     if (response.error) {
       throw new Error(`Last.fm error on request: ${JSON.stringify(params)}`);
@@ -189,7 +195,7 @@ export default class LastFm {
 
   private paramObjectToString(params: {[key: string]: string}) {
     return Object.keys(params).map((key) => {
-      return `${key}=${params[key]}`;
+      return `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`;
     }).join('&');
   }
 

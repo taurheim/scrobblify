@@ -122,6 +122,11 @@ export default Vue.extend({
       const tracks = this.tracksToScrobble;
 
       for (let i = this.scrobbledTracks; i < tracks.length; i++) {
+        // Check if manually paused
+        if (this.paused) {
+          return;
+        }
+
         // Check burst limit
         if (this.burstCount >= BURST_LIMIT) {
           this.pauseReason = `Approaching Last.fm's burst limit (~1,000 scrobbles). Pausing for 10 minutes to avoid being rate-limited.`;
