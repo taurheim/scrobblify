@@ -133,7 +133,10 @@ export default class LastFm {
       'track[0]': play.track,
       'timestamp[0]': play.timestamp.getTime() / 1000,
     };
-
+    // Add album if available
+    if (play.album) {
+      params['album[0]'] = play.album;
+    }
     await this.makeRequest('POST', params, true);
   }
 

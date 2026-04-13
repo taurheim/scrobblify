@@ -6,6 +6,7 @@ export default class SpotifyListen {
     public trackName: string,
     public listenDate: Date,
     public msPlayed: number,
+    public albumName: string = '',
   ) {
     this.key = listenDate.getTime();
   }

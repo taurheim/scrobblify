@@ -12,25 +12,35 @@
     Now all your plays will be automatically scrobbled (saved) to last.fm! You can use last.fm to track your listening history and use cool tools like <a href="https://savas.ca/lastwave">LastWave</a>.
 
     <h2>But I want to see cool graphs right now!</h2>
-    Well you're in luck - Scrobblify to the rescue! Scrobblify lets you retroactively scrobble your past 2 weeks of plays from spotify straight to last.fm.
+    Well you're in luck - Scrobblify to the rescue! Scrobblify lets you retroactively scrobble your Spotify listening history straight to last.fm.
     <br><br>
-    <b>1. Request to download your Spotify listening history</b><br>
-    Go to <a href="https://www.spotify.com/ca-en/account/privacy/">https://www.spotify.com/ca-en/account/privacy/</a>,
-    at the bottom click "Request" to request your personal data file. They say it can take up to 30 days but I've found
-    it usually only takes a couple days.<br>
-    <b>2. Receive email from Spotify that your data is ready</b><br>
-    Go back to <a href="https://www.spotify.com/ca-en/account/privacy/">https://www.spotify.com/ca-en/account/privacy/</a>
-    and download your zip file.<br>
+    <b>1. Request your Extended Streaming History from Spotify</b><br>
+    Go to <a href="https://www.spotify.com/account/privacy/">your Spotify account</a> (Account &gt; Privacy &gt; Download your data).
+    Make sure you request the <strong>"Extended streaming history"</strong> specifically — this is different from the basic "Account data" download.
+    The extended history includes your full listening history with timestamps, which is what Scrobblify needs.
+    Spotify says it can take up to 30 days, but it usually only takes a few days.<br>
+    <b>2. Download your data when it's ready</b><br>
+    You'll get an email from Spotify when your data is ready. Go back to your
+    <a href="https://www.spotify.com/account/privacy/">privacy settings</a> and download the ZIP file.<br>
     <b>3. Create a last.fm account</b><br>
-    Create a new account <a href="https://www.last.fm/join">here</a> (an existing account will also work - scrobblify
+    Create a new account <a href="https://www.last.fm/join">here</a> (an existing account will also work — Scrobblify
     will check to make sure it doesn't add any duplicate scrobbles).<br>
-    <b>4. Get your data ready</b><br>
-    Unzip <code>my_spotify_data.zip</code> and open <code>StreamingHistory.json</code> in a text editor (notepad will work fine).<br>
-    <b>5. Use scrobblify!</b><br>
-    Go to <router-link to="/scrobble">Scrobble</router-link> and follow the steps there.
+    <b>4. Drag and drop your ZIP file into Scrobblify</b><br>
+    No need to unzip or open any files! Just drag and drop the ZIP file directly into the
+    <router-link to="/scrobble">Scrobble</router-link> page and Scrobblify will handle the rest.<br>
+    <b>5. Sit back and let it run!</b><br>
+    Scrobblify will start submitting your listening history to last.fm. Note that last.fm has undocumented rate limits
+    (~2,800 scrobbles per day, ~1,000 per burst), so if you have a large history it may take a while.
+    Don't worry — Scrobblify handles this automatically by pausing and resuming when rate limits are hit.
+    You can also <strong>save your progress</strong> and come back later if you need to close the page. Your progress will be
+    waiting for you when you return!
 
     <h2>Why does scrobblify only backfill the last two weeks?</h2>
-    This is limitation that is enforced by last.fm. See community topic <a href="https://getsatisfaction.com/lastfm/topics/scrobbles-more-than-14-days">here</a>. Don't worry, 2 weeks of listening should be enough to get some neat stats - once you've connected your accounts all future plays will be kept forever!
+    This is a limitation enforced by last.fm — scrobbles are supposed to be for the past two weeks only.
+    See the community topic <a href="https://getsatisfaction.com/lastfm/topics/scrobbles-more-than-14-days">here</a>.
+    However, Scrobblify gives you the option to <strong>re-tag older listens to today's date</strong>, so you can still
+    import your full history if you'd like. Don't worry, once you've connected your accounts all future plays will be
+    kept forever!
   </div>
 </template>
 <style>

@@ -32,6 +32,7 @@
         </td>
         <td>{{ props.item.track }}</td>
         <td>{{ props.item.artist }}</td>
+        <td>{{ props.item.album }}</td>
         <td>{{ prettyDate(new Date(props.item.time)).toLocaleString() }}</td>
       </template>
     </v-data-table>
@@ -61,6 +62,10 @@ export default Vue.extend({
           value: 'artist',
         },
         {
+          text: 'Album',
+          value: 'album',
+        },
+        {
           text: 'Date',
           value: 'time',
         },
@@ -75,6 +80,7 @@ export default Vue.extend({
           id: i,
           track: scrob.trackName,
           artist: scrob.artistName,
+          album: scrob.albumName,
           time: scrob.listenDate.getTime(),
         };
       });
@@ -94,7 +100,7 @@ export default Vue.extend({
     },
     commitTracksToStore(tracks: any[]) {
       this.$store.commit('setSelectedScrobbles', tracks.map((track: any) => {
-        return new Scrobble(track.track, track.artist, new Date(track.time));
+        return new Scrobble(track.track, track.artist, new Date(track.time), track.album);
       }));
     },
   },

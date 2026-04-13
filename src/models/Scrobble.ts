@@ -3,6 +3,7 @@ export default class Scrobble {
     public track: string,
     public artist: string,
     public timestamp: Date,
+    public album: string = '',
   ) {
   }
 

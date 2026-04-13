@@ -10,24 +10,57 @@
       <v-btn class="primary" @click="finishStep" v-if="readyToScrobble">Choose which tracks to scrobble</v-btn>
     </div>
     <div v-else>
-      <h2>Paste the contents of StreamingHistory.json here:</h2>
-      <textarea v-model="spotifyStreamingHistory" placeholder="File contents go here">
-      </textarea>
+      <h2>Upload your Spotify Extended Streaming History ZIP file:</h2>
+      <div
+        class="drop-zone"
+        :class="{ 'drop-zone--active': isDragging }"
+        @dragover.prevent="isDragging = true"
+        @dragleave.prevent="isDragging = false"
+        @drop.prevent="onDrop"
+        @click="openFilePicker"
+      >
+        <input
+          ref="fileInput"
+          type="file"
+          accept=".zip"
+          style="display: none"
+          @change="onFileSelected"
+        >
+        <v-icon large class="mb-2">mdi-cloud-upload</v-icon>
+        <div v-if="selectedFileName">
+          <strong>{{ selectedFileName }}</strong>
+        </div>
+        <div v-else>
+          Drag &amp; drop your .zip file here, or click to browse
+        </div>
+      </div>
       <br>
       <v-checkbox color="primary" v-model="scrobbleOldPlays" :label="`Scrobble tracks older than 2 weeks (they will show as listened to today)`"></v-checkbox>
       <v-checkbox color="primary" v-model="followLfmRules" :label="`Follow last.fm scrobble rules (This will take longer but be more accurate about which tracks you actually listened to)`"></v-checkbox>
       <br>
-      <v-btn color="primary" @click="parseSpotifyData">
+      <v-btn color="primary" @click="parseSpotifyData" :disabled="!selectedFile">
         Find tracks
       </v-btn>
     </div>
   </div>
 </template>
 <style>
-.upload-step textarea {
-  height: 500px;
-  border: 1px solid #ed1c24;
-  width: 100%;
+.drop-zone {
+  border: 2px dashed #ed1c24;
+  border-radius: 8px;
+  padding: 48px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: background-color 0.2s, border-color 0.2s;
+}
+
+.drop-zone:hover {
+  background-color: rgba(237, 28, 36, 0.05);
+}
+
+.drop-zone--active {
+  background-color: rgba(237, 28, 36, 0.1);
+  border-color: #b71c1c;
 }
 
 .logs {
@@ -38,6 +71,7 @@
 <script lang="ts">
 import Vue from 'vue';
 import Bluebird, { delay } from 'bluebird';
+import JSZip from 'jszip';
 import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble from '@/models/Scrobble';
@@ -45,7 +79,9 @@ import Scrobble from '@/models/Scrobble';
 export default Vue.extend({
   data() {
     return {
-      spotifyStreamingHistory: '',
+      selectedFile: null as File | null,
+      selectedFileName: '',
+      isDragging: false,
       scrobbleOldPlays: false,
       followLfmRules: false,
       scrobblify: new Scrobblify(this.$store.state.lfmApi),
@@ -71,10 +107,54 @@ export default Vue.extend({
         await delay(100);
       }
     },
+    openFilePicker() {
+      (this.$refs.fileInput as HTMLInputElement).click();
+    },
+    onFileSelected(event: Event) {
+      const input = event.target as HTMLInputElement;
+      if (input.files && input.files.length > 0) {
+        this.setFile(input.files[0]);
+      }
+    },
+    onDrop(event: DragEvent) {
+      this.isDragging = false;
+      if (event.dataTransfer && event.dataTransfer.files.length > 0) {
+        this.setFile(event.dataTransfer.files[0]);
+      }
+    },
+    setFile(file: File) {
+      if (!file.name.endsWith('.zip')) {
+        alert('Please upload a .zip file');
+        return;
+      }
+      this.selectedFile = file;
+      this.selectedFileName = file.name;
+    },
     async parseSpotifyData() {
-      // Parse & clean the data from the user
+      if (!this.selectedFile) { return; }
+
       const reTagDate = new Date();
-      const parsedData: SpotifyListen[] = this.scrobblify.spotifyJsonToListens(this.spotifyStreamingHistory);
+      this.logs.push('Reading ZIP file...');
+      await delay(100);
+
+      const zip = await JSZip.loadAsync(this.selectedFile);
+      const audioFilePattern = /Streaming_History_Audio_.*\.json$/;
+      const matchingFiles = Object.keys(zip.files).filter(
+        (name) => audioFilePattern.test(name) && !zip.files[name].dir,
+      );
+
+      if (matchingFiles.length === 0) {
+        this.logs.push('No Streaming_History_Audio_*.json files found in the ZIP.');
+        return;
+      }
+
+      this.logs.push(`Found ${matchingFiles.length} audio history file(s) in ZIP.`);
+
+      const jsonStrings: string[] = await Promise.all(
+        matchingFiles.map((name) => zip.files[name].async('string')),
+      );
+
+      const parsedData: SpotifyListen[] = this.scrobblify.parseMultipleJsonFiles(jsonStrings);
       this.logs.push(`Found ${parsedData.length} plays in your spotify listening history.`);
 
       let newData: SpotifyListen[] = [];
@@ -117,7 +197,7 @@ export default Vue.extend({
       this.logs.push(`Checking for songs that have already been scrobbled.`);
       let skippedFromError = 0;
       const toBeScrobbled = await Bluebird.filter(validData, async (listen) => {
-        const scrobble = new Scrobble(listen.trackName, listen.artistName, listen.listenDate);
+        const scrobble = new Scrobble(listen.trackName, listen.artistName, listen.listenDate, listen.albumName);
         try {
           let isAlreadyScrobbled: boolean = false;
           if (scrobble.timestamp.getTime() !== reTagDate.getTime()) {
