@@ -204,6 +204,32 @@ test.describe('Select Step - Track Selection', () => {
     await expect(page.locator('th:has-text("Album")')).toBeVisible();
   });
 
+  test('date filtering reduces matching track count', async ({ page }) => {
+    // Go to select step WITHOUT re-tagging old listens so dates remain original
+    await goToUploadStep(page);
+    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    await fileInput.setInputFiles(FIXTURE_ZIP);
+    // Don't check "Scrobble tracks older than 2 weeks" — keep original dates
+    await page.locator('button:has-text("Find tracks")').click();
+    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('h3:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 5000 });
+
+    // Without re-tagging, old tracks are filtered out, so we should see 0 tracks
+    // (all fixture dates are from 2024, which is >2 weeks ago)
+    // Let's test with re-tagging on but verify date range shows
+    // Actually, re-do with the checkbox to get tracks, then check filtering
+    await goToSelectStep(page);
+    // All 5 tracks re-tagged to today — date filter for a future date should filter them
+    await expect(page.locator('button:has-text("Add 5 matching")')).toBeVisible();
+
+    // Set from date to tomorrow — should filter out everything
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    await page.locator('input[type="date"]').first().fill(tomorrow);
+
+    await expect(page.locator('button:has-text("Add 0 matching")')).toBeVisible({ timeout: 5000 });
+  });
+
   test('add matching + scrobble advances to scrobble step', async ({ page }) => {
     await goToSelectStep(page);
     await page.locator('button:has-text("matching")').click();

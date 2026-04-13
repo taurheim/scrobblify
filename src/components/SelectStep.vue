@@ -1,6 +1,9 @@
 <template>
   <div>
     <h3>Choose which tracks to scrobble</h3>
+    <p v-if="dataMinDate && dataMaxDate" class="caption grey--text">
+      Your data spans {{ dataMinDate }} to {{ dataMaxDate }}
+    </p>
 
     <v-row align="center" class="mb-2">
       <v-col cols="12" sm="4">
@@ -14,52 +17,24 @@
         ></v-text-field>
       </v-col>
       <v-col cols="6" sm="3">
-        <v-menu
-          v-model="fromMenu"
-          :close-on-content-click="false"
-          transition="scale-transition"
-          offset-y
-          min-width="290px"
-        >
-          <template v-slot:activator="{ on, attrs }">
-            <v-text-field
-              v-model="fromDate"
-              label="From date"
-              prepend-icon="mdi-calendar"
-              readonly
-              clearable
-              hide-details
-              v-bind="attrs"
-              v-on="on"
-              @click:clear="fromDate = ''"
-            ></v-text-field>
-          </template>
-          <v-date-picker v-model="fromDate" @input="fromMenu = false"></v-date-picker>
-        </v-menu>
+        <label class="caption grey--text">From date</label>
+        <input
+          type="date"
+          v-model="fromDate"
+          :min="dataMinDate"
+          :max="dataMaxDate"
+          class="date-input"
+        />
       </v-col>
       <v-col cols="6" sm="3">
-        <v-menu
-          v-model="toMenu"
-          :close-on-content-click="false"
-          transition="scale-transition"
-          offset-y
-          min-width="290px"
-        >
-          <template v-slot:activator="{ on, attrs }">
-            <v-text-field
-              v-model="toDate"
-              label="To date"
-              prepend-icon="mdi-calendar"
-              readonly
-              clearable
-              hide-details
-              v-bind="attrs"
-              v-on="on"
-              @click:clear="toDate = ''"
-            ></v-text-field>
-          </template>
-          <v-date-picker v-model="toDate" @input="toMenu = false"></v-date-picker>
-        </v-menu>
+        <label class="caption grey--text">To date</label>
+        <input
+          type="date"
+          v-model="toDate"
+          :min="dataMinDate"
+          :max="dataMaxDate"
+          class="date-input"
+        />
       </v-col>
       <v-col cols="12" sm="2">
         <v-btn color="primary" @click="addMatchingTracks" :disabled="filteredTracks.length === 0">
@@ -94,7 +69,18 @@
     </div>
   </div>
 </template>
-<style>
+<style scoped>
+.date-input {
+  width: 100%;
+  padding: 8px 4px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.42);
+  background: transparent;
+  font-size: 14px;
+  outline: none;
+}
+.date-input:focus {
+  border-bottom: 2px solid #1976d2;
+}
 </style>
 <script lang="ts">
 import Vue from 'vue';
@@ -108,8 +94,6 @@ export default Vue.extend({
       selectedTracks: [] as any[],
       fromDate: '',
       toDate: '',
-      fromMenu: false,
-      toMenu: false,
       headers: [
         { text: 'Track', value: 'track' },
         { text: 'Artist', value: 'artist' },
@@ -130,6 +114,18 @@ export default Vue.extend({
           time: scrob.listenDate.getTime(),
         };
       });
+    },
+    dataMinDate(): string {
+      const tracks = this.allScrobbleableTracks;
+      if (tracks.length === 0) { return ''; }
+      const min = Math.min(...tracks.map((t: any) => t.time));
+      return new Date(min).toISOString().slice(0, 10);
+    },
+    dataMaxDate(): string {
+      const tracks = this.allScrobbleableTracks;
+      if (tracks.length === 0) { return ''; }
+      const max = Math.max(...tracks.map((t: any) => t.time));
+      return new Date(max).toISOString().slice(0, 10);
     },
     filteredTracks(): any[] {
       let tracks = this.allScrobbleableTracks;
