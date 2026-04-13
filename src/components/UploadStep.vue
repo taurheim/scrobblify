@@ -37,7 +37,7 @@
       <br>
       <v-checkbox color="primary" v-model="scrobbleOldPlays" :label="`Scrobble tracks older than 2 weeks (they will show as listened to today)`"></v-checkbox>
       <v-checkbox color="primary" v-model="followLfmRules" :label="`Validate track lengths against last.fm rules (slower but more accurate — filters out tracks you didn't really listen to)`"></v-checkbox>
-      <v-checkbox color="primary" v-model="checkDuplicates" :label="`Check for duplicates (slower — skips tracks already in your last.fm history)`"></v-checkbox>
+      <v-checkbox color="primary" v-model="checkDuplicates" :label="`Check for duplicates (~0.35s per track — skips tracks already in your last.fm history)`"></v-checkbox>
       <br>
       <v-btn color="primary" @click="parseSpotifyData" :disabled="!selectedFile">
         Find tracks
@@ -203,7 +203,11 @@ export default Vue.extend({
         // Check each track against Last.fm history for duplicates
         this.stepProgress = 0;
         this.stepTotal = validData.length;
-        this.logs.push(`Checking for songs that have already been scrobbled.`);
+        const estMinutes = Math.ceil(validData.length * 0.35 / 60);
+        const estStr = estMinutes < 60
+          ? `~${estMinutes} minute${estMinutes !== 1 ? 's' : ''}`
+          : `~${Math.floor(estMinutes / 60)}h ${estMinutes % 60}m`;
+        this.logs.push(`Checking for songs that have already been scrobbled (${validData.length} tracks, estimated ${estStr}).`);
         let skippedFromError = 0;
         for (const listen of validData) {
           const scrobble = new Scrobble(listen.trackName, listen.artistName, listen.listenDate, listen.albumName);
