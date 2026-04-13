@@ -1,6 +1,4 @@
 import Scrobble from '@/models/Scrobble';
-import Bluebird from 'bluebird';
-import Request from 'request-promise';
 import md5 from 'blueimp-md5';
 
 export default class LastFm {
@@ -163,10 +161,8 @@ export default class LastFm {
     const paramsString = this.paramObjectToString(params);
     const requestURL = `${this.API_BASE_URL}?format=json&${paramsString}`;
 
-    const response = await Request(requestURL, {
-      method: httpMethod,
-      json: true,
-    });
+    const fetchResponse = await fetch(requestURL, { method: httpMethod });
+    const response = await fetchResponse.json();
 
     if (response.error) {
       throw new Error(`Last.fm error on request: ${JSON.stringify(params)}`);

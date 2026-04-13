@@ -62,7 +62,6 @@
 import Vue from 'vue';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble from '@/models/Scrobble';
-import Bluebird from 'bluebird';
 import Scrobblify from '@/scrobblify';
 
 // Steps

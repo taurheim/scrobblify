@@ -1,7 +1,6 @@
 import Scrobble from '@/models/Scrobble';
 import LastFm from '@/api/LastFm';
 import SpotifyListen from '@/models/SpotifyListen';
-import Bluebird from 'bluebird';
 import StringSimilarity from 'string-similarity';
 import store from '@/store';
 
@@ -95,20 +94,20 @@ export default class Scrobblify {
     const ASSUME_TRACK_LENGTH = 1 * this.MINUTES_TO_MS;
 
     // First get all the track lengths since we need to build a timeline
-    const trackLengthsMs: number[] = await Bluebird.map(listens, async (listen: SpotifyListen) => {
+    const trackLengthsMs: number[] = [];
+    for (const listen of listens) {
       await progress();
       if (assumeTrackLength) {
-        return ASSUME_TRACK_LENGTH;
+        trackLengthsMs.push(ASSUME_TRACK_LENGTH);
+      } else {
+        try {
+          trackLengthsMs.push(await this.lfmApi.getTrackTimeMs(listen.trackName, listen.artistName));
+        } catch (e) {
+          // Mark it as length 0
+          trackLengthsMs.push(0);
+        }
       }
-      try {
-        return await this.lfmApi.getTrackTimeMs(listen.trackName, listen.artistName);
-      } catch (e) {
-        // Mark it as length 0
-        return 0;
-      }
-    }, {
-      concurrency: 1,
-    });
+    }
 
     return listens.filter((listen, i) => {
       const msListened: number = listen.msPlayed;

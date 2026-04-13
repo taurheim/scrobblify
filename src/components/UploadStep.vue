@@ -70,11 +70,14 @@
 </style>
 <script lang="ts">
 import Vue from 'vue';
-import Bluebird, { delay } from 'bluebird';
 import JSZip from 'jszip';
 import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble from '@/models/Scrobble';
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 export default Vue.extend({
   data() {
@@ -196,7 +199,8 @@ export default Vue.extend({
       this.stepTotal = validData.length;
       this.logs.push(`Checking for songs that have already been scrobbled.`);
       let skippedFromError = 0;
-      const toBeScrobbled = await Bluebird.filter(validData, async (listen) => {
+      const toBeScrobbled: SpotifyListen[] = [];
+      for (const listen of validData) {
         const scrobble = new Scrobble(listen.trackName, listen.artistName, listen.listenDate, listen.albumName);
         try {
           let isAlreadyScrobbled: boolean = false;
@@ -204,15 +208,13 @@ export default Vue.extend({
             isAlreadyScrobbled = await this.scrobblify.isAlreadyScrobbled(scrobble);
           }
           await this.smartMoveProgress();
-
-          return !isAlreadyScrobbled;
+          if (!isAlreadyScrobbled) {
+            toBeScrobbled.push(listen);
+          }
         } catch (e) {
           skippedFromError += 1;
-          return false;
         }
-      }, {
-        concurrency: 1,
-      });
+      }
       this.logs.push(`Found ${toBeScrobbled.length} songs that haven't been scrobbled yet`);
       if (skippedFromError > 0) {
         this.logs.push(`${skippedFromError} tracks skipped due to errors.
