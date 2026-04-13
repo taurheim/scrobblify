@@ -193,20 +193,21 @@ test.describe('Select Step - Track Selection', () => {
     await page.locator('button:has-text("Choose which tracks to scrobble")').click();
 
     // Should now be on step 3
-    await expect(page.locator('text=Just scrobble everything')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('h3:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 5000 });
   }
 
   test('shows track list with artist and album columns', async ({ page }) => {
     await goToSelectStep(page);
     // Table headers should include Track, Artist, Album
-    await expect(page.locator('text=Track title')).toBeVisible();
-    await expect(page.locator('text=Artist')).toBeVisible();
-    await expect(page.locator('text=Album')).toBeVisible();
+    await expect(page.locator('th:has-text("Track")')).toBeVisible();
+    await expect(page.locator('th:has-text("Artist")')).toBeVisible();
+    await expect(page.locator('th:has-text("Album")')).toBeVisible();
   });
 
-  test('scrobble all button advances to scrobble step', async ({ page }) => {
+  test('add matching + scrobble advances to scrobble step', async ({ page }) => {
     await goToSelectStep(page);
-    await page.locator('button:has-text("Just scrobble everything")').click();
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
     // Should advance to step 4 - the scrobble step
     await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   });
@@ -224,8 +225,9 @@ test.describe('Scrobble Step', () => {
     await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
     await page.locator('button:has-text("Choose which tracks to scrobble")').click();
 
-    await expect(page.locator('button:has-text("Just scrobble everything")')).toBeVisible({ timeout: 5000 });
-    await page.locator('button:has-text("Just scrobble everything")').click();
+    await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
 
     await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   }
@@ -286,8 +288,9 @@ test.describe('Scrobble Step', () => {
     await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
     await page.locator('button:has-text("Choose which tracks to scrobble")').click();
 
-    await expect(page.locator('button:has-text("Just scrobble everything")')).toBeVisible({ timeout: 5000 });
-    await page.locator('button:has-text("Just scrobble everything")').click();
+    await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -352,8 +355,9 @@ test.describe('Scrobble Step', () => {
     await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
     await page.locator('button:has-text("Choose which tracks to scrobble")').click();
 
-    await expect(page.locator('button:has-text("Just scrobble everything")')).toBeVisible({ timeout: 5000 });
-    await page.locator('button:has-text("Just scrobble everything")').click();
+    await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -418,8 +422,9 @@ test.describe('Scrobble Step', () => {
     await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
     await page.locator('button:has-text("Choose which tracks to scrobble")').click();
 
-    await expect(page.locator('button:has-text("Just scrobble everything")')).toBeVisible({ timeout: 5000 });
-    await page.locator('button:has-text("Just scrobble everything")').click();
+    await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -448,8 +453,9 @@ test.describe('Complete Step', () => {
     await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
     await page.locator('button:has-text("Choose which tracks to scrobble")').click();
 
-    await expect(page.locator('button:has-text("Just scrobble everything")')).toBeVisible({ timeout: 5000 });
-    await page.locator('button:has-text("Just scrobble everything")').click();
+    await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -535,8 +541,9 @@ test.describe('URL Encoding', () => {
     await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
     await page.locator('button:has-text("Choose which tracks to scrobble")').click();
 
-    await expect(page.locator('button:has-text("Just scrobble everything")')).toBeVisible({ timeout: 5000 });
-    await page.locator('button:has-text("Just scrobble everything")').click();
+    await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
