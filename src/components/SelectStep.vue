@@ -42,10 +42,12 @@
       <v-col>
         <strong>{{ selectedTracks.length }}</strong> of {{ allScrobbleableTracks.length }} tracks selected to scrobble
       </v-col>
-      <v-col cols="auto">
+      <v-col cols="auto" class="text-center">
         <v-btn color="primary" @click="addMatchingTracks" :disabled="filteredTracks.length === 0">
           Add {{ filteredTracks.length }} matching
         </v-btn>
+      </v-col>
+      <v-col>
       </v-col>
     </v-row>
 
