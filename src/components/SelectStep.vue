@@ -36,16 +36,18 @@
           class="date-input"
         />
       </v-col>
-      <v-col cols="12" sm="2">
+    </v-row>
+
+    <v-row align="center" class="mb-2">
+      <v-col>
+        <strong>{{ selectedTracks.length }}</strong> of {{ allScrobbleableTracks.length }} tracks selected to scrobble
+      </v-col>
+      <v-col cols="auto">
         <v-btn color="primary" @click="addMatchingTracks" :disabled="filteredTracks.length === 0">
           Add {{ filteredTracks.length }} matching
         </v-btn>
       </v-col>
     </v-row>
-
-    <div class="mb-2">
-      <strong>{{ selectedTracks.length }}</strong> of {{ allScrobbleableTracks.length }} tracks selected to scrobble
-    </div>
 
     <v-data-table
       :headers="headers"
