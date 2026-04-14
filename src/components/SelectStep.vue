@@ -40,14 +40,16 @@
 
     <div class="mb-2 text-center">
       <strong>{{ selectedTracks.length }}</strong> of {{ allScrobbleableTracks.length }} tracks selected to scrobble
-      <v-btn color="primary" class="ml-3" @click="addMatchingTracks" :disabled="filteredTracks.length === 0">
-        Add {{ filteredTracks.length }} matching
+      <v-btn color="primary" class="ml-3" @click="addMatchingTracks" :disabled="dateFilteredTracks.length === 0">
+        Add {{ dateFilteredTracks.length }} matching
       </v-btn>
     </div>
 
     <v-data-table
       :headers="headers"
-      :items="filteredTracks"
+      :items="dateFilteredTracks"
+      :search="search"
+      :custom-filter="searchFilter"
       show-select
       class="elevation-1"
       item-key="id"
@@ -89,8 +91,6 @@ export default Vue.extend({
   data() {
     return {
       search: '',
-      debouncedSearch: '',
-      searchTimer: null as number | null,
       selectedTracks: [] as any[],
       fromDate: '',
       toDate: '',
@@ -101,17 +101,6 @@ export default Vue.extend({
         { text: 'Date', value: 'time' },
       ],
     };
-  },
-  watch: {
-    search(val: string) {
-      if (this.searchTimer) { clearTimeout(this.searchTimer); }
-      this.searchTimer = window.setTimeout(() => {
-        this.debouncedSearch = val || '';
-      }, 250);
-    },
-  },
-  beforeDestroy() {
-    if (this.searchTimer) { clearTimeout(this.searchTimer); }
   },
   computed: {
     allScrobbleableTracks(): any[] {
@@ -147,7 +136,7 @@ export default Vue.extend({
       }
       return new Date(max).toISOString().slice(0, 10);
     },
-    filteredTracks(): any[] {
+    dateFilteredTracks(): any[] {
       let tracks = this.allScrobbleableTracks;
 
       if (this.fromDate) {
@@ -155,29 +144,26 @@ export default Vue.extend({
         tracks = tracks.filter((t: any) => t.time >= from);
       }
       if (this.toDate) {
-        // Include the entire "to" day
         const to = new Date(this.toDate).getTime() + 86400000;
         tracks = tracks.filter((t: any) => t.time < to);
-      }
-      if (this.debouncedSearch) {
-        const q = this.debouncedSearch.toLowerCase();
-        tracks = tracks.filter((t: any) =>
-          t.trackLower.includes(q) ||
-          t.artistLower.includes(q) ||
-          t.albumLower.includes(q),
-        );
       }
 
       return tracks;
     },
   },
   methods: {
+    searchFilter(value: any, search: string, item: any): boolean {
+      const q = search.toLowerCase();
+      return item.trackLower.includes(q) ||
+        item.artistLower.includes(q) ||
+        item.albumLower.includes(q);
+    },
     formatDate(timestamp: number): string {
       return new Date(timestamp).toLocaleString();
     },
     addMatchingTracks() {
       const existingIds = new Set(this.selectedTracks.map((t: any) => t.id));
-      const toAdd = this.filteredTracks.filter((t: any) => !existingIds.has(t.id));
+      const toAdd = this.dateFilteredTracks.filter((t: any) => !existingIds.has(t.id));
       this.selectedTracks = [...this.selectedTracks, ...toAdd];
     },
     scrobbleSelectedTracks() {
