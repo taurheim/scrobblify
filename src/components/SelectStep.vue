@@ -38,18 +38,12 @@
       </v-col>
     </v-row>
 
-    <v-row align="center" class="mb-2">
-      <v-col>
-        <strong>{{ selectedTracks.length }}</strong> of {{ allScrobbleableTracks.length }} tracks selected to scrobble
-      </v-col>
-      <v-col cols="auto" class="text-center">
-        <v-btn color="primary" @click="addMatchingTracks" :disabled="filteredTracks.length === 0">
-          Add {{ filteredTracks.length }} matching
-        </v-btn>
-      </v-col>
-      <v-col>
-      </v-col>
-    </v-row>
+    <div class="mb-2 text-center">
+      <strong>{{ selectedTracks.length }}</strong> of {{ allScrobbleableTracks.length }} tracks selected to scrobble
+      <v-btn color="primary" class="ml-3" @click="addMatchingTracks" :disabled="filteredTracks.length === 0">
+        Add {{ filteredTracks.length }} matching
+      </v-btn>
+    </div>
 
     <v-data-table
       :headers="headers"
@@ -95,6 +89,8 @@ export default Vue.extend({
   data() {
     return {
       search: '',
+      debouncedSearch: '',
+      searchTimer: null as number | null,
       selectedTracks: [] as any[],
       fromDate: '',
       toDate: '',
@@ -106,6 +102,17 @@ export default Vue.extend({
       ],
     };
   },
+  watch: {
+    search(val: string) {
+      if (this.searchTimer) { clearTimeout(this.searchTimer); }
+      this.searchTimer = window.setTimeout(() => {
+        this.debouncedSearch = val || '';
+      }, 250);
+    },
+  },
+  beforeDestroy() {
+    if (this.searchTimer) { clearTimeout(this.searchTimer); }
+  },
   computed: {
     allScrobbleableTracks(): any[] {
       return this.$store.state.validScrobbles.map((scrob: SpotifyListen, i: number) => {
@@ -116,19 +123,28 @@ export default Vue.extend({
           artist: scrob.artistName,
           album: scrob.albumName,
           time: scrob.listenDate.getTime(),
+          trackLower: scrob.trackName.toLowerCase(),
+          artistLower: scrob.artistName.toLowerCase(),
+          albumLower: scrob.albumName.toLowerCase(),
         };
       });
     },
     dataMinDate(): string {
       const tracks = this.allScrobbleableTracks;
       if (tracks.length === 0) { return ''; }
-      const min = Math.min(...tracks.map((t: any) => t.time));
+      let min = tracks[0].time;
+      for (let i = 1; i < tracks.length; i++) {
+        if (tracks[i].time < min) { min = tracks[i].time; }
+      }
       return new Date(min).toISOString().slice(0, 10);
     },
     dataMaxDate(): string {
       const tracks = this.allScrobbleableTracks;
       if (tracks.length === 0) { return ''; }
-      const max = Math.max(...tracks.map((t: any) => t.time));
+      let max = tracks[0].time;
+      for (let i = 1; i < tracks.length; i++) {
+        if (tracks[i].time > max) { max = tracks[i].time; }
+      }
       return new Date(max).toISOString().slice(0, 10);
     },
     filteredTracks(): any[] {
@@ -143,12 +159,12 @@ export default Vue.extend({
         const to = new Date(this.toDate).getTime() + 86400000;
         tracks = tracks.filter((t: any) => t.time < to);
       }
-      if (this.search) {
-        const q = this.search.toLowerCase();
+      if (this.debouncedSearch) {
+        const q = this.debouncedSearch.toLowerCase();
         tracks = tracks.filter((t: any) =>
-          t.track.toLowerCase().includes(q) ||
-          t.artist.toLowerCase().includes(q) ||
-          t.album.toLowerCase().includes(q),
+          t.trackLower.includes(q) ||
+          t.artistLower.includes(q) ||
+          t.albumLower.includes(q),
         );
       }
 
