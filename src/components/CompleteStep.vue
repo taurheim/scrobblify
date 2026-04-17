@@ -50,7 +50,7 @@ export default Vue.extend({
       return this.$store.state.lfmApi.userName;
     },
     lastwaveUrl(): string {
-      const url = `https://savas.ca/lastwave#/?customrange=Last%202%20weeks&username=${this.userName}`;
+      const url = `https://savas.ca/lastwave`;
       return url;
     },
   },

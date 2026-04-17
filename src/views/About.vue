@@ -10,7 +10,7 @@
     <p>
       New to Last.fm? It's a music tracking service that builds a profile of your listening habits.
       Once your history is imported, you can explore stats, charts, and tools like
-      <a href="https://lastwave.savas.ca/">LastWave</a> to visualize your music taste over time.
+      <a href="https://savas.ca/lastwave">LastWave</a> to visualize your music taste over time.
     </p>
 
     <h1>Who built Scrobblify?</h1>
