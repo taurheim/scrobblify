@@ -1,5 +1,5 @@
 module.exports = {
-  "publicPath": "/",
+  "publicPath": "/scrobblify/",
   "outputDir": "dist",
   "transpileDependencies": [
     "vuetify"
