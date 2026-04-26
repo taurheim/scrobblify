@@ -4,7 +4,9 @@ import md5 from 'blueimp-md5';
 export default class LastFm {
   private API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
   private API_RATE_BUFFER_MS = 250;
-  private USER_AUTH_TOKEN_LOCALSTORAGE_KEY = 'scrobblifyLfmAuthToken';
+  // NOTE: Last.fm auth tokens are single-use (consumed by auth.getSession), so
+  // we deliberately do not persist them. Only the resulting session key is stored.
+  private USER_AUTH_TOKEN_LOCALSTORAGE_KEY_LEGACY = 'scrobblifyLfmAuthToken';
   private USER_AUTH_KEY_LOCALSTORAGE_KEY = 'scrobblifyLfmAuthKey';
   private USER_NAME_LOCALSTORAGE_KEY = 'scrobblifyLfmUserName';
   private userAuthKey: string | null = null;
@@ -17,15 +19,25 @@ export default class LastFm {
   }
 
   public async init(queryParams: any) {
+    // Clean up any legacy persisted auth token from older versions; tokens are single-use.
+    localStorage.removeItem(this.USER_AUTH_TOKEN_LOCALSTORAGE_KEY_LEGACY);
+
     this.setUserAuthKey(localStorage.getItem(this.USER_AUTH_KEY_LOCALSTORAGE_KEY));
-    this.setUserAuthToken(localStorage.getItem(this.USER_AUTH_TOKEN_LOCALSTORAGE_KEY) || queryParams.token);
     this.setUserName(localStorage.getItem(this.USER_NAME_LOCALSTORAGE_KEY));
+    // Auth token is single-use and only valid for ~60 minutes; always take the
+    // fresh value from the URL query (returned by Last.fm's auth callback).
+    this.userAuthToken = queryParams.token || null;
 
     if (!this.isAuthenticated() && this.userAuthToken) {
-      // Get the session auth
-      const response = await this.getSession();
-      this.setUserName(response.name);
-      this.setUserAuthKey(response.key);
+      try {
+        const response = await this.getSession();
+        this.setUserName(response.name);
+        this.setUserAuthKey(response.key);
+      } finally {
+        // Token is consumed by auth.getSession (success or failure); discard it
+        // so a retry doesn't reuse a dead token.
+        this.userAuthToken = null;
+      }
     }
   }
 
@@ -41,11 +53,8 @@ export default class LastFm {
   }
 
   public setUserAuthToken(authToken: string | null) {
-    if (!authToken) {
-      return;
-    }
-    localStorage.setItem(this.USER_AUTH_TOKEN_LOCALSTORAGE_KEY, authToken);
-    this.userAuthToken = authToken;
+    // Auth tokens are single-use and intentionally not persisted to localStorage.
+    this.userAuthToken = authToken || null;
   }
 
   public setUserName(userName: string | null) {
@@ -65,12 +74,15 @@ export default class LastFm {
     this.userAuthToken = null;
     this.userName = null;
     localStorage.removeItem(this.USER_AUTH_KEY_LOCALSTORAGE_KEY);
-    localStorage.removeItem(this.USER_AUTH_TOKEN_LOCALSTORAGE_KEY);
+    localStorage.removeItem(this.USER_AUTH_TOKEN_LOCALSTORAGE_KEY_LEGACY);
     localStorage.removeItem(this.USER_NAME_LOCALSTORAGE_KEY);
   }
 
   public isAuthenticated(): boolean {
-    return (this.userAuthKey !== null && this.userAuthToken !== null && this.userName !== null);
+    // A user is authenticated when we have a session key + username. The auth
+    // token is only used once during the initial getSession exchange and is
+    // not required (or valid) afterwards.
+    return (this.userAuthKey !== null && this.userName !== null);
   }
 
   public async getPlaysInTimeRange(from: Date, to: Date): Promise<Scrobble[]> {
@@ -197,7 +209,7 @@ export default class LastFm {
 
   // https://www.last.fm/api/show/track.scrobble
   public async scrobblePlay(play: Scrobble): Promise<void> {
-    if (!this.userAuthToken ) {
+    if (!this.userAuthKey) {
       throw new Error('Not authenticated.');
     }
     const params: {[key: string]: any} = {
