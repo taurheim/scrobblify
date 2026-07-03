@@ -54,10 +54,22 @@ export default class Scrobblify {
 
     const SAME_IF_COEFFICIENT_ABOVE = 0.9;
 
-    // Determine the date range of the Spotify data (with buffer)
-    const timestamps = listens.map((l) => l.listenDate.getTime());
-    const minTime = Math.min(...timestamps) - this.CONFLICT_BUFFER_TIME_MS;
-    const maxTime = Math.max(...timestamps) + this.CONFLICT_BUFFER_TIME_MS;
+    // Determine the date range of the Spotify data (with buffer).
+    // Iterate rather than spreading into Math.min/Math.max, which overflows the
+    // call stack for large histories (tens of thousands of listens).
+    let minTimestamp = listens[0].listenDate.getTime();
+    let maxTimestamp = minTimestamp;
+    for (const listen of listens) {
+      const time = listen.listenDate.getTime();
+      if (time < minTimestamp) {
+        minTimestamp = time;
+      }
+      if (time > maxTimestamp) {
+        maxTimestamp = time;
+      }
+    }
+    const minTime = minTimestamp - this.CONFLICT_BUFFER_TIME_MS;
+    const maxTime = maxTimestamp + this.CONFLICT_BUFFER_TIME_MS;
 
     // Bulk-fetch all existing scrobbles in that range
     const existingScrobbles = await this.lfmApi.getAllScrobblesInRange(
