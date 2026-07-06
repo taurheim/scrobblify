@@ -133,7 +133,13 @@ export default class Scrobblify {
   }
 
   public spotifyJsonToListens(jsonString: string): SpotifyListen[] {
-    const parsedJson: any[] = JSON.parse(jsonString);
+    /*
+      Some Spotify exports include a leading UTF-8 byte order mark (\uFEFF).
+      Lenient engines (V8/Chrome) ignore it, but stricter ones (Safari/WebKit)
+      reject it with "Unrecognized token", so strip it before parsing.
+    */
+    const sanitized = jsonString.charCodeAt(0) === 0xFEFF ? jsonString.slice(1) : jsonString;
+    const parsedJson: any[] = JSON.parse(sanitized);
     return parsedJson
       .filter((play) => play.master_metadata_track_name != null)
       .map((play) => {
