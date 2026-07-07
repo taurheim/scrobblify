@@ -133,7 +133,11 @@ export default class Scrobblify {
   }
 
   public spotifyJsonToListens(jsonString: string): SpotifyListen[] {
-    const parsedJson: any[] = JSON.parse(jsonString);
+    // Strip a leading UTF-8 BOM (\uFEFF) and surrounding whitespace before
+    // parsing. Some Spotify exports prepend a BOM, which makes JSON.parse fail
+    // with "Unrecognized token ''" in Safari/WebKit (the BOM renders as blank).
+    const cleaned = jsonString.replace(/^\uFEFF/, '').trim();
+    const parsedJson: any[] = JSON.parse(cleaned);
     return parsedJson
       .filter((play) => play.master_metadata_track_name != null)
       .map((play) => {

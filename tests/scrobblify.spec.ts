@@ -148,6 +148,24 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
     await expect(btn).toBeEnabled();
   });
 
+  test('parses a BOM-prefixed audio file without a JSON error', async ({ page }) => {
+    // Regression: the fixture's first audio file starts with a UTF-8 BOM, which
+    // previously caused "JSON Parse error: Unrecognized token ''" in WebKit.
+    const pageErrors: string[] = [];
+    page.on('pageerror', (e) => pageErrors.push(e.message));
+
+    await goToUploadStep(page);
+    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    await fileInput.setInputFiles(FIXTURE_ZIP);
+
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+
+    await expect(page.locator('text=5 plays')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=/Failed to parse/i')).toHaveCount(0);
+    expect(pageErrors.join('\n')).not.toContain('Unrecognized token');
+  });
+
   test('parses ZIP and shows track count', async ({ page }) => {
     await goToUploadStep(page);
     const fileInput = page.locator('input[type="file"][accept=".zip"]');

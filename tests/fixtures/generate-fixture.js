@@ -56,7 +56,10 @@ const testData2 = [
 
 async function generateFixture() {
   const zip = new JSZip();
-  zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024_0.json', JSON.stringify(testData, null, 2));
+  // Prepend a UTF-8 BOM (\uFEFF) to the first file. Some real Spotify exports
+  // include a BOM, which broke JSON.parse in Safari/WebKit ("Unrecognized
+  // token ''"). This keeps the fixture exercising that real-world edge case.
+  zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024_0.json', '\uFEFF' + JSON.stringify(testData, null, 2));
   zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024_1.json', JSON.stringify(testData2, null, 2));
   // Add a non-audio file that should be ignored
   zip.file('Spotify Extended Streaming History/Streaming_History_Video_2024.json', JSON.stringify([{ ts: '2024-01-15T12:00:00Z' }]));
