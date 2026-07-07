@@ -169,27 +169,36 @@ export default Vue.extend({
 
       this.logs.push(`Found ${matchingFiles.length} audio history file(s) in ZIP.`);
 
-      let jsonStrings: string[];
-      try {
-        jsonStrings = await Promise.all(
-          matchingFiles.map((name) => zip.files[name].async('string')),
-        );
-      } catch (e) {
-        this.errorMessage = 'Failed to extract files from the ZIP archive.';
-        this.errorDetails = (e as Error).message || String(e);
-        this.showError = true;
-        return;
-      }
+      // Read and parse one file at a time. Large exports can total well over
+      // 150MB of decompressed JSON; loading every file into memory at once
+      // (Promise.all) can exceed mobile Safari's memory limit and produce a
+      // corrupted/zeroed buffer, which then fails JSON.parse with an
+      // "Unrecognized token ''" error. Parsing incrementally keeps peak memory
+      // low because we only ever hold one raw file string at a time.
+      let parsedData: SpotifyListen[] = [];
+      for (const name of matchingFiles) {
+        const shortName = name.split('/').pop() || name;
 
-      let parsedData: SpotifyListen[];
-      try {
-        parsedData = this.scrobblify.parseMultipleJsonFiles(jsonStrings);
-      } catch (e) {
-        this.errorMessage = 'Failed to parse the Spotify listening history. The JSON data in the ZIP may be malformed.';
-        this.errorDetails = (e as Error).message || String(e);
-        this.showError = true;
-        return;
+        let jsonString: string;
+        try {
+          jsonString = await zip.files[name].async('string');
+        } catch (e) {
+          this.errorMessage = `Failed to extract "${shortName}" from the ZIP archive.`;
+          this.errorDetails = (e as Error).message || String(e);
+          this.showError = true;
+          return;
+        }
+
+        try {
+          parsedData = parsedData.concat(this.scrobblify.spotifyJsonToListens(jsonString));
+        } catch (e) {
+          this.errorMessage = `Failed to parse "${shortName}". The JSON data in this file may be malformed.`;
+          this.errorDetails = (e as Error).message || String(e);
+          this.showError = true;
+          return;
+        }
       }
+      parsedData.sort((a, b) => a.listenDate.getTime() - b.listenDate.getTime());
       this.logs.push(`Found ${parsedData.length} plays in your spotify listening history.`);
 
       let newData: SpotifyListen[] = [];
