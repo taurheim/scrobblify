@@ -35,7 +35,7 @@
         <div v-if="countdown > 0" class="text-h5 mb-2">
           Auto-resuming in {{ formattedCountdown }}
         </div>
-        <div class="mb-2 text-body-2">
+        <div v-if="countdown > 0" class="mb-2 text-body-2">
           You can save progress and leave now, then resume later at any time.
         </div>
         <div class="mb-3">{{ scrobbledTracks }} of {{ tracksToScrobble.length }} completed so far</div>
@@ -203,7 +203,7 @@ export default Vue.extend({
             this.rateLimitPauseCount++;
             const pauseDurationLabel = RATE_LIMIT_COOLDOWN_MS % MS_PER_MINUTE === 0
               ? `${RATE_LIMIT_COOLDOWN_MINUTES} ${RATE_LIMIT_COOLDOWN_MINUTES === 1 ? 'minute' : 'minutes'}`
-              : `${RATE_LIMIT_COOLDOWN_SECONDS} seconds`;
+              : `${RATE_LIMIT_COOLDOWN_SECONDS} ${RATE_LIMIT_COOLDOWN_SECONDS === 1 ? 'second' : 'seconds'}`;
             this.pauseReason = `Rate limited by Last.fm. Pausing for ${pauseDurationLabel} before retrying.`;
             trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
             trackEvent('scrobble_rate_limited', {
