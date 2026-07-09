@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Upload Step - ZIP Drag & Drop >> parses ZIP and shows track count
-- Location: tests/scrobblify.spec.ts:169:7
+- Location: tests/scrobblify.spec.ts:171:7
 
 # Error details
 

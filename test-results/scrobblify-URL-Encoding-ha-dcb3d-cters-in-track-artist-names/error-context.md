@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> URL Encoding >> handles special characters in track/artist names
-- Location: tests/scrobblify.spec.ts:536:7
+- Location: tests/scrobblify.spec.ts:587:7
 
 # Error details
 

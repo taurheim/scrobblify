@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Upload Step - ZIP Drag & Drop >> parses a BOM-prefixed audio file without a JSON error
-- Location: tests/scrobblify.spec.ts:151:7
+- Location: tests/scrobblify.spec.ts:153:7
 
 # Error details
 

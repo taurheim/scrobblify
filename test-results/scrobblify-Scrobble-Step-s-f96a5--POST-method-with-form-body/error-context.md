@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Scrobble Step >> scrobbles use POST method with form body
-- Location: tests/scrobblify.spec.ts:417:7
+- Location: tests/scrobblify.spec.ts:419:7
 
 # Error details
 

@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Complete Step >> shows completion message after full scrobble
-- Location: tests/scrobblify.spec.ts:485:7
+- Location: tests/scrobblify.spec.ts:536:7
 
 # Error details
 

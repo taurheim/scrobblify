@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Select Step - Track Selection >> add matching + scrobble advances to scrobble step
-- Location: tests/scrobblify.spec.ts:251:7
+- Location: tests/scrobblify.spec.ts:253:7
 
 # Error details
 

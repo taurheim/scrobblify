@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Upload Step - ZIP Drag & Drop >> accepts ZIP file via file picker
-- Location: tests/scrobblify.spec.ts:130:7
+- Location: tests/scrobblify.spec.ts:132:7
 
 # Error details
 

@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Scrobble Page - Authentication Step >> shows authentication step by default
-- Location: tests/scrobblify.spec.ts:103:7
+- Location: tests/scrobblify.spec.ts:105:7
 
 # Error details
 

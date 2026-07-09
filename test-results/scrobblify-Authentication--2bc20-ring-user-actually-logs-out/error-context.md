@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Authentication - clearUser >> clearing user actually logs out
-- Location: tests/scrobblify.spec.ts:514:7
+- Location: tests/scrobblify.spec.ts:565:7
 
 # Error details
 

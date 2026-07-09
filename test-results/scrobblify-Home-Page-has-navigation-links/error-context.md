@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Home Page >> has navigation links
-- Location: tests/scrobblify.spec.ts:88:7
+- Location: tests/scrobblify.spec.ts:90:7
 
 # Error details
 

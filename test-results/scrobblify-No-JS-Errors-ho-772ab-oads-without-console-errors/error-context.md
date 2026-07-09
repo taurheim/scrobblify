@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> No JS Errors >> home page loads without console errors
-- Location: tests/scrobblify.spec.ts:610:7
+- Location: tests/scrobblify.spec.ts:661:7
 
 # Error details
 

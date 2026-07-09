@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Scrobble Page - Authentication Step >> auto-advances when already authenticated
-- Location: tests/scrobblify.spec.ts:113:7
+- Location: tests/scrobblify.spec.ts:115:7
 
 # Error details
 

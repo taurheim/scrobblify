@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Select Step - Track Selection >> shows track list with artist and album columns
-- Location: tests/scrobblify.spec.ts:217:7
+- Location: tests/scrobblify.spec.ts:219:7
 
 # Error details
 

@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Upload Step - ZIP Drag & Drop >> shows upload zone when authenticated
-- Location: tests/scrobblify.spec.ts:124:7
+- Location: tests/scrobblify.spec.ts:126:7
 
 # Error details
 

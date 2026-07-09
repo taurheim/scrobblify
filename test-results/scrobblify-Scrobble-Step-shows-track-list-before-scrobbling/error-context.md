@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Scrobble Step >> shows track list before scrobbling
-- Location: tests/scrobblify.spec.ts:279:7
+- Location: tests/scrobblify.spec.ts:281:7
 
 # Error details
 

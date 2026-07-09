@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Upload Step - ZIP Drag & Drop >> filters out podcast entries (null track name)
-- Location: tests/scrobblify.spec.ts:187:7
+- Location: tests/scrobblify.spec.ts:189:7
 
 # Error details
 

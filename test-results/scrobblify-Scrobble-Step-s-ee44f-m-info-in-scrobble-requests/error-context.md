@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Scrobble Step >> sends album info in scrobble requests
-- Location: tests/scrobblify.spec.ts:352:7
+- Location: tests/scrobblify.spec.ts:354:7
 
 # Error details
 

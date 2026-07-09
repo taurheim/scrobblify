@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Scrobble Page - Authentication Step >> shows Last.fm auth link
-- Location: tests/scrobblify.spec.ts:108:7
+- Location: tests/scrobblify.spec.ts:110:7
 
 # Error details
 

@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Upload Step - ZIP Drag & Drop >> Find tracks button is enabled after file selection
-- Location: tests/scrobblify.spec.ts:143:7
+- Location: tests/scrobblify.spec.ts:145:7
 
 # Error details
 

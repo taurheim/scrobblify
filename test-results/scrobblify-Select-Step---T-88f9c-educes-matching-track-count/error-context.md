@@ -7,7 +7,7 @@
 # Test info
 
 - Name: scrobblify.spec.ts >> Select Step - Track Selection >> date filtering reduces matching track count
-- Location: tests/scrobblify.spec.ts:225:7
+- Location: tests/scrobblify.spec.ts:227:7
 
 # Error details
 
