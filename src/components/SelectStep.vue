@@ -206,6 +206,13 @@ function createSearchWorker(): Worker | null {
 }
 
 export default Vue.extend({
+  beforeCreate() {
+    // Non-reactive storage for large arrays
+    (this as any)._tracks = [] as any[];
+    (this as any)._filteredIndices = [] as number[];
+    (this as any)._selectedIds = new Set<number>();
+    (this as any)._searchMatchIds = null as Set<number> | null;
+  },
   data() {
     return {
       search: '',
@@ -234,12 +241,6 @@ export default Vue.extend({
     };
   },
   created() {
-    // Non-reactive storage for large arrays
-    (this as any)._tracks = [] as any[];
-    (this as any)._filteredIndices = [] as number[];
-    (this as any)._selectedIds = new Set<number>();
-    (this as any)._searchMatchIds = null as Set<number> | null;
-
     this.searchWorker = createSearchWorker();
     if (this.searchWorker) {
       this.searchWorker.onmessage = (e: MessageEvent) => {
