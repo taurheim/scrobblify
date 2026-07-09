@@ -88,6 +88,7 @@ const MS_PER_MINUTE = 60 * 1000;
 const BURST_COOLDOWN_MS = 10 * MS_PER_MINUTE;
 const RATE_LIMIT_COOLDOWN_MS = 1 * MS_PER_MINUTE;
 const RATE_LIMIT_COOLDOWN_MINUTES = RATE_LIMIT_COOLDOWN_MS / MS_PER_MINUTE;
+const RATE_LIMIT_COOLDOWN_SECONDS = Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000);
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
@@ -200,8 +201,10 @@ export default Vue.extend({
               this.firstRateLimitAtMs = rateLimitStartMs;
             }
             this.rateLimitPauseCount++;
-            const minuteLabel = RATE_LIMIT_COOLDOWN_MINUTES === 1 ? 'minute' : 'minutes';
-            this.pauseReason = `Rate limited by Last.fm. Pausing for ${RATE_LIMIT_COOLDOWN_MINUTES} ${minuteLabel} before retrying.`;
+            const pauseDurationLabel = RATE_LIMIT_COOLDOWN_MS % MS_PER_MINUTE === 0
+              ? `${RATE_LIMIT_COOLDOWN_MINUTES} ${RATE_LIMIT_COOLDOWN_MINUTES === 1 ? 'minute' : 'minutes'}`
+              : `${RATE_LIMIT_COOLDOWN_SECONDS} seconds`;
+            this.pauseReason = `Rate limited by Last.fm. Pausing for ${pauseDurationLabel} before retrying.`;
             trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
             trackEvent('scrobble_rate_limited', {
               scrobbled_tracks: this.scrobbledTracks,
@@ -210,7 +213,7 @@ export default Vue.extend({
               burst_count: this.burstCount,
               daily_count: this.dailyCount,
               rate_limit_pause_count: this.rateLimitPauseCount,
-              elapsed_since_first_rate_limit_ms: this.firstRateLimitAtMs ? rateLimitStartMs - this.firstRateLimitAtMs : 0,
+              elapsed_since_first_rate_limit_ms: rateLimitStartMs - this.firstRateLimitAtMs,
             });
             await this.pauseWithCountdown(RATE_LIMIT_COOLDOWN_MS);
             trackEvent('scrobble_rate_limit_cooldown_complete', {
