@@ -1,5 +1,7 @@
 import { test, expect, Page, Route } from '@playwright/test';
 import path from 'path';
+import LastFm from '../src/api/LastFm';
+import Scrobble from '../src/models/Scrobble';
 
 const FIXTURE_ZIP = path.resolve(__dirname, 'fixtures', 'test-spotify-data.zip');
 
@@ -473,11 +475,60 @@ test.describe('Scrobble Step', () => {
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
 
-    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('body')).toContainText('Finished scrobbling', { timeout: 30000 });
 
     // Verify scrobble used POST with form body
     expect(scrobbleMethod).toBe('POST');
     expect(scrobbleContentType).toContain('application/x-www-form-urlencoded');
+  });
+});
+
+test.describe('LastFm API client', () => {
+  test('uses integer timestamps and redacts secrets in Last.fm API errors', async () => {
+    const api = new LastFm('test-api-key', 'test-shared-secret');
+    (api as any).userAuthKey = 'fake-session-key';
+
+    const originalFetch = globalThis.fetch;
+    let requestBody = '';
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = String(init?.body || '');
+      return new Response(JSON.stringify({ error: 11, message: 'Invalid timestamp' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+
+    try {
+      let thrownError: Error | null = null;
+
+      try {
+        await api.scrobblePlay(new Scrobble(
+          'Viva La Vida',
+          'Coldplay',
+          new Date('2026-07-09T14:29:13.948Z'),
+          'Viva La Vida or Death and All His Friends',
+        ));
+      } catch (error) {
+        thrownError = error as Error;
+      }
+
+      expect(thrownError).not.toBeNull();
+      expect(thrownError!.message).toContain('Last.fm API error 11');
+      expect(thrownError!.message).toContain('Invalid timestamp');
+      expect(thrownError!.message).toContain('"api_key":"[redacted]"');
+      expect(thrownError!.message).toContain('"sk":"[redacted]"');
+      expect(thrownError!.message).toContain('"api_sig":"[redacted]"');
+      expect(thrownError!.message).toContain('"timestamp[0]":"1783607353"');
+      expect(thrownError!.message).not.toContain('test-api-key');
+      expect(thrownError!.message).not.toContain('fake-session-key');
+
+      const sentParams = new URLSearchParams(requestBody);
+      expect(sentParams.get('timestamp[0]')).toBe('1783607353');
+      expect(sentParams.get('album[0]')).toBe('Viva La Vida or Death and All His Friends');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 
