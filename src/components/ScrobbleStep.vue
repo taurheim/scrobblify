@@ -35,6 +35,9 @@
         <div v-if="countdown > 0" class="text-h5 mb-2">
           Auto-resuming in {{ formattedCountdown }}
         </div>
+        <div v-if="countdown > 0" class="mb-2 text-body-2">
+          You can save progress and leave now, then resume later at any time.
+        </div>
         <div class="mb-3">{{ scrobbledTracks }} of {{ tracksToScrobble.length }} completed so far</div>
 
         <v-btn class="primary mr-2" @click="saveAndExit">Save Progress &amp; Leave</v-btn>
@@ -81,7 +84,11 @@ import { trackEvent, trackError } from '@/services/Analytics';
 
 const BURST_LIMIT = 950;
 const DAILY_LIMIT = 2700;
-const BURST_COOLDOWN_MS = 10 * 60 * 1000;
+const MS_PER_MINUTE = 60 * 1000;
+const BURST_COOLDOWN_MS = 10 * MS_PER_MINUTE;
+const RATE_LIMIT_COOLDOWN_MS = 1 * MS_PER_MINUTE;
+const RATE_LIMIT_COOLDOWN_MINUTES = RATE_LIMIT_COOLDOWN_MS / MS_PER_MINUTE;
+const RATE_LIMIT_COOLDOWN_SECONDS = Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000);
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
@@ -96,6 +103,8 @@ export default Vue.extend({
       countdownTimer: null as number | null,
       burstCount: 0,
       dailyCount: 0,
+      rateLimitPauseCount: 0,
+      firstRateLimitAtMs: null as number | null,
       failedTracks: [] as Array<{ track: Scrobble; error: string }>,
       completed: false,
       showError: false,
@@ -140,7 +149,8 @@ export default Vue.extend({
         });
       }
 
-      for (let i = this.scrobbledTracks; i < tracks.length; i++) {
+      // `i` is incremented conditionally at the end so a rate-limited track can be retried.
+      for (let i = this.scrobbledTracks; i < tracks.length; ) {
         // Check if manually paused
         if (this.paused) {
           return;
@@ -165,33 +175,93 @@ export default Vue.extend({
         const track = tracks[i];
         this.currentTrackName = track.toString();
 
+        let retryDueToRateLimit = false;
+        let recoveredFromRateLimit = false;
+        let elapsedSinceFirstRateLimitMs = 0;
+        let recoveredRateLimitPauseCount = 0;
         try {
           await api.scrobblePlay(track);
           this.$store.commit('trackScrobbled');
           this.burstCount++;
           this.dailyCount++;
+          if (this.firstRateLimitAtMs !== null) {
+            recoveredFromRateLimit = true;
+            elapsedSinceFirstRateLimitMs = Date.now() - this.firstRateLimitAtMs;
+            recoveredRateLimitPauseCount = this.rateLimitPauseCount;
+            this.firstRateLimitAtMs = null;
+            this.rateLimitPauseCount = 0;
+          }
           consecutiveFailures = 0;
         } catch (e) {
-          this.$store.commit('trackFailed');
-          this.failedTracks.push({ track, error: (e as Error).message || 'Unknown error' });
-          consecutiveFailures++;
-
-          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-            trackError('scrobble.repeatedFailures', e, {
-              consecutive_failures: consecutiveFailures,
+          // Rate limit (Last.fm error 29 / HTTP 429): pause and retry the same track
+          // rather than counting it as a failure.
+          if (LastFm.isRateLimitError(e)) {
+            const rateLimitStartMs = Date.now();
+            if (this.firstRateLimitAtMs === null) {
+              this.firstRateLimitAtMs = rateLimitStartMs;
+            }
+            this.rateLimitPauseCount++;
+            const pauseDurationLabel = RATE_LIMIT_COOLDOWN_MS % MS_PER_MINUTE === 0
+              ? `${RATE_LIMIT_COOLDOWN_MINUTES} ${RATE_LIMIT_COOLDOWN_MINUTES === 1 ? 'minute' : 'minutes'}`
+              : `${RATE_LIMIT_COOLDOWN_SECONDS} ${RATE_LIMIT_COOLDOWN_SECONDS === 1 ? 'second' : 'seconds'}`;
+            this.pauseReason = `Rate limited by Last.fm. Pausing for ${pauseDurationLabel} before retrying.`;
+            trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
+            trackEvent('scrobble_rate_limited', {
               scrobbled_tracks: this.scrobbledTracks,
-              failed_tracks: this.failedTracks.length,
+              total_tracks: tracks.length,
+              track_index: i,
+              burst_count: this.burstCount,
+              daily_count: this.dailyCount,
+              rate_limit_pause_count: this.rateLimitPauseCount,
+              elapsed_since_first_rate_limit_ms: rateLimitStartMs - this.firstRateLimitAtMs,
             });
-            this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} tracks failed in a row. There may be a problem with Last.fm or your authentication.`;
-            this.errorDetails = (e as Error).message || String(e);
-            this.showError = true;
-            this.pauseReason = 'Paused due to repeated failures.';
-            this.paused = true;
-            return;
+            await this.pauseWithCountdown(RATE_LIMIT_COOLDOWN_MS);
+            trackEvent('scrobble_rate_limit_cooldown_complete', {
+              scrobbled_tracks: this.scrobbledTracks,
+              total_tracks: tracks.length,
+              track_index: i,
+              burst_count: this.burstCount,
+              daily_count: this.dailyCount,
+              rate_limit_pause_count: this.rateLimitPauseCount,
+              configured_cooldown_ms: RATE_LIMIT_COOLDOWN_MS,
+              actual_pause_ms: Date.now() - rateLimitStartMs,
+            });
+            retryDueToRateLimit = true;
+          } else {
+            this.$store.commit('trackFailed');
+            this.failedTracks.push({ track, error: (e as Error).message || 'Unknown error' });
+            consecutiveFailures++;
+
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+              trackError('scrobble.repeatedFailures', e, {
+                consecutive_failures: consecutiveFailures,
+                scrobbled_tracks: this.scrobbledTracks,
+                failed_tracks: this.failedTracks.length,
+              });
+              this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} tracks failed in a row. There may be a problem with Last.fm or your authentication.`;
+              this.errorDetails = (e as Error).message || String(e);
+              this.showError = true;
+              this.pauseReason = 'Paused due to repeated failures.';
+              this.paused = true;
+              return;
+            }
           }
         }
 
-        this.scrobbledTracks += 1;
+        if (!retryDueToRateLimit) {
+          this.scrobbledTracks += 1;
+          if (recoveredFromRateLimit) {
+            trackEvent('scrobble_rate_limit_recovered', {
+              scrobbled_tracks: this.scrobbledTracks,
+              total_tracks: tracks.length,
+              burst_count: this.burstCount,
+              daily_count: this.dailyCount,
+              rate_limit_pause_count: recoveredRateLimitPauseCount,
+              elapsed_since_first_rate_limit_ms: elapsedSinceFirstRateLimitMs,
+            });
+          }
+          i++;
+        }
       }
 
       this.completed = true;
@@ -239,4 +309,3 @@ export default Vue.extend({
   },
 });
 </script>
-
