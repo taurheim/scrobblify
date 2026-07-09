@@ -86,6 +86,7 @@ const BURST_LIMIT = 950;
 const DAILY_LIMIT = 2700;
 const BURST_COOLDOWN_MS = 10 * 60 * 1000;
 const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
+const RATE_LIMIT_COOLDOWN_MINUTES = RATE_LIMIT_COOLDOWN_MS / (60 * 1000);
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
@@ -146,6 +147,7 @@ export default Vue.extend({
         });
       }
 
+      // `i` is incremented conditionally at the end so a rate-limited track can be retried.
       for (let i = this.scrobbledTracks; i < tracks.length; ) {
         // Check if manually paused
         if (this.paused) {
@@ -199,7 +201,7 @@ export default Vue.extend({
               this.firstRateLimitAtMs = rateLimitStartMs;
             }
             this.rateLimitPauseCount++;
-            this.pauseReason = 'Rate limited by Last.fm. Pausing for 1 minute before retrying.';
+            this.pauseReason = `Rate limited by Last.fm. Pausing for ${RATE_LIMIT_COOLDOWN_MINUTES} minute(s) before retrying.`;
             trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
             trackEvent('scrobble_rate_limited', {
               scrobbled_tracks: this.scrobbledTracks,
