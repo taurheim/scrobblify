@@ -212,11 +212,11 @@ export default class LastFm {
     if (!this.userAuthKey) {
       throw new Error('Not authenticated.');
     }
-    const params: {[key: string]: any} = {
+    const params: {[key: string]: string} = {
       'method': 'track.scrobble',
       'artist[0]': play.artist,
       'track[0]': play.track,
-      'timestamp[0]': play.timestamp.getTime() / 1000,
+      'timestamp[0]': Math.floor(play.timestamp.getTime() / 1000).toString(),
     };
     // Add album if available
     if (play.album) {
@@ -277,14 +277,19 @@ export default class LastFm {
         }
 
         if (response.error) {
-          throw new Error(`Last.fm error on request: ${JSON.stringify(params)}`);
+          throw new Error(this.buildLastFmErrorMessage(
+            fetchResponse.status,
+            response.error,
+            response.message,
+            params,
+          ));
         }
 
         await new Promise((r) => setTimeout(r, this.API_RATE_BUFFER_MS));
 
         return response;
       } catch (e) {
-        if (attempt < maxRetries && !(e instanceof Error && e.message.startsWith('Last.fm error'))) {
+        if (attempt < maxRetries && !this.isLastFmApiError(e)) {
           const backoff = Math.pow(2, attempt + 1) * 1000;
           await new Promise((r) => setTimeout(r, backoff));
           continue;
@@ -312,6 +317,29 @@ export default class LastFm {
     return Object.keys(params).map((key) => {
       return `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`;
     }).join('&');
+  }
+
+  private buildLastFmErrorMessage(
+    httpStatus: number,
+    errorCode: number | string,
+    errorMessage: string,
+    params: {[key: string]: string},
+  ): string {
+    const safeParams = this.sanitizeRequestParams(params);
+    const statusPart = httpStatus ? ` (HTTP ${httpStatus})` : '';
+    return `Last.fm API error ${errorCode}${statusPart}: ${errorMessage}. Request: ${JSON.stringify(safeParams)}`;
+  }
+
+  private sanitizeRequestParams(params: {[key: string]: string}): {[key: string]: string} {
+    const sensitiveKeys = new Set(['api_key', 'api_sig', 'sk', 'token']);
+    return Object.keys(params).reduce((acc, key) => {
+      acc[key] = sensitiveKeys.has(key) ? '[redacted]' : params[key];
+      return acc;
+    }, {} as {[key: string]: string});
+  }
+
+  private isLastFmApiError(error: unknown): boolean {
+    return error instanceof Error && error.message.startsWith('Last.fm API error');
   }
 
   // TODO make a class for the api response instead of any
