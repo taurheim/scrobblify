@@ -366,7 +366,7 @@ export default Vue.extend({
       const hasTo = !!this.toDate;
       const fromTs = hasFrom ? new Date(this.fromDate).getTime() : 0;
       const toTs = hasTo ? new Date(this.toDate).getTime() + 86400000 : 0;
-      const searchIds = ((this as any)._searchMatchIds ?? null) as Set<number> | null;
+      const searchIds = (this as any)._searchMatchIds as Set<number> | null;
       const showSelected = this.showSelectedOnly;
       const selIds = (this as any)._selectedIds as Set<number>;
 
