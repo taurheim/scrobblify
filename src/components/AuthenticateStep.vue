@@ -18,6 +18,7 @@
 import Vue from 'vue';
 import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
+import { trackEvent, trackError, identifyUser } from '@/services/Analytics';
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
   data() {
@@ -39,6 +40,8 @@ export default Vue.extend({
     try {
       await api.init(this.$route.query);
     } catch (e) {
+      trackError('auth.init', e);
+      trackEvent('auth_failed');
       this.$data.checkingAuth = false;
       this.errorMessage = 'Failed to authenticate with Last.fm. Please try again.';
       this.errorDetails = (e as Error).message || String(e);
@@ -46,6 +49,8 @@ export default Vue.extend({
       return;
     }
     if (api.isAuthenticated()) {
+      identifyUser(api.getUserName());
+      trackEvent('auth_success', { returning: !this.$route.query.token });
       setTimeout(() => {
         this.$emit('complete');
       }, 2000);

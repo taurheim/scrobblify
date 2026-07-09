@@ -76,6 +76,7 @@ import JSZip from 'jszip';
 import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
 import ErrorDialog from '@/components/ErrorDialog.vue';
+import { trackEvent, trackError } from '@/services/Analytics';
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -143,6 +144,13 @@ export default Vue.extend({
     async parseSpotifyData() {
       if (!this.selectedFile) { return; }
 
+      trackEvent('upload_parse_started', {
+        file_size_bytes: this.selectedFile.size,
+        scrobble_old_plays: this.scrobbleOldPlays,
+        follow_lfm_rules: this.followLfmRules,
+        check_duplicates: this.checkDuplicates,
+      });
+
       const reTagDate = new Date();
       this.logs.push('Reading ZIP file...');
       await delay(100);
@@ -151,6 +159,7 @@ export default Vue.extend({
       try {
         zip = await JSZip.loadAsync(this.selectedFile);
       } catch (e) {
+        trackError('upload.loadZip', e);
         this.errorMessage = 'Failed to read the ZIP file. It may be corrupted or not a valid ZIP archive.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
@@ -162,6 +171,7 @@ export default Vue.extend({
       );
 
       if (matchingFiles.length === 0) {
+        trackEvent('upload_no_matching_files');
         this.errorMessage = 'No Streaming_History_Audio_*.json files found in the ZIP. Make sure you uploaded the correct Spotify Extended Streaming History export.';
         this.showError = true;
         return;
@@ -183,6 +193,7 @@ export default Vue.extend({
         try {
           jsonString = await zip.files[name].async('string');
         } catch (e) {
+          trackError('upload.extractFile', e, { file: shortName });
           this.errorMessage = `Failed to extract "${shortName}" from the ZIP archive.`;
           this.errorDetails = (e as Error).message || String(e);
           this.showError = true;
@@ -192,6 +203,7 @@ export default Vue.extend({
         try {
           parsedData = parsedData.concat(this.scrobblify.spotifyJsonToListens(jsonString));
         } catch (e) {
+          trackError('upload.parseJson', e, { file: shortName });
           this.errorMessage = `Failed to parse "${shortName}". The JSON data in this file may be malformed.`;
           this.errorDetails = (e as Error).message || String(e);
           this.showError = true;
@@ -227,6 +239,7 @@ export default Vue.extend({
       try {
         validData = await this.scrobblify.removeInvalidListens(newData, this.smartMoveProgress, !this.followLfmRules);
       } catch (e) {
+        trackError('upload.removeInvalidListens', e);
         this.errorMessage = 'An error occurred while validating your listening history.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
@@ -256,6 +269,7 @@ export default Vue.extend({
           toBeScrobbled = result.unique;
           this.logs.push(`Found ${result.duplicateCount} duplicates — ${toBeScrobbled.length} new tracks to scrobble.`);
         } catch (e) {
+          trackError('upload.filterDuplicates', e);
           this.errorMessage = 'An error occurred while checking for duplicates. Proceeding with all tracks.';
           this.errorDetails = (e as Error).message || String(e);
           this.showError = true;
@@ -266,6 +280,12 @@ export default Vue.extend({
       this.logs.push(`Ready to scrobble ${toBeScrobbled.length} tracks.`);
       this.readyToScrobble = true;
       this.$store.commit('setValidScrobbles', toBeScrobbled);
+      trackEvent('upload_parse_completed', {
+        total_plays: parsedData.length,
+        valid_count: validData.length,
+        to_scrobble_count: toBeScrobbled.length,
+        checked_duplicates: this.checkDuplicates,
+      });
     },
   },
 });

@@ -74,7 +74,7 @@ import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import ErrorDialog from '@/components/ErrorDialog.vue';
-
+import { trackEvent, trackError, resetUser } from '@/services/Analytics';
 
 export default Vue.extend({
   components: {
@@ -97,24 +97,37 @@ export default Vue.extend({
     };
   },
   async mounted() {
+    trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
     try {
       this.hasResumableState = await this.stateManager.hasSavedState();
     } catch (e) {
       // IndexedDB not available — not critical, just skip resume
     }
   },
+  watch: {
+    currentStep(step: number) {
+      trackEvent('step_viewed', { step, step_name: this.stepName(step) });
+    },
+  },
   methods: {
+    stepName(step: number): string {
+      return ['', 'authenticate', 'upload', 'select', 'scrobble', 'complete'][step] || String(step);
+    },
     clearToken() {
       const api = this.$store.state.lfmApi as LastFm;
       this.currentStep = 1;
       api.clearUser();
+      resetUser();
+      trackEvent('user_logged_out');
     },
     async resumeFromSaved() {
       try {
         const state = await this.stateManager.loadState();
         if (!state) { return; }
+        trackEvent('session_resumed', { source: 'saved', total_tracks: state.totalTracks });
         this.restoreFromState(state);
       } catch (e) {
+        trackError('scrobblify.resumeFromSaved', e);
         this.errorMessage = 'Failed to load your saved progress.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
@@ -128,8 +141,10 @@ export default Vue.extend({
       if (!input.files || input.files.length === 0) { return; }
       try {
         const state = await this.stateManager.importFromFile(input.files[0]);
+        trackEvent('session_resumed', { source: 'file', total_tracks: state.totalTracks });
         this.restoreFromState(state);
       } catch (e) {
+        trackError('scrobblify.onImportFile', e);
         this.errorMessage = 'The selected file is not a valid Scrobblify progress file.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
@@ -194,7 +209,12 @@ export default Vue.extend({
       try {
         await this.stateManager.saveState(state);
         this.stateManager.exportToFile(state);
+        trackEvent('session_saved', {
+          scrobbled_tracks: info.scrobbledTracks,
+          total_tracks: tracks.length,
+        });
       } catch (e) {
+        trackError('scrobblify.onSaveAndExit', e);
         this.errorMessage = 'Failed to save your scrobbling progress. You can try the "Save Progress" button again.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
