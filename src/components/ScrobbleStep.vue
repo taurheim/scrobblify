@@ -177,7 +177,7 @@ export default Vue.extend({
           // Rate limit (Last.fm error 29 / HTTP 429): pause and retry the same track
           // rather than counting it as a failure.
           if (LastFm.isRateLimitError(e)) {
-            this.pauseReason = `Rate limited by Last.fm. Pausing for 1 minute before retrying...`;
+            this.pauseReason = `Rate limited by Last.fm. Pausing for 1 minute before retrying.`;
             trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
             await this.pauseWithCountdown(RATE_LIMIT_COOLDOWN_MS);
             retryDueToRateLimit = true;
