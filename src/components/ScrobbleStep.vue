@@ -84,9 +84,10 @@ import { trackEvent, trackError } from '@/services/Analytics';
 
 const BURST_LIMIT = 950;
 const DAILY_LIMIT = 2700;
-const BURST_COOLDOWN_MS = 10 * 60 * 1000;
-const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
-const RATE_LIMIT_COOLDOWN_MINUTES = RATE_LIMIT_COOLDOWN_MS / (60 * 1000);
+const MS_PER_MINUTE = 60 * 1000;
+const BURST_COOLDOWN_MS = 10 * MS_PER_MINUTE;
+const RATE_LIMIT_COOLDOWN_MS = 1 * MS_PER_MINUTE;
+const RATE_LIMIT_COOLDOWN_MINUTES = RATE_LIMIT_COOLDOWN_MS / MS_PER_MINUTE;
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
@@ -174,20 +175,18 @@ export default Vue.extend({
         this.currentTrackName = track.toString();
 
         let retryDueToRateLimit = false;
+        let recoveredFromRateLimit = false;
+        let elapsedSinceFirstRateLimitMs = 0;
+        let recoveredRateLimitPauseCount = 0;
         try {
           await api.scrobblePlay(track);
           this.$store.commit('trackScrobbled');
           this.burstCount++;
           this.dailyCount++;
           if (this.firstRateLimitAtMs !== null) {
-            trackEvent('scrobble_rate_limit_recovered', {
-              scrobbled_tracks: this.scrobbledTracks + 1,
-              total_tracks: tracks.length,
-              burst_count: this.burstCount,
-              daily_count: this.dailyCount,
-              rate_limit_pause_count: this.rateLimitPauseCount,
-              elapsed_since_first_rate_limit_ms: Date.now() - this.firstRateLimitAtMs,
-            });
+            recoveredFromRateLimit = true;
+            elapsedSinceFirstRateLimitMs = Date.now() - this.firstRateLimitAtMs;
+            recoveredRateLimitPauseCount = this.rateLimitPauseCount;
             this.firstRateLimitAtMs = null;
             this.rateLimitPauseCount = 0;
           }
@@ -201,7 +200,8 @@ export default Vue.extend({
               this.firstRateLimitAtMs = rateLimitStartMs;
             }
             this.rateLimitPauseCount++;
-            this.pauseReason = `Rate limited by Last.fm. Pausing for ${RATE_LIMIT_COOLDOWN_MINUTES} minute(s) before retrying.`;
+            const minuteLabel = RATE_LIMIT_COOLDOWN_MINUTES === 1 ? 'minute' : 'minutes';
+            this.pauseReason = `Rate limited by Last.fm. Pausing for ${RATE_LIMIT_COOLDOWN_MINUTES} ${minuteLabel} before retrying.`;
             trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
             trackEvent('scrobble_rate_limited', {
               scrobbled_tracks: this.scrobbledTracks,
@@ -247,6 +247,16 @@ export default Vue.extend({
 
         if (!retryDueToRateLimit) {
           this.scrobbledTracks += 1;
+          if (recoveredFromRateLimit) {
+            trackEvent('scrobble_rate_limit_recovered', {
+              scrobbled_tracks: this.scrobbledTracks,
+              total_tracks: tracks.length,
+              burst_count: this.burstCount,
+              daily_count: this.dailyCount,
+              rate_limit_pause_count: recoveredRateLimitPauseCount,
+              elapsed_since_first_rate_limit_ms: elapsedSinceFirstRateLimitMs,
+            });
+          }
           i++;
         }
       }
