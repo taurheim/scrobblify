@@ -35,6 +35,9 @@
         <div v-if="countdown > 0" class="text-h5 mb-2">
           Auto-resuming in {{ formattedCountdown }}
         </div>
+        <div class="mb-2 text-body-2">
+          You can save progress and leave now, then resume later at any time.
+        </div>
         <div class="mb-3">{{ scrobbledTracks }} of {{ tracksToScrobble.length }} completed so far</div>
 
         <v-btn class="primary mr-2" @click="saveAndExit">Save Progress &amp; Leave</v-btn>
@@ -97,6 +100,8 @@ export default Vue.extend({
       countdownTimer: null as number | null,
       burstCount: 0,
       dailyCount: 0,
+      rateLimitPauseCount: 0,
+      firstRateLimitAtMs: null as number | null,
       failedTracks: [] as Array<{ track: Scrobble; error: string }>,
       completed: false,
       showError: false,
@@ -172,14 +177,50 @@ export default Vue.extend({
           this.$store.commit('trackScrobbled');
           this.burstCount++;
           this.dailyCount++;
+          if (this.firstRateLimitAtMs !== null) {
+            trackEvent('scrobble_rate_limit_recovered', {
+              scrobbled_tracks: this.scrobbledTracks + 1,
+              total_tracks: tracks.length,
+              burst_count: this.burstCount,
+              daily_count: this.dailyCount,
+              rate_limit_pause_count: this.rateLimitPauseCount,
+              elapsed_since_first_rate_limit_ms: Date.now() - this.firstRateLimitAtMs,
+            });
+            this.firstRateLimitAtMs = null;
+            this.rateLimitPauseCount = 0;
+          }
           consecutiveFailures = 0;
         } catch (e) {
           // Rate limit (Last.fm error 29 / HTTP 429): pause and retry the same track
           // rather than counting it as a failure.
           if (LastFm.isRateLimitError(e)) {
-            this.pauseReason = `Rate limited by Last.fm. Pausing for 1 minute before retrying.`;
+            const rateLimitStartMs = Date.now();
+            if (this.firstRateLimitAtMs === null) {
+              this.firstRateLimitAtMs = rateLimitStartMs;
+            }
+            this.rateLimitPauseCount++;
+            this.pauseReason = 'Rate limited by Last.fm. Pausing for 1 minute before retrying.';
             trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
+            trackEvent('scrobble_rate_limited', {
+              scrobbled_tracks: this.scrobbledTracks,
+              total_tracks: tracks.length,
+              track_index: i,
+              burst_count: this.burstCount,
+              daily_count: this.dailyCount,
+              rate_limit_pause_count: this.rateLimitPauseCount,
+              elapsed_since_first_rate_limit_ms: this.firstRateLimitAtMs ? rateLimitStartMs - this.firstRateLimitAtMs : 0,
+            });
             await this.pauseWithCountdown(RATE_LIMIT_COOLDOWN_MS);
+            trackEvent('scrobble_rate_limit_cooldown_complete', {
+              scrobbled_tracks: this.scrobbledTracks,
+              total_tracks: tracks.length,
+              track_index: i,
+              burst_count: this.burstCount,
+              daily_count: this.dailyCount,
+              rate_limit_pause_count: this.rateLimitPauseCount,
+              configured_cooldown_ms: RATE_LIMIT_COOLDOWN_MS,
+              actual_pause_ms: Date.now() - rateLimitStartMs,
+            });
             retryDueToRateLimit = true;
           } else {
             this.$store.commit('trackFailed');
@@ -253,4 +294,3 @@ export default Vue.extend({
   },
 });
 </script>
-
