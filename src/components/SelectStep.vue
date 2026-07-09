@@ -155,6 +155,7 @@
 import Vue from 'vue';
 import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
+import { trackEvent } from '@/services/Analytics';
 
 const workerCode = `
   let count = 0;
@@ -501,6 +502,10 @@ export default Vue.extend({
       this.$store.commit('setSelectedScrobbles', selected.map((track: any) => {
         return new Scrobble(track.track, track.artist, new Date(track.time), track.album);
       }));
+      trackEvent('tracks_selected', {
+        selected_count: selected.length,
+        total_count: this.totalTrackCount,
+      });
       this.$emit('complete');
     },
   },

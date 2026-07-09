@@ -77,6 +77,7 @@ import Vue from 'vue';
 import Scrobble from '@/models/Scrobble';
 import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
+import { trackEvent, trackError } from '@/services/Analytics';
 
 const BURST_LIMIT = 950;
 const DAILY_LIMIT = 2700;
@@ -130,6 +131,15 @@ export default Vue.extend({
       let consecutiveFailures = 0;
       const MAX_CONSECUTIVE_FAILURES = 10;
 
+      if (this.scrobbledTracks === 0) {
+        trackEvent('scrobble_started', { total_tracks: tracks.length });
+      } else {
+        trackEvent('scrobble_resumed', {
+          total_tracks: tracks.length,
+          already_scrobbled: this.scrobbledTracks,
+        });
+      }
+
       for (let i = this.scrobbledTracks; i < tracks.length; i++) {
         // Check if manually paused
         if (this.paused) {
@@ -139,6 +149,7 @@ export default Vue.extend({
         // Check burst limit
         if (this.burstCount >= BURST_LIMIT) {
           this.pauseReason = `Approaching Last.fm's burst limit (~1,000 scrobbles). Pausing for 10 minutes to avoid being rate-limited.`;
+          trackEvent('scrobble_paused', { reason: 'burst_limit', scrobbled_tracks: this.scrobbledTracks });
           await this.pauseWithCountdown(BURST_COOLDOWN_MS);
           this.burstCount = 0;
         }
@@ -146,6 +157,7 @@ export default Vue.extend({
         // Check daily limit
         if (this.dailyCount >= DAILY_LIMIT) {
           this.pauseReason = `Approaching Last.fm's daily limit (~2,800 scrobbles). You'll need to come back tomorrow to continue.`;
+          trackEvent('scrobble_paused', { reason: 'daily_limit', scrobbled_tracks: this.scrobbledTracks });
           this.paused = true;
           return;
         }
@@ -165,6 +177,11 @@ export default Vue.extend({
           consecutiveFailures++;
 
           if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            trackError('scrobble.repeatedFailures', e, {
+              consecutive_failures: consecutiveFailures,
+              scrobbled_tracks: this.scrobbledTracks,
+              failed_tracks: this.failedTracks.length,
+            });
             this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} tracks failed in a row. There may be a problem with Last.fm or your authentication.`;
             this.errorDetails = (e as Error).message || String(e);
             this.showError = true;
@@ -178,6 +195,11 @@ export default Vue.extend({
       }
 
       this.completed = true;
+      trackEvent('scrobble_completed', {
+        total_tracks: tracks.length,
+        scrobbled_tracks: this.scrobbledTracks,
+        failed_tracks: this.failedTracks.length,
+      });
       this.$emit('complete');
     },
 
@@ -203,6 +225,7 @@ export default Vue.extend({
 
     manualPause() {
       this.pauseReason = 'Manually paused.';
+      trackEvent('scrobble_paused', { reason: 'manual', scrobbled_tracks: this.scrobbledTracks });
       this.paused = true;
     },
 
