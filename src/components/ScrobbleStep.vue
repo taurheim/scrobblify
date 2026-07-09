@@ -141,7 +141,7 @@ export default Vue.extend({
         });
       }
 
-      for (let i = this.scrobbledTracks; i < tracks.length; i++) {
+      for (let i = this.scrobbledTracks; i < tracks.length; ) {
         // Check if manually paused
         if (this.paused) {
           return;
@@ -166,6 +166,7 @@ export default Vue.extend({
         const track = tracks[i];
         this.currentTrackName = track.toString();
 
+        let retryDueToRateLimit = false;
         try {
           await api.scrobblePlay(track);
           this.$store.commit('trackScrobbled');
@@ -175,34 +176,36 @@ export default Vue.extend({
         } catch (e) {
           // Rate limit (Last.fm error 29 / HTTP 429): pause and retry the same track
           // rather than counting it as a failure.
-          if ((e as Error).message?.includes('API error 29')) {
+          if (LastFm.isRateLimitError(e)) {
             this.pauseReason = `Rate limited by Last.fm. Pausing for 1 minute before retrying...`;
             trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
             await this.pauseWithCountdown(RATE_LIMIT_COOLDOWN_MS);
-            i--; // retry the same track (for loop will i++ on next iteration)
-            continue;
-          }
+            retryDueToRateLimit = true;
+          } else {
+            this.$store.commit('trackFailed');
+            this.failedTracks.push({ track, error: (e as Error).message || 'Unknown error' });
+            consecutiveFailures++;
 
-          this.$store.commit('trackFailed');
-          this.failedTracks.push({ track, error: (e as Error).message || 'Unknown error' });
-          consecutiveFailures++;
-
-          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-            trackError('scrobble.repeatedFailures', e, {
-              consecutive_failures: consecutiveFailures,
-              scrobbled_tracks: this.scrobbledTracks,
-              failed_tracks: this.failedTracks.length,
-            });
-            this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} tracks failed in a row. There may be a problem with Last.fm or your authentication.`;
-            this.errorDetails = (e as Error).message || String(e);
-            this.showError = true;
-            this.pauseReason = 'Paused due to repeated failures.';
-            this.paused = true;
-            return;
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+              trackError('scrobble.repeatedFailures', e, {
+                consecutive_failures: consecutiveFailures,
+                scrobbled_tracks: this.scrobbledTracks,
+                failed_tracks: this.failedTracks.length,
+              });
+              this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} tracks failed in a row. There may be a problem with Last.fm or your authentication.`;
+              this.errorDetails = (e as Error).message || String(e);
+              this.showError = true;
+              this.pauseReason = 'Paused due to repeated failures.';
+              this.paused = true;
+              return;
+            }
           }
         }
 
-        this.scrobbledTracks += 1;
+        if (!retryDueToRateLimit) {
+          this.scrobbledTracks += 1;
+          i++;
+        }
       }
 
       this.completed = true;

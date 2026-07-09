@@ -342,6 +342,11 @@ export default class LastFm {
     return error instanceof Error && error.message.startsWith('Last.fm API error');
   }
 
+  public static isRateLimitError(error: unknown): boolean {
+    // Last.fm error code 29 = Rate Limit Exceeded
+    return error instanceof Error && /^Last\.fm API error 29\b/.test(error.message);
+  }
+
   // TODO make a class for the api response instead of any
   private trackToScrobble(track: any): Scrobble {
     return new Scrobble(
