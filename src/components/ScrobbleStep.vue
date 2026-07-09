@@ -82,6 +82,7 @@ import { trackEvent, trackError } from '@/services/Analytics';
 const BURST_LIMIT = 950;
 const DAILY_LIMIT = 2700;
 const BURST_COOLDOWN_MS = 10 * 60 * 1000;
+const RATE_LIMIT_COOLDOWN_MS = 60 * 1000;
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
@@ -172,6 +173,16 @@ export default Vue.extend({
           this.dailyCount++;
           consecutiveFailures = 0;
         } catch (e) {
+          // Rate limit (Last.fm error 29 / HTTP 429): pause and retry the same track
+          // rather than counting it as a failure.
+          if ((e as Error).message?.includes('API error 29')) {
+            this.pauseReason = `Rate limited by Last.fm. Pausing for 1 minute before retrying...`;
+            trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
+            await this.pauseWithCountdown(RATE_LIMIT_COOLDOWN_MS);
+            i--; // retry the same track (for loop will i++ on next iteration)
+            continue;
+          }
+
           this.$store.commit('trackFailed');
           this.failedTracks.push({ track, error: (e as Error).message || 'Unknown error' });
           consecutiveFailures++;
