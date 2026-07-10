@@ -37,6 +37,7 @@ export default Vue.extend({
   async mounted() {
     this.$data.checkingAuth = true;
     const api = this.$store.state.lfmApi as LastFm;
+    const hadToken = !!this.$route.query.token;
     try {
       await api.init(this.$route.query);
     } catch (e) {
@@ -47,10 +48,24 @@ export default Vue.extend({
       this.errorDetails = (e as Error).message || String(e);
       this.showError = true;
       return;
+    } finally {
+      // Last.fm auth tokens are single-use (consumed by auth.getSession). Strip
+      // the token from the URL once we've attempted the exchange so a page
+      // refresh or re-navigation never resubmits a consumed token, which Last.fm
+      // rejects with error 4 "Unauthorized Token - This token has not been issued".
+      if (hadToken) {
+        const query = { ...this.$route.query };
+        delete query.token;
+        this.$router.replace({ query }).catch((err: any) => {
+          if (err && err.name !== 'NavigationDuplicated') {
+            trackError('auth.strip_token_url', err);
+          }
+        });
+      }
     }
     if (api.isAuthenticated()) {
       identifyUser(api.getUserName());
-      trackEvent('auth_success', { returning: !this.$route.query.token });
+      trackEvent('auth_success', { returning: !hadToken });
       setTimeout(() => {
         this.$emit('complete');
       }, 2000);
