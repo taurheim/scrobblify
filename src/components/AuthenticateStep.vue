@@ -56,7 +56,11 @@ export default Vue.extend({
       if (hadToken) {
         const query = { ...this.$route.query };
         delete query.token;
-        this.$router.replace({ query }).catch(() => { /* ignore redundant navigation */ });
+        this.$router.replace({ query }).catch((err: any) => {
+          if (err && err.name !== 'NavigationDuplicated') {
+            trackError('auth.strip_token_url', err);
+          }
+        });
       }
     }
     if (api.isAuthenticated()) {
