@@ -177,7 +177,7 @@ export default Vue.extend({
         const track = tracks[i];
         this.currentTrackName = track.toString();
 
-        let retryDueToRateLimit = false;
+        let retrySameTrack = false;
         let recoveredFromRateLimit = false;
         let elapsedSinceFirstRateLimitMs = 0;
         let recoveredRateLimitPauseCount = 0;
@@ -228,7 +228,7 @@ export default Vue.extend({
               configured_cooldown_ms: RATE_LIMIT_COOLDOWN_MS,
               actual_pause_ms: Date.now() - rateLimitStartMs,
             });
-            retryDueToRateLimit = true;
+            retrySameTrack = true;
           } else if (LastFm.isNetworkError(e)) {
             // Transient connectivity problem (offline, DNS, connection reset,
             // etc.). Don't count this against the track: pause briefly and retry
@@ -241,7 +241,7 @@ export default Vue.extend({
               track_index: i,
             });
             await this.pauseWithCountdown(NETWORK_ERROR_COOLDOWN_MS);
-            retryDueToRateLimit = true;
+            retrySameTrack = true;
           } else {
             this.$store.commit('trackFailed');
             this.failedTracks.push({ track, error: (e as Error).message || 'Unknown error' });
@@ -263,7 +263,7 @@ export default Vue.extend({
           }
         }
 
-        if (!retryDueToRateLimit) {
+        if (!retrySameTrack) {
           this.scrobbledTracks += 1;
           if (recoveredFromRateLimit) {
             trackEvent('scrobble_rate_limit_recovered', {
