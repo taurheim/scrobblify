@@ -120,6 +120,39 @@ test.describe('Scrobble Page - Authentication Step', () => {
     // Should auto-advance past step 1 to the upload step
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
   });
+
+  test('does not re-exchange a single-use token when the callback URL is revisited', async ({ page }) => {
+    // Regression: Last.fm auth tokens are single-use. If the callback URL is
+    // re-loaded while it still carries the token (in-flight refresh, browser
+    // restoring the tab, duplicate load), the consumed token must NOT be sent to
+    // auth.getSession again — Last.fm rejects re-use with error 4 "Unauthorized
+    // Token - This token has not been issued".
+    let getSessionCount = 0;
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(new URL(route.request().url()).search);
+      if (params.get('method') === 'auth.getSession') {
+        getSessionCount++;
+        await route.fulfill({
+          status: 403,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            error: 4,
+            message: 'Unauthorized Token - This token has not been issued.',
+          }),
+        });
+      } else {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+      }
+    });
+
+    await page.goto('/#/scrobble?token=single-use-token');
+    await expect.poll(() => getSessionCount, { timeout: 10000 }).toBe(1);
+
+    // Revisit the callback URL with the same token still present.
+    await page.goto('/#/scrobble?token=single-use-token');
+    await page.waitForTimeout(1000);
+    expect(getSessionCount).toBe(1);
+  });
 });
 
 test.describe('Upload Step - ZIP Drag & Drop', () => {

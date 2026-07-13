@@ -9,6 +9,12 @@ export default class LastFm {
   private USER_AUTH_TOKEN_LOCALSTORAGE_KEY_LEGACY = 'scrobblifyLfmAuthToken';
   private USER_AUTH_KEY_LOCALSTORAGE_KEY = 'scrobblifyLfmAuthKey';
   private USER_NAME_LOCALSTORAGE_KEY = 'scrobblifyLfmUserName';
+  // Records the single-use auth token we've already begun exchanging so that a
+  // reload / component re-mount / duplicate load during the in-flight
+  // auth.getSession call never re-submits the same token. Kept in
+  // sessionStorage (per-tab, cleared when the tab closes) because a token only
+  // needs to be exchanged once within a single browsing session.
+  private ATTEMPTED_AUTH_TOKEN_SESSIONSTORAGE_KEY = 'scrobblifyLfmAttemptedAuthToken';
   private userAuthKey: string | null = null;
   private userAuthToken: string | null = null;
   private userName: string | null = null;
@@ -29,10 +35,31 @@ export default class LastFm {
     this.userAuthToken = queryParams.token || null;
 
     if (!this.isAuthenticated() && this.userAuthToken) {
+      // Guard against exchanging the same single-use token twice. Last.fm
+      // consumes the token on auth.getSession and rejects any re-use with
+      // error 4 "Unauthorized Token - This token has not been issued". A reload
+      // or component re-mount while the first exchange is still in flight (slow
+      // network, impatient refresh, browser restoring the callback URL, etc.)
+      // would otherwise re-submit the already-consumed token. Marking the token
+      // *before* the network call closes that window.
+      if (sessionStorage.getItem(this.ATTEMPTED_AUTH_TOKEN_SESSIONSTORAGE_KEY) === this.userAuthToken) {
+        this.userAuthToken = null;
+        return;
+      }
+      sessionStorage.setItem(this.ATTEMPTED_AUTH_TOKEN_SESSIONSTORAGE_KEY, this.userAuthToken);
+
       try {
         const response = await this.getSession();
         this.setUserName(response.name);
         this.setUserAuthKey(response.key);
+      } catch (e) {
+        // A pure network failure means the request never reached Last.fm, so
+        // the token was not consumed and remains valid for a retry. Clear the
+        // marker so a subsequent attempt (e.g. after reconnecting) can proceed.
+        if (LastFm.isNetworkError(e)) {
+          sessionStorage.removeItem(this.ATTEMPTED_AUTH_TOKEN_SESSIONSTORAGE_KEY);
+        }
+        throw e;
       } finally {
         // Token is consumed by auth.getSession (success or failure); discard it
         // so a retry doesn't reuse a dead token.
