@@ -150,7 +150,9 @@ test.describe('Scrobble Page - Authentication Step', () => {
 
     // Revisit the callback URL with the same token still present.
     await page.goto('/#/scrobble?token=single-use-token');
-    await page.waitForTimeout(1000);
+    // Wait for init() to settle (the "checking auth" spinner clears once the
+    // token exchange is skipped) rather than an arbitrary delay.
+    await expect(page.locator('text=Checking for authentication')).toBeHidden({ timeout: 10000 });
     expect(getSessionCount).toBe(1);
   });
 });
