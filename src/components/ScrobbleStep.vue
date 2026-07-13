@@ -89,6 +89,8 @@ const BURST_COOLDOWN_MS = 10 * MS_PER_MINUTE;
 const RATE_LIMIT_COOLDOWN_MS = 1 * MS_PER_MINUTE;
 const RATE_LIMIT_COOLDOWN_MINUTES = RATE_LIMIT_COOLDOWN_MS / MS_PER_MINUTE;
 const RATE_LIMIT_COOLDOWN_SECONDS = Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000);
+const NETWORK_ERROR_COOLDOWN_MS = 30 * 1000;
+const NETWORK_ERROR_COOLDOWN_SECONDS = Math.ceil(NETWORK_ERROR_COOLDOWN_MS / 1000);
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
@@ -226,6 +228,19 @@ export default Vue.extend({
               configured_cooldown_ms: RATE_LIMIT_COOLDOWN_MS,
               actual_pause_ms: Date.now() - rateLimitStartMs,
             });
+            retryDueToRateLimit = true;
+          } else if (LastFm.isNetworkError(e)) {
+            // Transient connectivity problem (offline, DNS, connection reset,
+            // etc.). Don't count this against the track: pause briefly and retry
+            // the same track once the network hopefully recovers.
+            this.pauseReason = `Couldn't reach Last.fm (network error). Retrying in ${NETWORK_ERROR_COOLDOWN_SECONDS} seconds. Check your internet connection.`;
+            trackEvent('scrobble_paused', { reason: 'network_error', scrobbled_tracks: this.scrobbledTracks });
+            trackEvent('scrobble_network_error', {
+              scrobbled_tracks: this.scrobbledTracks,
+              total_tracks: tracks.length,
+              track_index: i,
+            });
+            await this.pauseWithCountdown(NETWORK_ERROR_COOLDOWN_MS);
             retryDueToRateLimit = true;
           } else {
             this.$store.commit('trackFailed');
