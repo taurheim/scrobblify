@@ -347,6 +347,23 @@ export default class LastFm {
     return error instanceof Error && /^Last\.fm API error 29\b/.test(error.message);
   }
 
+  // A failed `fetch` (offline, DNS failure, connection reset, CORS, ad-blocker,
+  // etc.) rejects with a TypeError rather than an HTTP response. These are
+  // transient connectivity problems, not a problem with a specific track, so
+  // callers should pause and retry rather than treat the track as failed.
+  // The message differs per browser: "Failed to fetch" (Chrome/Edge),
+  // "NetworkError when attempting to fetch resource." (Firefox),
+  // "Load failed" (Safari).
+  public static isNetworkError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+    if (error instanceof TypeError) {
+      return true;
+    }
+    return /failed to fetch|networkerror|network request failed|load failed/i.test(error.message);
+  }
+
   // TODO make a class for the api response instead of any
   private trackToScrobble(track: any): Scrobble {
     return new Scrobble(
