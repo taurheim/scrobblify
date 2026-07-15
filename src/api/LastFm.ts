@@ -374,6 +374,18 @@ export default class LastFm {
     return error instanceof Error && /^Last\.fm API error 29\b/.test(error.message);
   }
 
+  // Last.fm auth-token errors returned by auth.getSession. All of them mean the
+  // token can never be exchanged again, so the only recovery is to send the user
+  // back through the authorize flow to obtain a fresh token:
+  //   4  = Invalid/unissued token ("This token has not been issued") — e.g. the
+  //        single-use token was already consumed (by a link scanner, preview
+  //        bot, prefetch, or an earlier tab) before this exchange ran.
+  //   14 = This token has not been authorized by the user.
+  //   15 = This token has expired (tokens are valid for ~60 minutes).
+  public static isAuthTokenError(error: unknown): boolean {
+    return error instanceof Error && /^Last\.fm API error (4|14|15)\b/.test(error.message);
+  }
+
   // A failed `fetch` (offline, DNS failure, connection reset, CORS, ad-blocker,
   // etc.) rejects with a TypeError rather than an HTTP response. These are
   // transient connectivity problems, not a problem with a specific track, so
