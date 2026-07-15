@@ -51,7 +51,7 @@ export default Vue.extend({
   },
   computed: {
     authorizeUrl(): string {
-      return `http://www.last.fm/api/auth/?api_key=${LFM_API_KEY}&cb=${LFM_AUTH_CALLBACK}`;
+      return `https://www.last.fm/api/auth/?api_key=${LFM_API_KEY}&cb=${LFM_AUTH_CALLBACK}`;
     },
   },
   methods: {
@@ -67,17 +67,16 @@ export default Vue.extend({
       await api.init(this.$route.query);
     } catch (e) {
       this.$data.checkingAuth = false;
+      trackError('auth.init', e);
       // A dead/expired token (already consumed, unauthorized, or expired) isn't a
       // failure the user can fix by retrying the same link — the only recovery is
       // to authorize again for a fresh token. Show a dedicated, non-alarming
       // recovery prompt instead of the generic error dialog.
       if (LastFm.isAuthTokenError(e)) {
-        trackError('auth.init', e);
         trackEvent('auth_token_invalid');
         this.tokenExpired = true;
         return;
       }
-      trackError('auth.init', e);
       trackEvent('auth_failed');
       this.errorMessage = 'Failed to authenticate with Last.fm. Please try again.';
       this.errorDetails = (e as Error).message || String(e);
