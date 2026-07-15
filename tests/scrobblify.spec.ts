@@ -120,6 +120,68 @@ test.describe('Scrobble Page - Authentication Step', () => {
     // Should auto-advance past step 1 to the upload step
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
   });
+
+  test('does not re-exchange a single-use token when the callback URL is revisited', async ({ page }) => {
+    // Regression: Last.fm auth tokens are single-use. If the callback URL is
+    // re-loaded while it still carries the token (in-flight refresh, browser
+    // restoring the tab, duplicate load), the consumed token must NOT be sent to
+    // auth.getSession again — Last.fm rejects re-use with error 4 "Unauthorized
+    // Token - This token has not been issued".
+    let getSessionCount = 0;
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(new URL(route.request().url()).search);
+      if (params.get('method') === 'auth.getSession') {
+        getSessionCount++;
+        await route.fulfill({
+          status: 403,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            error: 4,
+            message: 'Unauthorized Token - This token has not been issued.',
+          }),
+        });
+      } else {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+      }
+    });
+
+    await page.goto('/#/scrobble?token=single-use-token');
+    await expect.poll(() => getSessionCount, { timeout: 10000 }).toBe(1);
+
+    // Revisit the callback URL with the same token still present.
+    await page.goto('/#/scrobble?token=single-use-token');
+    // Wait for init() to settle (the "checking auth" spinner clears once the
+    // token exchange is skipped) rather than an arbitrary delay.
+    await expect(page.locator('text=Checking for authentication')).toBeHidden({ timeout: 10000 });
+    expect(getSessionCount).toBe(1);
+  });
+
+  test('shows a recovery prompt when the auth token is already used or expired', async ({ page }) => {
+    // Regression: a single-use token can be consumed before the user (link
+    // scanner / preview bot / prefetch) or simply expire. auth.getSession then
+    // returns error 4. Instead of a generic failure, the user should get a clear
+    // "authorize again" recovery path with a fresh authorize link.
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(new URL(route.request().url()).search);
+      if (params.get('method') === 'auth.getSession') {
+        await route.fulfill({
+          status: 403,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            error: 4,
+            message: 'Unauthorized Token - This token has not been issued.',
+          }),
+        });
+      } else {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+      }
+    });
+
+    await page.goto('/#/scrobble?token=dead-token');
+    await expect(page.locator('text=/already used or has expired/i')).toBeVisible({ timeout: 10000 });
+    // Recovery affordance points back at the Last.fm authorize flow.
+    await expect(page.locator('a:has-text("Authorize again")')).toHaveAttribute('href', /last\.fm\/api\/auth/);
+  });
 });
 
 test.describe('Upload Step - ZIP Drag & Drop', () => {
