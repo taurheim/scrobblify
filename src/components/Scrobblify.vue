@@ -152,7 +152,7 @@ export default Vue.extend({
     },
     restoreFromState(state: ScrobbleState) {
       const api = this.$store.state.lfmApi as LastFm;
-      if (api.getUserName() && api.getUserName() !== state.userName) {
+      if (state.userName && api.getUserName() && api.getUserName() !== state.userName) {
         this.errorMessage = `This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`;
         this.showError = true;
         return;
