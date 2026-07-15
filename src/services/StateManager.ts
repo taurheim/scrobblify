@@ -100,9 +100,12 @@ export default class StateManager {
     });
     const data = JSON.parse(text);
 
+    // Only the fields needed to actually restore scrobbles are required.
+    // Everything else is optional metadata that is defaulted below, so an
+    // older or partial progress file (e.g. one without "userName") can still
+    // be imported successfully.
     const requiredFields: Array<keyof ScrobbleState> = [
-      'userName', 'totalTracks', 'completedIndices', 'failedIndices',
-      'tracks', 'burstCount', 'dailyCount', 'dailyCountDate', 'savedAt',
+      'totalTracks', 'completedIndices', 'failedIndices', 'tracks',
     ];
 
     for (const field of requiredFields) {
@@ -111,7 +114,14 @@ export default class StateManager {
       }
     }
 
-    return data as ScrobbleState;
+    return {
+      userName: '',
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+      ...data,
+    } as ScrobbleState;
   }
 
   private openDB(): Promise<IDBDatabase> {
