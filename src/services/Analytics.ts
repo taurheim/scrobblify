@@ -65,6 +65,29 @@ export function trackPageView(path: string): void {
   }
 }
 
+function normalizeErrorMessage(message: string): string {
+  const lastFmMatch = message.match(/^(Last\.fm API error .*?)\. Request: \{.*\}$/);
+  return lastFmMatch ? lastFmMatch[1] : message;
+}
+
+function normalizeErrorForTracking(error: Error): { trackedError: Error; rawMessage?: string } {
+  const normalizedMessage = normalizeErrorMessage(error.message);
+  if (normalizedMessage === error.message) {
+    return { trackedError: error };
+  }
+
+  const trackedError = new Error(normalizedMessage);
+  trackedError.name = error.name;
+  if (error.stack) {
+    trackedError.stack = error.stack.replace(error.message, normalizedMessage);
+  }
+
+  return {
+    trackedError,
+    rawMessage: error.message,
+  };
+}
+
 /*
   Records an error against a named context (e.g. 'upload.parseZip') so failures
   can be grouped and investigated. Captures both a filterable custom event and,
@@ -72,18 +95,24 @@ export function trackPageView(path: string): void {
 */
 export function trackError(context: string, error: unknown, extra: Record<string, any> = {}): void {
   const err = error instanceof Error ? error : new Error(String(error));
+  const { trackedError, rawMessage } = normalizeErrorForTracking(err);
 
   if (initialized) {
     try {
       posthog.capture('scrobblify_error', {
         context,
-        message: err.message,
-        stack: err.stack,
+        message: trackedError.message,
+        ...(rawMessage ? { raw_message: rawMessage } : {}),
+        stack: trackedError.stack,
         ...extra,
       });
       const captureException = (posthog as any).captureException;
       if (typeof captureException === 'function') {
-        captureException.call(posthog, err, { context, ...extra });
+        captureException.call(posthog, trackedError, {
+          context,
+          ...(rawMessage ? { raw_message: rawMessage } : {}),
+          ...extra,
+        });
       }
     } catch (e) {
       // ignore
