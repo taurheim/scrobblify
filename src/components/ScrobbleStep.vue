@@ -161,7 +161,7 @@ export default Vue.extend({
         // Check burst limit
         if (this.burstCount >= BURST_LIMIT) {
           this.pauseReason = `Approaching Last.fm's burst limit (~1,000 scrobbles). Pausing for 10 minutes to avoid being rate-limited.`;
-          trackEvent('scrobble_paused', { reason: 'burst_limit', scrobbled_tracks: this.scrobbledTracks });
+          trackEvent('scrobble_paused', { reason: 'burst_limit', scrobbled_tracks: this.scrobbledTracks, total_tracks: tracks.length });
           await this.pauseWithCountdown(BURST_COOLDOWN_MS);
           this.burstCount = 0;
         }
@@ -169,7 +169,7 @@ export default Vue.extend({
         // Check daily limit
         if (this.dailyCount >= DAILY_LIMIT) {
           this.pauseReason = `Approaching Last.fm's daily limit (~2,800 scrobbles). You'll need to come back tomorrow to continue.`;
-          trackEvent('scrobble_paused', { reason: 'daily_limit', scrobbled_tracks: this.scrobbledTracks });
+          trackEvent('scrobble_paused', { reason: 'daily_limit', scrobbled_tracks: this.scrobbledTracks, total_tracks: tracks.length });
           this.paused = true;
           return;
         }
@@ -207,7 +207,7 @@ export default Vue.extend({
               ? `${RATE_LIMIT_COOLDOWN_MINUTES} ${RATE_LIMIT_COOLDOWN_MINUTES === 1 ? 'minute' : 'minutes'}`
               : `${RATE_LIMIT_COOLDOWN_SECONDS} ${RATE_LIMIT_COOLDOWN_SECONDS === 1 ? 'second' : 'seconds'}`;
             this.pauseReason = `Rate limited by Last.fm. Pausing for ${pauseDurationLabel} before retrying.`;
-            trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks });
+            trackEvent('scrobble_paused', { reason: 'rate_limit', scrobbled_tracks: this.scrobbledTracks, total_tracks: tracks.length });
             trackEvent('scrobble_rate_limited', {
               scrobbled_tracks: this.scrobbledTracks,
               total_tracks: tracks.length,
@@ -234,7 +234,7 @@ export default Vue.extend({
             // etc.). Don't count this against the track: pause briefly and retry
             // the same track once the network hopefully recovers.
             this.pauseReason = `Couldn't reach Last.fm (network error). Retrying in ${NETWORK_ERROR_COOLDOWN_SECONDS} seconds. Check your internet connection.`;
-            trackEvent('scrobble_paused', { reason: 'network_error', scrobbled_tracks: this.scrobbledTracks });
+            trackEvent('scrobble_paused', { reason: 'network_error', scrobbled_tracks: this.scrobbledTracks, total_tracks: tracks.length });
             trackEvent('scrobble_network_error', {
               scrobbled_tracks: this.scrobbledTracks,
               total_tracks: tracks.length,
@@ -310,7 +310,7 @@ export default Vue.extend({
 
     manualPause() {
       this.pauseReason = 'Manually paused.';
-      trackEvent('scrobble_paused', { reason: 'manual', scrobbled_tracks: this.scrobbledTracks });
+      trackEvent('scrobble_paused', { reason: 'manual', scrobbled_tracks: this.scrobbledTracks, total_tracks: this.tracksToScrobble.length });
       this.paused = true;
     },
 
