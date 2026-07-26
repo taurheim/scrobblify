@@ -71,3 +71,18 @@ Network failures emit `scrobble_network_error`.
 Use the helpers in `src/services/Analytics.ts` (`trackEvent`, `trackError`,
 `identifyUser`) rather than calling `posthog` directly. Analytics must never
 break the app: every call is wrapped in try/catch and ignored on failure.
+
+## Linting
+
+`npm run lint` auto-fixes; `npm run lint:check` (`--no-fix`) is what CI runs, so
+use that to see what CI will see. The config is ESLint + `@vue/airbnb` +
+`@vue/typescript`.
+
+Several airbnb rules are switched off in `.eslintrc.js` because they fight
+patterns this codebase uses on purpose — each has a comment explaining why.
+The load-bearing one: **`no-underscore-dangle` is off because Vue 2 skips
+reactivity for keys starting with `_`**, which is how `SelectStep` holds large
+track arrays cheaply. Renaming those fields would silently make them reactive
+and tank performance on big histories.
+
+Warnings (mostly `no-explicit-any`) do not fail the build; only errors do.

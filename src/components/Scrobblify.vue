@@ -1,7 +1,8 @@
 <template>
   <div class="scrobblify">
     <div v-if="currentStep > 1">
-      Currently authenticated as: {{ this.$store.state.lfmApi.userName }}. <a @click="clearToken">Not you?</a>
+      Currently authenticated as: {{ this.$store.state.lfmApi.userName }}.
+      <a role="button" tabindex="0" @click="clearToken" @keydown.enter="clearToken">Not you?</a>
     </div>
     <v-alert v-if="hasResumableState && currentStep <= 2" type="info" prominent class="mb-4">
       <div>
@@ -17,6 +18,7 @@
         ref="importFileInput"
         type="file"
         accept=".json"
+        aria-label="Import saved session file"
         style="display: none"
         @change="onImportFile"
       >
@@ -226,4 +228,3 @@ export default Vue.extend({
   },
 });
 </script>
-

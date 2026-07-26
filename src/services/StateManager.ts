@@ -24,7 +24,6 @@ const STORE_NAME = 'scrobbleState';
 const STATE_KEY = 'current';
 
 export default class StateManager {
-
   static serializeScrobbles(scrobbles: Scrobble[]): SerializedScrobble[] {
     return scrobbles.map((s) => ({
       track: s.track,

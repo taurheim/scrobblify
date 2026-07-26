@@ -9,11 +9,17 @@ export default class Scrobblify {
     How much time around a given scrobble do we consider it a duplicate?
   */
   private MINUTES_TO_MS = 60000;
+
   private SECONDS_TO_MS = 1000;
+
   private DAYS_TO_MS = 86400000;
+
   private CONFLICT_BUFFER_TIME_MS = 3.5 * this.MINUTES_TO_MS;
+
   private RETROACTIVE_SCROBBLE_LIMIT_MS = 14 * this.DAYS_TO_MS;
+
   private retroactiveScrobbleLimitDate = (new Date()).getTime() - this.RETROACTIVE_SCROBBLE_LIMIT_MS;
+
   private lfmApi: LastFm;
 
   constructor(api: LastFm) {
@@ -29,10 +35,10 @@ export default class Scrobblify {
     const scrobbledPlays = await this.lfmApi.getPlaysInTimeRange(checkFrom, checkTo);
 
     const wasScrobbled = scrobbledPlays.some((scrobbledPlay: Scrobble) => {
-      const trackNameSimilarity =  StringSimilarity.compareTwoStrings(proposedScrobble.track, scrobbledPlay.track);
+      const trackNameSimilarity = StringSimilarity.compareTwoStrings(proposedScrobble.track, scrobbledPlay.track);
       return (
-        scrobbledPlay.artist === proposedScrobble.artist &&
-        trackNameSimilarity > SAME_IF_COEFFICIENT_ABOVE
+        scrobbledPlay.artist === proposedScrobble.artist
+        && trackNameSimilarity > SAME_IF_COEFFICIENT_ABOVE
       );
     });
 
@@ -126,10 +132,6 @@ export default class Scrobblify {
     });
 
     return { unique, duplicateCount };
-  }
-
-  public async postScrobble(scrobble: Scrobble): Promise<void> {
-    return;
   }
 
   public spotifyJsonToListens(jsonString: string): SpotifyListen[] {
@@ -243,11 +245,12 @@ export default class Scrobblify {
       return isValid;
     });
   }
+
   /*
     In addition, the last.fm scrobbling api only allows 14 days prior to be scrobbled:
     https://getsatisfaction.com/lastfm/topics/scrobbles-more-than-14-days
   */
-  public removeOldListens(listens: SpotifyListen[], reTagOldListens: boolean = false): SpotifyListen[] {
+  public removeOldListens(listens: SpotifyListen[], reTagOldListens = false): SpotifyListen[] {
     return listens.filter((listen) => {
       const currentTrackStartedAt = listen.listenDate.getTime();
       return (currentTrackStartedAt > this.retroactiveScrobbleLimitDate);
@@ -259,6 +262,9 @@ export default class Scrobblify {
   */
   public reTagOldListens(listens: SpotifyListen[], newDate: Date): SpotifyListen[] {
     return listens.map((listen) => {
+      // Mutated in place on purpose: SpotifyListen is a class, so cloning it
+      // here would drop its prototype (and `originalListenDate`).
+      // eslint-disable-next-line no-param-reassign
       listen.listenDate = newDate;
       return listen;
     });

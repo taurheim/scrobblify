@@ -500,9 +500,13 @@ export default Vue.extend({
       const selIds = (this as any)._selectedIds as Set<number>;
       const tracks = (this as any)._tracks as any[];
       const selected = tracks.filter((t: any) => selIds.has(t.id));
-      this.$store.commit('setSelectedScrobbles', selected.map((track: any) => {
-        return new Scrobble(track.track, track.artist, new Date(track.time), track.album);
-      }));
+      const scrobbles = selected.map((track: any) => new Scrobble(
+        track.track,
+        track.artist,
+        new Date(track.time),
+        track.album,
+      ));
+      this.$store.commit('setSelectedScrobbles', scrobbles);
       trackEvent('tracks_selected', {
         selected_count: selected.length,
         total_count: this.totalTrackCount,

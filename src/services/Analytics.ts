@@ -106,7 +106,7 @@ export function trackError(context: string, error: unknown, extra: Record<string
         stack: trackedError.stack,
         ...extra,
       });
-      const captureException = (posthog as any).captureException;
+      const { captureException } = posthog as any;
       if (typeof captureException === 'function') {
         captureException.call(posthog, trackedError, {
           context,
