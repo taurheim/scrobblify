@@ -2,72 +2,10 @@ import { test, expect, Page, Route } from '@playwright/test';
 import path from 'path';
 import LastFm from '../src/api/LastFm';
 import Scrobble from '../src/models/Scrobble';
+// Shared Last.fm mock, also used by the `npm run dev:mock` interactive script.
+import { interceptLastFm, mockLastFmAuth } from './lastfmMock';
 
 const FIXTURE_ZIP = path.resolve(__dirname, 'fixtures', 'test-spotify-data.zip');
-
-// Helper: mock Last.fm auth so the app thinks we're logged in.
-// Must be called AFTER a page.goto() so we're on the same origin.
-async function mockLastFmAuth(page: Page) {
-  await page.evaluate(() => {
-    localStorage.setItem('scrobblifyLfmAuthToken', 'fake-token');
-    localStorage.setItem('scrobblifyLfmAuthKey', 'fake-session-key');
-    localStorage.setItem('scrobblifyLfmUserName', 'testuser');
-  });
-}
-
-// Helper: intercept all Last.fm API calls
-function interceptLastFm(page: Page) {
-  return page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
-    const url = route.request().url();
-    const method = route.request().method();
-
-    const postData = route.request().postData() || '';
-    const allParams = new URLSearchParams(
-      method === 'POST' ? postData : new URL(url).search,
-    );
-    const apiMethod = allParams.get('method');
-
-    if (apiMethod === 'auth.getSession') {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          session: { name: 'testuser', key: 'fake-session-key', subscriber: 0 },
-        }),
-      });
-    } else if (apiMethod === 'track.getInfo') {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          track: { duration: '240000', name: allParams.get('track'), artist: { name: allParams.get('artist') } },
-        }),
-      });
-    } else if (apiMethod === 'user.getrecenttracks') {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          recenttracks: { track: [] },
-        }),
-      });
-    } else if (apiMethod === 'track.scrobble') {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          scrobbles: { '@attr': { accepted: 1, ignored: 0 } },
-        }),
-      });
-    } else {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({}),
-      });
-    }
-  });
-}
 
 // Navigate past auth (step 1 -> step 2) with mocked auth
 async function goToUploadStep(page: Page) {
