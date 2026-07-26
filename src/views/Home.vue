@@ -12,11 +12,13 @@
     Now all your plays will be automatically scrobbled (saved) to last.fm! You can use last.fm to track your listening history and use cool tools like <a href="https://savas.ca/lastwave">LastWave</a>.
 
     <h2>But I want to see cool graphs right now!</h2>
-    Well you're in luck - Scrobblify to the rescue! Scrobblify lets you retroactively scrobble your Spotify listening history straight to last.fm.
+    Well you're in luck - Scrobblify to the rescue! Scrobblify lets you
+    retroactively scrobble your Spotify listening history straight to last.fm.
     <br><br>
     <b>1. Request your Extended Streaming History from Spotify</b><br>
     Go to <a href="https://www.spotify.com/account/privacy/">your Spotify account</a> (Account &gt; Privacy &gt; Download your data).
-    Make sure you request the <strong>"Extended streaming history"</strong> specifically — this is different from the basic "Account data" download.
+    Make sure you request the <strong>"Extended streaming history"</strong> specifically — this is
+    different from the basic "Account data" download.
     The extended history includes your full listening history with timestamps, which is what Scrobblify needs.
     Spotify says it can take up to 30 days, but it usually only takes a few days.<br>
     <b>2. Download your data when it's ready</b><br>
@@ -32,8 +34,8 @@
     Scrobblify will start submitting your listening history to last.fm. Note that last.fm has undocumented rate limits
     (~2,800 scrobbles per day, ~1,000 per burst), so if you have a large history it may take a while.
     Don't worry — Scrobblify handles this automatically by pausing and resuming when rate limits are hit.
-    You can also <strong>save your progress</strong> and come back later if you need to close the page. Your progress will be
-    waiting for you when you return!
+    You can also <strong>save your progress</strong> and come back later if you need to close the page.
+    Your progress will be waiting for you when you return!
 
     <h2>Why does scrobblify only backfill the last two weeks?</h2>
     This is a limitation enforced by last.fm — scrobbles are supposed to be for the past two weeks only.
@@ -57,10 +59,6 @@
 </style>
 <script lang="ts">
 import Vue from 'vue';
-import ScrobblifyVue from '@/components/Scrobblify.vue';
-export default Vue.extend({
-  components: {
-    scrobblify: ScrobblifyVue,
-  },
-});
+
+export default Vue.extend({});
 </script>

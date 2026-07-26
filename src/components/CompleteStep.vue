@@ -18,12 +18,13 @@
     </div>
     <div v-else>
       <div v-if="this.$store.state.tracksFailed > 0" class="mt-2">
-        Some scrobbles failed. This can happen due to temporary Last.fm issues. You may want to try again later for those tracks.
+        Some scrobbles failed. This can happen due to temporary Last.fm issues.
+        You may want to try again later for those tracks.
       </div>
     </div>
     <br>
     <h1>Now go make pretty things!</h1>
-    <img src="../assets/lastwave_example.png"><br>
+    <img src="../assets/lastwave_example.png" alt="Example LastWave graph of recent listening history"><br>
     Now that you have some listening history, you should make yourself a wave graph for your last two weeks.
     <br><br>
     <h2><a :href="lastwaveUrl" target="_blank">Make me a LastWave!</a></h2>
@@ -38,6 +39,7 @@
 <script lang="ts">
 import Vue from 'vue';
 import LastFm from '@/api/LastFm';
+
 export default Vue.extend({
   props: {
     hasRemaining: {
@@ -50,10 +52,9 @@ export default Vue.extend({
       return this.$store.state.lfmApi.userName;
     },
     lastwaveUrl(): string {
-      const url = `https://savas.ca/lastwave`;
+      const url = 'https://savas.ca/lastwave';
       return url;
     },
   },
 });
 </script>
-

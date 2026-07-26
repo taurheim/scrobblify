@@ -13,16 +13,21 @@
       <h2>Upload your Spotify Extended Streaming History ZIP file:</h2>
       <div
         class="drop-zone"
+        role="button"
+        tabindex="0"
         :class="{ 'drop-zone--active': isDragging }"
         @dragover.prevent="isDragging = true"
         @dragleave.prevent="isDragging = false"
         @drop.prevent="onDrop"
         @click="openFilePicker"
+        @keydown.enter="openFilePicker"
+        @keydown.space.prevent="openFilePicker"
       >
         <input
           ref="fileInput"
           type="file"
           accept=".zip"
+          aria-label="Spotify streaming history ZIP file"
           style="display: none"
           @change="onFileSelected"
         >
@@ -35,9 +40,21 @@
         </div>
       </div>
       <br>
-      <v-checkbox color="primary" v-model="scrobbleOldPlays" :label="`Scrobble tracks older than 2 weeks (they will show as listened to today)`"></v-checkbox>
-      <v-checkbox color="primary" v-model="followLfmRules" :label="`Validate track lengths (filters out tracks shorter than 30s, or played for less than half their duration / 4 minutes)`"></v-checkbox>
-      <v-checkbox color="primary" v-model="checkDuplicates" :label="`Check for duplicates (fetches your last.fm history and skips tracks already scrobbled)`"></v-checkbox>
+      <v-checkbox
+        color="primary"
+        v-model="scrobbleOldPlays"
+        :label="`Scrobble tracks older than 2 weeks (they will show as listened to today)`"
+      ></v-checkbox>
+      <v-checkbox
+        color="primary"
+        v-model="followLfmRules"
+        :label="followLfmRulesLabel"
+      ></v-checkbox>
+      <v-checkbox
+        color="primary"
+        v-model="checkDuplicates"
+        :label="`Check for duplicates (fetches your last.fm history and skips tracks already scrobbled)`"
+      ></v-checkbox>
       <br>
       <v-btn color="primary" @click="parseSpotifyData" :disabled="!selectedFile">
         Find tracks
@@ -86,6 +103,8 @@ export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
   data() {
     return {
+      followLfmRulesLabel: 'Validate track lengths (filters out tracks shorter than 30s, '
+        + 'or played for less than half their duration / 4 minutes)',
       selectedFile: null as File | null,
       selectedFileName: '',
       isDragging: false,
@@ -104,7 +123,7 @@ export default Vue.extend({
   },
   computed: {
     progress(): number {
-      return 100 * this.stepProgress / this.stepTotal;
+      return (100 * this.stepProgress) / this.stepTotal;
     },
   },
   methods: {
@@ -225,12 +244,12 @@ export default Vue.extend({
       this.stepProgress = 0;
       this.stepTotal = newData.length;
       if (this.followLfmRules) {
-        this.logs.push(`Validating listens against last.fm scrobble rules...`);
+        this.logs.push('Validating listens against last.fm scrobble rules...');
         const EXPECTED_MS_PER_REQUEST = 500;
-        const expectedTime = newData.length * EXPECTED_MS_PER_REQUEST / 60000;
+        const expectedTime = (newData.length * EXPECTED_MS_PER_REQUEST) / 60000;
         this.logs.push(`This requires looking up each track's duration. Estimated time: ~${Math.ceil(expectedTime)} minutes.`);
       } else {
-        this.logs.push(`Filtering listens by play time (using estimated track lengths)...`);
+        this.logs.push('Filtering listens by play time (using estimated track lengths)...');
       }
 
       await delay(500);
@@ -256,7 +275,7 @@ export default Vue.extend({
         // Bulk-fetch Last.fm history and filter duplicates locally
         this.stepProgress = 0;
         this.stepTotal = 1;
-        this.logs.push(`Fetching your Last.fm history to check for duplicates...`);
+        this.logs.push('Fetching your Last.fm history to check for duplicates...');
         try {
           const result = await this.scrobblify.filterDuplicates(
             validData,

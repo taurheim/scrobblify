@@ -1,10 +1,11 @@
 import Vue from 'vue';
-import './plugins/vuetify.ts';
+import {
+  initAnalytics, registerGlobalErrorHandlers, trackError, trackPageView,
+} from '@/services/Analytics';
+import vuetify from './plugins/vuetify';
 import App from './App.vue';
 import router from './router';
 import store from './store';
-import vuetify from './plugins/vuetify';
-import { initAnalytics, registerGlobalErrorHandlers, trackError, trackPageView } from '@/services/Analytics';
 
 Vue.config.productionTip = false;
 

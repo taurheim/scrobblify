@@ -3,21 +3,30 @@ import md5 from 'blueimp-md5';
 
 export default class LastFm {
   private API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
+
   private API_RATE_BUFFER_MS = 250;
+
   // NOTE: Last.fm auth tokens are single-use (consumed by auth.getSession), so
   // we deliberately do not persist them. Only the resulting session key is stored.
   private USER_AUTH_TOKEN_LOCALSTORAGE_KEY_LEGACY = 'scrobblifyLfmAuthToken';
+
   private USER_AUTH_KEY_LOCALSTORAGE_KEY = 'scrobblifyLfmAuthKey';
+
   private USER_NAME_LOCALSTORAGE_KEY = 'scrobblifyLfmUserName';
+
   // Records the single-use auth token we've already begun exchanging so that a
   // reload / component re-mount / duplicate load during the in-flight
   // auth.getSession call never re-submits the same token. Kept in
   // sessionStorage (per-tab, cleared when the tab closes) because a token only
   // needs to be exchanged once within a single browsing session.
   private ATTEMPTED_AUTH_TOKEN_SESSIONSTORAGE_KEY = 'scrobblifyLfmAttemptedAuthToken';
+
   private userAuthKey: string | null = null;
+
   private userAuthToken: string | null = null;
+
   private userName: string | null = null;
+
   constructor(
     private lfmApiKey: string,
     private lfmSharedSecret: string,
@@ -240,7 +249,7 @@ export default class LastFm {
       throw new Error('Not authenticated.');
     }
     const params: {[key: string]: string} = {
-      'method': 'track.scrobble',
+      method: 'track.scrobble',
       'artist[0]': play.artist,
       'track[0]': play.track,
       'timestamp[0]': Math.floor(play.timestamp.getTime() / 1000).toString(),
@@ -255,21 +264,23 @@ export default class LastFm {
   private async makeRequest(
     httpMethod: string,
     params: {[key: string]: string},
-    authenticatedRequest: boolean = false,
-    maxRetries: number = 3,
+    authenticatedRequest = false,
+    maxRetries = 3,
   ): Promise<any> {
-    params.api_key = this.lfmApiKey;
+    // Work on a copy so signing never writes credentials (api_key/sk/api_sig)
+    // back into the caller's object.
+    const requestParams: {[key: string]: string} = { ...params, api_key: this.lfmApiKey };
 
     // Decide which api key to use
     if (authenticatedRequest) {
       if (this.userAuthKey) {
-        params.sk = this.userAuthKey;
+        requestParams.sk = this.userAuthKey;
       }
-      const sig = this.getMethodSignature(params, this.userAuthToken || '');
-      params.api_sig = sig;
+      const sig = this.getMethodSignature(requestParams, this.userAuthToken || '');
+      requestParams.api_sig = sig;
     }
 
-    const paramsString = this.paramObjectToString(params);
+    const paramsString = this.paramObjectToString(requestParams);
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
@@ -288,7 +299,7 @@ export default class LastFm {
         // Retry on 429 (rate limited) or 5xx server errors
         if (fetchResponse.status === 429 || fetchResponse.status >= 500) {
           if (attempt < maxRetries) {
-            const backoff = Math.pow(2, attempt + 1) * 1000;
+            const backoff = 2 ** (attempt + 1) * 1000;
             await new Promise((r) => setTimeout(r, backoff));
             continue;
           }
@@ -298,7 +309,7 @@ export default class LastFm {
 
         // Last.fm error code 29 = rate limit exceeded
         if (response.error === 29 && attempt < maxRetries) {
-          const backoff = Math.pow(2, attempt + 1) * 1000;
+          const backoff = 2 ** (attempt + 1) * 1000;
           await new Promise((r) => setTimeout(r, backoff));
           continue;
         }
@@ -308,7 +319,7 @@ export default class LastFm {
             fetchResponse.status,
             response.error,
             response.message,
-            params,
+            requestParams,
           ));
         }
 
@@ -317,13 +328,17 @@ export default class LastFm {
         return response;
       } catch (e) {
         if (attempt < maxRetries && !this.isLastFmApiError(e)) {
-          const backoff = Math.pow(2, attempt + 1) * 1000;
+          const backoff = 2 ** (attempt + 1) * 1000;
           await new Promise((r) => setTimeout(r, backoff));
           continue;
         }
         throw e;
       }
     }
+
+    // Unreachable: the final attempt either returns or throws. Kept so the
+    // method never resolves to undefined if the loop bounds ever change.
+    throw new Error('Last.fm request exhausted all retries without a response');
   }
 
   private getMethodSignature(params: {[key: string]: any}, token: string) {
@@ -341,9 +356,7 @@ export default class LastFm {
   }
 
   private paramObjectToString(params: {[key: string]: string}) {
-    return Object.keys(params).map((key) => {
-      return `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`;
-    }).join('&');
+    return Object.keys(params).map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`).join('&');
   }
 
   private buildLastFmErrorMessage(

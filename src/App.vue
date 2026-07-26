@@ -3,7 +3,7 @@
     <v-app>
       <div id="nav">
         <div id="logo">
-          <img src="./assets/logo.png"> scrobblify
+          <img src="./assets/logo.png" alt=""> scrobblify
         </div>
         <router-link to="/">Home</router-link> |
         <router-link to="/scrobble">Scrobble</router-link> |
@@ -37,7 +37,7 @@
 </style>
 <script lang="ts">
 import Vue from 'vue';
+
 export default Vue.extend({
 });
 </script>
-

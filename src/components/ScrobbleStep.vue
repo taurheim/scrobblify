@@ -2,7 +2,10 @@
   <div>
     <!-- Pre-scrobble view -->
     <div v-if="!scrobbling">
-      <p>{{ tracksToScrobble.length }} tracks ready to scrobble. Please review them and then click Scrobble to begin.</p>
+      <p>
+        {{ tracksToScrobble.length }} tracks ready to scrobble.
+        Please review them and then click Scrobble to begin.
+      </p>
       <div class="final-list">
         <span v-for="(track, i) in tracksToScrobble" :key="i">
           {{ track.track }} - {{ track.artist }} @ {{ track.timestamp.toString() }}<br>
@@ -119,7 +122,7 @@ export default Vue.extend({
       return this.$store.state.selectedScrobbles;
     },
     progress(): number {
-      return 100 * this.scrobbledTracks / this.tracksToScrobble.length;
+      return (100 * this.scrobbledTracks) / this.tracksToScrobble.length;
     },
     formattedCountdown(): string {
       const minutes = Math.floor(this.countdown / 60);
@@ -152,7 +155,7 @@ export default Vue.extend({
       }
 
       // `i` is incremented conditionally at the end so a rate-limited track can be retried.
-      for (let i = this.scrobbledTracks; i < tracks.length; ) {
+      for (let i = this.scrobbledTracks; i < tracks.length;) {
         // Check if manually paused
         if (this.paused) {
           return;
@@ -160,7 +163,7 @@ export default Vue.extend({
 
         // Check burst limit
         if (this.burstCount >= BURST_LIMIT) {
-          this.pauseReason = `Approaching Last.fm's burst limit (~1,000 scrobbles). Pausing for 10 minutes to avoid being rate-limited.`;
+          this.pauseReason = 'Approaching Last.fm\'s burst limit (~1,000 scrobbles). Pausing for 10 minutes to avoid being rate-limited.';
           trackEvent('scrobble_paused', { reason: 'burst_limit', scrobbled_tracks: this.scrobbledTracks, total_tracks: tracks.length });
           await this.pauseWithCountdown(BURST_COOLDOWN_MS);
           this.burstCount = 0;
@@ -168,7 +171,7 @@ export default Vue.extend({
 
         // Check daily limit
         if (this.dailyCount >= DAILY_LIMIT) {
-          this.pauseReason = `Approaching Last.fm's daily limit (~2,800 scrobbles). You'll need to come back tomorrow to continue.`;
+          this.pauseReason = 'Approaching Last.fm\'s daily limit (~2,800 scrobbles). You\'ll need to come back tomorrow to continue.';
           trackEvent('scrobble_paused', { reason: 'daily_limit', scrobbled_tracks: this.scrobbledTracks, total_tracks: tracks.length });
           this.paused = true;
           return;

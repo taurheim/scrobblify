@@ -1,4 +1,6 @@
-import { test, expect, Page, Route } from '@playwright/test';
+import {
+  test, expect, Page, Route,
+} from '@playwright/test';
 import path from 'path';
 import LastFm from '../src/api/LastFm';
 import Scrobble from '../src/models/Scrobble';
@@ -586,7 +588,7 @@ test.describe('Authentication - clearUser', () => {
 test.describe('URL Encoding', () => {
   test('handles special characters in track/artist names', async ({ page }) => {
     // This test verifies that URL encoding works correctly
-    let capturedPostBodies: string[] = [];
+    const capturedPostBodies: string[] = [];
 
     await page.route('https://ws.audioscrobbler.com/**', async (route) => {
       const postData = route.request().postData() || '';
@@ -647,7 +649,7 @@ test.describe('URL Encoding', () => {
 
     // At least one scrobble body should contain "Rock" (from "Rock & Roll")
     // The & should be properly encoded in the POST body
-    const hasRockAndRoll = capturedPostBodies.some(body => {
+    const hasRockAndRoll = capturedPostBodies.some((body) => {
       const params = new URLSearchParams(body);
       const artist = params.get('artist[0]');
       const track = params.get('track[0]');

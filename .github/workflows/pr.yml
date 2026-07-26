@@ -5,6 +5,19 @@ on:
     branches: [master]
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+      - run: npm ci
+      # --no-fix: `npm run lint` auto-fixes, which would let CI silently pass.
+      - run: npm run lint:check
+
   build:
     name: Build
     runs-on: ubuntu-latest
