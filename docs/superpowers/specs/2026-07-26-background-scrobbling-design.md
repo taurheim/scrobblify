@@ -16,6 +16,48 @@ does not make it unnecessary. Most users with large histories never finish.
 This design adds an opt-in beta backend that continues a user's import while
 their browser is closed.
 
+## Measured baseline (PostHog, 2026-07-09 to 2026-07-26)
+
+All figures filtered to `properties.app = 'scrobblify'`.
+
+| Metric | Value |
+| --- | --- |
+| People who started scrobbling | 63 |
+| People who hit a Last.fm rate limit | 33 |
+| Of those, people who completed | 7 |
+| Median tracks selected (rate-limited users) | 34,769 |
+| Median tracks actually scrobbled | 745 |
+| **Median share of import completed** | **2.1%** |
+
+**The preventive pause is not working.** Reactive rate limits outnumber
+preventive pauses roughly 9:1 — 2,135 `scrobble_rate_limited` events against 190
+`burst_limit` and 40 `daily_limit` pauses.
+
+`BURST_LIMIT` is set too high. The highest `burst_count` ever observed at the
+moment of a rate limit is **849**, below the 950 threshold. The median is 187.
+
+**Half of all first rate limits occur at `burst_count = 0`** — before a single
+successful scrobble in the session. Last.fm's limit is a rolling window on the
+account, while `burstCount` and `dailyCount` are in-memory and reset on every
+page load. Users who return after being throttled are immediately throttled
+again.
+
+**The 1-minute cooldown almost never clears the limit.** Of 2,135 rate limits,
+only 33 produced a `scrobble_rate_limit_recovered`. Where recovery did occur, the
+median elapsed time was **130 minutes**. Median actual pause duration is exactly
+the configured 60 seconds, so this is not timer throttling — the cooldown is
+simply two orders of magnitude too short, and recovery happens by accident when a
+user walks away.
+
+Two consequences for this design:
+
+1. The worker must not reuse the client's cooldown or threshold values. It needs
+   backoff on the order of hours, and limit counters persisted per user rather
+   than per session.
+2. **Fixing the client's cooldown and thresholds is a cheaper, higher-value
+   change than this feature, and should ship first.** It benefits all users
+   immediately and de-risks the backend by establishing real limit values.
+
 ## Non-goals
 
 - **Making imports faster.** The 2,700/day per-user limit is imposed by Last.fm
@@ -223,30 +265,56 @@ migrating to a dedicated IP would help at all.
 Jobs run for weeks, so bugs **will** be fixed while jobs are in flight. The
 design must make that safe.
 
-### Duplicate scrobbles: reconcile, don't prevent
+### Timestamps are assigned by the worker, not the client
+
+Two facts make client-assigned timestamps unusable for a long-running job.
+
+**Re-tagged listens all share one timestamp.** `UploadStep.vue:173` creates a
+single `reTagDate`, and `scrobblify.ts:263-270` assigns that same `Date` instance
+to every listen. Users with more than two weeks of history — the overwhelming
+majority, and the only users offered background mode — therefore submit tens of
+thousands of scrobbles carrying an identical millisecond timestamp.
+
+**A 37-day job outlives Last.fm's 14-day window.** Any timestamp fixed at job
+creation is rejected from roughly day 15 onward.
+
+Therefore the job blob stores artist, track, and album, plus the original listen
+date only as metadata. **The worker assigns the actual scrobble timestamp at send
+time**, spreading a batch across the preceding minute so every track in it is
+unique. Tracks whose original timestamp still falls inside the 14-day window at
+send time keep it; everything else is stamped to the present.
+
+A visible consequence worth stating in the beta copy: a background import spreads
+re-tagged listens across the whole run rather than landing them all on one day.
+This is more plausible than the current behaviour, not less.
+
+### Duplicate scrobbles: persist the timestamp, then reconcile on it
 
 **The ambiguity window is irreducible.** Even committing the cursor after every
 single track, the worker can crash between Last.fm accepting a scrobble and D1
 recording it. No cursor granularity eliminates this.
 
-Therefore the worker **reconciles against Last.fm** using the existing
-`getAllScrobblesInRange`, fetching the user's actual recent scrobbles and
-skipping any already present. The duplicate-detection logic in the upload step
-already performs this comparison.
+Reconciling against the *user's* timestamps cannot resolve it, for the reasons
+above. Reconciling against *ours* can:
 
-An **unclean tick** is precisely: a job whose `locked_until` lease expired
-without the tick having committed a final cursor. The next tick to pick up that
-job reconciles before scrobbling anything.
+1. Before sending a batch, durably write its index→assigned-timestamp mapping to
+   D1.
+2. Send the batch.
+3. Commit the cursor.
 
-The **reconciliation range** runs from the timestamp of the earliest track in the
-uncommitted cursor range to the present. Tracks found already on the user's
-profile are marked complete and skipped; the cursor advances past them.
+Because the worker chose those timestamps and they are unique by construction,
+the mapping is a stable idempotency key that survives a crash. On recovery, the
+next tick fetches the narrow window covering the uncommitted mapping via
+`getAllScrobblesInRange` and checks for those exact `(artist, track, timestamp)`
+tuples. Present means done; absent means safe to send. Last.fm's own
+deduplication is not relied upon.
 
-Once reconciliation exists, batch size is purely a throughput tuning knob rather
-than a safety mechanism. Last.fm's own deduplication is not relied upon.
+An **unclean tick** is precisely: a job whose `locked_until` lease expired without
+the tick having committed a final cursor. The next tick to pick up that job
+reconciles before scrobbling anything.
 
-Re-tagged listens carry today's timestamp, so they fall inside the reconciliation
-window like any other recent scrobble.
+Because the reconciliation window is one batch wide — under a minute — this costs
+a single API call, not a paginated crawl of the user's history.
 
 ### Safe-deploy mechanics
 
@@ -308,3 +376,9 @@ New error contexts: `background.handoff`, `background.upload`,
   It does not affect correctness, because reconciliation is required regardless.
 - Wall-clock limits for scheduled Workers on the free tier, which bound how long
   a single tick may pace its batch.
+- **Whether Last.fm silently deduplicates identical `(artist, track, timestamp)`
+  submissions.** Because `reTagOldListens` currently assigns one identical
+  timestamp to every listen, a user who played the same track fifty times may be
+  credited with a single scrobble today. If confirmed, this is a pre-existing
+  data-loss bug in the client, independent of this feature, and the fix — unique
+  timestamps — is the same mechanism this design already requires.
