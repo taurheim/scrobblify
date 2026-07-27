@@ -2,6 +2,7 @@ import {
   test, expect, Page, Route,
 } from '@playwright/test';
 import path from 'path';
+import JSZip from 'jszip';
 import LastFm from '../src/api/LastFm';
 import Scrobble from '../src/models/Scrobble';
 // Shared Last.fm mock, also used by the `npm run dev:mock` interactive script.
@@ -1076,5 +1077,199 @@ test.describe('Re-tagged old plays', () => {
     // Every *other* track still gets its own second.
     const afterRetry = timestamps.slice(1);
     expect(new Set(afterRetry).size).toBe(afterRetry.length);
+  });
+});
+
+test.describe('Import robustness', () => {
+  // Builds a ZIP in-memory so each test can decide exactly how the history
+  // files are damaged, without checking another binary fixture into the repo.
+  async function makeZip(files: Record<string, string>): Promise<Buffer> {
+    const zip = new JSZip();
+    for (const [name, content] of Object.entries(files)) {
+      zip.file(`Spotify Extended Streaming History/${name}`, content);
+    }
+    return zip.generateAsync({ type: 'nodebuffer' });
+  }
+
+  function play(track: string, artist: string, ts: string) {
+    return {
+      ts,
+      master_metadata_track_name: track,
+      master_metadata_album_artist_name: artist,
+      master_metadata_album_album_name: 'An Album',
+      ms_played: 300000,
+    };
+  }
+
+  async function uploadZip(page: Page, buffer: Buffer) {
+    await page.locator('input[type="file"][accept=".zip"]').setInputFiles({
+      name: 'my_spotify_data.zip',
+      mimeType: 'application/zip',
+      buffer,
+    });
+  }
+
+  test('one malformed history file does not throw away the whole import', async ({ page }) => {
+    await goToUploadStep(page);
+
+    const good = JSON.stringify([
+      play('Bohemian Rhapsody', 'Queen', '2024-01-15T10:30:00Z'),
+      play('Yesterday', 'The Beatles', '2024-01-15T10:36:00Z'),
+    ]);
+    // Truncated mid-object, which is what a corrupted or partially-read export
+    // looks like. Real users hit this on large exports.
+    const broken = '[{"ts": "2024-01-15T10:30:00Z", "master_metadata_tra';
+
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': broken,
+      'Streaming_History_Audio_2024_1.json': good,
+    }));
+
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+
+    // The readable file still gets imported...
+    await expect(page.locator('text=Found 2 plays')).toBeVisible({ timeout: 15000 });
+    // ...and the user is told plainly that part of their history is missing.
+    await expect(page.locator('text=skipped 1 of 2 file(s)')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 15000 });
+  });
+
+  test('a ZIP where every history file is unreadable still reports an error', async ({ page }) => {
+    await goToUploadStep(page);
+
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': 'not json at all',
+    }));
+
+    await page.locator('button:has-text("Find tracks")').click();
+    await expect(page.locator('text=None of the 1 history file(s) in this ZIP could be read')).toBeVisible({ timeout: 15000 });
+  });
+
+  test('a repeated track is looked up once, not once per play', async ({ page }) => {
+    await interceptLastFm(page);
+    const lookups: string[] = [];
+    await page.route('https://ws.audioscrobbler.com/**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('method') === 'track.getInfo') {
+        lookups.push(`${url.searchParams.get('artist')} - ${url.searchParams.get('track')}`);
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ track: { duration: '354000' } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await page.reload();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    // The same track six times — exactly the repeat-heavy shape of a real
+    // listening history, and the case the per-play lookup punished hardest.
+    const plays = [];
+    for (let i = 0; i < 6; i++) {
+      plays.push(play('Bohemian Rhapsody', 'Queen', `2024-01-15T10:${10 + i}:00Z`));
+    }
+    plays.push(play('Yesterday', 'The Beatles', '2024-01-15T11:00:00Z'));
+
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': JSON.stringify(plays),
+    }));
+
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('label:has-text("Validate track lengths")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+
+    await expect(page.locator('text=Found 7 valid scrobbles')).toBeVisible({ timeout: 30000 });
+    expect(lookups.length).toBe(2);
+    expect(new Set(lookups).size).toBe(2);
+  });
+
+  test('a track with no duration on Last.fm is kept, not silently discarded', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('method') === 'track.getInfo') {
+        // Last.fm really does return tracks with an empty duration.
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ track: { name: 'Obscure B-Side', duration: '' } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await page.reload();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': JSON.stringify([
+        play('Obscure B-Side', 'Some Band', '2024-01-15T10:30:00Z'),
+      ]),
+    }));
+
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('label:has-text("Validate track lengths")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+
+    // An unparseable duration used to arrive as NaN and fail every comparison,
+    // dropping the play. The documented intent is to give the user the scrobble.
+    await expect(page.locator('text=Found 1 valid scrobbles')).toBeVisible({ timeout: 30000 });
+  });
+
+  test('duplicate-check requests use integer timestamps', async ({ page }) => {
+    await interceptLastFm(page);
+    const ranges: Array<{ from: string; to: string }> = [];
+    await page.route('https://ws.audioscrobbler.com/**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('method') === 'user.getrecenttracks') {
+        ranges.push({
+          from: url.searchParams.get('from') || '',
+          to: url.searchParams.get('to') || '',
+        });
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            recenttracks: { '@attr': { totalPages: '1', total: '0' }, track: [] },
+          }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await page.reload();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': JSON.stringify([
+        // Deliberately *recent* so the play is not re-tagged: re-tagged plays
+        // get provisional timestamps and are exempt from the duplicate check,
+        // so they would never issue a history request at all.
+        play('Bohemian Rhapsody', 'Queen', new Date(Date.now() - 86400000).toISOString()),
+      ]),
+    }));
+
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+
+    expect(ranges.length).toBeGreaterThan(0);
+    for (const range of ranges) {
+      // Last.fm documents UNIX timestamps; "1784563202.848" is not one.
+      expect(range.from).toMatch(/^\d+$/);
+      expect(range.to).toMatch(/^\d+$/);
+    }
   });
 });

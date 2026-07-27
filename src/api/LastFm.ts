@@ -15,6 +15,12 @@ export default class LastFm {
 
   private API_RATE_BUFFER_MS = 250;
 
+  // Track durations are immutable, but a Spotify export is mostly *repeat*
+  // plays — the whole point of the app. Looking a track up once per play rather
+  // than once per distinct track multiplied every validation run by the user's
+  // average play count, at 250ms of enforced rate buffer each.
+  private trackDurationCache = new Map<string, number>();
+
   // NOTE: Last.fm auth tokens are single-use (consumed by auth.getSession), so
   // we deliberately do not persist them. Only the resulting session key is stored.
   private USER_AUTH_TOKEN_LOCALSTORAGE_KEY_LEGACY = 'scrobblifyLfmAuthToken';
@@ -138,8 +144,8 @@ export default class LastFm {
     const requestParams: {[key: string]: string} = {
       method: 'user.getrecenttracks',
       user: this.userName,
-      from: this.dateToSecondsString(from),
-      to: this.dateToSecondsString(to),
+      from: LastFm.dateToSecondsString(from, 'floor'),
+      to: LastFm.dateToSecondsString(to, 'ceil'),
     };
     const response = await this.makeRequest('GET', requestParams);
     const tracks = response.recenttracks.track;
@@ -172,8 +178,8 @@ export default class LastFm {
     const firstParams: {[key: string]: string} = {
       method: 'user.getrecenttracks',
       user: this.userName,
-      from: this.dateToSecondsString(from),
-      to: this.dateToSecondsString(to),
+      from: LastFm.dateToSecondsString(from, 'floor'),
+      to: LastFm.dateToSecondsString(to, 'ceil'),
       limit: PAGE_SIZE.toString(),
       page: '1',
     };
@@ -200,8 +206,8 @@ export default class LastFm {
       const params: {[key: string]: string} = {
         method: 'user.getrecenttracks',
         user: this.userName,
-        from: this.dateToSecondsString(from),
-        to: this.dateToSecondsString(to),
+        from: LastFm.dateToSecondsString(from, 'floor'),
+        to: LastFm.dateToSecondsString(to, 'ceil'),
         limit: PAGE_SIZE.toString(),
         page: page.toString(),
       };
@@ -225,16 +231,40 @@ export default class LastFm {
   public async getTrackTimeMs(trackName: string, trackArtist: string): Promise<number> {
     // TODO this could be better done with musicbrainz/spotify api instead?
     // That way we wouldn't rely on last.fm's track length data
+    const cacheKey = `${trackArtist.toLowerCase()}\u0000${trackName.toLowerCase()}`;
+    const cached = this.trackDurationCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
     const requestParams = {
       method: 'track.getInfo',
       artist: trackArtist,
       track: trackName,
     };
-    const response = await this.makeRequest('GET', requestParams);
 
-    const listenTime = parseInt(response.track.duration, 10);
+    let response;
+    try {
+      response = await this.makeRequest('GET', requestParams);
+    } catch (e) {
+      // "Track not found" is a permanent answer, and a track a user played 40
+      // times would otherwise be looked up (and rejected) 40 times. Rate limits
+      // and network blips are *not* permanent, so those stay uncached.
+      if (this.isLastFmApiError(e) && !LastFm.isRateLimitError(e)) {
+        this.trackDurationCache.set(cacheKey, 0);
+      }
+      throw e;
+    }
 
-    return listenTime;
+    // Last.fm happily returns a track with a missing, empty or non-numeric
+    // duration. Returning NaN from here poisoned every downstream comparison
+    // (every `NaN > x` is false), which silently discarded the play instead of
+    // falling back to the caller's generous default. 0 means "unknown".
+    const listenTime = parseInt(response.track && response.track.duration, 10);
+    const durationMs = Number.isFinite(listenTime) && listenTime > 0 ? listenTime : 0;
+
+    this.trackDurationCache.set(cacheKey, durationMs);
+    return durationMs;
   }
 
   public async getSession(): Promise<any> {
@@ -479,7 +509,17 @@ export default class LastFm {
     );
   }
 
-  private dateToSecondsString(date: Date): string {
-    return (date.getTime() / 1000).toString();
+  /**
+   * Last.fm expects integer UNIX timestamps. Sending `1784563202.848` is not
+   * something the API promises to handle, and the fractional part appeared in
+   * every `user.getrecenttracks` window the duplicate check requested.
+   *
+   * The two ends round outwards so the window can only ever widen: a duplicate
+   * check that misses a scrobble writes a real duplicate into the user's
+   * library, whereas one that looks slightly too far costs nothing.
+   */
+  private static dateToSecondsString(date: Date, round: 'floor' | 'ceil' = 'floor'): string {
+    const seconds = date.getTime() / 1000;
+    return String(round === 'ceil' ? Math.ceil(seconds) : Math.floor(seconds));
   }
 }

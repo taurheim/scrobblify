@@ -205,6 +205,7 @@ export default Vue.extend({
       // "Unrecognized token ''" error. Parsing incrementally keeps peak memory
       // low because we only ever hold one raw file string at a time.
       let parsedData: SpotifyListen[] = [];
+      const failedFiles: string[] = [];
       for (const name of matchingFiles) {
         const shortName = name.split('/').pop() || name;
 
@@ -213,21 +214,37 @@ export default Vue.extend({
           jsonString = await zip.files[name].async('string');
         } catch (e) {
           trackError('upload.extractFile', e, { file: shortName });
-          this.errorMessage = `Failed to extract "${shortName}" from the ZIP archive.`;
-          this.errorDetails = (e as Error).message || String(e);
-          this.showError = true;
-          return;
+          failedFiles.push(shortName);
+          this.logs.push(`Skipped "${shortName}" — it couldn't be read from the ZIP.`);
+          continue;
         }
 
         try {
           parsedData = parsedData.concat(this.scrobblify.spotifyJsonToListens(jsonString));
         } catch (e) {
           trackError('upload.parseJson', e, { file: shortName });
-          this.errorMessage = `Failed to parse "${shortName}". The JSON data in this file may be malformed.`;
-          this.errorDetails = (e as Error).message || String(e);
-          this.showError = true;
-          return;
+          failedFiles.push(shortName);
+          this.logs.push(`Skipped "${shortName}" — its JSON is malformed or was read incompletely.`);
         }
+      }
+
+      // A Spotify export is split across many files, and one of them being
+      // unreadable used to abandon the entire import. Salvaging the rest turns
+      // a total loss into a partial one; only a complete failure is fatal.
+      if (failedFiles.length > 0) {
+        trackEvent('upload_files_skipped', {
+          skipped_count: failedFiles.length,
+          total_files: matchingFiles.length,
+        });
+      }
+      if (failedFiles.length === matchingFiles.length) {
+        this.errorMessage = `None of the ${matchingFiles.length} history file(s) in this ZIP could be read. The download may be incomplete — try exporting from Spotify again.`;
+        this.errorDetails = `Failed files: ${failedFiles.join(', ')}`;
+        this.showError = true;
+        return;
+      }
+      if (failedFiles.length > 0) {
+        this.logs.push(`Warning: skipped ${failedFiles.length} of ${matchingFiles.length} file(s) — some of your history is missing from this import.`);
       }
       parsedData.sort((a, b) => a.listenDate.getTime() - b.listenDate.getTime());
       this.logs.push(`Found ${parsedData.length} plays in your spotify listening history.`);

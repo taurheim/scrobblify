@@ -232,7 +232,13 @@ export default class Scrobblify {
       // This way if they've listened to more than a minute we count it.
       // It's better to err on the side of giving them the scrobble as it will help populate their
       // last.fm history
-      if (currentTrackDurationMs === 0) {
+      //
+      // `!(x > 0)` rather than `=== 0` on purpose: a missing or non-numeric
+      // duration used to arrive here as NaN, and because every comparison
+      // against NaN is false it slipped past this fallback *and* past the
+      // minimum-length check, only to fail `msListened > NaN` at the end. The
+      // play was thrown away — the exact opposite of the intent above.
+      if (!(currentTrackDurationMs > 0)) {
         currentTrackDurationMs = 2 * this.MINUTES_TO_MS;
       }
 
