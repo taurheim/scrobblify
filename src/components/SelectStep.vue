@@ -274,6 +274,7 @@ export default Vue.extend({
           artist: scrob.artistName,
           album: scrob.albumName,
           time: scrob.listenDate.getTime(),
+          reTagged: scrob.reTagged,
           originalTime: scrob.originalListenDate.getTime(),
           trackLower: scrob.trackName.toLowerCase(),
           artistLower: scrob.artistName.toLowerCase(),
@@ -505,8 +506,13 @@ export default Vue.extend({
         track.artist,
         new Date(track.time),
         track.album,
+        !!track.reTagged,
       ));
       this.$store.commit('setSelectedScrobbles', scrobbles);
+      // A fresh selection resets the resume lineage: this is the new "original"
+      // import that all later resume progress is measured against.
+      this.$store.commit('setOriginalTotalTracks', scrobbles.length);
+      this.$store.commit('setResumedScrobbleCount', 0);
       trackEvent('tracks_selected', {
         selected_count: selected.length,
         total_count: this.totalTrackCount,

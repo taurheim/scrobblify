@@ -5,6 +5,12 @@ export interface SerializedScrobble {
   artist: string;
   album: string;
   timestamp: number;
+  /**
+   * Absent in files written before re-tagged plays were given per-play
+   * timestamps. deserializeScrobbles() infers it for those — see
+   * hasCollapsedTimestamps().
+   */
+  reTagged?: boolean;
 }
 
 export interface ScrobbleState {
@@ -13,6 +19,34 @@ export interface ScrobbleState {
   completedIndices: number[];
   failedIndices: number[];
   tracks: SerializedScrobble[];
+  /**
+   * Size of the user's *original* selection. `totalTracks` shrinks on every
+   * resume (only the remaining tracks are re-saved), so it cannot be used as a
+   * completion denominator. This one is carried forward untouched.
+   */
+  originalTotalTracks: number;
+  /**
+   * Cumulative count of tracks successfully scrobbled across every session of
+   * this import, not just the most recent one.
+   */
+  originalSucceededCount: number;
+  /**
+   * Timestamps (ms) of recent successful scrobbles — the rolling window used by
+   * RateLimitTracker. This is the authoritative rate-limit record.
+   */
+  sendTimestamps: number[];
+  /**
+   * High-water mark of the send-time timestamp allocator for re-tagged plays.
+   * Optional: absent from files written before it existed, in which case the
+   * allocator simply starts from the current clock.
+   */
+  lastReTagTimestampSec?: number;
+  /**
+   * Legacy count-based rate-limit fields. Kept so progress files written by
+   * older versions still import, and so files written by this version remain
+   * readable by them. RateLimitTracker.seedFromLegacyCounts() converts these
+   * into a rolling window when sendTimestamps is absent.
+   */
   burstCount: number;
   dailyCount: number;
   dailyCountDate: string;
@@ -30,11 +64,54 @@ export default class StateManager {
       artist: s.artist,
       album: s.album,
       timestamp: s.timestamp.getTime(),
+      reTagged: s.reTagged,
     }));
   }
 
+  /**
+   * Older versions stamped every re-tagged play with the same Date object, so a
+   * saved queue from one of those is recognisable by essentially *all* of its
+   * timestamps being identical — real listening history never looks like that.
+   *
+   * Without this, someone mid-import from an older build would resume into a
+   * queue that Last.fm collapses into a single scrobble, and (once the saved
+   * date ages past 14 days) rejects outright.
+   *
+   * The thresholds are deliberately strict. A saved file holds only the
+   * *remaining* queue, so a near-finished import can be down to a handful of
+   * tracks, and Spotify exports do contain occasional genuinely-identical
+   * second-precision timestamps. A loose test would re-stamp those real listen
+   * dates — corrupting good data to rescue bad. The bug being migrated produced
+   * identical timestamps for 100% of entries, so demanding 90% costs nothing.
+   */
+  static hasCollapsedTimestamps(data: SerializedScrobble[]): boolean {
+    const MIN_SAMPLE = 20;
+    const MIN_SHARE = 0.9;
+    if (data.length < MIN_SAMPLE) {
+      return false;
+    }
+    const counts = new Map<number, number>();
+    let mostCommon = 0;
+    for (const d of data) {
+      const next = (counts.get(d.timestamp) || 0) + 1;
+      counts.set(d.timestamp, next);
+      if (next > mostCommon) {
+        mostCommon = next;
+      }
+    }
+    return mostCommon >= data.length * MIN_SHARE;
+  }
+
   static deserializeScrobbles(data: SerializedScrobble[]): Scrobble[] {
-    return data.map((d) => new Scrobble(d.track, d.artist, new Date(d.timestamp), d.album));
+    const inferReTagged = data.some((d) => d.reTagged === undefined)
+      && StateManager.hasCollapsedTimestamps(data);
+    return data.map((d) => new Scrobble(
+      d.track,
+      d.artist,
+      new Date(d.timestamp),
+      d.album,
+      d.reTagged ?? inferReTagged,
+    ));
   }
 
   public async saveState(state: ScrobbleState): Promise<void> {
@@ -115,11 +192,20 @@ export default class StateManager {
 
     return {
       userName: '',
+      sendTimestamps: [],
+      lastReTagTimestampSec: 0,
       burstCount: 0,
       dailyCount: 0,
       dailyCountDate: new Date().toISOString().split('T')[0],
       savedAt: new Date().toISOString(),
       ...data,
+      // Files written before these existed have no lineage information, so the
+      // best available approximation is this file's own totals. Applied after
+      // the spread so a genuinely absent field is filled rather than kept as
+      // undefined.
+      originalTotalTracks: data.originalTotalTracks || data.totalTracks,
+      originalSucceededCount: data.originalSucceededCount
+        ?? (Array.isArray(data.completedIndices) ? data.completedIndices.length : 0),
     } as ScrobbleState;
   }
 

@@ -58,19 +58,88 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `user_logged_out`.
 
 Rate limiting has its own events: `scrobble_rate_limited`,
-`scrobble_rate_limit_cooldown_complete`, and `scrobble_rate_limit_recovered`.
-Network failures emit `scrobble_network_error`.
+`scrobble_rate_limit_cooldown_complete`, `scrobble_rate_limit_recovered`,
+`scrobble_rate_limit_gave_up` (the escalating backoff was exhausted and progress
+was auto-saved), and `scrobble_burst_limit_lowered` / `scrobble_burst_limit_raised`
+from the adaptive limit in `RateLimitTracker`. Network failures emit
+`scrobble_network_error`. `scrobble_ignored` fires when Last.fm accepts the
+request but discards the play (see below).
 
-`scrobble_paused` carries a `reason` of `burst_limit`, `daily_limit`, or `manual`
-— the first two are Last.fm rate limiting, not bugs. These dominate by volume
-(`scrobble_paused` and `scrobble_rate_limited` are the highest-count events after
-`step_viewed`), so treat them as normal operation, not signal.
+`scrobble_paused` carries a `reason` of `burst_limit`, `daily_limit`,
+`rate_limit`, `rate_limit_exhausted`, `network_error`, `lastfm_daily_limit`, or
+`manual` — only `manual` is a user action; the rest are Last.fm throttling, not
+bugs. These dominate by volume (`scrobble_paused` and `scrobble_rate_limited`
+are the highest-count events after `step_viewed`), so treat them as normal
+operation, not signal.
+
+### Measuring completion
+
+Do **not** build completion percentages from `scrobbled_tracks / total_tracks`.
+Those are session-scoped: a resume restores only the *remaining* tracks, so
+`total_tracks` shrinks on every resume and the ratio measures progress through
+the current chunk, not the import. Real examples: 81,313 → 573, 9,924 → 40.
+
+Every scrobble event carries resume-stable fields instead — use these:
+`original_total_tracks`, `total_succeeded`, `completion_pct`, `is_resumed`,
+`previously_scrobbled`. Note these only exist on events emitted after the
+telemetry fix, so older events cannot be compared against them.
+
+`total_succeeded` is still an **upper bound**: Last.fm silently discards a
+scrobble duplicating an existing (artist, track, timestamp) while reporting it
+as accepted, so re-scrobbling history a user already has inflates the count with
+no way to detect it from the API.
 
 ### Adding instrumentation
 
 Use the helpers in `src/services/Analytics.ts` (`trackEvent`, `trackError`,
 `identifyUser`) rather than calling `posthog` directly. Analytics must never
 break the app: every call is wrapped in try/catch and ignored on failure.
+
+## Scrobble timestamps
+
+Last.fm keys a scrobble on **(user, artist, track, timestamp)** and silently
+drops any repeat of that tuple — it still returns `accepted=1, ignored=0`, so
+the loss is **undetectable from the response**. This was verified experimentally
+against the live API; Last.fm does not document it and there is no
+`ignoredMessage` code for it. Uniqueness therefore has to be guaranteed
+client-side.
+
+An early version gave every play the *same* `Date` when the user ticked
+"Scrobble tracks older than 2 weeks" (~78% of imports), which collapsed all
+repeat listens of a track into a single scrobble.
+
+Plays that must be moved into Last.fm's 14-day window are flagged
+`reTagged` (`SpotifyListen` → `Scrobble` → `SerializedScrobble`). Their
+timestamps are **allocated at send time**, not at parse time, from a cursor in
+`ScrobbleStep`:
+
+```
+reTagCursorSec = min(nowSec, max(reTagCursorSec + 1, nowSec - RETAG_BACKFILL_SECONDS))
+```
+
+This matters because absolute timestamps baked in at parse time expire: a queue
+saved today and resumed three weeks later would be rejected wholesale with
+ignore code 3. The cursor is persisted as a high-water mark
+(`lastReTagTimestampSec`) so a resumed run can never reuse seconds an earlier
+run already sent.
+
+`scrobblePlay` returns a `ScrobbleResult`; a 200 does **not** mean the play was
+stored. Check `ignored` and `ignoredMessage.code` (1 artist ignored, 2 track
+ignored, 3 timestamp too old, 4 timestamp too new, 5 daily limit). Parsing
+deliberately defaults to *accepted* on an unrecognised shape so a surprise can
+never invent failures.
+
+Two consequences worth knowing before touching this code:
+
+- **A retry must re-send the identical timestamp.** It is allocated once per
+  track and held across attempts. If the original request reached Last.fm and
+  only the response was lost, an identical resend is deduplicated away; a fresh
+  second would become a phantom play.
+- **`filterDuplicates` skips `reTagged` listens.** Their timestamps are
+  provisional, so matching them against real history compares fiction against
+  fact and would silently drop import rows. Their true dates survive on
+  `originalListenDate`, but checking those would mean fetching the user's whole
+  Last.fm history back to the start of the export.
 
 ## Linting
 

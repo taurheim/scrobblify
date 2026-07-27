@@ -534,6 +534,278 @@ test.describe('LastFm API client', () => {
   });
 });
 
+test.describe('Session Resume', () => {
+  // Writes a saved session straight into IndexedDB, which is exactly what
+  // `StateManager.saveState` produces. Lets the resume path be exercised
+  // without first having to drive a real pause.
+  async function seedSavedState(page: Page, state: Record<string, unknown>) {
+    await page.evaluate(async (savedState) => {
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.open('scrobblify', 1);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          if (!db.objectStoreNames.contains('scrobbleState')) {
+            db.createObjectStore('scrobbleState');
+          }
+        };
+        request.onsuccess = () => {
+          const db = request.result;
+          const tx = db.transaction('scrobbleState', 'readwrite');
+          tx.objectStore('scrobbleState').put(savedState, 'current');
+          tx.oncomplete = () => { db.close(); resolve(); };
+          tx.onerror = () => { db.close(); reject(tx.error); };
+        };
+        request.onerror = () => reject(request.error);
+      });
+    }, state);
+  }
+
+  function buildState(overrides: Record<string, unknown> = {}) {
+    const tracks = [1, 2, 3, 4, 5].map((n) => ({
+      track: `Track ${n}`,
+      artist: `Artist ${n}`,
+      album: `Album ${n}`,
+      timestamp: Date.UTC(2024, 0, n),
+    }));
+    return {
+      userName: 'testuser',
+      totalTracks: 5,
+      completedIndices: [0, 1, 2],
+      failedIndices: [],
+      tracks,
+      originalTotalTracks: 5,
+      originalSucceededCount: 3,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+      ...overrides,
+    };
+  }
+
+  test('resuming scrobbles only the remaining tracks', async ({ page }) => {
+    const scrobbled: string[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState());
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+
+    // Only the 2 not-yet-completed tracks should be queued...
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    // ...but progress must still be reported against the original import size,
+    // not against the shrunken remainder.
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+
+    // Outlast AuthenticateStep's delayed `complete` emit before interacting, so
+    // the click can't race the stepper transition it used to trigger.
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+
+    expect(scrobbled).toEqual(['Track 4', 'Track 5']);
+  });
+
+  test('resuming immediately is not undone by the delayed auth redirect', async ({ page }) => {
+    // Regression: AuthenticateStep emits `complete` on a 2s setTimeout. Resuming
+    // inside that window used to jump to the scrobble step and then get dragged
+    // back to the upload step, silently losing the resumed session.
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState());
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+
+    // Outlast the delayed auth emit, then confirm we're still on the scrobble step.
+    await page.waitForTimeout(4000);
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    await expect(page.locator('.upload-step')).toBeHidden();
+  });
+
+  test('a resumed session reports overall progress, not just the remaining chunk', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    // A third session: 5 of 10 already done, only 2 tracks left in this chunk.
+    await seedSavedState(page, buildState({
+      totalTracks: 5,
+      completedIndices: [0, 1, 2],
+      originalTotalTracks: 10,
+      originalSucceededCount: 5,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+
+    await expect(page.locator('.overall-progress')).toContainText('5 of 10');
+  });
+
+  test('legacy progress files without lineage fields still resume', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    const legacy = buildState();
+    delete (legacy as Record<string, unknown>).originalTotalTracks;
+    delete (legacy as Record<string, unknown>).originalSucceededCount;
+    delete (legacy as Record<string, unknown>).sendTimestamps;
+    await seedSavedState(page, legacy);
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    // Falls back to this file's own totals rather than reporting nothing.
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+  });
+});
+
+test.describe('Rate limit handling', () => {
+  // Always rate-limited. Also short-circuits LastFm's own internal retry
+  // budget so the component-level backoff is what's under test.
+  async function alwaysRateLimited(page: Page) {
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      const apiMethod = params.get('method');
+      if (apiMethod === 'track.scrobble') {
+        await route.fulfill({
+          status: 429,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 29, message: 'Rate limit exceeded' }),
+        });
+        return;
+      }
+      if (apiMethod === 'auth.getSession') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ session: { name: 'testuser', key: 'fake-session-key' } }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ recenttracks: { track: [] } }),
+      });
+    });
+  }
+
+  async function seedSelection(page: Page) {
+    await page.evaluate(async () => {
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.open('scrobblify', 1);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          if (!db.objectStoreNames.contains('scrobbleState')) {
+            db.createObjectStore('scrobbleState');
+          }
+        };
+        request.onsuccess = () => {
+          const db = request.result;
+          const tx = db.transaction('scrobbleState', 'readwrite');
+          tx.objectStore('scrobbleState').put({
+            userName: 'testuser',
+            totalTracks: 2,
+            completedIndices: [],
+            failedIndices: [],
+            tracks: [1, 2].map((n) => ({
+              track: `Track ${n}`, artist: `Artist ${n}`, album: '', timestamp: Date.UTC(2024, 0, n),
+            })),
+            originalTotalTracks: 2,
+            originalSucceededCount: 0,
+            sendTimestamps: [],
+            burstCount: 0,
+            dailyCount: 0,
+            dailyCountDate: new Date().toISOString().split('T')[0],
+            savedAt: new Date().toISOString(),
+          }, 'current');
+          tx.oncomplete = () => { db.close(); resolve(); };
+          tx.onerror = () => { db.close(); reject(tx.error); };
+        };
+        request.onerror = () => reject(request.error);
+      });
+    });
+  }
+
+  test('gives up and saves instead of retrying a rate limit forever', async ({ page }) => {
+    // Regression: the old handler paused a flat 60s and retried the same track
+    // indefinitely. Two production users sat through 200+ consecutive retries.
+    //
+    // The backoff ladder spans ~50 minutes, so time is faked. With the clock
+    // frozen nothing advances on its own — including the API client's own retry
+    // backoff — so the clock has to be driven forward while polling.
+    await page.clock.install();
+    await alwaysRateLimited(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSelection(page);
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible();
+    await page.clock.runFor(3000);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    // Advance simulated time until the loop reaches a terminal state, recording
+    // whether the escalating backoff was surfaced along the way.
+    let sawFirstBackoff = false;
+    let gaveUp = false;
+    for (let i = 0; i < 250 && !gaveUp; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await page.clock.runFor(30 * 1000);
+      // eslint-disable-next-line no-await-in-loop
+      await page.waitForTimeout(50);
+      if (!sawFirstBackoff) {
+        // eslint-disable-next-line no-await-in-loop
+        sawFirstBackoff = await page.locator('text=attempt 1 of 3').isVisible();
+      }
+      // eslint-disable-next-line no-await-in-loop
+      gaveUp = await page.locator('text=still rate limiting your account').isVisible();
+    }
+
+    // The user is told how long we'll wait, instead of a bare 1-minute countdown.
+    expect(sawFirstBackoff).toBe(true);
+    // The loop must terminate with an actionable message, not keep spinning.
+    expect(gaveUp).toBe(true);
+    await expect(page.getByRole('button', { name: 'Try Again Now' })).toBeVisible();
+    // ...and progress must have been saved automatically so the user can leave.
+    await expect(page.locator('text=saved automatically')).toBeVisible();
+  });
+});
+
 test.describe('Complete Step', () => {
   test('shows completion message after full scrobble', async ({ page }) => {
     await interceptLastFm(page);
@@ -674,5 +946,135 @@ test.describe('No JS Errors', () => {
     await page.goto('/#/scrobble');
     await page.waitForTimeout(2000);
     expect(errors).toEqual([]);
+  });
+});
+
+test.describe('Re-tagged old plays', () => {
+  // Drives an import with "Scrobble tracks older than 2 weeks" enabled, which is
+  // the path ~78% of real imports take, and hands back every timestamp Last.fm
+  // was asked to store.
+  async function runReTaggedImport(
+    page: Page,
+    scrobbleResponse: object | ((attempt: number) => object | 'abort'),
+  ) {
+    const timestamps: number[] = [];
+    let scrobbleAttempts = 0;
+    await page.route('https://ws.audioscrobbler.com/**', async (route) => {
+      const postData = route.request().postData() || '';
+      const allParams = new URLSearchParams(
+        route.request().method() === 'POST' ? postData : new URL(route.request().url()).search,
+      );
+      const apiMethod = allParams.get('method');
+
+      if (apiMethod === 'track.scrobble') {
+        const raw = allParams.get('timestamp%5B0%5D') || allParams.get('timestamp[0]') || '0';
+        timestamps.push(Number(raw));
+        scrobbleAttempts++;
+        const outcome = typeof scrobbleResponse === 'function'
+          ? scrobbleResponse(scrobbleAttempts)
+          : scrobbleResponse;
+        if (outcome === 'abort') {
+          await route.abort('connectionfailed');
+          return;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify(outcome),
+        });
+      } else if (apiMethod === 'track.getInfo') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ track: { duration: '240000' } }),
+        });
+      } else if (apiMethod === 'user.getrecenttracks') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ recenttracks: { track: [] } }),
+        });
+      } else {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ session: { name: 'testuser', key: 'fake-session-key' } }),
+        });
+      }
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await page.reload();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    await page.locator('input[type="file"][accept=".zip"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+
+    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
+
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+
+    return timestamps;
+  }
+
+  test('gives every re-tagged play its own timestamp so repeats are not collapsed', async ({ page }) => {
+    const timestamps = await runReTaggedImport(page, { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } });
+
+    expect(timestamps.length).toBeGreaterThan(1);
+    // The bug: every play shared one Date, so Last.fm — which keys a scrobble on
+    // (user, artist, track, timestamp) — kept one and silently dropped the rest.
+    expect(new Set(timestamps).size).toBe(timestamps.length);
+
+    const sorted = [...timestamps].sort((a, b) => a - b);
+    expect(timestamps).toEqual(sorted);
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const fourteenDaysSec = 14 * 24 * 60 * 60;
+    for (const ts of timestamps) {
+      expect(ts).toBeLessThanOrEqual(nowSec);
+      expect(ts).toBeGreaterThan(nowSec - fourteenDaysSec);
+    }
+  });
+
+  test('a scrobble Last.fm ignored is reported as failed, not scrobbled', async ({ page }) => {
+    const timestamps = await runReTaggedImport(page, {
+      scrobbles: {
+        '@attr': { accepted: 0, ignored: 1 },
+        scrobble: { ignoredMessage: { code: '3', '#text': 'Timestamp too old' } },
+      },
+    });
+
+    expect(timestamps.length).toBeGreaterThan(0);
+    // The scrobble step is still mounted but hidden once the stepper advances,
+    // so assert on text content rather than visibility.
+    await expect(page.locator('.v-expansion-panel-header')).toContainText(`${timestamps.length} failed track(s)`);
+    await expect(page.locator('.overall-progress')).toContainText(`0 of ${timestamps.length}`);
+  });
+
+  test('retrying a track re-sends the identical timestamp', async ({ page }) => {
+    // The retry waits out a 30s network cooldown before the second attempt.
+    test.setTimeout(120000);
+
+    const ok = { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } };
+    // Drop the response to the very first attempt, exactly like a connection
+    // reset or a suspended tab would.
+    const timestamps = await runReTaggedImport(page, (attempt) => (attempt === 1 ? 'abort' : ok));
+
+    expect(timestamps.length).toBeGreaterThan(2);
+    // If the retry allocated a fresh second, a request that Last.fm actually
+    // received would be stored a second time as a phantom play — an identical
+    // resend is silently deduplicated instead.
+    expect(timestamps[1]).toBe(timestamps[0]);
+    // Every *other* track still gets its own second.
+    const afterRetry = timestamps.slice(1);
+    expect(new Set(afterRetry).size).toBe(afterRetry.length);
   });
 });
