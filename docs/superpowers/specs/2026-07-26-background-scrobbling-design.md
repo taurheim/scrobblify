@@ -68,10 +68,14 @@ Two consequences for this design:
 
 ## Scope
 
-Background mode is offered **only when the selected track count exceeds
+Background mode is offered **only when the number of tracks *remaining* exceeds
 `DAILY_LIMIT` (2,700)** — that is, only to users who would otherwise have to
 return at least once. Smaller imports finish in one sitting and stay entirely
 client-side.
+
+"Remaining" rather than "selected" is deliberate: users already part-way through
+an import must be able to hand off what is left. See Backwards compatibility for
+the four entry points where the offer appears.
 
 It is an **opt-in beta**. Users must actively choose it, and the UI must label it
 as beta.
@@ -347,13 +351,97 @@ Because this is a beta that may be withdrawn:
   polling and retries retain headroom. When full, the UI offers the normal
   client-side flow and reports that background mode is at capacity.
 
+## Backwards compatibility
+
+The feature must not strand anyone already part-way through an import, and must
+not break the existing client-side flow in either direction.
+
+### Entry points
+
+Background mode is offered wherever the *remaining* track count exceeds 2,700 —
+not only on fresh imports:
+
+1. **New import**, at step 3→4 after selection.
+2. **Resume from saved IndexedDB state**, via `restoreFromState`
+   (`Scrobblify.vue:154-173`), which already computes the remaining set.
+3. **Import of a progress JSON file**, which flows through the same
+   `restoreFromState` path.
+4. **Mid-scrobble, on the step 4 pause screen** — particularly when paused for
+   `daily_limit` or `rate_limit`.
+
+Entry point 4 matters most. Telemetry shows users abandon precisely at those
+pauses, so that screen is where "let us finish this for you" belongs. The offer
+must be available while paused, not only at the start of a run.
+
+### Handing off partial progress
+
+The job payload is the **remaining** tracks, exactly as `restoreFromState`
+already derives them. Already-scrobbled tracks are never re-sent, so the
+timestamps the client previously used are irrelevant to the job.
+
+Two rules make the transition safe:
+
+- **The handoff is atomic from the client's perspective.** Local state is cleared
+  only after the server has confirmed both job creation and blob storage. A
+  failure at any earlier point leaves local state untouched and the user
+  continues client-side, none the wiser.
+- **The client must halt its scrobble loop on successful handoff.** If both the
+  browser tab and the worker hold the same remaining track list, both will
+  scrobble it. This is the single most likely source of duplicates in the whole
+  design, and it is entirely self-inflicted.
+
+### Tolerating old and new state files
+
+`StateManager.importFromFile` requires only `totalTracks`, `completedIndices`,
+`failedIndices`, and `tracks`, defaulting everything else. Handoff must depend on
+nothing beyond that set — in particular it must not require `userName`, which
+older files lack. The Last.fm username comes from the auth handoff itself.
+
+Any field this feature adds to `ScrobbleState` **must be optional**, so that old
+files still import into new clients and new files still import into older cached
+clients.
+
+### Falling back to the client
+
+The export escape hatch must emit exactly the `ScrobbleState` shape
+`importFromFile` accepts, so a user can always return to the client-side flow.
+Ordering matters on cancellation: **generate and deliver the export before
+deleting the R2 blob**, or the data needed to build it is already gone.
+
+### Conflict rules
+
+- A live background job and local saved state must never both be active for one
+  user. On detecting both, the UI presents the background job as authoritative
+  and offers to discard the local state.
+- The client-side scrobble loop must refuse to start while a live background job
+  exists for the authenticated user.
+
 ## Beta framing
 
-- Opt-in only, presented at step 3→4 when the selection exceeds 2,700 tracks.
+- Opt-in only, offered at any of the four entry points above when the remaining
+  selection exceeds 2,700 tracks.
 - Labelled clearly as beta in the UI.
 - The opt-in must state plainly: the selected track list is uploaded to
   Scrobblify's server; a Last.fm credential is stored until the import finishes;
   access can be revoked at any time at last.fm/settings/applications.
+
+### Reporting bugs
+
+Because this is a beta running unattended for weeks, users need a direct channel
+when something looks wrong — there is no support system, and a silently stalled
+job is indistinguishable from a slow one.
+
+Both the opt-in dialog and the status view carry a feedback link to
+**niko@savas.ca**, following the prefilled-mailto pattern already established in
+`ErrorDialog.vue:52-68`: a fixed subject and a body pre-populated with context.
+
+The body should include the **job ID**, so a report is traceable to a specific
+job without asking the user to describe their state. The job ID is an opaque
+identifier and not personal data; analytics already identifies users by
+`lastfm_username` regardless.
+
+The link must remain reachable on a *failed* or *stalled* job, not only a healthy
+one. That is the case where it will actually be used.
 
 ## Analytics
 
@@ -365,6 +453,11 @@ New events: `background_offered`, `background_opted_in`, `background_declined`,
 `background_handoff_failed`, `background_job_created`,
 `background_job_completed`, `background_job_cancelled`, `background_reauth_needed`,
 `background_capacity_full`.
+
+`background_offered` and `background_opted_in` carry an `entry_point` property
+(`new_import`, `resume_saved`, `resume_file`, `paused`) so the four entry points
+can be compared. If the paused-screen offer is where users actually convert, that
+is worth knowing early.
 
 New error contexts: `background.handoff`, `background.upload`,
 `background.status`, `worker.scrobbleBatch`, `worker.reconcile`.
