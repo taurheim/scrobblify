@@ -1,6 +1,15 @@
 import Scrobble from '@/models/Scrobble';
 import md5 from 'blueimp-md5';
 
+/** Outcome of a single track.scrobble call, as reported by Last.fm itself. */
+export interface ScrobbleResult {
+  accepted: number;
+  ignored: number;
+  /** 0 when accepted. See LastFm.describeIgnoreCode for the rest. */
+  ignoredCode: number;
+  ignoredMessage: string;
+}
+
 export default class LastFm {
   private API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
 
@@ -244,21 +253,66 @@ export default class LastFm {
   }
 
   // https://www.last.fm/api/show/track.scrobble
-  public async scrobblePlay(play: Scrobble): Promise<void> {
+  public async scrobblePlay(play: Scrobble, timestampSecOverride?: number): Promise<ScrobbleResult> {
     if (!this.userAuthKey) {
       throw new Error('Not authenticated.');
     }
+    const timestampSec = timestampSecOverride !== undefined
+      ? timestampSecOverride
+      : Math.floor(play.timestamp.getTime() / 1000);
     const params: {[key: string]: string} = {
       method: 'track.scrobble',
       'artist[0]': play.artist,
       'track[0]': play.track,
-      'timestamp[0]': Math.floor(play.timestamp.getTime() / 1000).toString(),
+      'timestamp[0]': timestampSec.toString(),
     };
     // Add album if available
     if (play.album) {
       params['album[0]'] = play.album;
     }
-    await this.makeRequest('POST', params, true);
+    const response = await this.makeRequest('POST', params, true);
+    return LastFm.parseScrobbleResponse(response);
+  }
+
+  /**
+   * A 200 from track.scrobble does not mean the play was stored. Last.fm
+   * reports per-scrobble rejections in `ignoredMessage`, which this client used
+   * to discard entirely — so expired timestamps and daily-limit rejections were
+   * counted as successes.
+   *
+   * Defaults to "accepted" whenever the shape is unrecognised: an unparseable
+   * response must never turn a working scrobble into a reported failure.
+   */
+  private static parseScrobbleResponse(response: any): ScrobbleResult {
+    const attr = (response && response.scrobbles && response.scrobbles['@attr']) || {};
+    let entry = response && response.scrobbles && response.scrobbles.scrobble;
+    if (Array.isArray(entry)) {
+      [entry] = entry;
+    }
+    const ignoredMessage = (entry && entry.ignoredMessage) || {};
+
+    const accepted = Number(attr.accepted);
+    const ignored = Number(attr.ignored);
+    const code = Number(ignoredMessage.code);
+
+    return {
+      accepted: Number.isFinite(accepted) ? accepted : 1,
+      ignored: Number.isFinite(ignored) ? ignored : 0,
+      ignoredCode: Number.isFinite(code) ? code : 0,
+      ignoredMessage: ignoredMessage['#text'] || '',
+    };
+  }
+
+  /** https://www.last.fm/api/show/track.scrobble — ignoredMessage codes. */
+  public static describeIgnoreCode(code: number, message: string): string {
+    const known: {[key: number]: string} = {
+      1: 'Last.fm ignored this artist',
+      2: 'Last.fm ignored this track',
+      3: 'Timestamp was too far in the past (Last.fm only accepts the last 14 days)',
+      4: 'Timestamp was in the future',
+      5: 'Daily scrobble limit reached',
+    };
+    return known[code] || message || `Last.fm ignored this scrobble (code ${code})`;
   }
 
   private async makeRequest(

@@ -14,6 +14,18 @@ export default new Vuex.Store({
     selectedScrobbles: [],
     tracksScrobbled: 0,
     tracksFailed: 0,
+    // Number of tracks already scrobbled in a previously saved session that is
+    // being resumed. `selectedScrobbles` only ever holds the *remaining* tracks,
+    // so this is the only way the scrobble step can tell a resume from a fresh
+    // start (without it, `scrobble_resumed` could never fire).
+    resumedScrobbleCount: 0,
+    // Size of the user's original selection. Unlike `selectedScrobbles.length`
+    // this does NOT shrink on resume, so it is the only stable denominator for
+    // "how much of my import is done" — both in the UI and in analytics.
+    originalTotalTracks: 0,
+    // High-water mark of the re-tagged-play timestamp allocator, carried across
+    // a resume so a later run cannot reuse seconds an earlier one already sent.
+    reTagCursorSec: 0,
   },
   mutations: {
     setValidScrobbles(state: any, tracks: SpotifyListen[]) {
@@ -21,6 +33,15 @@ export default new Vuex.Store({
     },
     setSelectedScrobbles(state: any, tracks: Scrobble[]) {
       Vue.set(state, 'selectedScrobbles', tracks);
+    },
+    setResumedScrobbleCount(state: any, count: number) {
+      state.resumedScrobbleCount = count;
+    },
+    setOriginalTotalTracks(state: any, count: number) {
+      state.originalTotalTracks = count;
+    },
+    setReTagCursorSec(state: any, seconds: number) {
+      state.reTagCursorSec = seconds;
     },
     trackScrobbled(state: any) {
       state.tracksScrobbled += 1;

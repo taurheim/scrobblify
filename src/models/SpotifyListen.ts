@@ -4,6 +4,9 @@ export default class SpotifyListen {
 
   public originalListenDate: Date;
 
+  /** See Scrobble.reTagged — set by Scrobblify.reTagOldListens. */
+  public reTagged = false;
+
   constructor(
     public artistName: string,
     public trackName: string,

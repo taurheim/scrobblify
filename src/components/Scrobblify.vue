@@ -37,7 +37,7 @@
       </v-stepper-header>
       <v-stepper-items>
         <v-stepper-content step="1">
-          <authenticate-step v-on:complete="currentStep = 2"></authenticate-step>
+          <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
         </v-stepper-content>
         <v-stepper-content step="2">
           <upload-step v-on:complete="currentStep = 3"></upload-step>
@@ -49,6 +49,7 @@
           <scrobble-step
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
+            v-on:auto-save="onAutoSave"
           ></scrobble-step>
         </v-stepper-content>
         <v-stepper-content step="5">
@@ -75,8 +76,19 @@ import LastFm from '@/api/LastFm';
 import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
+import RateLimitTracker from '@/services/RateLimitTracker';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError, resetUser } from '@/services/Analytics';
+
+interface ProgressSnapshot {
+  scrobbledTracks: number;
+  originalTotalTracks: number;
+  originalSucceededCount: number;
+  sendTimestamps: number[];
+  lastReTagTimestampSec: number;
+  burstCount: number;
+  dailyCount: number;
+}
 
 export default Vue.extend({
   components: {
@@ -115,6 +127,37 @@ export default Vue.extend({
     stepName(step: number): string {
       return ['', 'authenticate', 'upload', 'select', 'scrobble', 'complete'][step] || String(step);
     },
+    /**
+     * AuthenticateStep confirms an existing session and then emits `complete`
+     * on a 2 second delay (so the "Checking for authentication..." spinner is
+     * readable). The user can act inside that window — most importantly they can
+     * hit "Resume", which jumps straight to the scrobble step. Advancing
+     * unconditionally would then yank them back to the upload step a moment
+     * later, losing the resumed session. Only ever move *forward* off step 1.
+     */
+    onAuthenticated() {
+      if (this.currentStep === 1) {
+        this.currentStep = 2;
+      }
+    },
+    /**
+     * `state.totalTracks` is only the tracks left to do, so on its own it makes
+     * a resumed import look smaller each time. Always report the original size
+     * and the cumulative progress alongside it.
+     */
+    resumeProps(state: ScrobbleState, source: string) {
+      const originalTotal = state.originalTotalTracks || state.totalTracks;
+      const succeeded = state.originalSucceededCount ?? state.completedIndices.length;
+      return {
+        source,
+        total_tracks: state.totalTracks,
+        original_total_tracks: originalTotal,
+        total_succeeded: succeeded,
+        completion_pct: originalTotal
+          ? Math.round((1000 * succeeded) / originalTotal) / 10
+          : 0,
+      };
+    },
     clearToken() {
       const api = this.$store.state.lfmApi as LastFm;
       this.currentStep = 1;
@@ -126,7 +169,7 @@ export default Vue.extend({
       try {
         const state = await this.stateManager.loadState();
         if (!state) { return; }
-        trackEvent('session_resumed', { source: 'saved', total_tracks: state.totalTracks });
+        trackEvent('session_resumed', this.resumeProps(state, 'saved'));
         this.restoreFromState(state);
       } catch (e) {
         trackError('scrobblify.resumeFromSaved', e);
@@ -143,7 +186,7 @@ export default Vue.extend({
       if (!input.files || input.files.length === 0) { return; }
       try {
         const state = await this.stateManager.importFromFile(input.files[0]);
-        trackEvent('session_resumed', { source: 'file', total_tracks: state.totalTracks });
+        trackEvent('session_resumed', this.resumeProps(state, 'file'));
         this.restoreFromState(state);
       } catch (e) {
         trackError('scrobblify.onImportFile', e);
@@ -160,6 +203,9 @@ export default Vue.extend({
         return;
       }
 
+      this.restoreRateLimitWindow(state, api.getUserName() || state.userName || null);
+      this.$store.commit('setReTagCursorSec', state.lastReTagTimestampSec || 0);
+
       // Restore remaining (not yet completed) tracks to store
       const allScrobbles = StateManager.deserializeScrobbles(state.tracks);
       const completedSet = new Set(state.completedIndices);
@@ -167,9 +213,37 @@ export default Vue.extend({
       const remaining = allScrobbles.filter((_, i) => !completedSet.has(i) && !failedSet.has(i));
 
       this.$store.commit('setSelectedScrobbles', remaining);
+      // The scrobble step only ever sees the remaining tracks, so it needs to be
+      // told separately that this is a resume — otherwise `scrobble_resumed`
+      // can never fire and the resume funnel is invisible. `originalTotalTracks`
+      // likewise has to be carried forward, since `remaining.length` shrinks on
+      // every resume and would otherwise make completion look better each time.
+      this.$store.commit('setResumedScrobbleCount', state.originalSucceededCount ?? completedSet.size);
+      this.$store.commit('setOriginalTotalTracks', state.originalTotalTracks || state.totalTracks);
       this.hasResumableState = false;
       // Skip to scrobble step (step 4)
       this.currentStep = 4;
+    },
+
+    /**
+     * Rate-limit budget is a property of the Last.fm *account*, not of a page
+     * load, so a restored session must restore it too. Files written before
+     * this existed only carry counts, which are converted to a (pessimistic)
+     * rolling window.
+     */
+    restoreRateLimitWindow(state: ScrobbleState, userName: string | null) {
+      try {
+        const tracker = new RateLimitTracker(userName);
+        if (Array.isArray(state.sendTimestamps) && state.sendTimestamps.length > 0) {
+          tracker.setSendTimestamps(state.sendTimestamps);
+        } else if (state.burstCount || state.dailyCount) {
+          const savedAtMs = state.savedAt ? new Date(state.savedAt).getTime() : Date.now();
+          tracker.seedFromLegacyCounts(state.burstCount, state.dailyCount, savedAtMs);
+        }
+      } catch (e) {
+        // A missing/corrupt rate-limit record must never block a restore; the
+        // tracker simply starts from an empty window.
+      }
     },
     async clearSavedState() {
       try {
@@ -185,10 +259,11 @@ export default Vue.extend({
       } catch (e) {
         // Not critical — continue anyway
       }
+      this.$store.commit('setResumedScrobbleCount', 0);
       this.hasRemainingTracks = false;
       this.currentStep = 5;
     },
-    async onSaveAndExit(info: { scrobbledTracks: number, burstCount: number, dailyCount: number }) {
+    buildState(info: ProgressSnapshot): ScrobbleState {
       const tracks = this.$store.state.selectedScrobbles as Scrobble[];
       const completedIndices: number[] = [];
       const failedIndices: number[] = [];
@@ -196,25 +271,56 @@ export default Vue.extend({
         completedIndices.push(i);
       }
 
-      const state: ScrobbleState = {
+      return {
         userName: (this.$store.state.lfmApi as LastFm).getUserName() || '',
         totalTracks: tracks.length,
         completedIndices,
         failedIndices,
         tracks: StateManager.serializeScrobbles(tracks),
+        originalTotalTracks: info.originalTotalTracks || tracks.length,
+        originalSucceededCount: info.originalSucceededCount,
+        sendTimestamps: info.sendTimestamps || [],
+        lastReTagTimestampSec: info.lastReTagTimestampSec || 0,
         burstCount: info.burstCount,
         dailyCount: info.dailyCount,
         dailyCountDate: new Date().toISOString().split('T')[0],
         savedAt: new Date().toISOString(),
       };
+    },
+    saveProps(info: ProgressSnapshot, automatic: boolean) {
+      const originalTotal = info.originalTotalTracks
+        || (this.$store.state.selectedScrobbles as Scrobble[]).length;
+      return {
+        automatic,
+        scrobbled_tracks: info.scrobbledTracks,
+        total_tracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
+        original_total_tracks: originalTotal,
+        total_succeeded: info.originalSucceededCount,
+        completion_pct: originalTotal
+          ? Math.round((1000 * info.originalSucceededCount) / originalTotal) / 10
+          : 0,
+      };
+    },
+    /**
+     * Silent save used when the scrobble step gives up (rate limited or daily
+     * limit reached). No file download and no navigation: the user stays on the
+     * explanation and can simply close the tab and come back.
+     */
+    async onAutoSave(info: ProgressSnapshot) {
+      try {
+        await this.stateManager.saveState(this.buildState(info));
+        trackEvent('session_saved', this.saveProps(info, true));
+      } catch (e) {
+        trackError('scrobblify.onAutoSave', e);
+      }
+    },
+    async onSaveAndExit(info: ProgressSnapshot) {
+      const state = this.buildState(info);
 
       try {
         await this.stateManager.saveState(state);
         this.stateManager.exportToFile(state);
-        trackEvent('session_saved', {
-          scrobbled_tracks: info.scrobbledTracks,
-          total_tracks: tracks.length,
-        });
+        trackEvent('session_saved', this.saveProps(info, false));
       } catch (e) {
         trackError('scrobblify.onSaveAndExit', e);
         this.errorMessage = 'Failed to save your scrobbling progress. You can try the "Save Progress" button again.';

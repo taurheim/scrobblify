@@ -60,12 +60,27 @@ export default class Scrobblify {
 
     const SAME_IF_COEFFICIENT_ABOVE = 0.9;
 
+    // Re-tagged plays carry provisional timestamps that are discarded and
+    // re-allocated at send time, so matching them against real history compares
+    // fiction against fact. Now that those timestamps are spread out rather
+    // than collapsed onto a single instant, the comparison window spans hours
+    // of genuine listening, and any import row whose fake second happens to
+    // land near a real recent play of the same track would be silently dropped.
+    //
+    // Their true dates survive on `originalListenDate`, but checking against
+    // those would mean fetching the user's entire Last.fm history back to the
+    // start of the export — potentially years. So they are simply exempt.
+    const checkable = listens.filter((listen) => !listen.reTagged);
+    if (checkable.length === 0) {
+      return { unique: listens, duplicateCount: 0 };
+    }
+
     // Determine the date range of the Spotify data (with buffer).
     // Iterate rather than spreading into Math.min/Math.max, which overflows the
     // call stack for large histories (tens of thousands of listens).
-    let minTimestamp = listens[0].listenDate.getTime();
+    let minTimestamp = checkable[0].listenDate.getTime();
     let maxTimestamp = minTimestamp;
-    for (const listen of listens) {
+    for (const listen of checkable) {
       const time = listen.listenDate.getTime();
       if (time < minTimestamp) {
         minTimestamp = time;
@@ -109,6 +124,9 @@ export default class Scrobblify {
     // Filter locally
     let duplicateCount = 0;
     const unique = listens.filter((listen) => {
+      if (listen.reTagged) {
+        return true;
+      }
       const artistKey = listen.artistName.toLowerCase();
       const candidates = scrobblesByArtist.get(artistKey);
       if (!candidates) {
@@ -250,7 +268,7 @@ export default class Scrobblify {
     In addition, the last.fm scrobbling api only allows 14 days prior to be scrobbled:
     https://getsatisfaction.com/lastfm/topics/scrobbles-more-than-14-days
   */
-  public removeOldListens(listens: SpotifyListen[], reTagOldListens = false): SpotifyListen[] {
+  public removeOldListens(listens: SpotifyListen[]): SpotifyListen[] {
     return listens.filter((listen) => {
       const currentTrackStartedAt = listen.listenDate.getTime();
       return (currentTrackStartedAt > this.retroactiveScrobbleLimitDate);
@@ -258,14 +276,27 @@ export default class Scrobblify {
   }
 
   /*
-    The 14 day limit can be circumvented by changing the listen date to a day within the last two weeks
+    The 14 day limit can be circumvented by changing the listen date to a day within the last two weeks.
+
+    Every listen must land on its own second. Last.fm keys a scrobble on
+    (user, artist, track, timestamp), so giving every play the same timestamp —
+    as this used to — silently collapses repeat listens of a track down to a
+    single scrobble and throws the rest away.
+
+    These dates are provisional. `reTagged` marks them so the scrobble loop can
+    re-stamp each play against the clock at send time, which is what actually
+    keeps a long-running or resumed import inside the 14-day window.
   */
   public reTagOldListens(listens: SpotifyListen[], newDate: Date): SpotifyListen[] {
-    return listens.map((listen) => {
+    const endMs = newDate.getTime();
+    const startMs = endMs - Math.max(0, listens.length - 1) * this.SECONDS_TO_MS;
+    return listens.map((listen, i) => {
       // Mutated in place on purpose: SpotifyListen is a class, so cloning it
       // here would drop its prototype (and `originalListenDate`).
-      // eslint-disable-next-line no-param-reassign
-      listen.listenDate = newDate;
+      /* eslint-disable no-param-reassign */
+      listen.listenDate = new Date(startMs + i * this.SECONDS_TO_MS);
+      listen.reTagged = true;
+      /* eslint-enable no-param-reassign */
       return listen;
     });
   }

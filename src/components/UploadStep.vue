@@ -237,7 +237,7 @@ export default Vue.extend({
         newData = this.scrobblify.reTagOldListens(parsedData, reTagDate);
         this.logs.push(`No tracks removed - old listens have been moved to today (${reTagDate.toDateString()})`);
       } else {
-        newData = this.scrobblify.removeOldListens(parsedData, this.scrobbleOldPlays);
+        newData = this.scrobblify.removeOldListens(parsedData);
         this.logs.push(`Found ${newData.length} tracks that were listened to in the last two weeks`);
       }
 
