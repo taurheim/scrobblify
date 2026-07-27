@@ -141,6 +141,32 @@ Two consequences worth knowing before touching this code:
   `originalListenDate`, but checking those would mean fetching the user's whole
   Last.fm history back to the start of the export.
 
+## Import robustness
+
+A Spotify export is split across many `Streaming_History_Audio_*.json` files and
+real ones do arrive damaged — truncated downloads, and large exports that read
+back corrupted on memory-constrained mobile browsers. **A file that can't be
+read or parsed is skipped, not fatal**; the import proceeds with what survived
+and warns the user in the log. Only a ZIP where *every* history file fails is an
+error. Don't "simplify" this back into an early return.
+
+Two Last.fm quirks the validation path has to absorb:
+
+- `track.getInfo` returns tracks with a **missing, empty or non-numeric
+  duration**. `getTrackTimeMs` normalises those to `0`, meaning "unknown", and
+  `removeInvalidListens` treats unknown as a generous 2 minutes. Returning `NaN`
+  instead silently discarded the play, because every comparison against `NaN` is
+  false — so it slipped past the fallback *and* the minimum-length check before
+  failing the final test.
+- Durations are cached per `(artist, track)` on the `LastFm` instance, including
+  permanent "track not found" answers. A listening history is mostly repeat
+  plays, so looking a track up once per *play* multiplied every validation run
+  by the user's average play count, at 250ms of enforced rate buffer each. Rate
+  limits and network errors are deliberately **not** cached.
+
+Timestamps sent to Last.fm are always integer seconds — `from`/`to` window ends
+round outwards so a duplicate-check window can only widen, never miss.
+
 ## Linting
 
 `npm run lint` auto-fixes; `npm run lint:check` (`--no-fix`) is what CI runs, so
