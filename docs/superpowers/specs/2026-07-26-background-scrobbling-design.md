@@ -157,6 +157,27 @@ and decompressing the whole thing every tick, for every job, will exhaust both
 CPU and memory. Store **independently compressed chunks plus a manifest**, sized
 so a tick reads exactly the chunk its cursor points into.
 
+Chunking solves random access and introduces its own requirements. An
+authenticated user uploads arbitrary compressed bytes, so:
+
+- **Bound both compressed and uncompressed chunk size**, and enforce field length
+  and per-chunk entry count limits. Otherwise a small compression bomb exhausts
+  Worker memory at *scheduling* time, taking down every job on that tick rather
+  than just the attacker's.
+- **Hash every chunk** and validate on upload; write chunks with write-once
+  semantics so a chunk cannot be swapped after validation.
+- **Publish the manifest last**, and make the `active` transition conditional on
+  every chunk being present, hash-valid, and non-overlapping. Missing, duplicated,
+  or reordered chunks must be detectable from the manifest alone.
+
+### Listening history is personal data
+
+An earlier framing treated "no email, no password" as meaning there is no PII
+here. That is wrong as a threat model. A user's complete listening history,
+bound to their Last.fm username, is personal data — and the retained failed-track
+list is a subset of it. It should be minimised, deleted on the same schedule as
+the credential, and never logged into analytics.
+
 ### Portability requirements
 
 The worker must be movable to a plain VM without a rewrite:
@@ -205,27 +226,53 @@ only in Vuex (`SelectStep.vue:504-511`) and is **not** persisted, so a naive
 ordering below is easy to get wrong in ways that either strand a credential or
 lose an import.
 
-Required protocol:
+Required protocol. Note step 0 — an earlier draft had the SPA commit the digest
+only to `localStorage`, then had the worker "verify against the digest committed
+in step 1", which it had never been told. The nonce has the same problem: a
+worker-signed value cannot originate on the client.
 
-1. **Persist before leaving.** The SPA writes the selected track list to
-   `localStorage`/IndexedDB *before* redirecting, together with a
-   `pending_handoff` record holding a nonce, the expected Last.fm username, and a
-   SHA-256 digest of the serialised list.
-2. **Bind the nonce.** The `cb=` URL carries a worker-signed, single-use,
-   short-TTL nonce. The worker rejects any callback whose nonce is unknown,
-   expired, or already consumed.
+0. **Server preflight.** Before redirecting, the SPA calls the worker with the
+   expected Last.fm username, the payload's SHA-256 digest, the track count, and
+   the chunk manifest bounds. The worker durably records a `handoff` row in state
+   `issued` and returns a signed, single-use, short-TTL opaque state value. This
+   is what makes later verification possible at all.
+1. **Persist before leaving.** *Then* the SPA writes the selected track list to
+   IndexedDB, because a full-page redirect destroys Vuex.
+2. **Bind the callback.** The `cb=` URL carries the signed state from step 0. The
+   worker rejects any callback whose state is unknown, expired, already consumed,
+   or whose signature fails.
 3. **Verify the account.** `auth.getSession` returns a username. If it does not
-   match the username bound to the nonce, **abort and discard the session key.**
+   match the username recorded in step 0, **abort and discard the session key.**
    Without this check a user logged into a second Last.fm account in another tab
    — or an attacker who lands their own callback — has one account's history
    written into another's. This is the single most damaging failure mode in the
    design.
-4. **Upload, then finalise.** The job is created in `pending_upload`. The SPA
-   uploads the blob; the worker verifies the digest matches the one committed in
-   step 1, then transitions the job to `active`.
+4. **Upload, then finalise.** The job sits in `pending_upload`. The SPA uploads
+   chunks; the worker validates each chunk's hash, publishes the manifest last,
+   and only then transitions to `active`.
 5. **Clear last.** The SPA clears its own session key and cached list only after
    the worker confirms `active`. Clearing first turns any upload failure into
    total data loss.
+
+#### States, because the happy path is the easy part
+
+The transitions are `issued → exchanging → pending_upload → finalizing → active`,
+every one an atomic compare-and-set from the expected prior state. Callback and
+finalise must be **idempotent**, because these cases are all reachable:
+
+| Situation | Required behaviour |
+| --- | --- |
+| Duplicate callbacks race for one Last.fm token | CAS `issued → exchanging`; the loser returns the winner's outcome, never a second `auth.getSession` |
+| State claimed, then `auth.getSession` times out | Bounded retry from `exchanging`; on give-up, fail the handoff and discard any key |
+| Session obtained, job row creation fails | The credential must be written in the same transaction as the row that owns it, or it is unreachable garbage holding write access |
+| Finalise commits `active`, response lost | **Most dangerous case.** The client must not assume failure; it queries handoff status and resumes locally only if the server says the job is not active |
+| Reaper fires during an active upload | Reaping is a CAS from the expected state with a freshness check, never an unconditional delete |
+| Two tabs start handoffs for one username | One live handoff per username; the second is refused with a pointer to the first |
+| Capacity fills between authorisation and activation | Reserve the slot at step 0, not at activation, and release it if the handoff is reaped |
+
+The general rule: **on any uncertain outcome the client stays disabled and asks
+the server**, rather than resuming a local scrobble run that may now be racing a
+live background job.
 6. **Reap abandoned handoffs.** Jobs stuck in `pending_upload`, and unconsumed
    nonces, expire on a timer, deleting any captured credential. A user who closes
    the tab mid-flow must not leave a permanent write credential behind.
@@ -244,25 +291,46 @@ separate server-only API application.)
 
 ### Sessions and identity
 
-**`savas.ca` is a shared origin.** LastWave is served from `savas.ca/lastwave` —
-a path, not a subdomain. Any cookie scoped `Domain=savas.ca` is readable by
-LastWave's JavaScript, and browser security has no way to distinguish the two
-applications. The earlier claim of origin isolation was wrong.
+**`savas.ca` is a shared origin, and no credential scheme can change that.**
+LastWave is served from `savas.ca/lastwave` — a path, not a subdomain. Scrobblify
+and LastWave are the *same web origin*, so the browser has no mechanism that
+distinguishes them.
 
-Accordingly:
+A previous draft tried to engineer around this with a `__Host-` cookie plus an
+SPA-held bearer token. That does not work, and stating why matters more than the
+mitigation did:
 
-- **Use a `__Host-` cookie set on `api.savas.ca`.** `__Host-` forbids the
-  `Domain` attribute, so the cookie is locked to that exact host and is invisible
-  to anything served from `savas.ca`. Attributes: `Secure`, `Path=/`,
-  `SameSite=Lax`, `HttpOnly`.
-- Because the cookie is host-locked, the SPA cannot rely on ambient credentials
-  for cross-site calls; status and control endpoints take an explicit
-  **bearer token issued to the SPA**, with CORS restricted to the exact origin.
-- **All state-changing endpoints require an anti-CSRF token**, since `SameSite=Lax`
-  still permits top-level cross-site GET navigations.
-- Longer term, moving Scrobblify to its own origin is the only way to get real
-  isolation from LastWave. Flagged as an open question because it affects the
-  existing site structure.
+- A `__Host-` cookie on `api.savas.ca` cannot be *read* by `savas.ca` scripts —
+  but cookies are attached by request **destination**, not by initiator. Since
+  `savas.ca` and `api.savas.ca` are same-site, a credentialed `fetch` from
+  LastWave's JavaScript to the API carries the cookie anyway.
+- A bearer token the SPA can read is, by definition, one LastWave can read: same
+  origin, same `localStorage`.
+- CORS restricted "to the exact origin" admits both applications, because it *is*
+  the same origin.
+- Anti-CSRF tokens defend against *cross-site* requests. LastWave is not
+  cross-site.
+
+So the honest choice is binary:
+
+| Option | Consequence |
+| --- | --- |
+| **Dedicated origin** for Scrobblify | Real isolation. `__Host-` cookie on `api.savas.ca` then works as intended. Requires restructuring the existing site. |
+| **Accept a shared trust boundary** | Every script served from `savas.ca` — including LastWave and anything it loads — is inside Scrobblify's security perimeter. An XSS in LastWave is an XSS in Scrobblify. |
+
+**Interim decision: accept the shared trust boundary, and document it.** Both
+applications are written and deployed by the same author, so this is a defensible
+position rather than a third-party exposure — but it must be a *stated* position,
+not an accident, and it means no third-party scripts may be added to `savas.ca`
+without reconsidering it.
+
+Even under that acceptance, keep the mechanisms that defend against everything
+*outside* the origin: `__Host-` cookie on `api.savas.ca` (`Secure`, `Path=/`,
+`SameSite=Lax`, `HttpOnly`), exact-origin CORS, and CSRF tokens on state-changing
+endpoints. They are worth having; they are simply not isolation from LastWave.
+
+Moving to a dedicated origin remains the recommended long-term fix and is a
+blocking open question.
 
 **Fallback:** re-authenticate through Last.fm. The username resolves to the job.
 Works on any device, from any browser, after any cookie loss.
@@ -368,12 +436,30 @@ Last.fm may also **correct** artist/album/track names, flagged by `corrected`.
 Reconciliation must compare against corrected names or it will not find its own
 writes.
 
+### A batch of 50 has 50 outcomes, and a cursor has one
+
+Batching breaks the assumption that progress is a single monotonic index. One
+response can simultaneously contain accepted entries, permanent code 1/2
+rejections, code 5 entries that must be retried later, and — if the response is
+lost — entries whose fate is unknown. Code 5 can begin part-way through a batch,
+so the failures are not even a suffix.
+
+A single `cursor` integer cannot represent that, and advancing it past a mixed
+batch silently drops tracks.
+
+**Therefore:** persist a per-entry outcome (an outcome bitmap or a status column
+keyed by index) for every in-flight batch. The cursor advances only across a
+**contiguous prefix** of entries that are terminal — accepted or permanently
+failed. Unknown and code-5 entries stay behind and are retried or reconciled
+individually. Progress counts and the audit log are derived from the per-entry
+outcomes, not from the cursor.
+
 ### Error handling
 
 | Condition | Response |
 | --- | --- |
 | Error 29 (IP rate limit) | Trip the **global** circuit breaker; back off all jobs. Log with timestamp and active-job count. |
-| `ignoredMessage` code 5 | Per-user daily cap reached. Stop that job until tomorrow; do not treat as failure. |
+| `ignoredMessage` code 5 | Per-user daily cap reached. Stop that job and back off (see below); do not treat as failure. |
 | `ignoredMessage` code 3/4 | Worker timestamp assignment is wrong. Alert; do not silently drop. |
 | `ignoredMessage` code 1/2 | Last.fm rejected the artist/track. Record as permanently failed; never retry. |
 | **Error 9 (invalid session key)** | Credential revoked. Delete it, mark `needs_reauth`, stop. **Never retry.** |
@@ -390,6 +476,20 @@ shared with the public client bundle, so anyone can abuse it and get it
 suspended, killing every background job at once. A **separate, server-only
 Last.fm API application** would isolate that risk, at the cost of an honest
 second authorisation prompt.
+
+### "Wait until tomorrow" is an assumption, not a fact
+
+Code 5 proves the daily cap was reached. It says nothing about *when* it resets:
+whether at midnight in some timezone, or on a rolling 24-hour window. Encoding
+"resume at midnight" into the scheduler risks waking every job at once and
+immediately re-hitting the cap — while also making the thundering herd worse for
+the shared egress IP.
+
+**Until measured:** record the timestamps of accepted sends, wait a conservative
+24 hours from the *first* accepted send of the capped period, and probe with a
+single small batch before resuming full rate. Back off exponentially if the probe
+also returns code 5. The observed reset behaviour is a metric worth capturing in
+the beta precisely because it is currently unknown.
 
 ## Correctness under change
 
@@ -420,20 +520,35 @@ send time keep it; everything else is stamped near the present, spread so that
 every timestamp in a batch is unique.
 
 **What this costs the user.** Their Last.fm history will show these plays at the
-time the import ran, not when they listened. Play counts and top-artist charts
-are correct; the listening *timeline* is fiction. Anyone who values that timeline
-should not use background mode — the foreground path has the same problem for
-re-tagged listens, but over hours rather than weeks.
+time the import ran, not when they listened. **Lifetime play counts stay correct**
+(modulo the duplicates at-least-once permits), but *time-bounded* charts —
+weekly, monthly, yearly — are badly distorted, because the entire import lands in
+whatever weeks the job happened to run. The listening timeline is fiction. Anyone
+who values that timeline should not use background mode; the foreground path has
+the same problem for re-tagged listens, but over hours rather than weeks.
 
-**Ordering is a genuine trade-off, and must be chosen explicitly:**
+**Ordering: send by earliest expiry deadline, not by recency.**
 
-| Order | Effect |
-| --- | --- |
-| Oldest-first | Preserves relative chronology, but tracks near the start of the queue age out of the 14-day window and get restamped anyway. |
-| Recent-first | Maximises the number of tracks keeping their true timestamp; reverses chronology for everything else. |
+An earlier draft chose recent-first "to maximise preserved timestamps". That is
+backwards. A track played today has ~14 days of slack before its timestamp
+becomes unscrobbleable; a track played 13 days ago has one day. Sending recent
+tracks first spends the slack of the tracks that need it least and lets the
+nearly-expired ones expire. This is ordinary earliest-deadline-first scheduling,
+and recency is the wrong key.
 
-**Decision: recent-first**, because it preserves the most genuine data, and
-because the alternative's chronology is itself an artefact of restamping. This
+Two queues, re-evaluated at send time because deadlines move as the job runs:
+
+| Queue | Order | Rationale |
+| --- | --- | --- |
+| Still inside the 14-day window | Earliest expiry first (≈ oldest valid first) | Maximises the number of tracks that keep their true timestamp |
+| Already outside the window | Chronological, so relative order survives | Nothing left to preserve; only ordering is a choice |
+
+**Decision: deadline-first.** For the users this feature targets — large,
+re-tagged, multi-year histories — nearly every track is already outside the
+window at job creation, so the first queue is usually small. That does not make
+the policy unimportant: it is exactly the users with *some* recent listening who
+would notice their genuine timestamps being thrown away needlessly.
+
 must be stated in the opt-in copy, not buried.
 
 ### Duplicate scrobbles: at-least-once, with a narrow reconciliation
@@ -482,8 +597,16 @@ a single API call, not a paginated crawl of the user's history.
 
 ### Safe-deploy mechanics
 
-- **Immutable job payload.** The R2 blob is written once at job creation and
-  never mutated. No code change can alter what an existing job will scrobble.
+- **Immutable job payload — but bytes are not behaviour.** The R2 chunks are
+  written once at job creation and never mutated. That prevents the *data* from
+  changing; it does **not** prevent new code from parsing, normalising, ordering,
+  or timestamping the same bytes differently. Immutability alone is not a
+  deploy-safety guarantee.
+
+  Each job therefore pins an **algorithm version** alongside its manifest
+  version, covering parsing, ordering policy, and timestamp assignment. A worker
+  that encounters a job pinned to semantics it no longer implements must refuse
+  it and flag it, not reinterpret it.
 - **Fencing tokens, not just leases.** A `locked_until` timestamp alone does
   **not** prevent concurrent execution: a tick that stalls past its lease keeps
   running, and its in-flight writes can land after a second tick has claimed the
@@ -500,6 +623,16 @@ a single API call, not a paginated crawl of the user's history.
   This is also what makes a deploy safe mid-batch: the killed tick's lease
   expires, the next tick bumps the generation, and any zombie writes are fenced
   out.
+
+  **Fencing protects D1, not Last.fm.** A superseded tick's *external* request
+  cannot be revoked: worker A sends a batch, its lease expires in flight, worker
+  B takes over and reconciles before A's scrobbles are visible, B resends, then
+  A's request lands too. Fencing rejects A's database writes but not its
+  scrobbles. Mitigate by having a taking-over tick wait at least the maximum
+  outbound request timeout plus a read-visibility grace period before
+  reconciling — and accept that this is exactly the duplicate window the
+  at-least-once decision already acknowledges. It is a reason that decision has to
+  be explicit rather than a claim to have eliminated duplicates.
 - **Additive-only migrations.** Never drop or rename a column a running job
   depends on. Job rows carry a `schema_version` so the worker can handle rows
   created by older code.
@@ -518,10 +651,24 @@ Because this is a beta that may be withdrawn:
   both code paths already exist (`StateManager.exportToFile` /
   `importFromFile`), so this costs almost nothing and guarantees progress is
   never stranded server-side.
-- **Concurrency cap.** Background mode admits a bounded number of concurrent jobs
-  — initially **20**, deliberately below the ~24 capacity ceiling so that status
-  polling and retries retain headroom. When full, the UI offers the normal
-  client-side flow and reports that background mode is at capacity.
+- **Concurrency cap.** Background mode admits a bounded number of concurrent jobs.
+  **The initial number cannot be chosen yet** — the earlier "20, below the ~24
+  ceiling" was derived from the withdrawn capacity model and is void. It must come
+  out of the feasibility spike (see Open questions). When full, the UI offers the
+  normal client-side flow and reports that background mode is at capacity.
+
+  Define explicitly *which states consume a slot*. A job that is `needs_reauth`,
+  `needs_attention`, or paused must not squat a scarce slot for 60 days: attach an
+  inactivity deadline after which it is cancelled, its credential deleted, and the
+  user told.
+
+- **Admission control on job size.** At ~2,700 scrobbles/day, the 60-day
+  credential TTL caps a completable job at roughly **162,000 tracks** — and that
+  assumes no outages, no global pauses, and no code-5 backoff. Reject jobs whose
+  conservative completion estimate exceeds the TTL rather than accepting an import
+  that is guaranteed to be abandoned half-finished. The measured median selection
+  is 34,769, so this affects few users, but those users are precisely the ones
+  most motivated to opt in.
 
 ## Backwards compatibility
 
@@ -638,38 +785,69 @@ New error contexts: `background.handoff`, `background.upload`,
 
 **Blocking — these change the design:**
 
+- **A feasibility spike is a design gate, not a follow-up.** Withdrawing the false
+  ~24-user number was necessary but is not sufficient; "Cloudflare stops being the
+  binding constraint" is currently an assertion, and the 10ms CPU limit was filed
+  as non-blocking despite a tick doing HMAC signing, gzip decompression, JSON
+  parsing, response processing, and reconciliation. **No concurrency cap may be
+  chosen until this is measured.** The spike must state, for one 50-track batch:
+  the exact D1 statements and rows written (including index write amplification),
+  R2 operations, subrequest count, and measured CPU — comparing a
+  **one-mapping-row-per-batch** representation against **fifty**. If the free tier
+  cannot carry even a handful of jobs, that is an argument for starting on Oracle,
+  and it is much cheaper to learn now than after the auth flow is built.
 - **Should Scrobblify move to its own origin?** LastWave shares
-  `https://savas.ca`, so cookie-level isolation between the two is impossible.
-  `__Host-` cookies on `api.savas.ca` mitigate this; a dedicated origin fixes it.
-  Affects existing site structure, so it is the user's call.
+  `https://savas.ca`, and no cookie, token, or CORS configuration can isolate two
+  applications on one origin. Either accept a shared trust boundary explicitly or
+  move. Affects existing site structure, so it is the user's call.
 - **A separate, server-only Last.fm API application?** The public API key can be
   abused by anyone into an error-26 suspension that kills every background job.
   Isolating it costs an extra, honestly-explained authorisation prompt.
-- **D1 write budget on the free tier.** The whole scheduler design assumes cheap
-  per-batch writes (mapping + cursor + audit row, fenced by generation). Measure
-  the actual quota before committing to a tick cadence; if writes are the scarce
-  resource, batch size and audit granularity must be tuned to it, not to
-  subrequest count.
 
 **Non-blocking:**
 
-- Wall-clock and the 10ms CPU limit for scheduled Workers on the free tier, which
-  bound how much pacing and decompression a single tick may do.
+- **Whether Last.fm's daily cap resets on a clock or a rolling window**, which
+  determines the resume schedule after code 5. Measure during the beta.
 - **Whether Last.fm silently deduplicates identical `(artist, track, timestamp)`
   submissions.** Because `reTagOldListens` historically assigned one identical
   timestamp to every listen, a user who played the same track fifty times may
   have been credited with a single scrobble. If confirmed, this is a pre-existing
   client data-loss bug independent of this feature, and the fix — unique
   timestamps — is the same mechanism this design already requires.
+- Concurrent scrobbling from Spotify or another scrobbler consumes the same
+  account budget invisibly. The conflict rules cover Scrobblify's own clients
+  only; nothing can see the rest.
 
 ## Review status
 
-Reviewed adversarially on 2026-07-26. Findings incorporated: batched scrobbling,
-the error-29-vs-ignore-code-5 distinction, the shared-origin cookie flaw, the
-handoff transaction protocol with username binding, fencing tokens, chunked blob
-storage, the withdrawal of the exactly-once and capacity claims, and honest
-framing of timestamp reassignment.
+Reviewed adversarially over two rounds on 2026-07-26.
+
+**Round one** produced: batched scrobbling, the error-29-vs-ignore-code-5
+distinction, the shared-origin cookie flaw, the handoff transaction protocol with
+username binding, fencing tokens, chunked blob storage, withdrawal of the
+exactly-once and capacity claims, and honest framing of timestamp reassignment.
+
+**Round two** corrected the round-one fixes, several of which were wrong:
+
+- Recent-first ordering was **backwards**; it spends slack on the tracks that
+  need it least. Now earliest-deadline-first.
+- The `__Host-` cookie plus bearer token did **not** isolate LastWave — cookies
+  attach by destination, and a token the SPA can read LastWave can read. Replaced
+  with an explicit, documented trust-boundary decision.
+- The handoff had no server-side commit of the digest it later claimed to verify.
+  Added a preflight step and a CAS state machine covering seven ambiguous states.
+- A single cursor cannot represent a 50-entry batch's mixed outcomes.
+- Fencing protects D1 but cannot revoke an in-flight Last.fm request.
+- "Immutable payload" does not make behaviour immutable; jobs now pin an
+  algorithm version.
+- The concurrency cap still referenced the withdrawn ceiling; it is now blocked
+  on a feasibility spike.
 
 Claims verified against Last.fm's published API documentation rather than
 assumed: the 50-scrobble batch limit, the 200-item `getRecentTracks` cap, the
 ASCII signature ordering rule, and the wording of error codes 9, 26, and 29.
+
+**Known unresolved**, carried deliberately rather than papered over: free-tier
+feasibility is unproven pending the spike; the shared origin is a product
+decision; export-before-deletion cannot guarantee delivery; and duplicates remain
+possible by design under at-least-once.
