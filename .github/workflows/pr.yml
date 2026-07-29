@@ -1,8 +1,10 @@
 name: PR
 
-on:
-  pull_request:
-    branches: [master]
+# Deliberately not filtered to `branches: [master]`. A PR stacked on another
+# PR targets a feature branch, and with that filter it ran no checks at all —
+# which is exactly the PR most likely to need them, since it is reviewed
+# against a base that has not landed yet.
+on: pull_request
 
 jobs:
   lint:
