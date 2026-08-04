@@ -20,3 +20,9 @@ yarn-error.log*
 *.njsproj
 *.sln
 *.sw*
+
+# Cloudflare worker
+worker/.wrangler/
+# Local secrets for wrangler dev. NEVER commit — holds the server-only
+# Last.fm shared secret and the credential encryption key.
+worker/.dev.vars

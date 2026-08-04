@@ -1,0 +1,28 @@
+# Template for `worker/.dev.vars` — copy to `.dev.vars` and fill in.
+#
+#   Copy-Item .dev.vars.example .dev.vars
+#
+# `.dev.vars` is gitignored and is read automatically by `wrangler dev`.
+# Never commit it, never paste these values into a chat, an issue, or a log
+# line. Production values are set with `wrangler secret put`, not from here.
+
+# --- Server-only Last.fm API application -----------------------------------
+# A SECOND Last.fm application, separate from the one in the browser bundle
+# (AuthenticateStep.vue). Register it with callback:
+#   https://api.savas.ca/scrobblify/auth/callback
+# Keeping it separate means an error-26 suspension of the public client key
+# cannot take the background jobs down with it, and vice versa.
+LASTFM_API_KEY=
+LASTFM_SHARED_SECRET=
+
+# --- Credential encryption --------------------------------------------------
+# AES-GCM key encrypting Last.fm session keys at rest, so D1 never holds a
+# usable credential on its own. Base64, 32 bytes. Generate with:
+#   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+CREDENTIAL_ENC_KEY=
+
+# --- Handoff state signing --------------------------------------------------
+# HMAC key for the single-use `state` in the auth callback, which binds a
+# handoff to an expected Last.fm username and payload digest. Generate the
+# same way as above.
+HANDOFF_SIGNING_KEY=
