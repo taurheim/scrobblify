@@ -89,16 +89,36 @@ function normalizeErrorForTracking(error: Error): { trackedError: Error; rawMess
 }
 
 /*
+  Coerces an arbitrary thrown value into an Error. `String(value)` throws for
+  Symbols and for objects with a throwing toString/Symbol.toPrimitive, and the
+  global handlers (window.onerror, unhandledrejection, Vue.config.errorHandler)
+  pass through whatever a third party threw — so this coercion has to be
+  survivable in its own right.
+*/
+function toError(value: unknown): Error {
+  if (value instanceof Error) {
+    return value;
+  }
+  try {
+    return new Error(String(value));
+  } catch (e) {
+    return new Error('Unstringifiable thrown value');
+  }
+}
+
+/*
   Records an error against a named context (e.g. 'upload.parseZip') so failures
   can be grouped and investigated. Captures both a filterable custom event and,
   when available, PostHog's native exception so it shows up in error tracking.
 */
 export function trackError(context: string, error: unknown, extra: Record<string, any> = {}): void {
-  const err = error instanceof Error ? error : new Error(String(error));
-  const { trackedError, rawMessage } = normalizeErrorForTracking(err);
+  const err = toError(error);
 
   if (initialized) {
     try {
+      // Kept inside the try: the global handlers hand us whatever a third party
+      // threw, so even reading .message/.stack off it can fail.
+      const { trackedError, rawMessage } = normalizeErrorForTracking(err);
       posthog.capture('scrobblify_error', {
         context,
         message: trackedError.message,
