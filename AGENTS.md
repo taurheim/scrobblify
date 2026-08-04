@@ -54,8 +54,8 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `step_viewed` → `auth_success` / `auth_failed` / `auth_token_invalid` →
 `upload_parse_started` / `upload_parse_completed` / `upload_no_matching_files` →
 `tracks_selected` → `scrobble_started` / `scrobble_resumed` / `scrobble_paused` /
-`scrobble_completed`, plus `session_saved`, `session_resumed`, and
-`user_logged_out`.
+`scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
+`session_resumed`, and `user_logged_out`.
 
 Rate limiting has its own events: `scrobble_rate_limited`,
 `scrobble_rate_limit_cooldown_complete`, `scrobble_rate_limit_recovered`,
@@ -65,12 +65,56 @@ from the adaptive limit in `RateLimitTracker`. Network failures emit
 `scrobble_network_error`. `scrobble_ignored` fires when Last.fm accepts the
 request but discards the play (see below).
 
-`scrobble_paused` carries a `reason` of `burst_limit`, `daily_limit`,
-`rate_limit`, `rate_limit_exhausted`, `network_error`, `lastfm_daily_limit`, or
-`manual` — only `manual` is a user action; the rest are Last.fm throttling, not
-bugs. These dominate by volume (`scrobble_paused` and `scrobble_rate_limited`
-are the highest-count events after `step_viewed`), so treat them as normal
-operation, not signal.
+**`scrobble_paused` and `scrobble_stopped` are deliberately separate events**, so
+"how often does a run end early, and why" is answerable without knowing which
+reasons happen to be terminal. Every terminal case used to be a `scrobble_paused`
+reason too, and two of them (`repeated_rejections`, `repeated_failures`) emitted
+nothing at all.
+
+- `scrobble_paused` — transient; the loop resumes by itself. Reasons:
+  `burst_limit`, `rate_limit`, `network_error`. This is Last.fm throttling, not
+  a bug: treat it as normal operation rather than signal.
+- `scrobble_stopped` — terminal; the run is over until the user comes back.
+  Reasons: `daily_limit`, `lastfm_daily_limit`, `rate_limit_exhausted`,
+  `repeated_rejections`, `repeated_failures`, `manual`. Only `manual` is a user
+  action. Every one carries `auto_saved`, which is the difference between an
+  interruption and lost work — all six now save, so `auto_saved: false` in the
+  data means the save itself failed and is worth investigating.
+
+All terminal paths go through the `trackStopped()` helper rather than emitting
+inline, so a new one cannot silently skip the event.
+
+Every terminal path must also leave the user a way back in. The paused panel's
+resume button is gated on the `canResume` computed (`stopped || manuallyPaused`),
+not on `stopped` alone: a manual pause is terminal but is *not* an error, so it
+sets `manuallyPaused` and gets `info` styling via `pauseAlertType` instead of a
+red `error` banner. Setting only `paused` renders a **disabled** "Wait Here"
+button waiting on an auto-resume the loop has already returned from — a dead end
+that stranded manual pauses, `repeated_rejections` and `repeated_failures`.
+
+`manualPause()` deliberately does **not** save. It only raises the flags; the
+save and the `scrobble_stopped` event happen in the scrobble loop's pause check,
+which runs *between* tracks. Saving on the click would snapshot a
+`scrobbledTracks` that omits the in-flight track, so the resume would re-send it
+— and for a re-tagged play that means a freshly allocated timestamp and a
+phantom duplicate scrobble.
+
+`burst_limit` is **preventive pacing, not a stoppage**, and it is emitted once
+per *stretch* of throttled sends — paired with a `scrobble_pacing_ended` event
+carrying `paced_tracks`, `paced_wait_ms` and `pacing_duration_ms`. Do not read
+it as one event per pause-and-resume of a track.
+
+That pairing exists because `msUntilBurstSafe()` frees exactly one slot at a
+time, so once the rolling window is saturated *every* remaining track waits a
+fraction of a second. Emitting per track made `scrobble_paused` a per-scrobble
+heartbeat: it went from ~15/day to 734/day and briefly became the
+highest-count event after `step_viewed`. **Events from 2026-07-27 to 2026-07-29
+are inflated this way and are not comparable with later data**, and before
+2026-07-29 `scrobble_paused` also carried the terminal reasons.
+
+Pacing waits under `PACING_COUNTDOWN_THRESHOLD_MS` (10s) are a plain sleep that
+leaves the scrobbling UI up; only longer waits show the paused panel and
+countdown.
 
 ### Measuring completion
 
@@ -94,6 +138,14 @@ no way to detect it from the API.
 Use the helpers in `src/services/Analytics.ts` (`trackEvent`, `trackError`,
 `identifyUser`) rather than calling `posthog` directly. Analytics must never
 break the app: every call is wrapped in try/catch and ignored on failure.
+
+That invariant covers *deriving* the payload, not just sending it. `trackError`
+receives arbitrary values — the global handlers hand it whatever a third party
+threw — so coercion goes through `toError()`, which guards `String(value)`
+(that throws for Symbols and for objects with a throwing `toString`), and
+`normalizeErrorForTracking` is called inside the try. Doing either before the
+guard loses the report *and* throws a fresh error out of a `catch` block or a
+global handler, which is exactly where it does the most damage.
 
 ## Scrobble timestamps
 

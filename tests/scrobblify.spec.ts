@@ -686,6 +686,173 @@ test.describe('Session Resume', () => {
     // Falls back to this file's own totals rather than reporting nothing.
     await expect(page.locator('.overall-progress')).toContainText('3 of 5');
   });
+
+  test('preventive pacing keeps scrobbling, it does not pause per track', async ({ page }) => {
+    // Regression: `msUntilBurstSafe()` frees exactly one slot at a time, so once
+    // the rolling window is full *every* remaining track waits a fraction of a
+    // second. Those waits went through `pauseWithCountdown`, which flipped the
+    // whole view into the paused panel and emitted a `scrobble_paused` event —
+    // once per track, for the rest of the import.
+    test.setTimeout(120000);
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+
+    // A burst window filled to exactly the default limit, spaced at the rate
+    // that limit implies (500 sends / 10 minutes = one per 1.2s), so slots free
+    // up one at a time and every track waits a fraction of a second — the shape
+    // seen in production.
+    //
+    // Anchored slightly in the future because the window keeps draining while
+    // the resume UI is driven: whatever time that takes just frees that many
+    // slots. The lead has to stay under PACING_COUNTDOWN_THRESHOLD_MS (10s) so
+    // that even an instant start pauses below the countdown threshold, and the
+    // track count has to exceed the slots a slow start can free.
+    const SETUP_LEAD_MS = 8000;
+    const anchor = Date.now() + SETUP_LEAD_MS;
+    const sendTimestamps = Array.from({ length: 500 }, (_, k) => anchor - (499 - k) * 1200);
+    const tracks = Array.from({ length: 24 }, (_, n) => ({
+      track: `Track ${n + 1}`,
+      artist: `Artist ${n + 1}`,
+      album: '',
+      timestamp: Date.UTC(2024, 0, n + 1),
+    }));
+    await seedSavedState(page, buildState({
+      totalTracks: 24,
+      completedIndices: [],
+      tracks,
+      originalTotalTracks: 24,
+      originalSucceededCount: 0,
+      sendTimestamps,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=24 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    // Pacing must announce itself...
+    await expect(page.locator('text=Pacing to stay under')).toBeVisible({ timeout: 20000 });
+
+    // ...without ever handing the run over to the paused panel. Sampled
+    // repeatedly because the bug was a flicker — one flip per track — which a
+    // single instantaneous check could land between.
+    let sawPausedPanel = false;
+    let finished = false;
+    for (let i = 0; i < 600 && !finished; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await page.waitForTimeout(100);
+      // eslint-disable-next-line no-await-in-loop
+      if (await page.locator('text=Auto-resuming in').isVisible()) {
+        sawPausedPanel = true;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      finished = await page.locator('text=Finished scrobbling').isVisible();
+    }
+
+    expect(sawPausedPanel).toBe(false);
+    expect(finished).toBe(true);
+  });
+
+  test('a manual pause saves, offers a way back, and does not re-send the in-flight track', async ({ page }) => {
+    // Regression: "Pause & Save" set `paused` but not `stopped`, so the paused
+    // panel rendered a *disabled* "Wait Here" button and waited forever for an
+    // auto-resume the loop had already returned from — a dead end. It also
+    // never actually saved, despite the label.
+    test.setTimeout(90000);
+
+    const scrobbled: string[] = [];
+    const tracks = Array.from({ length: 12 }, (_, n) => ({
+      track: `Track ${n + 1}`,
+      artist: `Artist ${n + 1}`,
+      album: `Album ${n + 1}`,
+      timestamp: Date.UTC(2024, 0, n + 1),
+    }));
+
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+        // Slow enough that the pause lands mid-run rather than after the queue
+        // has already drained.
+        await new Promise((resolve) => { setTimeout(resolve, 700); });
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState({
+      totalTracks: 12,
+      completedIndices: [0, 1],
+      tracks,
+      originalTotalTracks: 12,
+      originalSucceededCount: 2,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    // Let a couple of tracks go out, then ask to stop.
+    await expect.poll(() => scrobbled.length, { timeout: 20000 }).toBeGreaterThanOrEqual(2);
+    await page.getByRole('button', { name: 'Pause & Save' }).click();
+
+    // The user must be offered a way back in, not a disabled button.
+    const resume = page.getByRole('button', { name: 'Resume Now' });
+    await expect(resume).toBeVisible({ timeout: 10000 });
+    await expect(resume).toBeEnabled();
+    await expect(page.locator('text=Wait Here')).toHaveCount(0);
+    // And the label's promise must have been kept.
+    await expect(page.locator('text=Your progress has been saved automatically'))
+      .toBeVisible();
+
+    // The loop really stopped rather than quietly draining the queue.
+    const atPause = scrobbled.length;
+    await page.waitForTimeout(2000);
+    expect(scrobbled.length).toBe(atPause);
+    expect(atPause).toBeLessThan(10);
+
+    await resume.click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 40000 });
+
+    // The save is taken between tracks, so the track that was in flight when
+    // the user clicked must not be sent twice. A re-send of a re-tagged play
+    // would be allocated a fresh timestamp and become a phantom scrobble.
+    expect(scrobbled).toEqual(tracks.slice(2).map((t) => t.track));
+  });
 });
 
 test.describe('Rate limit handling', () => {

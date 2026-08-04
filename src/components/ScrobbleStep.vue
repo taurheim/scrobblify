@@ -23,6 +23,15 @@
       <p>Scrobbling... <b>{{ currentTrackName }}</b></p>
       <v-progress-linear v-model="progress" class="mb-4"></v-progress-linear>
 
+      <!--
+        Preventive pacing is normal operation, not an interruption: it stays put
+        for the whole throttled stretch rather than flipping the view into the
+        paused panel once per track.
+      -->
+      <v-alert v-if="pacing" type="info" dense text class="mb-4">
+        {{ pacingNotice }}
+      </v-alert>
+
       <v-card class="pa-3 mb-4" outlined>
         <div class="overall-progress">
           Overall: {{ totalSucceeded }} of {{ originalTotalTracks }} scrobbled
@@ -40,7 +49,7 @@
 
     <!-- Paused view -->
     <div v-else-if="paused">
-      <v-alert :type="stopped ? 'error' : 'warning'" prominent>
+      <v-alert :type="pauseAlertType" prominent>
         {{ pauseReason }}
       </v-alert>
 
@@ -51,7 +60,7 @@
         <div v-if="countdown > 0" class="mb-2 text-body-2">
           You can save progress and leave now, then resume later at any time.
         </div>
-        <div v-if="stopped && autoSaved" class="mb-2 text-body-2">
+        <div v-if="canResume && autoSaved" class="mb-2 text-body-2">
           Your progress has been saved automatically — just come back to this page later
           and choose "Resume".
         </div>
@@ -60,7 +69,14 @@
         </div>
 
         <v-btn class="primary mr-2" @click="saveAndExit">Save Progress &amp; Leave</v-btn>
-        <v-btn v-if="stopped" outlined @click="scrobble">Try Again Now</v-btn>
+        <!--
+          Anything terminal needs a way back in. Without this a manual pause was
+          a dead end: a disabled button waiting on an auto-resume that the loop
+          had already returned from.
+        -->
+        <v-btn v-if="canResume" outlined @click="scrobble">
+          {{ manuallyPaused ? 'Resume Now' : 'Try Again Now' }}
+        </v-btn>
         <v-btn v-else outlined disabled>Wait Here</v-btn>
       </v-card>
     </div>
@@ -133,6 +149,18 @@ const MAX_RATE_LIMIT_RETRIES = RATE_LIMIT_BACKOFF_MS.length;
 const NETWORK_ERROR_COOLDOWN_MS = 30 * MS_PER_SECOND;
 const NETWORK_ERROR_COOLDOWN_SECONDS = Math.ceil(NETWORK_ERROR_COOLDOWN_MS / MS_PER_SECOND);
 
+// Preventive pacing waits shorter than this are ordinary throughput control,
+// not something to interrupt the user with.
+//
+// `msUntilBurstSafe()` frees exactly one slot at a time, so once the rolling
+// window is saturated *every* remaining track waits a fraction of a second
+// (observed median: 630ms). Treating each of those as a pause flipped the whole
+// view into the paused panel and emitted a `scrobble_paused` event once per
+// track — roughly one analytics event per scrobble. Above this threshold the
+// wait is long enough to be worth an explicit countdown, which happens when a
+// window saturated by an earlier session has to drain before we can start.
+const PACING_COUNTDOWN_THRESHOLD_MS = 10 * MS_PER_SECOND;
+
 const MAX_CONSECUTIVE_FAILURES = 10;
 
 // Re-tagged plays (see Scrobble.reTagged) are stamped at send time, starting
@@ -181,10 +209,22 @@ export default Vue.extend({
       // A pause the loop will not resume from on its own. Distinguishes "wait a
       // moment" from "we've given up for now, come back later".
       stopped: false,
+      // A terminal pause the *user* asked for. Terminal like `stopped`, but not
+      // an error, so it gets its own flag rather than colouring a deliberate
+      // action as a failure.
+      manuallyPaused: false,
       autoSaved: false,
       pauseReason: '',
       countdown: 0,
       countdownTimer: null as number | null,
+      // Preventive pacing is a *stretch* of throttled sends, not a single
+      // pause: it is entered once when the rolling window fills and left once
+      // the window has room again. Telemetry and UI both describe the stretch,
+      // so neither fires per track.
+      pacing: false,
+      pacingStartedAtMs: 0,
+      pacedTracks: 0,
+      pacedWaitMs: 0,
       // Mirrors of RateLimitTracker state. The tracker itself is deliberately
       // non-reactive (see created()), so these are refreshed explicitly.
       burstCount: 0,
@@ -235,6 +275,27 @@ export default Vue.extend({
       const seconds = this.countdown % 60;
       return `${minutes}:${seconds.toString().padStart(2, '0')}`;
     },
+    pacingNotice(): string {
+      return `Pacing to stay under Last.fm's rate limit — ${this.burstCount} scrobbles in the`
+        + ' last 10 minutes. Scrobbling continues automatically.';
+    },
+
+    /*
+      Whether the loop has returned for good and the user must restart it. Both
+      giving up on an error and pausing on purpose qualify; only the transient
+      waits (which clear `paused` themselves) do not.
+    */
+    canResume(): boolean {
+      return this.stopped || this.manuallyPaused;
+    },
+
+    // A deliberate pause is not a failure, so it must not be styled as one.
+    pauseAlertType(): string {
+      if (this.manuallyPaused) {
+        return 'info';
+      }
+      return this.stopped ? 'error' : 'warning';
+    },
   },
   created() {
     this.syncRateLimitCounters();
@@ -270,6 +331,71 @@ export default Vue.extend({
       this.burstLimit = tracker.burstLimit;
     },
 
+    sleep(ms: number): Promise<void> {
+      return new Promise((resolve) => { window.setTimeout(resolve, ms); });
+    },
+
+    /**
+     * Report that the run has ended and will not pick itself back up.
+     *
+     * Kept as its own event rather than another `scrobble_paused` reason: every
+     * terminal case used to share the event name with the transient ones, so
+     * answering "how often does a run stop early, and why" meant knowing by
+     * heart which of the seven reasons happen to be terminal. `scrobble_paused`
+     * now always means "waiting, will resume itself"; this always means "over
+     * until the user comes back".
+     *
+     * `auto_saved` records whether their progress actually survived, which is
+     * the difference between an interruption and lost work.
+     */
+    trackStopped(reason: string, extra: Record<string, unknown> = {}) {
+      this.endPacing();
+      trackEvent('scrobble_stopped', this.progressProps({
+        reason,
+        auto_saved: this.autoSaved,
+        ...extra,
+      }));
+    },
+
+    /**
+     * Enter the paced state, reporting it once. Repeated calls while already
+     * pacing are deliberately no-ops: the burst check runs per track, but a
+     * pacing stretch is one event, not one per track.
+     */
+    beginPacing(tracker: RateLimitTracker, waitMs: number) {
+      if (this.pacing) {
+        return;
+      }
+      this.pacing = true;
+      this.pacingStartedAtMs = Date.now();
+      this.pacedTracks = 0;
+      this.pacedWaitMs = 0;
+      trackEvent('scrobble_paused', this.progressProps({
+        reason: 'burst_limit',
+        burst_count: tracker.burstCount,
+        burst_limit: tracker.burstLimit,
+        wait_ms: waitMs,
+      }));
+    },
+
+    /**
+     * Leave the paced state, reporting how much the pacing actually cost. Safe
+     * to call unconditionally — it is a no-op when we were not pacing.
+     */
+    endPacing() {
+      if (!this.pacing) {
+        return;
+      }
+      const { pacedTracks, pacedWaitMs } = this;
+      this.pacing = false;
+      trackEvent('scrobble_pacing_ended', this.progressProps({
+        reason: 'burst_limit',
+        paced_tracks: pacedTracks,
+        paced_wait_ms: pacedWaitMs,
+        pacing_duration_ms: Date.now() - this.pacingStartedAtMs,
+      }));
+    },
+
     /**
      * Progress properties attached to every scrobble analytics event.
      *
@@ -299,10 +425,14 @@ export default Vue.extend({
 
     async scrobble() {
       const tracker = this.rateLimitTracker();
+      // Defensive: a previous run that was torn down mid-stretch would
+      // otherwise suppress the next `beginPacing`.
+      this.endPacing();
       this.scrobbling = true;
       this.completed = false;
       this.paused = false;
       this.stopped = false;
+      this.manuallyPaused = false;
       this.autoSaved = false;
       this.pauseReason = '';
       // A manual retry after giving up starts a fresh backoff ladder.
@@ -339,8 +469,18 @@ export default Vue.extend({
 
       // `i` is incremented conditionally at the end so a rate-limited track can be retried.
       for (let i = this.scrobbledTracks; i < tracks.length;) {
-        // Check if manually paused
+        // Check if manually paused. Transient waits clear `paused` before
+        // returning, so reaching here with it set means the user asked to stop.
+        // The save happens *here* rather than in `manualPause` so the snapshot
+        // is taken between tracks: saving mid-send would omit the in-flight
+        // track's increment and re-send it on resume, which for a re-tagged
+        // play means a brand new timestamp and a phantom duplicate scrobble.
         if (this.paused) {
+          this.endPacing();
+          if (this.manuallyPaused) {
+            this.autoSave();
+            this.trackStopped('manual', { track_index: i });
+          }
           return;
         }
 
@@ -350,15 +490,26 @@ export default Vue.extend({
         // don't have.
         const burstWaitMs = tracker.msUntilBurstSafe();
         if (burstWaitMs > 0) {
-          this.pauseReason = `Pacing to stay under Last.fm's rate limit — ${tracker.burstCount} scrobbles sent in the last 10 minutes. Resuming automatically.`;
-          trackEvent('scrobble_paused', this.progressProps({
-            reason: 'burst_limit',
-            burst_count: tracker.burstCount,
-            burst_limit: tracker.burstLimit,
-            wait_ms: burstWaitMs,
-          }));
-          await this.pauseWithCountdown(burstWaitMs);
+          // Reported once for the whole stretch, not once per track: the window
+          // only ever frees one slot at a time, so this branch is taken for
+          // every remaining track once the limit is reached.
+          this.beginPacing(tracker, burstWaitMs);
+          this.pacedTracks += 1;
+          this.pacedWaitMs += burstWaitMs;
+
+          if (burstWaitMs >= PACING_COUNTDOWN_THRESHOLD_MS) {
+            this.pauseReason = `Pacing to stay under Last.fm's rate limit — ${tracker.burstCount} scrobbles sent in the last 10 minutes. Resuming automatically.`;
+            await this.pauseWithCountdown(burstWaitMs);
+          } else {
+            // Sub-second spacing between sends. Deliberately *not*
+            // `pauseWithCountdown`: that shows the paused panel and only
+            // resolves on a 1s tick, which would both flicker the UI once per
+            // track and round every wait up to a full second.
+            await this.sleep(burstWaitMs);
+          }
           this.syncRateLimitCounters();
+        } else {
+          this.endPacing();
         }
 
         // Daily ceiling: a rolling 24h window, so it frees up gradually rather
@@ -367,14 +518,13 @@ export default Vue.extend({
         const dailyWaitMs = tracker.msUntilDailySafe();
         if (dailyWaitMs > 0) {
           this.pauseReason = `You've reached Last.fm's daily limit of about ${DAILY_LIMIT} scrobbles. Come back in ${formatDuration(dailyWaitMs)} to continue where you left off.`;
-          trackEvent('scrobble_paused', this.progressProps({
-            reason: 'daily_limit',
-            daily_count: tracker.dailyCount,
-            wait_ms: dailyWaitMs,
-          }));
           this.stopped = true;
           this.paused = true;
           this.autoSave();
+          this.trackStopped('daily_limit', {
+            daily_count: tracker.dailyCount,
+            wait_ms: dailyWaitMs,
+          });
           return;
         }
 
@@ -419,10 +569,10 @@ export default Vue.extend({
               // the queue *unprocessed*. Recording it as failed here would
               // count it once now and again when the resume re-sends it.
               this.pauseReason = 'Last.fm says you have hit your daily scrobble limit. Your progress is saved — come back tomorrow and resume.';
-              trackEvent('scrobble_paused', this.progressProps({ reason: 'lastfm_daily_limit' }));
               this.stopped = true;
               this.paused = true;
               this.autoSave();
+              this.trackStopped('lastfm_daily_limit');
               return;
             }
 
@@ -449,12 +599,16 @@ export default Vue.extend({
             this.errorDetails = this.failedTracks[this.failedTracks.length - 1].error;
             this.showError = true;
             this.pauseReason = 'Paused because Last.fm rejected several scrobbles in a row.';
+            this.stopped = true;
             this.paused = true;
             // These were permanent rejections, so the tracks are genuinely
             // processed — advance past this one before saving so the resume
             // doesn't re-send and re-count it.
             this.scrobbledTracks += 1;
             this.autoSave();
+            this.trackStopped('repeated_rejections', {
+              consecutive_failures: consecutiveFailures,
+            });
             return;
           }
         } catch (e) {
@@ -462,6 +616,10 @@ export default Vue.extend({
           // same track rather than counting it as a failure.
           if (LastFm.isRateLimitError(e)) {
             const rateLimitStartMs = Date.now();
+            // Real throttling supersedes preventive pacing: close out the
+            // stretch so its cost is reported against the pacing, not the
+            // minutes we are about to spend backing off.
+            this.endPacing();
             if (this.firstRateLimitAtMs === null) {
               this.firstRateLimitAtMs = rateLimitStartMs;
             }
@@ -483,9 +641,6 @@ export default Vue.extend({
               // Retrying further is not useful: recovery from a sustained rate
               // limit takes hours, not minutes. Save and hand control back.
               this.pauseReason = `Last.fm is still rate limiting your account after ${MAX_RATE_LIMIT_RETRIES} retries over ${formatDuration(Date.now() - this.firstRateLimitAtMs)}. This usually clears after a few hours — come back later and resume.`;
-              trackEvent('scrobble_paused', this.progressProps({
-                reason: 'rate_limit_exhausted',
-              }));
               trackEvent('scrobble_rate_limit_gave_up', this.progressProps({
                 track_index: i,
                 burst_count: tracker.burstCount,
@@ -497,6 +652,10 @@ export default Vue.extend({
               this.stopped = true;
               this.paused = true;
               this.autoSave();
+              this.trackStopped('rate_limit_exhausted', {
+                rate_limit_pause_count: this.rateLimitPauseCount,
+                elapsed_since_first_rate_limit_ms: Date.now() - this.firstRateLimitAtMs,
+              });
               return;
             }
 
@@ -535,8 +694,16 @@ export default Vue.extend({
               this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} tracks failed in a row. There may be a problem with Last.fm or your authentication.`;
               this.errorDetails = (e as Error).message || String(e);
               this.showError = true;
-              this.pauseReason = 'Paused due to repeated failures.';
+              this.pauseReason = 'Paused due to repeated failures. Your progress is saved.';
+              this.stopped = true;
               this.paused = true;
+              // The track is left unconsumed (scrobbledTracks is not advanced):
+              // these were exceptions, not rejections, so a resume should retry
+              // it rather than skip it.
+              this.autoSave();
+              this.trackStopped('repeated_failures', {
+                consecutive_failures: consecutiveFailures,
+              });
               return;
             }
           }
@@ -558,6 +725,7 @@ export default Vue.extend({
         }
       }
 
+      this.endPacing();
       this.completed = true;
       trackEvent('scrobble_completed', this.progressProps());
       this.$emit('complete');
@@ -589,9 +757,13 @@ export default Vue.extend({
     },
 
     manualPause() {
-      this.pauseReason = 'Manually paused.';
-      trackEvent('scrobble_paused', this.progressProps({ reason: 'manual' }));
+      this.pauseReason = 'Paused. Your progress is saved — resume whenever you like.';
       this.paused = true;
+      // Tracked separately from `stopped`, which drives the red error styling.
+      // A deliberate pause is not a failure, but it is just as terminal: the
+      // loop returns, so the user needs a way back in. The scrobble loop picks
+      // this up and does the saving and reporting.
+      this.manuallyPaused = true;
     },
 
     /**
