@@ -15,6 +15,10 @@ import md5 from './md5';
 interface Env {
   DB: D1Database;
   BLOBS: R2Bucket;
+  LASTFM_API_KEY: string;
+  LASTFM_SHARED_SECRET: string;
+  CREDENTIAL_ENC_KEY: string;
+  HANDOFF_SIGNING_KEY: string;
 }
 
 interface Track {
@@ -156,8 +160,77 @@ async function migrate(env: Env, sub: SubrequestCounter) {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // Verifies the server-only Last.fm application's credentials without ever
+    // revealing them. auth.getToken is signed but needs no user session, so it
+    // exercises the api key, the shared secret and the signature algorithm in
+    // one call — and Last.fm distinguishes the failures: error 10 means the key
+    // is wrong, error 13 means the signature (and so the secret) is wrong.
+    if (url.pathname === '/verify') {
+      const present = (v: string | undefined) => (typeof v === 'string' && v.length > 0);
+      const b64Bytes = (v: string | undefined) => {
+        if (!present(v)) return 0;
+        try {
+          return Uint8Array.from(atob(v as string), (c) => c.charCodeAt(0)).length;
+        } catch {
+          return -1;
+        }
+      };
+
+      const config = {
+        LASTFM_API_KEY: present(env.LASTFM_API_KEY) ? `set (${env.LASTFM_API_KEY.length} chars)` : 'MISSING',
+        LASTFM_SHARED_SECRET: present(env.LASTFM_SHARED_SECRET) ? `set (${env.LASTFM_SHARED_SECRET.length} chars)` : 'MISSING',
+        CREDENTIAL_ENC_KEY: `${b64Bytes(env.CREDENTIAL_ENC_KEY)} bytes decoded`,
+        HANDOFF_SIGNING_KEY: `${b64Bytes(env.HANDOFF_SIGNING_KEY)} bytes decoded`,
+      };
+
+      if (!present(env.LASTFM_API_KEY) || !present(env.LASTFM_SHARED_SECRET)) {
+        return Response.json({ ok: false, config, error: 'Last.fm credentials not loaded from .dev.vars' }, { status: 400 });
+      }
+
+      const sigParams: Record<string, string> = {
+        api_key: env.LASTFM_API_KEY,
+        method: 'auth.getToken',
+      };
+      const sorted = Object.keys(sigParams).sort();
+      const sig = md5(sorted.map((k) => k + sigParams[k]).join('') + env.LASTFM_SHARED_SECRET);
+
+      const qs = new URLSearchParams({ ...sigParams, api_sig: sig, format: 'json' });
+      const res = await fetch(`https://ws.audioscrobbler.com/2.0/?${qs}`, {
+        headers: { 'User-Agent': 'scrobblify-worker-spike' },
+      });
+      const payload: any = await res.json().catch(() => ({}));
+
+      if (payload && payload.token) {
+        return Response.json({
+          ok: true,
+          config,
+          httpStatus: res.status,
+          // Truncated: a token is short-lived and user-agnostic, but there is no
+          // reason to print credentials-adjacent values in full.
+          tokenPreview: `${String(payload.token).slice(0, 6)}…`,
+          meaning: 'API key and shared secret are both valid, and the MD5 signature format is correct.',
+        });
+      }
+
+      const hints: Record<number, string> = {
+        10: 'Invalid API key — check LASTFM_API_KEY matches the new server-only application.',
+        13: 'Invalid method signature — LASTFM_SHARED_SECRET is wrong, or belongs to a different application than the API key.',
+        26: 'This API key is suspended.',
+        29: 'Rate limited (IP-level), not a credential problem. Retry shortly.',
+      };
+      return Response.json({
+        ok: false,
+        config,
+        httpStatus: res.status,
+        lastfmError: payload?.error,
+        lastfmMessage: payload?.message,
+        hint: hints[payload?.error] || 'Unrecognised failure.',
+      }, { status: 400 });
+    }
+
     if (url.pathname !== '/spike') {
-      return new Response('POST /spike', { status: 404 });
+      return new Response('GET /verify or GET /spike[?bench=1]', { status: 404 });
     }
 
     const sub = new SubrequestCounter();
