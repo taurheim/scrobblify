@@ -202,6 +202,20 @@ read or parsed is skipped, not fatal**; the import proceeds with what survived
 and warns the user in the log. Only a ZIP where *every* history file fails is an
 error. Don't "simplify" this back into an early return.
 
+The file matcher is anchored to the **basename** (`/^Streaming_History_Audio_.*\.json$/`
+tested against `name.split('/').pop()`), and that anchoring is load-bearing.
+Testing the unanchored pattern against the full ZIP path also matched
+`__MACOSX/._Streaming_History_Audio_*.json` — the AppleDouble sidecar macOS
+writes for every entry when an archive is created or re-zipped on a Mac. There
+is exactly one per real file, so the count doubled, every sidecar failed
+`JSON.parse`, and the user was warned that half their history was missing when
+none of it was. In telemetry this looked exactly like corruption: the giveaway
+was that `skipped_count` was always precisely half of `total_files`, every
+affected user was on macOS, and all the failures landed within ~400ms of the
+parse starting (far too fast for the memory-exhaustion case this path exists
+for). The sidecars are also why some parse errors quote `"    Ma"` — that's the
+`Mac OS X` marker inside the AppleDouble header, not export data.
+
 Two Last.fm quirks the validation path has to absorb:
 
 - `track.getInfo` returns tracks with a **missing, empty or non-numeric
