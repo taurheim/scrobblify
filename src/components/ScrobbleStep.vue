@@ -53,6 +53,26 @@
         {{ pauseReason }}
       </v-alert>
 
+      <!--
+        This is where the offer belongs. Telemetry says this screen is where
+        large imports are abandoned: the user has been told to come back in a
+        day, and most never do.
+      -->
+      <v-alert v-if="canOfferBackground" type="info" text class="mb-4">
+        <div class="font-weight-medium mb-1">
+          Don't want to keep coming back?
+          <v-chip x-small color="deep-purple" text-color="white" class="ml-1">Beta</v-chip>
+        </div>
+        <div class="mb-3 text-body-2">
+          Scrobblify's server can finish the remaining
+          {{ tracksRemaining.toLocaleString() }} tracks for you. Close the tab
+          and it keeps going.
+        </div>
+        <v-btn color="primary" :disabled="handoffHalted" @click="requestBackground">
+          Finish this in the background
+        </v-btn>
+      </v-alert>
+
       <v-card class="pa-4 mb-4 text-center" outlined>
         <div v-if="countdown > 0" class="text-h5 mb-2">
           Auto-resuming in {{ formattedCountdown }}
@@ -74,7 +94,7 @@
           a dead end: a disabled button waiting on an auto-resume that the loop
           had already returned from.
         -->
-        <v-btn v-if="canResume" outlined @click="scrobble">
+        <v-btn v-if="canResume" outlined :disabled="handoffHalted" @click="scrobble">
           {{ manuallyPaused ? 'Resume Now' : 'Try Again Now' }}
         </v-btn>
         <v-btn v-else outlined disabled>Wait Here</v-btn>
@@ -124,6 +144,14 @@ import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError } from '@/services/Analytics';
 import RateLimitTracker, { DAILY_LIMIT } from '@/services/RateLimitTracker';
+import { canCompress } from '@/services/BackgroundScrobbling';
+
+/**
+ * Below this, finishing in the browser takes about a day and the extra moving
+ * parts of a handoff are not worth it. Must match the worker's
+ * `MIN_TRACKS_FOR_BACKGROUND`, which rejects a smaller preflight outright.
+ */
+const MIN_TRACKS_FOR_BACKGROUND = 2700;
 
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
@@ -193,6 +221,17 @@ function formatDuration(ms: number): string {
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
+  props: {
+    /**
+     * Whether the parent has confirmed with the server that background mode is
+     * live and accepting jobs. Defaults to false so the offer stays hidden
+     * unless something has positively established otherwise.
+     */
+    backgroundAvailable: {
+      type: Boolean,
+      default: false,
+    },
+  },
   data() {
     return {
       scrobbling: false,
@@ -206,6 +245,13 @@ export default Vue.extend({
       // plays. Persisted so a resume cannot reuse an earlier run's seconds.
       reTagCursorSec: 0,
       paused: false,
+      // True only while the send loop is actually executing. `scrobbling`
+      // stays set across a pause so the paused view keeps rendering, so it
+      // cannot tell a handoff whether the loop has really stopped.
+      loopActive: false,
+      // Set while a background handoff is being negotiated, so the paused view
+      // explains itself instead of offering a "Resume" that would race it.
+      handoffHalted: false,
       // A pause the loop will not resume from on its own. Distinguishes "wait a
       // moment" from "we've given up for now, come back later".
       stopped: false,
@@ -295,6 +341,26 @@ export default Vue.extend({
         return 'info';
       }
       return this.stopped ? 'error' : 'warning';
+    },
+
+    /** Tracks in this session that have not been processed yet. */
+    tracksRemaining(): number {
+      return Math.max(0, this.tracksToScrobble.length - this.scrobbledTracks);
+    },
+
+    /**
+     * Whether to advertise background mode on the paused screen.
+     *
+     * `backgroundAvailable` is the parent's live answer from the server, so an
+     * undeployed or full worker never advertises itself. `canCompress` is
+     * checked here too because the upload needs it, and discovering that after
+     * a redirect through Last.fm would strand the user.
+     */
+    canOfferBackground(): boolean {
+      return this.backgroundAvailable
+        && !this.handoffHalted
+        && canCompress()
+        && this.tracksRemaining >= MIN_TRACKS_FOR_BACKGROUND;
     },
   },
   created() {
@@ -429,6 +495,18 @@ export default Vue.extend({
       // otherwise suppress the next `beginPacing`.
       this.endPacing();
       this.scrobbling = true;
+      // Distinct from `scrobbling`, which stays true across a pause so the
+      // paused view keeps rendering. This tracks whether the send loop is
+      // actually executing, which is what a handoff has to wait for.
+      this.loopActive = true;
+      try {
+        await this.runScrobbleLoop(tracker);
+      } finally {
+        this.loopActive = false;
+      }
+    },
+
+    async runScrobbleLoop(tracker: RateLimitTracker) {
       this.completed = false;
       this.paused = false;
       this.stopped = false;
@@ -764,6 +842,48 @@ export default Vue.extend({
       // loop returns, so the user needs a way back in. The scrobble loop picks
       // this up and does the saving and reporting.
       this.manuallyPaused = true;
+    },
+
+    /**
+     * Stops the loop before a background handoff is negotiated.
+     *
+     * This is the single most important line in the client half of the
+     * feature. The handoff uploads the tracks that are *currently* remaining;
+     * if the loop keeps running while the user is being redirected through
+     * Last.fm, every track it sends in the meantime is also in the uploaded
+     * list, and the server will scrobble it a second time.
+     *
+     * The loop only checks `paused` between tracks, so this resolves once the
+     * in-flight track has been consumed and the flag observed. Awaiting that
+     * is what makes the snapshot taken afterwards accurate.
+     */
+    async haltForHandoff(): Promise<void> {
+      if (!this.scrobbling) {
+        return;
+      }
+      this.handoffHalted = true;
+      this.paused = true;
+      this.manuallyPaused = true;
+      this.pauseReason = 'Handing this over to the background service…';
+      // One tick of the loop is at most one track plus its retry budget.
+      // Polling rather than awaiting a promise keeps this independent of where
+      // in the loop the halt landed.
+      for (let i = 0; i < 300 && this.loopActive; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await this.sleep(100);
+      }
+    },
+
+    /**
+     * Undoes `haltForHandoff` when the handoff did not happen.
+     */
+    releaseHandoffHalt() {
+      this.handoffHalted = false;
+      this.pauseReason = 'Paused. Your progress is saved — resume whenever you like.';
+    },
+
+    requestBackground() {
+      this.$emit('background', this.progressSnapshot());
     },
 
     /**

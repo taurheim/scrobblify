@@ -42,6 +42,21 @@ export interface ScrobbleState {
    */
   lastReTagTimestampSec?: number;
   /**
+   * Second at which a background handoff pinned its ordering.
+   *
+   * The upload digest is committed to the server *before* the redirect to
+   * Last.fm, and the bytes are produced after it. Both derive the track order
+   * from this state, so the sort key has to be pinned — re-evaluating it
+   * against a moved clock could shift a boundary track between the in-window
+   * and out-of-window queues and produce bytes the committed digest does not
+   * describe.
+   *
+   * Optional, like every field added after the format shipped: files written
+   * before this existed must still import, and files written now must still
+   * import into an older cached client.
+   */
+  handoffOrderEpoch?: number;
+  /**
    * Legacy count-based rate-limit fields. Kept so progress files written by
    * older versions still import, and so files written by this version remain
    * readable by them. RateLimitTracker.seedFromLegacyCounts() converts these

@@ -408,12 +408,21 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
         // fail identically; they are reported separately instead.
         return;
       }
+      const reTagged = t.originalTimestampSec === 0;
       tracks.push({
         artist: t.artist,
         track: t.track,
         album: t.album ?? '',
-        timestamp: t.originalTimestampSec * 1000,
-        reTagged: false,
+        /*
+          Re-tagged plays never had a real listen date — the client sends 0 to
+          ask for send-time assignment. Exporting that as-is would hand back a
+          queue stamped 1970, which the client would faithfully preserve
+          (`reTagged: false` suppresses its own inference) and Last.fm would
+          reject wholesale as too old. The placeholder is cosmetic; the flag is
+          what makes the client re-stamp against its own clock.
+        */
+        timestamp: reTagged ? nowSec * 1000 : t.originalTimestampSec * 1000,
+        reTagged,
       });
     });
   }

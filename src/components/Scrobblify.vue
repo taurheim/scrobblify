@@ -4,7 +4,58 @@
       Currently authenticated as: {{ this.$store.state.lfmApi.userName }}.
       <a role="button" tabindex="0" @click="clearToken" @keydown.enter="clearToken">Not you?</a>
     </div>
-    <v-alert v-if="hasResumableState && currentStep <= 2" type="info" prominent class="mb-4">
+
+    <!--
+      A live server-side job outranks everything else on this page. If it is
+      running and the user also has local progress, offering "Resume" would
+      invite them to scrobble the same tracks the server is scrobbling, so the
+      job banner replaces the resume prompt rather than sitting beside it.
+    -->
+    <v-alert v-if="backgroundJob" :type="jobAlertType" prominent class="mb-4">
+      <div>
+        <strong>{{ jobHeadline }}</strong>
+        <v-chip x-small color="deep-purple" text-color="white" class="ml-2">Beta</v-chip>
+      </div>
+      <div class="mt-1">
+        {{ backgroundJob.scrobbled.toLocaleString() }} of
+        {{ backgroundJob.totalTracks.toLocaleString() }} scrobbled<span
+          v-if="backgroundJob.failed > 0"
+        >, {{ backgroundJob.failed.toLocaleString() }} rejected by Last.fm</span>.
+        <span v-if="jobEta">{{ jobEta }}</span>
+      </div>
+      <div v-if="backgroundJob.reason" class="mt-1 text-body-2">{{ backgroundJob.reason }}</div>
+      <div class="mt-2">
+        <v-btn
+          v-if="backgroundJob.state === 'active'"
+          outlined
+          class="mr-2"
+          :loading="backgroundBusy"
+          @click="pauseBackgroundJob"
+        >Pause</v-btn>
+        <v-btn
+          v-else-if="backgroundJob.state === 'paused'"
+          color="primary"
+          class="mr-2"
+          :loading="backgroundBusy"
+          @click="resumeBackgroundJob"
+        >Resume on the server</v-btn>
+        <v-btn outlined class="mr-2" :loading="backgroundBusy" @click="takeBackProgress">
+          Take my progress back
+        </v-btn>
+        <v-btn text @click="refreshBackgroundJob">Refresh</v-btn>
+      </div>
+    </v-alert>
+
+    <v-alert v-if="backgroundNotice" type="warning" class="mb-4">
+      {{ backgroundNotice }}
+    </v-alert>
+
+    <v-alert
+      v-if="hasResumableState && currentStep <= 2 && !backgroundJob"
+      type="info"
+      prominent
+      class="mb-4"
+    >
       <div>
         <strong>Resume previous session?</strong>
         You have saved progress from a previous scrobbling session.
@@ -47,9 +98,12 @@
         </v-stepper-content>
         <v-stepper-content step="4">
           <scrobble-step
+            ref="scrobbleStep"
+            :background-available="backgroundAvailable"
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
             v-on:auto-save="onAutoSave"
+            v-on:background="onBackgroundRequested"
           ></scrobble-step>
         </v-stepper-content>
         <v-stepper-content step="5">
@@ -57,6 +111,13 @@
         </v-stepper-content>
       </v-stepper-items>
     </v-stepper>
+    <background-offer
+      v-model="showBackgroundOffer"
+      :remaining="backgroundRemaining"
+      :all-re-tagged="backgroundAllReTagged"
+      :busy="backgroundBusy"
+      v-on:accept="startBackgroundHandoff"
+    ></background-offer>
     <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
   </div>
 </template>
@@ -78,6 +139,11 @@ import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import RateLimitTracker from '@/services/RateLimitTracker';
 import ErrorDialog from '@/components/ErrorDialog.vue';
+import BackgroundOffer from '@/components/BackgroundOffer.vue';
+import * as background from '@/services/BackgroundScrobbling';
+import {
+  beginHandoff, completeHandoff, uploadListFromState, stateFromExport,
+} from '@/services/BackgroundHandoff';
 import { trackEvent, trackError, resetUser } from '@/services/Analytics';
 
 interface ProgressSnapshot {
@@ -98,6 +164,7 @@ export default Vue.extend({
     'scrobble-step': ScrobbleStepVue,
     'complete-step': CompleteStepVue,
     'error-dialog': ErrorDialog,
+    'background-offer': BackgroundOffer,
   },
   data() {
     return {
@@ -108,10 +175,32 @@ export default Vue.extend({
       showError: false,
       errorMessage: '',
       errorDetails: '',
+      showBackgroundOffer: false,
+      backgroundAvailable: false,
+      backgroundRemaining: 0,
+      backgroundAllReTagged: false,
+      backgroundBusy: false,
+      backgroundJob: null as background.JobStatus | null,
+      backgroundNotice: '',
+      /** Snapshot from the scrobble step, held while the offer dialog is open. */
+      pendingSnapshot: null as ProgressSnapshot | null,
+      /** State to hand off, when the offer came from a resume rather than a live queue. */
+      pendingState: null as ScrobbleState | null,
     };
   },
   async mounted() {
     trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
+
+    // Ordering matters. A handoff coming back from Last.fm must be finished
+    // before anything reads local state, because the upload derives its bytes
+    // from that state and completing the handoff is what clears it.
+    const resumed = await this.resumeHandoffIfReturning();
+    if (resumed) {
+      return;
+    }
+
+    await this.refreshBackgroundJob();
+    await this.probeBackgroundAvailability();
     try {
       this.hasResumableState = await this.stateManager.hasSavedState();
     } catch (e) {
@@ -123,10 +212,274 @@ export default Vue.extend({
       trackEvent('step_viewed', { step, step_name: this.stepName(step) });
     },
   },
+  computed: {
+    jobAlertType(): string {
+      if (!this.backgroundJob) { return 'info'; }
+      if (this.backgroundJob.state === 'completed') { return 'success'; }
+      if (this.backgroundJob.state === 'active') { return 'info'; }
+      return 'warning';
+    },
+    jobHeadline(): string {
+      if (!this.backgroundJob) { return ''; }
+      switch (this.backgroundJob.state) {
+        case 'active':
+          return 'Scrobblify is finishing your import in the background.';
+        case 'paused':
+          return 'Your background import is paused.';
+        case 'completed':
+          return 'Your background import has finished.';
+        case 'needs_reauth':
+          return 'Your background import needs you to reconnect Last.fm.';
+        case 'needs_attention':
+          return 'Your background import has stopped and needs a look.';
+        default:
+          return 'Your background import has stopped.';
+      }
+    },
+    jobEta(): string {
+      const job = this.backgroundJob;
+      if (!job || job.state !== 'active' || !job.estimatedCompletionSec) { return ''; }
+      const days = Math.ceil(job.estimatedCompletionSec / 86400);
+      if (days <= 1) { return 'Should finish within a day.'; }
+      return `Should finish in about ${days} days.`;
+    },
+  },
   methods: {
     stepName(step: number): string {
       return ['', 'authenticate', 'upload', 'select', 'scrobble', 'complete'][step] || String(step);
     },
+
+    // ---- background scrobbling ----
+
+    /**
+     * Whether the offer may be shown at all.
+     *
+     * Deliberately conservative. Every "no" here just leaves the user with the
+     * behaviour they already had, whereas offering a handoff the browser or
+     * server cannot actually complete strands them mid-redirect.
+     */
+    canOfferBackground(remaining: number): boolean {
+      return this.backgroundAvailable
+        && !this.backgroundJob
+        && remaining >= 2700;
+    },
+
+    /**
+     * Asks the server, once, whether it is actually accepting work.
+     *
+     * A build-time flag is not enough. The URL is baked into the bundle, but
+     * the worker behind it may not be deployed, may be down, or may be full —
+     * and a cached bundle outlives any of those. Advertising the feature on
+     * the strength of the flag alone would offer users a handoff that dies at
+     * the first request, after they had already agreed to it.
+     *
+     * Failure is silent and simply means "don't offer".
+     */
+    async probeBackgroundAvailability() {
+      if (!background.isBackgroundConfigured() || !background.canCompress()) {
+        return;
+      }
+      try {
+        const capacity = await background.fetchCapacity();
+        this.backgroundAvailable = !!capacity && capacity.available;
+      } catch (e) {
+        this.backgroundAvailable = false;
+      }
+    },
+
+    /**
+     * Opens the offer for a queue the scrobble step is currently working on.
+     */
+    onBackgroundRequested(info: ProgressSnapshot) {
+      const state = this.buildState(info);
+      const remaining = uploadListFromState(state, Math.floor(Date.now() / 1000)).length;
+      if (!this.canOfferBackground(remaining)) {
+        return;
+      }
+      this.pendingSnapshot = info;
+      this.pendingState = null;
+      this.backgroundRemaining = remaining;
+      this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
+      this.showBackgroundOffer = true;
+      trackEvent('background_offer_shown', {
+        entry_point: 'scrobble_step',
+        track_count: remaining,
+      });
+    },
+
+    async startBackgroundHandoff() {
+      const step = this.$refs.scrobbleStep as any;
+
+      // Halt the loop *before* anything else. The handoff uploads whatever is
+      // remaining right now; every track the loop sends between here and the
+      // redirect would be in that upload too, and the server would scrobble it
+      // again. This is the single largest duplicate risk in the design.
+      this.backgroundBusy = true;
+      if (step && step.haltForHandoff) {
+        await step.haltForHandoff();
+      }
+
+      // The state is rebuilt *after* the halt, from a live snapshot where
+      // there is one, so it describes what is actually left rather than what
+      // was left when the dialog opened.
+      const snapshot = step && step.progressSnapshot ? step.progressSnapshot() : this.pendingSnapshot;
+      const state = snapshot && this.pendingSnapshot
+        ? this.buildState(snapshot)
+        : this.pendingState;
+      if (!state) {
+        this.backgroundBusy = false;
+        return;
+      }
+
+      const username = (this.$store.state.lfmApi as LastFm).getUserName() || state.userName || '';
+      const entryPoint = this.pendingSnapshot ? 'scrobble_step' : 'resume';
+      const result = await beginHandoff(this.stateManager, state, username, entryPoint);
+      if (!result.ok) {
+        this.backgroundBusy = false;
+        this.showBackgroundOffer = false;
+        if (step && step.releaseHandoffHalt) {
+          step.releaseHandoffHalt();
+        }
+        this.backgroundNotice = result.reason === 'at_capacity'
+          ? 'The background service is full right now — it is limited during the beta. Your progress is saved; try again later or keep scrobbling in this tab.'
+          : 'Couldn\'t hand this over to the background service. Your progress is saved and nothing has changed — keep scrobbling in this tab.';
+      }
+      // On success the tab is navigating to Last.fm; leave `busy` set so the
+      // dialog cannot be double-submitted during the redirect.
+    },
+
+    /**
+     * Finishes a handoff that Last.fm has just redirected back to us.
+     *
+     * Returns true when this page load belongs to a handoff, in which case the
+     * caller must not touch local state — the upload reads it and the
+     * finalise clears it.
+     */
+    async resumeHandoffIfReturning(): Promise<boolean> {
+      const params = new URLSearchParams(window.location.search);
+      const handoffParam = params.get('handoff');
+      if (!handoffParam) {
+        return false;
+      }
+
+      if (handoffParam === 'failed') {
+        this.backgroundNotice = 'Last.fm didn\'t complete the handoff, so nothing was started. Your progress is still saved here.';
+        trackEvent('background_handoff_failed', { reason: params.get('reason') || 'callback' });
+        this.stripQuery();
+        return false;
+      }
+
+      const fragment = background.consumeRedirectFragment();
+      const handoffId = (fragment && fragment.handoffId) || background.getPendingHandoff();
+      this.stripQuery();
+      if (!handoffId) {
+        this.backgroundNotice = 'The handoff came back without a session, so nothing was started. Your progress is still saved here.';
+        return false;
+      }
+
+      this.backgroundBusy = true;
+      this.backgroundNotice = 'Uploading your remaining tracks…';
+      let result;
+      try {
+        result = await completeHandoff(this.stateManager, handoffId, (done, total) => {
+          this.backgroundNotice = `Uploading your remaining tracks… ${done} of ${total}`;
+        });
+      } catch (e) {
+        trackError('background.completeHandoff', e);
+        // An unexpected throw tells us nothing about whether the job started,
+        // so this must not fall through to "resume locally".
+        this.backgroundBusy = false;
+        this.backgroundNotice = 'Something went wrong finishing the handoff, and we can\'t tell whether the background import started. Reload this page in a minute — don\'t resume here in the meantime, or your tracks could be scrobbled twice.';
+        return true;
+      }
+      this.backgroundBusy = false;
+
+      if (result.outcome.status === 'active') {
+        this.backgroundNotice = '';
+        this.hasResumableState = false;
+        await this.refreshBackgroundJob();
+        return true;
+      }
+
+      if (result.safeToResumeLocally) {
+        this.backgroundNotice = 'The upload didn\'t finish, so nothing is running on the server. Your progress is exactly where you left it.';
+        return false;
+      }
+
+      this.backgroundNotice = 'We can\'t tell whether the background import started. Reload this page in a minute — don\'t resume here in the meantime, or your tracks could be scrobbled twice.';
+      return true;
+    },
+
+    /**
+     * Removes the handoff parameters so a reload does not re-run the flow.
+     */
+    stripQuery() {
+      try {
+        window.history.replaceState(null, '', window.location.pathname);
+      } catch (e) {
+        trackError('background.stripQuery', e);
+      }
+    },
+
+    async refreshBackgroundJob() {
+      this.backgroundJob = await background.fetchJob();
+    },
+
+    async pauseBackgroundJob() {
+      if (!this.backgroundJob) { return; }
+      this.backgroundBusy = true;
+      await background.jobAction(this.backgroundJob.id, 'pause');
+      await this.refreshBackgroundJob();
+      this.backgroundBusy = false;
+    },
+
+    async resumeBackgroundJob() {
+      if (!this.backgroundJob) { return; }
+      this.backgroundBusy = true;
+      await background.jobAction(this.backgroundJob.id, 'resume');
+      await this.refreshBackgroundJob();
+      this.backgroundBusy = false;
+    },
+
+    /**
+     * Cancels the job and restores what is left of it to this browser.
+     *
+     * The export is fetched *before* the cancel and the local state is written
+     * *before* the server is told to stop, so a failure at any point leaves the
+     * job running rather than leaving the user with nothing.
+     */
+    async takeBackProgress() {
+      if (!this.backgroundJob) { return; }
+      this.backgroundBusy = true;
+      const jobId = this.backgroundJob.id;
+      try {
+        const exported = await background.exportJob(jobId);
+        const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
+        const restored = stateFromExport(
+          exported,
+          username,
+          this.backgroundJob.totalTracks || 0,
+        );
+        if (!restored) {
+          throw new Error('The server did not return your remaining tracks.');
+        }
+        // Saved before the job is cancelled. Cancelling first and then failing
+        // to save would destroy the only copy of the queue.
+        await this.stateManager.saveState(restored);
+        await background.jobAction(jobId, 'cancel');
+        this.backgroundJob = null;
+        this.hasResumableState = true;
+        this.backgroundNotice = 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
+        trackEvent('background_job_reclaimed', { job_id: jobId });
+      } catch (e) {
+        trackError('background.takeBackProgress', e);
+        this.errorMessage = 'Couldn\'t bring your progress back. The background import is still running, so nothing has been lost.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+      }
+      this.backgroundBusy = false;
+    },
+
     /**
      * AuthenticateStep confirms an existing session and then emits `complete`
      * on a 2 second delay (so the "Checking for authentication..." spinner is
@@ -223,6 +576,31 @@ export default Vue.extend({
       this.hasResumableState = false;
       // Skip to scrobble step (step 4)
       this.currentStep = 4;
+
+      // A resume of this size is the clearest signal that the browser is the
+      // wrong place to be doing this: the user has already come back at least
+      // once and still has weeks of it ahead.
+      this.offerBackgroundForState(state, 'resume');
+    },
+
+    /**
+     * Offers background mode for an already-built state, if it qualifies.
+     */
+    offerBackgroundForState(state: ScrobbleState, entryPoint: string) {
+      const remaining = uploadListFromState(state, Math.floor(Date.now() / 1000)).length;
+      if (!this.canOfferBackground(remaining)) {
+        return;
+      }
+      // The offer needs a snapshot it can rebuild the state from at accept
+      // time. Everything it needs is already in `state`, so reuse it directly
+      // rather than reconstructing a ProgressSnapshot that would lose the
+      // completed/failed index sets.
+      this.pendingSnapshot = null;
+      this.pendingState = state;
+      this.backgroundRemaining = remaining;
+      this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
+      this.showBackgroundOffer = true;
+      trackEvent('background_offer_shown', { entry_point: entryPoint, track_count: remaining });
     },
 
     /**

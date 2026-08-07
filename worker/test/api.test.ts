@@ -99,21 +99,22 @@ function req(path: string, init: RequestInit & { token?: string } = {}): Request
   return new Request(`https://api.savas.ca${path}`, { ...init, headers });
 }
 
-function tracksNdjson(count: number): Uint8Array {
+function tracksNdjson(count: number, reTagged = false): Uint8Array {
   const lines: string[] = [];
   for (let i = 0; i < count; i += 1) {
     lines.push(JSON.stringify({
       artist: `Artist ${i}`,
       track: `Track ${i}`,
       album: 'Album',
-      originalTimestampSec: 1_700_000_000 + i,
+      // 0 is how the client asks for send-time assignment; see toUploadTrack.
+      originalTimestampSec: reTagged ? 0 : 1_700_000_000 + i,
     }));
   }
   return new TextEncoder().encode(lines.join('\n'));
 }
 
 async function seedJob(sql: Sql, blobs: BlobStore, username: string, opts: {
-  total?: number; cursor?: number; live?: boolean; state?: string;
+  total?: number; cursor?: number; live?: boolean; state?: string; reTagged?: boolean;
 } = {}): Promise<string> {
   const total = opts.total ?? 100;
   const id = randomId();
@@ -128,7 +129,7 @@ async function seedJob(sql: Sql, blobs: BlobStore, username: string, opts: {
       NOW, NOW, NOW + 60 * 86400,
     ],
   );
-  const raw = tracksNdjson(total);
+  const raw = tracksNdjson(total, opts.reTagged);
   const gz = await gzip(raw);
   const buf = gz.buffer.slice(gz.byteOffset, gz.byteOffset + gz.byteLength) as ArrayBuffer;
   await uploadChunk(sql, blobs, {
@@ -483,6 +484,31 @@ async function main() {
       body.state.tracks[0]);
     check('timestamps are milliseconds, as the client uses',
       body.state.tracks[0].timestamp > 1e12, body.state.tracks[0].timestamp);
+    check('tracks with a real listen date are not marked re-tagged',
+      body.state.tracks.every((t: any) => t.reTagged === false));
+  }
+
+  console.log('\n-- a re-tagged job survives the round trip --');
+  {
+    /*
+      Re-tagged plays are stored with originalTimestampSec 0, meaning "assign
+      one at send time". Exporting that literally would hand back a queue
+      stamped 1970 with reTagged false, which the client preserves verbatim
+      (an explicit false suppresses its own inference) and Last.fm rejects
+      wholesale as older than 14 days — a silent total loss of the export.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 40, reTagged: true });
+    const token = await issueSession('listener', SIGNING, NOW);
+    const body: any = await (await handleRequest(env,
+      req(`/scrobblify/job/${id}/export`, { token }))).json();
+
+    check('re-tagged tracks come back flagged',
+      body.state.tracks.every((t: any) => t.reTagged === true), body.state.tracks[0]);
+    check('and never with a 1970 timestamp',
+      body.state.tracks.every((t: any) => t.timestamp > 1e12), body.state.tracks[0]);
   }
 
   console.log('\n-- unknown routes --');
