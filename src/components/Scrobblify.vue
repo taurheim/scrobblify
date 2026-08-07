@@ -481,14 +481,15 @@ export default Vue.extend({
         // No handoff id means it never got as far as preflight, so nothing was
         // ever reserved and the freeze can simply lift.
         if (!owner.id) {
-          background.setQueueOwner(null);
+          background.releaseQueueOwnerIfSame(owner);
           this.ownershipBlocked = false;
           trackEvent('background_freeze_released', { reason: 'no_handoff' });
           return;
         }
         const active = await background.isHandoffActive(owner.id);
         if (active === false) {
-          background.setQueueOwner(null);
+          // Only if the freeze we examined is still the one on record.
+          background.releaseQueueOwnerIfSame(owner);
           this.ownershipBlocked = false;
           trackEvent('background_freeze_released', { reason: 'handoff_inactive' });
           return;
@@ -502,7 +503,8 @@ export default Vue.extend({
 
       const live = await background.hasLiveJob(owner.id);
       if (live === false) {
-        background.setQueueOwner(null);
+        // Only if the record we examined is still the one on record.
+        background.releaseQueueOwnerIfSame(owner);
         this.ownershipBlocked = false;
         try {
           this.hasResumableState = await this.stateManager.hasSavedState();
@@ -537,6 +539,9 @@ export default Vue.extend({
      */
     async resolveOwnership(marker: background.OwnershipMarker) {
       this.showReauth = false;
+      // Captured before the round-trip so the release below can prove the
+      // record it clears is the one this answer is actually about.
+      const observed = background.queueOwner();
       const active = await background.resolveOwnershipMarker(marker);
 
       if (active === true) {
@@ -577,8 +582,12 @@ export default Vue.extend({
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         // Released origin-wide: this is a definitive "the browser owns it"
-        // answer, so other tabs may scrobble again too.
-        background.setQueueOwner(null);
+        // answer, so other tabs may scrobble again too — but only if the
+        // record is still the one this answer was about. Another tab may have
+        // established a new freeze while the request was in flight.
+        if (observed) {
+          background.releaseQueueOwnerIfSame(observed);
+        }
         // Cleared alongside the marker: this is a definitive "the browser owns
         // it" answer, so leaving the gate closed would hide a queue we have
         // just proved is safe to resume.
@@ -981,6 +990,16 @@ export default Vue.extend({
       if (!this.backgroundJob) { return; }
       this.backgroundBusy = true;
       const jobId = this.backgroundJob.id;
+      /*
+        One claim for the whole take-back, not just the export loop.
+
+        The server accepts an export retry only from the claimant, so a fresh
+        token per attempt would lock this take-back out of its own claim. The
+        cancel at the end presents it too: cancelling deletes the blobs, and
+        the server refuses a cancel during an active export unless the caller
+        can prove it owns that export.
+      */
+      const exportClaim = background.newExportClaim();
       try {
         if (!await background.jobAction(jobId, 'pause')) {
           throw new Error('The background import could not be paused.');
@@ -989,7 +1008,7 @@ export default Vue.extend({
         // A Last.fm request can take fifteen seconds, and a batch mid-flight is
         // still after the cursor, so it would be exported *and* sent. The
         // server rejects the export with 409 until that settles.
-        const exported = await this.exportWhenQuiescent(jobId);
+        const exported = await this.exportWhenQuiescent(jobId, exportClaim);
         const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
         const restored = stateFromExport(
           exported,
@@ -999,6 +1018,17 @@ export default Vue.extend({
         if (!restored) {
           throw new Error('The server did not return your remaining tracks.');
         }
+        /*
+          The seconds the worker actually used are folded into the lineage
+          before anything is cleared. `stateFromExport` only *consults* them to
+          pick this cycle's band; once the job is cancelled they exist nowhere
+          else, and a second handover would then allocate over them.
+        */
+        const carriedLineage = background.mergeExportedRanges(
+          (background.getHandoffLineage() || {}).reTagUsedRanges,
+          exported.usedRanges,
+          !!exported.usedRangesTruncated,
+        );
         // Saved before the job is cancelled. Cancelling first and then failing
         // to save would destroy the only copy of the queue.
         await this.stateManager.saveState(restored);
@@ -1015,7 +1045,7 @@ export default Vue.extend({
         // Only a *confirmed* cancel releases local ownership. A cancel whose
         // request never arrived leaves the job alive, and showing "Resume"
         // then invites the user to scrobble everything a second time.
-        if (!await background.jobAction(jobId, 'cancel')) {
+        if (!await background.jobAction(jobId, 'cancel', exportClaim)) {
           this.backgroundNotice = 'Your tracks were copied back, but the background import could not be stopped, so this browser will not resume them yet. Use "Take my progress back" again in a moment.';
           await this.refreshBackgroundJob();
           this.backgroundBusy = false;
@@ -1031,7 +1061,7 @@ export default Vue.extend({
         background.releaseQueueOwnerIfUnclaimed(jobId);
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
-        background.clearHandoffLineage();
+        background.clearHandoffLineage(carriedLineage);
         this.backgroundNotice = 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
         trackEvent('background_job_reclaimed', { job_id: jobId });
       } catch (e) {
@@ -1058,12 +1088,8 @@ export default Vue.extend({
      * previous version inferred quiescence from a status call returning
      * nothing, which reads an unreachable server as "the job is gone".
      */
-    async exportWhenQuiescent(jobId: string): Promise<any> {
+    async exportWhenQuiescent(jobId: string, claim: string): Promise<any> {
       let lastReason = 'unreachable';
-      // One claim for the whole loop. The server accepts a retry only from the
-      // claimant, so generating a fresh one per attempt would lock the
-      // take-back out of its own claim.
-      const claim = background.newExportClaim();
       /*
         Budgeted to outlast a lease *and* a missed sweep.
 

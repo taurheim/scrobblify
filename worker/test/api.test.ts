@@ -256,7 +256,7 @@ async function main() {
     const victimJob = await seedJob(sql, blobs, 'victim');
     const attacker = await issueSession('attacker', SIGNING, NOW);
 
-    for (const [action, method] of [['pause', 'POST'], ['resume', 'POST'], ['cancel', 'POST'], ['export', 'GET']] as const) {
+    for (const [action, method] of [['pause', 'POST'], ['resume', 'POST'], ['cancel', 'POST'], ['export', 'POST']] as const) {
       // eslint-disable-next-line no-await-in-loop
       const res = await handleRequest(env, req(
         `/scrobblify/job/${victimJob}/${action}`, { method, token: attacker },
@@ -577,9 +577,10 @@ async function main() {
     check('and it cannot be resumed out from under the export',
       resumed.status === 409, resumed.status);
 
-    // Cancel is the take-back *completing*, so it must still work.
-    const cancelled = await handleRequest(env2,
-      req(`/scrobblify/job/${id}/cancel`, { method: 'POST', token }));
+    // Cancel is the take-back *completing*, so it must still work — but only
+    // for the claimant, since cancelling deletes the blobs the export reads.
+    const cancelled = await handleRequest(env2, req(`/scrobblify/job/${id}/cancel`,
+      { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }));
     check('cancel still works from exporting', cancelled.status === 200, cancelled.status);
   }
 
@@ -665,6 +666,42 @@ async function main() {
         && (i === 0 || r.from > body.usedRanges[i - 1].to)), body.usedRanges);
     check('a complete list is not reported as truncated',
       body.usedRangesTruncated === false, body.usedRangesTruncated);
+  }
+
+  console.log('\n-- cancelling during an export needs that export\'s claim --');
+  {
+    /*
+      Cancel deletes the blobs and the export reads them, so a second
+      authorised caller cancelling mid-read would destroy the queue at the one
+      moment it exists nowhere else. The session is a bearer token, so "the UI
+      would not do that" is not an argument.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 0, state: 'paused' });
+    const token = await issueSession('listener', SIGNING, NOW);
+
+    await handleRequest(env, req(`/scrobblify/job/${id}/export`,
+      { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }));
+    check('the export left the job claimed',
+      (await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]))!.state === 'exporting');
+
+    const noClaim = await handleRequest(env,
+      req(`/scrobblify/job/${id}/cancel`, { method: 'POST', token }));
+    check('a cancel with no claim is refused', noClaim.status === 409, noClaim.status);
+
+    const wrongClaim = await handleRequest(env, req(`/scrobblify/job/${id}/cancel`,
+      { method: 'POST', token, body: JSON.stringify({ claim: 'some-other-claim-token' }) }));
+    check('a cancel with a foreign claim is refused',
+      wrongClaim.status === 409, wrongClaim.status);
+    check('and the job is still exporting, not cancelled',
+      (await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]))!.state === 'exporting');
+
+    const ok = await handleRequest(env, req(`/scrobblify/job/${id}/cancel`,
+      { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }));
+    check('the claimant may cancel', ok.status === 200, ok.status);
+    check('and the job is cancelled', (await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]))!.state === 'cancelled');
   }
 
   console.log('\n-- unknown routes --');

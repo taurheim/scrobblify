@@ -477,6 +477,28 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       return exportJob(env, job, nowSec, exportBody);
     }
     if (action === 'cancel') {
+      /*
+        A cancel during an active export must present that export's claim.
+
+        Cancelling deletes the blobs, and the export reads them. The normal UI
+        only cancels after its export has returned, so this is not reachable by
+        ordinary interaction — but the session is a bearer token, and a second
+        authorised caller cancelling mid-read would delete the queue out from
+        under a client that is about to save it. That is the one irreversible
+        outcome in this whole flow: the tracks exist nowhere else at that
+        moment.
+      */
+      if (job.state === 'exporting' && job.export_claim) {
+        let cancelBody: any = null;
+        try {
+          cancelBody = await request.json();
+        } catch {
+          cancelBody = null;
+        }
+        if (!cancelBody || cancelBody.claim !== job.export_claim) {
+          return json(env, { error: 'export_in_progress' }, 409);
+        }
+      }
       // Order matters: the export is built from the blob, so the blob is only
       // deleted after the caller has had the chance to take it. Deleting first
       // strands the user's progress permanently.

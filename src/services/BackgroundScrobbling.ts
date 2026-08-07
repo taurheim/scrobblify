@@ -227,11 +227,18 @@ export interface HandoffLineage {
 /**
  * How many re-tag ranges the lineage keeps.
  *
- * Only the *lowest* bound actually constrains the next reservation, so the
- * list is trimmed from the top. The rest are kept because they make a
- * misallocation diagnosable after the fact, which a single number would not.
+ * Which ones are kept matters more than how many. The old allocator reserved
+ * below the *lowest* used second, so the lowest ranges were the only ones that
+ * constrained it and trimming the high end was free. The gap search inverted
+ * that: it walks down from the present, so the ranges it collides with first
+ * are the *highest* ones, and dropping those is what causes a reused second.
+ * The low end is the safe end to lose — those ranges age out of Last.fm's
+ * window on their own, at which point nothing can be scrobbled into them.
+ *
+ * Raised alongside the change of policy, because the gap search genuinely
+ * consults every range rather than reducing them to one bound.
  */
-const MAX_LINEAGE_RANGES = 32;
+const MAX_LINEAGE_RANGES = 128;
 
 /**
  * Last.fm's accepted-timestamp window. A range entirely older than this can no
@@ -242,14 +249,17 @@ const RETAG_WINDOW_LIMIT_SECONDS = 13 * 86400;
 function sanitizeRanges(raw: unknown): { from: number; to: number }[] {
   if (!Array.isArray(raw)) { return []; }
   const cutoff = Math.floor(Date.now() / 1000) - RETAG_WINDOW_LIMIT_SECONDS;
-  return raw
+  const kept = raw
     .filter((r): r is { from: number; to: number } => !!r
       && Number.isFinite((r as any).from) && Number.isFinite((r as any).to)
       && (r as any).from > 0 && (r as any).to >= (r as any).from
       && (r as any).to > cutoff)
     .map((r) => ({ from: Math.floor(r.from), to: Math.floor(r.to) }))
-    .sort((a, b) => a.from - b.from)
+    // Highest first, so the cap drops the oldest rather than the newest.
+    .sort((a, b) => b.to - a.to)
     .slice(0, MAX_LINEAGE_RANGES);
+  // Stored ascending, which is how every consumer expects to read them.
+  return kept.sort((a, b) => a.from - b.from);
 }
 
 /**
@@ -268,6 +278,31 @@ export function mergeReTagRange(
     all.push({ from: Math.floor(range.from), to: Math.floor(range.to) });
   }
   return sanitizeRanges(all);
+}
+
+/**
+ * Folds the seconds a worker job actually used back into the lineage.
+ *
+ * A take-back consults the exported ranges when it picks the browser's next
+ * band, but consulting them is not remembering them. Once the job is cancelled
+ * those ranges exist nowhere else, so a *second* handover-and-take-back cycle
+ * would allocate as though the first job's scrobbles had never happened — and
+ * Last.fm discards a repeat of (artist, track, timestamp) while reporting it
+ * accepted, so the loss is invisible from both ends.
+ *
+ * `truncated` is carried through as a refusal rather than a partial merge:
+ * an incomplete list would leave gaps that look free and are not.
+ */
+export function mergeExportedRanges(
+  existing: { from: number; to: number }[] | undefined,
+  exported: unknown,
+  truncated: boolean,
+): { from: number; to: number }[] {
+  const base = sanitizeRanges(existing);
+  if (truncated) {
+    return base;
+  }
+  return sanitizeRanges([...base, ...sanitizeRanges(exported)]);
 }
 
 export function setHandoffLineage(lineage: HandoffLineage): void {
@@ -299,7 +334,7 @@ export function getHandoffLineage(): HandoffLineage | null {
   }
 }
 
-export function clearHandoffLineage(): void {
+export function clearHandoffLineage(keepRanges?: { from: number; to: number }[]): void {
   try {
     /*
       The re-tag history outlives the lineage that carried it.
@@ -310,11 +345,17 @@ export function clearHandoffLineage(): void {
       consumed. Dropping them would let the next reservation land on them, and
       Last.fm discards those plays without reporting an error.
 
+      `keepRanges` lets a take-back hand in the seconds the *worker* used,
+      which are not in the stored lineage — the job that owned them is about
+      to be cancelled, so this is the last moment they can be recorded.
+
       The counts really are cosmetic and are dropped. If nothing is left worth
       keeping the key goes too.
     */
     const existing = getHandoffLineage();
-    const ranges = existing ? sanitizeRanges(existing.reTagUsedRanges) : [];
+    const ranges = keepRanges
+      ? sanitizeRanges(keepRanges)
+      : sanitizeRanges(existing ? existing.reTagUsedRanges : []);
     if (ranges.length === 0) {
       window.localStorage.removeItem(LINEAGE_STORAGE_KEY);
       return;
@@ -464,6 +505,35 @@ export function freezeAttemptIsFresh(record: QueueOwner, nowMs = Date.now()): bo
   // A token from the future means a clock change; treated as fresh, since the
   // conservative reading of an unusable timestamp is "someone is working".
   return mintedAt > nowMs || nowMs - mintedAt < FREEZE_ATTEMPT_FRESH_MS;
+}
+
+/**
+ * Clears ownership only if it is still exactly the record the caller examined.
+ *
+ * Every release here follows an `await` on a network round-trip, and the
+ * record can change underneath it: a status request about an old job can be
+ * in flight while another tab establishes a *new* freeze, and the reply —
+ * "that job is finished" — is then true but no longer about the record being
+ * cleared. Releasing on it lets every sibling resume into the middle of the
+ * new handover.
+ *
+ * Comparing the whole identity rather than the id alone matters because the
+ * two fields move independently: the same handoff id appears first under
+ * `freezing` and then under `server`, and those are different situations.
+ *
+ * Returns whether the record was cleared.
+ */
+export function releaseQueueOwnerIfSame(expected: QueueOwner): boolean {
+  const current = queueOwner();
+  if (!current) {
+    return false;
+  }
+  if (current.owner !== expected.owner || current.id !== expected.id
+    || current.attempt !== expected.attempt) {
+    return false;
+  }
+  setQueueOwner(null);
+  return true;
 }
 
 /**
@@ -1261,9 +1331,19 @@ export async function resolveOwnershipMarker(
   return isHandoffActive(marker.id);
 }
 
-export async function jobAction(jobId: string, action: 'pause' | 'resume' | 'cancel'): Promise<boolean> {
+export async function jobAction(
+  jobId: string,
+  action: 'pause' | 'resume' | 'cancel',
+  claim?: string,
+): Promise<boolean> {
   try {
-    const res = await request(`/scrobblify/job/${jobId}/${action}`, { method: 'POST' });
+    // The claim is only meaningful for a cancel that follows this client's own
+    // export; the server demands it to stop a second caller deleting the blobs
+    // while an export is still reading them.
+    const res = await request(`/scrobblify/job/${jobId}/${action}`, {
+      method: 'POST',
+      ...(claim ? { body: JSON.stringify({ claim }) } : {}),
+    });
     return res.ok;
   } catch {
     return false;
