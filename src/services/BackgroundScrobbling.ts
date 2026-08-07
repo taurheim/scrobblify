@@ -19,6 +19,13 @@ const API_BASE = process.env.VUE_APP_BACKGROUND_API || '';
 
 const SESSION_STORAGE_KEY = 'scrobblify.background.session';
 const HANDOFF_STORAGE_KEY = 'scrobblify.background.handoff';
+/**
+ * Set when we know a handoff happened but not whether the server took
+ * ownership. Kept out of `clearSession` on purpose: losing the session token
+ * makes the uncertainty worse, not better.
+ */
+const UNRESOLVED_STORAGE_KEY = 'scrobblify.background.unresolved';
+const LINEAGE_STORAGE_KEY = 'scrobblify.background.lineage';
 
 export interface Capacity {
   available: boolean;
@@ -106,6 +113,99 @@ export function getPendingHandoff(): string | null {
 export function setPendingHandoff(id: string): void {
   try {
     window.localStorage.setItem(HANDOFF_STORAGE_KEY, id);
+  } catch {
+    // Nothing to do.
+  }
+}
+
+export function clearPendingHandoff(): void {
+  try {
+    window.localStorage.removeItem(HANDOFF_STORAGE_KEY);
+  } catch {
+    // Nothing to do.
+  }
+}
+
+/**
+ * Records that we could not establish whether the server owns the queue.
+ *
+ * Component state does not survive a reload, and the recovery we ask the user
+ * to perform *is* a reload. Without a durable marker, a reload after an
+ * unresolved finalise reads IndexedDB, finds a queue, and cheerfully offers
+ * "Resume" — while a worker may be scrobbling the very same tracks.
+ *
+ * Absence of the marker means "resolved". Only a positive answer from the
+ * server clears it.
+ */
+export function setOwnershipUnresolved(handoffId: string): void {
+  try {
+    window.localStorage.setItem(UNRESOLVED_STORAGE_KEY, handoffId);
+  } catch {
+    // Private browsing. Nothing better is available; the in-memory path still
+    // refuses to resume for the life of this page.
+  }
+}
+
+export function getOwnershipUnresolved(): string | null {
+  try {
+    return window.localStorage.getItem(UNRESOLVED_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function clearOwnershipUnresolved(): void {
+  try {
+    window.localStorage.removeItem(UNRESOLVED_STORAGE_KEY);
+  } catch {
+    // Nothing to do.
+  }
+}
+
+/**
+ * How far the import had already got when it was handed over.
+ *
+ * The progress bar counts against the size of the *original* import, not the
+ * remainder. That lineage lives in the saved state, which is deliberately
+ * destroyed once the server takes ownership, and the server is never told it —
+ * it only ever receives the tracks still outstanding. Without a durable copy, a
+ * take-back would restart the bar at "0 of 4,000" for a user who had already
+ * scrobbled 20,000, which reads as lost work.
+ *
+ * Purely cosmetic: every consumer treats a missing record as "no lineage" and
+ * falls back to the remaining count.
+ */
+export interface HandoffLineage {
+  originalTotalTracks: number;
+  originalSucceededCount: number;
+}
+
+export function setHandoffLineage(lineage: HandoffLineage): void {
+  try {
+    window.localStorage.setItem(LINEAGE_STORAGE_KEY, JSON.stringify(lineage));
+  } catch {
+    // Cosmetic only — the progress bar falls back to the remaining count.
+  }
+}
+
+export function getHandoffLineage(): HandoffLineage | null {
+  try {
+    const raw = window.localStorage.getItem(LINEAGE_STORAGE_KEY);
+    if (!raw) { return null; }
+    const parsed = JSON.parse(raw);
+    const total = Number(parsed.originalTotalTracks);
+    const succeeded = Number(parsed.originalSucceededCount);
+    if (!Number.isFinite(total) || !Number.isFinite(succeeded)) { return null; }
+    return { originalTotalTracks: total, originalSucceededCount: succeeded };
+  } catch {
+    // Corrupt or unreadable. Cosmetic, so degrade rather than throw.
+    return null;
+  }
+}
+
+export function clearHandoffLineage(): void {
+  try {
+    window.localStorage.removeItem(LINEAGE_STORAGE_KEY);
   } catch {
     // Nothing to do.
   }
@@ -327,7 +427,18 @@ export async function uploadAndFinalize(
 /**
  * Resolves an `unknown` outcome by asking the server what actually happened.
  *
- * The client may only resume locally when this returns `false`.
+ * Tri-state on purpose:
+ *   true  — the worker owns these tracks
+ *   false — it definitively does not, and never will for this handoff
+ *   null  — we cannot tell yet
+ *
+ * The client may only resume locally on `false`. An in-flight state such as
+ * `finalizing` is `null`, not `false`: the finalise whose response we lost may
+ * be a moment away from activating the job, and reading that as "inactive" is
+ * exactly how the tab and the worker end up scrobbling the same tracks.
+ *
+ * Older workers do not send `resolved`. They are treated as unresolved unless
+ * they say `active`, because their `false` cannot be trusted to be terminal.
  */
 export async function isHandoffActive(handoffId: string): Promise<boolean | null> {
   try {
@@ -336,7 +447,10 @@ export async function isHandoffActive(handoffId: string): Promise<boolean | null
       return null;
     }
     const body = await res.json();
-    return body.active === true;
+    if (body.active === true) {
+      return true;
+    }
+    return body.resolved === true ? false : null;
   } catch {
     return null;
   }

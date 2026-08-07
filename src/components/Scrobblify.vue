@@ -187,6 +187,8 @@ export default Vue.extend({
       pendingSnapshot: null as ProgressSnapshot | null,
       /** State to hand off, when the offer came from a resume rather than a live queue. */
       pendingState: null as ScrobbleState | null,
+      /** Retained so the listener can be removed again. Not reactive state. */
+      onPageShow: null as ((event: PageTransitionEvent) => void) | null,
     };
   },
   async mounted() {
@@ -215,7 +217,37 @@ export default Vue.extend({
       // IndexedDB not available — not critical, just skip resume
     }
 
+    // ...but ownership is not an enhancement, so it *is* awaited. A previous
+    // visit may have ended without establishing whether the server took the
+    // queue, and offering Resume in that state is how the tab and the worker
+    // end up scrobbling the same tracks.
+    await this.resolveOwnership();
+
     this.probeBackgroundAvailability();
+
+    /*
+      Back-forward cache recovery.
+
+      Handing over navigates this tab to Last.fm with `backgroundBusy` left set
+      and the scrobble loop halted, deliberately: it stops the dialog being
+      submitted twice while the redirect is in flight. If the user then presses
+      Back instead of authorising, the browser may restore this exact page from
+      the bfcache — same JavaScript state, no `mounted()`, no reload — leaving a
+      permanently busy screen with a stopped loop and no way out but a refresh.
+
+      `pageshow` with `persisted` is the only event that fires in that case.
+    */
+    this.onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        this.recoverFromBfcache();
+      }
+    };
+    window.addEventListener('pageshow', this.onPageShow);
+  },
+  beforeDestroy() {
+    if (this.onPageShow) {
+      window.removeEventListener('pageshow', this.onPageShow);
+    }
   },
   watch: {
     currentStep(step: number) {
@@ -272,6 +304,56 @@ export default Vue.extend({
       return this.backgroundAvailable
         && !this.backgroundJob
         && remaining >= 2700;
+    },
+
+    /**
+     * Settles a handoff whose outcome was never established.
+     *
+     * A previous visit may have uploaded a queue and then lost the finalise
+     * response, or failed to clear local state after the server took over. In
+     * both cases IndexedDB still holds a queue the worker may be scrobbling,
+     * and the ordinary startup path would offer to resume it.
+     *
+     * Only two answers are acted on. "Active" means the server owns it, so the
+     * local copy goes. "Definitively inactive" means it does not, so the user
+     * carries on as normal. Anything else — including a network failure —
+     * leaves the marker in place and Resume withheld, because at this scale an
+     * unnecessary delay is recoverable and a duplicated import is not.
+     */
+    async resolveOwnership() {
+      const handoffId = background.getOwnershipUnresolved();
+      if (!handoffId) {
+        return;
+      }
+
+      const active = await background.isHandoffActive(handoffId);
+
+      if (active === true) {
+        try {
+          await this.stateManager.clearState();
+          this.hasResumableState = false;
+        } catch (e) {
+          trackError('background.resolveOwnershipClear', e);
+        }
+        background.clearOwnershipUnresolved();
+        background.clearPendingHandoff();
+        await this.refreshBackgroundJob();
+        this.backgroundNotice = 'Your import was handed over successfully and is running on the server.';
+        trackEvent('background_ownership_resolved', { outcome: 'server_owns' });
+        return;
+      }
+
+      if (active === false) {
+        background.clearOwnershipUnresolved();
+        background.clearPendingHandoff();
+        trackEvent('background_ownership_resolved', { outcome: 'client_owns' });
+        return;
+      }
+
+      // Unresolved. Withhold Resume rather than risk a duplicate import.
+      this.hasResumableState = false;
+      this.backgroundNotice = 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
+      trackEvent('background_ownership_unresolved');
     },
 
     /**
@@ -341,7 +423,18 @@ export default Vue.extend({
       // again. This is the single largest duplicate risk in the design.
       this.backgroundBusy = true;
       if (step && step.haltForHandoff) {
-        await step.haltForHandoff();
+        const halted = await step.haltForHandoff();
+        if (!halted) {
+          // The loop did not stop within the timeout. Handing over now would
+          // leave the tab sending tracks that are also in the uploaded list,
+          // which is the one outcome worse than not offering the feature.
+          this.backgroundBusy = false;
+          this.showBackgroundOffer = false;
+          step.releaseHandoffHalt();
+          this.backgroundNotice = 'Couldn\'t pause this tab\'s scrobbling in time, so the handover was cancelled to avoid sending anything twice. Nothing has changed — try again in a moment.';
+          trackEvent('background_handoff_failed', { reason: 'halt_timeout' });
+          return;
+        }
       }
 
       // The state is rebuilt *after* the halt, from a live snapshot where
@@ -358,6 +451,14 @@ export default Vue.extend({
 
       const username = (this.$store.state.lfmApi as LastFm).getUserName() || state.userName || '';
       const entryPoint = this.pendingSnapshot ? 'scrobble_step' : 'resume';
+
+      // Recorded before the redirect. The saved state is destroyed once the
+      // server takes ownership, and it is the only place this lineage lives.
+      background.setHandoffLineage({
+        originalTotalTracks: state.originalTotalTracks || state.totalTracks,
+        originalSucceededCount: state.originalSucceededCount || 0,
+      });
+
       const result = await beginHandoff(this.stateManager, state, username, entryPoint);
       if (!result.ok) {
         this.backgroundBusy = false;
@@ -371,6 +472,40 @@ export default Vue.extend({
       }
       // On success the tab is navigating to Last.fm; leave `busy` set so the
       // dialog cannot be double-submitted during the redirect.
+    },
+
+    /**
+     * Undoes the "navigating away" state after a bfcache restore.
+     *
+     * Reaching here means the user went to Last.fm and came back without
+     * authorising, so no job can exist: the upload only happens after the
+     * callback returns. The handoff row the server is holding is `pending_upload`
+     * and gets reaped on its own.
+     *
+     * The one case that must not be released is an *unresolved* handoff from
+     * some earlier attempt, where the server may genuinely own the queue.
+     * That check is cheap and local, so it is done before anything is undone.
+     */
+    recoverFromBfcache() {
+      if (background.getOwnershipUnresolved()) {
+        return;
+      }
+      if (!this.backgroundBusy && !this.showBackgroundOffer) {
+        return;
+      }
+
+      this.backgroundBusy = false;
+      this.showBackgroundOffer = false;
+      background.clearPendingHandoff();
+      background.clearHandoffLineage();
+
+      const step = this.$refs.scrobbleStep as any;
+      if (step && step.releaseHandoffHalt) {
+        step.releaseHandoffHalt();
+      }
+
+      this.backgroundNotice = 'The handover wasn\'t completed, so nothing was started. Your progress is still here — carry on in this tab, or try handing it over again.';
+      trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore' });
     },
 
     /**
@@ -469,15 +604,39 @@ export default Vue.extend({
     /**
      * Cancels the job and restores what is left of it to this browser.
      *
-     * The export is fetched *before* the cancel and the local state is written
-     * *before* the server is told to stop, so a failure at any point leaves the
-     * job running rather than leaving the user with nothing.
+     * Ordering is the whole correctness argument, and it has to satisfy two
+     * opposing constraints at once:
+     *
+     *   - Cancelling first would be lossy: the cancel deletes the job's blobs,
+     *     and the export is built from them.
+     *   - Exporting first is racy: the worker keeps scrobbling and advancing
+     *     its cursor while the export is in flight, so tracks it sent after
+     *     the snapshot are still in the returned queue and would be scrobbled
+     *     again locally.
+     *
+     * So the job is *paused* first and confirmed stopped, and only then
+     * exported. A paused job is not claimed by `acquireJob`, and a tick
+     * already in flight re-reads the state before each batch, so a confirmed
+     * pause means the cursor is no longer moving.
      */
     async takeBackProgress() {
       if (!this.backgroundJob) { return; }
       this.backgroundBusy = true;
       const jobId = this.backgroundJob.id;
       try {
+        if (!await background.jobAction(jobId, 'pause')) {
+          throw new Error('The background import could not be paused.');
+        }
+
+        // Confirm rather than assume. `pause` returning 200 means the row was
+        // updated, but a tick already holding the lease finishes its current
+        // batch first; exporting before it settles would snapshot a cursor
+        // that is still moving.
+        const settled = await this.awaitJobQuiescent(jobId);
+        if (!settled) {
+          throw new Error('The background import did not stop in time.');
+        }
+
         const exported = await background.exportJob(jobId);
         const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
         const restored = stateFromExport(
@@ -491,18 +650,63 @@ export default Vue.extend({
         // Saved before the job is cancelled. Cancelling first and then failing
         // to save would destroy the only copy of the queue.
         await this.stateManager.saveState(restored);
-        await background.jobAction(jobId, 'cancel');
+
+        // Only a *confirmed* cancel releases local ownership. A cancel whose
+        // request never arrived leaves the job alive, and showing "Resume"
+        // then invites the user to scrobble everything a second time.
+        if (!await background.jobAction(jobId, 'cancel')) {
+          this.backgroundNotice = 'Your tracks were copied back, but the background import could not be stopped, so this browser will not resume them yet. Use "Take my progress back" again in a moment.';
+          await this.refreshBackgroundJob();
+          this.backgroundBusy = false;
+          return;
+        }
+
         this.backgroundJob = null;
         this.hasResumableState = true;
+        background.clearHandoffLineage();
         this.backgroundNotice = 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
         trackEvent('background_job_reclaimed', { job_id: jobId });
       } catch (e) {
         trackError('background.takeBackProgress', e);
-        this.errorMessage = 'Couldn\'t bring your progress back. The background import is still running, so nothing has been lost.';
+        // The job may have been left paused. Say so, and re-read its real
+        // state rather than leaving a stale banner on screen.
+        await this.refreshBackgroundJob();
+        this.errorMessage = 'Couldn\'t bring your progress back. Your tracks are still safe on the server — nothing has been lost or scrobbled twice.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
       }
       this.backgroundBusy = false;
+    },
+
+    /**
+     * Waits for a paused job to stop moving.
+     *
+     * "Paused" in the database and "not currently sending" are different
+     * things: a tick that already holds the lease finishes its batch first. A
+     * stable cursor across consecutive polls is the observable proof that it
+     * has, which is what makes the export that follows a true snapshot.
+     */
+    async awaitJobQuiescent(jobId: string): Promise<boolean> {
+      let lastCursor = -1;
+      let stableReads = 0;
+      for (let i = 0; i < 20; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const job = await background.fetchJob();
+        if (!job || job.id !== jobId) {
+          // The job is gone entirely, so nothing is scrobbling it.
+          return true;
+        }
+        if (job.state === 'paused' || job.state === 'needs_attention' || job.state === 'needs_reauth') {
+          stableReads = job.scrobbled === lastCursor ? stableReads + 1 : 0;
+          lastCursor = job.scrobbled;
+          if (stableReads >= 2) {
+            return true;
+          }
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((resolve) => { setTimeout(resolve, 1500); });
+      }
+      return false;
     },
 
     /**

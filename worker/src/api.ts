@@ -283,14 +283,28 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     if (!handoff || handoff.username !== username) {
       return json(env, { ok: false, reason: 'unknown' }, 404);
     }
-    // The client resumes locally only if this says the job is not active. A
-    // lost finalise response must never be read as failure — that is how both
-    // the tab and the worker end up scrobbling the same tracks.
+    /*
+      Tri-state, deliberately. The client resumes locally only on a definitive
+      "no", so anything still in flight has to be reported as unknown rather
+      than as inactive.
+
+      `finalizing` is the case that matters: `finalizeHandoff` moves
+      pending_upload -> finalizing -> active, so a finalise whose response was
+      lost sits in `finalizing` for the moment it takes to activate. Reporting
+      that as inactive is precisely how the tab and the worker end up
+      scrobbling the same tracks.
+
+      Nobody is stranded by this: the reaper turns every in-flight state
+      terminal once `expires_at` passes, so an abandoned handoff resolves to a
+      definitive "no" on its own.
+    */
+    const TERMINAL_INACTIVE = ['failed', 'expired', 'reaped', 'cancelled'];
     return json(env, {
       ok: true,
       state: handoff.state,
       jobId: handoff.job_id,
       active: handoff.state === 'active',
+      resolved: handoff.state === 'active' || TERMINAL_INACTIVE.includes(handoff.state),
     });
   }
 

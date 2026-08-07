@@ -197,13 +197,19 @@ export async function completeHandoff(
     try {
       await stateManager.clearState();
     } catch (e) {
+      // The clear failing is not cosmetic: the queue is still on disk and a
+      // reload would offer to resume it alongside the running job. Record the
+      // uncertainty durably so startup refuses rather than offers.
       trackError('background.clearAfterHandoff', e);
+      api.setOwnershipUnresolved(handoffId);
     }
+    api.clearPendingHandoff();
     trackEvent('background_handoff_completed', { track_count: tracks.length });
     return { outcome, safeToResumeLocally: false };
   }
 
   if (outcome.status === 'failed') {
+    api.clearPendingHandoff();
     trackEvent('background_handoff_failed', { reason: outcome.reason });
     return { outcome, safeToResumeLocally: true };
   }
@@ -211,6 +217,7 @@ export async function completeHandoff(
   // `unknown`: one more question to the server before deciding.
   const active = await api.isHandoffActive(handoffId);
   if (active === false) {
+    api.clearPendingHandoff();
     trackEvent('background_handoff_failed', { reason: 'finalize_lost_but_inactive' });
     return { outcome: { status: 'failed', reason: 'finalize failed' }, safeToResumeLocally: true };
   }
@@ -219,7 +226,9 @@ export async function completeHandoff(
       await stateManager.clearState();
     } catch (e) {
       trackError('background.clearAfterHandoff', e);
+      api.setOwnershipUnresolved(handoffId);
     }
+    api.clearPendingHandoff();
     trackEvent('background_handoff_completed', { track_count: tracks.length, recovered: true });
     return { outcome: { status: 'active', jobId: handoffId }, safeToResumeLocally: false };
   }
@@ -227,6 +236,10 @@ export async function completeHandoff(
   // Still unknown. Refusing to resume is the conservative choice: duplicates
   // are irreversible from the user's side at this scale, whereas a stalled
   // import can be retried the moment the server answers.
+  //
+  // Recorded durably because the recovery we ask for is a reload, and
+  // component state does not survive one.
+  api.setOwnershipUnresolved(handoffId);
   trackEvent('background_handoff_unresolved');
   return { outcome, safeToResumeLocally: false };
 }
@@ -241,10 +254,10 @@ export async function completeHandoff(
  * and a missing or renamed server field can only ever produce a conservative
  * default rather than a structurally invalid save.
  *
- * Everything the server cannot know is reconstructed conservatively:
- * the rate-limit window starts empty (the server's sends were made from a
- * different IP, and the browser's own budget has had days to recover), and
- * the re-tag allocator restarts from the current clock.
+ * Everything the server cannot know is reconstructed conservatively: the
+ * rate-limit window starts empty (the server's sends were made from a different
+ * IP, and the browser's own budget has had days to recover), while the re-tag
+ * allocator resumes *above* every second the server can have used.
  */
 export function stateFromExport(
   exported: any,
@@ -275,15 +288,50 @@ export function stateFromExport(
     ? exported.scrobbledByServer
     : 0;
 
+  /*
+    The re-tag allocator's high-water mark, carried across the ownership
+    change. Getting this wrong loses plays silently.
+
+    The two allocators run in opposite directions: the worker assigns synthetic
+    seconds marching *downwards* from just below its clock, the browser marches
+    *upwards* from six hours back. So a browser that restarted from zero after a
+    take-back would walk straight through the range the worker just used. Last.fm
+    silently discards a repeat of (artist, track, timestamp) while still
+    reporting it as accepted, so a repeated song landing on a reused second
+    would vanish with no error anywhere.
+
+    `exportedAt` is an upper bound on every second the worker can have used —
+    each was at most its own clock at the time, and that is never later than
+    this. Starting above it is therefore clear of all of them.
+  */
+  const serverBoundarySec = Number.isFinite(exported.exportedAt) && exported.exportedAt > 0
+    ? exported.exportedAt
+    : Math.floor(Date.now() / 1000);
+
+  /*
+    Progress is reported against the size of the *whole* import, so the counts
+    from before the handoff have to be folded back in. `getHandoffLineage` is
+    the durable copy taken before local state was destroyed; when it is missing
+    the numbers still make sense, they just describe the remainder.
+  */
+  const lineage = api.getHandoffLineage();
+  const priorTotal = lineage ? lineage.originalTotalTracks : 0;
+  const priorSucceeded = lineage ? lineage.originalSucceededCount : 0;
+
   return {
     userName: username,
     totalTracks: serialized.length,
     completedIndices: [],
     failedIndices: [],
     tracks: serialized,
-    originalTotalTracks: Math.max(fallbackOriginalTotal, serialized.length + scrobbledByServer),
-    originalSucceededCount: scrobbledByServer,
+    originalTotalTracks: Math.max(
+      fallbackOriginalTotal,
+      priorTotal,
+      serialized.length + priorSucceeded + scrobbledByServer,
+    ),
+    originalSucceededCount: priorSucceeded + scrobbledByServer,
     sendTimestamps: [],
+    lastReTagTimestampSec: serverBoundarySec,
     burstCount: 0,
     dailyCount: 0,
     dailyCountDate: new Date().toISOString().slice(0, 10),

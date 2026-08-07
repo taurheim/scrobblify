@@ -490,6 +490,18 @@ export default Vue.extend({
     },
 
     async scrobble() {
+      // Re-entry guard. "Resume Now" is a plain button, and a second click —
+      // or a click racing a halt that has not finished unwinding — would start
+      // a second loop over the same array. Both would send, and both would
+      // write conflicting progress indices.
+      if (this.loopActive) {
+        return;
+      }
+      // A halt is in force; the handoff owns these tracks until it says
+      // otherwise. The button is disabled too, but the guard is what matters.
+      if (this.handoffHalted) {
+        return;
+      }
       const tracker = this.rateLimitTracker();
       // Defensive: a previous run that was torn down mid-stretch would
       // otherwise suppress the next `beginPacing`.
@@ -547,6 +559,14 @@ export default Vue.extend({
 
       // `i` is incremented conditionally at the end so a rate-limited track can be retried.
       for (let i = this.scrobbledTracks; i < tracks.length;) {
+        // A handoff outranks everything. Checked separately from `paused`
+        // because `pauseWithCountdown` clears that flag when its timer expires,
+        // so a halt landing during a backoff would otherwise be undone.
+        if (this.handoffHalted) {
+          this.endPacing();
+          return;
+        }
+
         // Check if manually paused. Transient waits clear `paused` before
         // returning, so reaching here with it set means the user asked to stop.
         // The save happens *here* rather than in `manualPause` so the snapshot
@@ -588,6 +608,14 @@ export default Vue.extend({
           this.syncRateLimitCounters();
         } else {
           this.endPacing();
+        }
+
+        // Re-checked after the waits above. A halt that arrived while this
+        // track was waiting must not be spent on sending it: that track is
+        // already in the list about to be uploaded.
+        if (this.handoffHalted) {
+          this.endPacing();
+          return;
         }
 
         // Daily ceiling: a rolling 24h window, so it frees up gradually rather
@@ -819,19 +847,32 @@ export default Vue.extend({
         // counter: background tabs throttle setInterval, which would otherwise
         // stretch a 30-minute backoff into something much longer.
         this.countdownTimer = window.setInterval(() => {
+          // A handoff must not have to wait out a 30-minute backoff, and its
+          // halt must survive one. Resolving without clearing `paused` returns
+          // control to the loop, which then sees `handoffHalted` and stops.
+          if (this.handoffHalted) {
+            this.cancelCountdown();
+            resolve();
+            return;
+          }
           const remainingMs = deadline - Date.now();
           this.countdown = Math.max(0, Math.ceil(remainingMs / MS_PER_SECOND));
           if (remainingMs <= 0) {
-            if (this.countdownTimer) {
-              clearInterval(this.countdownTimer);
-              this.countdownTimer = null;
-            }
+            this.cancelCountdown();
             this.paused = false;
             this.pauseReason = '';
             resolve();
           }
         }, 1000);
       });
+    },
+
+    cancelCountdown() {
+      if (this.countdownTimer) {
+        clearInterval(this.countdownTimer);
+        this.countdownTimer = null;
+      }
+      this.countdown = 0;
     },
 
     manualPause() {
@@ -853,18 +894,31 @@ export default Vue.extend({
      * Last.fm, every track it sends in the meantime is also in the uploaded
      * list, and the server will scrobble it a second time.
      *
-     * The loop only checks `paused` between tracks, so this resolves once the
-     * in-flight track has been consumed and the flag observed. Awaiting that
-     * is what makes the snapshot taken afterwards accurate.
+     * `handoffHalted` is the stop signal rather than `paused`, because
+     * `pauseWithCountdown` clears `paused` unconditionally when its timer
+     * expires. Halting a loop that was sitting in a 30-minute rate-limit
+     * backoff would otherwise last only until that backoff ended, and the loop
+     * would resume mid-redirect — the exact duplicate this exists to prevent.
+     *
+     * Returns whether the loop actually stopped. A false return must abort the
+     * handoff: proceeding while the loop is still sending is worse than not
+     * offering the feature at all.
      */
-    async haltForHandoff(): Promise<void> {
-      if (!this.scrobbling) {
-        return;
+    async haltForHandoff(): Promise<boolean> {
+      if (!this.scrobbling || !this.loopActive) {
+        // Nothing is sending, so there is nothing to stop. Still flagged, so
+        // the paused view explains itself and "Resume Now" stays disabled.
+        this.handoffHalted = true;
+        return true;
       }
       this.handoffHalted = true;
       this.paused = true;
       this.manuallyPaused = true;
       this.pauseReason = 'Handing this over to the background service…';
+      // Any countdown in progress is abandoned outright. Waiting out a
+      // 30-minute backoff before handing over would be absurd, and its timer
+      // would clear `paused` on the way through.
+      this.cancelCountdown();
       // One tick of the loop is at most one track plus its retry budget.
       // Polling rather than awaiting a promise keeps this independent of where
       // in the loop the halt landed.
@@ -872,6 +926,7 @@ export default Vue.extend({
         // eslint-disable-next-line no-await-in-loop
         await this.sleep(100);
       }
+      return !this.loopActive;
     },
 
     /**
