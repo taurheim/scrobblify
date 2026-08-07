@@ -76,6 +76,12 @@ export function isTerminalHandoffState(state: HandoffState): boolean {
 export interface JobRow {
   id: string;
   username: string;
+  /**
+   * Nullable mirror of `username`, NULLed on terminal states. A UNIQUE index
+   * on it is what makes "one live job per user" a database guarantee rather
+   * than a code convention — two tabs genuinely race here.
+   */
+  live_username: string | null;
   state: JobState;
   state_reason: string | null;
   generation: number;

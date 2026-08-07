@@ -63,6 +63,53 @@ async function hmacKey(secret: string): Promise<CryptoKey> {
   );
 }
 
+/**
+ * Signs an arbitrary JSON payload as `base64url(body).base64url(hmac)`.
+ *
+ * Not encryption — the body is readable by anyone holding the token. Only put
+ * things in here that the bearer is already entitled to know.
+ */
+export async function signPayload(payload: unknown, signingKey: string): Promise<string> {
+  const body = toBase64Url(enc.encode(JSON.stringify(payload)));
+  const key = await hmacKey(signingKey);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(body));
+  return `${body}.${toBase64Url(new Uint8Array(sig))}`;
+}
+
+/**
+ * Verifies a signed payload and returns it, or null.
+ *
+ * Null must be treated as "reject the request entirely", never as "carry on
+ * without the payload".
+ */
+export async function verifyPayload<T>(value: string, signingKey: string): Promise<T | null> {
+  const dot = value.indexOf('.');
+  if (dot <= 0 || dot === value.length - 1) {
+    return null;
+  }
+  const body = value.slice(0, dot);
+  const sig = value.slice(dot + 1);
+
+  let provided: Uint8Array;
+  try {
+    provided = fromBase64Url(sig);
+  } catch {
+    return null;
+  }
+
+  const key = await hmacKey(signingKey);
+  const expected = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(body)));
+  if (!timingSafeEqual(provided, expected)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(dec.decode(fromBase64Url(body))) as T;
+  } catch {
+    return null;
+  }
+}
+
 export interface HandoffState {
   /** Handoff row id. */
   h: string;
