@@ -6,8 +6,7 @@
  * worker.
  */
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { schemaSql } from './schema';
 import {
   Sql,
   SqlResult,
@@ -26,7 +25,6 @@ import {
   FencedError,
 } from '../src/store';
 
-const SCHEMA_PATH = join(__dirname, '..', 'schema', '001_init.sql');
 
 class NodeSql implements Sql {
   constructor(private db: DatabaseSync) {}
@@ -74,7 +72,7 @@ function check(name: string, cond: boolean, detail?: unknown) {
 
 function freshDb(): Sql {
   const db = new DatabaseSync(':memory:');
-  db.exec(readFileSync(SCHEMA_PATH, 'utf8'));
+  db.exec(schemaSql());
   return new NodeSql(db);
 }
 

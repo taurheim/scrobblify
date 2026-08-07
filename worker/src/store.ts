@@ -77,6 +77,7 @@ export interface JobRow {
   id: string;
   username: string;
   state: JobState;
+  state_reason: string | null;
   generation: number;
   locked_until: number;
   session_key_ct: string | null;
@@ -94,6 +95,8 @@ export interface JobRow {
   daily_window_start: number | null;
   daily_window_count: number;
   probing: number;
+  /** Lowest synthetic scrobble second used so far. See `002_synthetic_floor.sql`. */
+  synthetic_floor: number;
   created_at: number;
   updated_at: number;
   credential_expires_at: number;

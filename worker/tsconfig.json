@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noImplicitAny": false,
+    "noUnusedLocals": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node", "@cloudflare/workers-types"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "../src/shared/**/*.ts"],
+  "//": "spike.ts is throwaway benchmark code kept only as evidence for the concurrency cap; it is not part of the worker.",
+  "exclude": ["node_modules", ".test-build", "src/spike.ts"]
+}

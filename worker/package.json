@@ -4,11 +4,15 @@
   "description": "Background scrobbling worker for scrobblify",
   "private": true,
   "scripts": {
-    "test": "node scripts/run-tests.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run typecheck && node scripts/run-tests.mjs",
     "dev": "wrangler dev --local"
   },
   "type": "commonjs",
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260804.1",
+    "@types/node": "^26.1.2",
+    "typescript": "^5.9.3",
     "wrangler": "^4.114.0"
   },
   "dependencies": {

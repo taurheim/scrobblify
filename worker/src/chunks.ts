@@ -83,7 +83,7 @@ export async function gunzipBounded(
   compressed: ArrayBuffer | Uint8Array,
   maxBytes: number,
 ): Promise<Uint8Array> {
-  const stream = new Blob([compressed as BlobPart])
+  const stream = new Blob([compressed])
     .stream()
     .pipeThrough(new DecompressionStream('gzip'));
   const reader = stream.getReader();
@@ -114,7 +114,7 @@ export async function gunzipBounded(
 }
 
 export async function gzip(data: Uint8Array): Promise<Uint8Array> {
-  const stream = new Blob([data as BlobPart])
+  const stream = new Blob([data])
     .stream()
     .pipeThrough(new CompressionStream('gzip'));
   return new Uint8Array(await new Response(stream).arrayBuffer());

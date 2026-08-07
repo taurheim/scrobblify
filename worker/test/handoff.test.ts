@@ -4,8 +4,7 @@
  * a forged state, and an upload with a gap in it.
  */
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { schemaSql } from './schema';
 import { Sql, SqlResult } from '../src/store';
 import {
   preflight,
@@ -24,7 +23,6 @@ import {
   normalizeUsername,
 } from '../src/crypto';
 
-const SCHEMA_PATH = join(__dirname, '..', 'schema', '001_init.sql');
 const SIGNING_KEY = 'test-signing-key';
 const CRED_KEY = 'test-credential-key';
 const CALLBACK = 'https://api.savas.ca/scrobblify/auth/callback';
@@ -92,7 +90,7 @@ function check(name: string, cond: boolean, detail?: unknown) {
 
 function freshDb(): Sql {
   const db = new DatabaseSync(':memory:');
-  db.exec(readFileSync(SCHEMA_PATH, 'utf8'));
+  db.exec(schemaSql());
   return new NodeSql(db);
 }
 

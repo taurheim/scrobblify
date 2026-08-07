@@ -4,8 +4,7 @@
  * short chunk that would shift every subsequent index.
  */
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { schemaSql } from './schema';
 import { Sql, SqlResult } from '../src/store';
 import {
   BlobStore,
@@ -21,7 +20,6 @@ import {
 } from '../src/chunks';
 import { sha256Hex } from '../src/crypto';
 
-const SCHEMA_PATH = join(__dirname, '..', 'schema', '001_init.sql');
 const NOW = 1_800_000_000;
 
 class NodeSql implements Sql {
@@ -78,7 +76,7 @@ function check(name: string, cond: boolean, detail?: unknown) {
 
 function freshDb(): Sql {
   const db = new DatabaseSync(':memory:');
-  db.exec(readFileSync(SCHEMA_PATH, 'utf8'));
+  db.exec(schemaSql());
   return new NodeSql(db);
 }
 
