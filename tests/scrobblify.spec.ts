@@ -1313,6 +1313,44 @@ test.describe('Import robustness', () => {
     await expect(page.locator('text=None of the 1 history file(s) in this ZIP could be read')).toBeVisible({ timeout: 15000 });
   });
 
+  test('macOS resource-fork sidecars are not mistaken for history files', async ({ page }) => {
+    // Regression: the pattern was tested against the whole ZIP path and wasn't
+    // anchored, so `__MACOSX/._Streaming_History_Audio_*.json` matched too.
+    // macOS writes one of those per entry when a ZIP is created or re-zipped on
+    // a Mac, which doubled the file count, failed every sidecar in JSON.parse
+    // and warned that half the user's history was missing when none of it was.
+    await goToUploadStep(page);
+
+    const zip = new JSZip();
+    const names = ['Streaming_History_Audio_2024_0.json', 'Streaming_History_Audio_2024_1.json'];
+    zip.file(`Spotify Extended Streaming History/${names[0]}`, JSON.stringify([
+      play('Bohemian Rhapsody', 'Queen', '2024-01-15T10:30:00Z'),
+    ]));
+    zip.file(`Spotify Extended Streaming History/${names[1]}`, JSON.stringify([
+      play('Yesterday', 'The Beatles', '2024-01-15T10:36:00Z'),
+    ]));
+    for (const name of names) {
+      // AppleDouble sidecar: binary, and carrying the "Mac OS X" marker that
+      // showed up in the real parse errors.
+      zip.file(
+        `__MACOSX/Spotify Extended Streaming History/._${name}`,
+        Buffer.from([0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00,
+          ...Buffer.from('Mac OS X        \u0000\u0000\u0000\u0000', 'ascii')]),
+      );
+    }
+    await uploadZip(page, await zip.generateAsync({ type: 'nodebuffer' }));
+
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+
+    // Only the two real files are counted...
+    await expect(page.locator('text=Found 2 audio history file(s) in ZIP')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('text=Found 2 plays')).toBeVisible({ timeout: 15000 });
+    // ...and nothing is reported as damaged, because nothing was.
+    await expect(page.locator('text=skipped')).toHaveCount(0);
+    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 15000 });
+  });
+
   test('a repeated track is looked up once, not once per play', async ({ page }) => {
     await interceptLastFm(page);
     const lookups: string[] = [];

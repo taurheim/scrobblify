@@ -184,10 +184,20 @@ export default Vue.extend({
         this.showError = true;
         return;
       }
-      const audioFilePattern = /Streaming_History_Audio_.*\.json$/;
-      const matchingFiles = Object.keys(zip.files).filter(
-        (name) => audioFilePattern.test(name) && !zip.files[name].dir,
-      );
+      // Anchored to the *basename*, not the full path. macOS writes an
+      // AppleDouble sidecar (`__MACOSX/._<name>`) for every entry when a ZIP is
+      // created or re-zipped on a Mac, so an unanchored test matched one extra
+      // "history file" per real one — doubling the count, failing every sidecar
+      // in JSON.parse, and telling the user half their history was missing when
+      // none of it was.
+      const audioFilePattern = /^Streaming_History_Audio_.*\.json$/;
+      const matchingFiles = Object.keys(zip.files).filter((name) => {
+        if (zip.files[name].dir) {
+          return false;
+        }
+        const baseName = name.split('/').pop() || name;
+        return audioFilePattern.test(baseName);
+      });
 
       if (matchingFiles.length === 0) {
         trackEvent('upload_no_matching_files');
