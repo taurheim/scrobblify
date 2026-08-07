@@ -294,11 +294,26 @@ async function main() {
     check('the tick stopped sending for that job', h.fake.sent.length === 1, h.fake.sent.length);
     check('the reason is surfaced', /daily/i.test(job.state_reason || ''), job.state_reason);
     check('report counts only what was accepted', report.scrobbled === 20, report);
+
+    // The point of recording this is to answer whether the cap resets on a
+    // clock or a rolling window — which decides whether the blind 24h wait is
+    // correct or is costing every capped user most of a day.
+    const hit = await h.sql.all<any>(
+      "SELECT * FROM audit WHERE job_id = ? AND event = 'daily_cap_hit'", [h.jobId],
+    );
+    check('the cap is recorded for measurement', hit.length === 1, hit.length);
+    check('with the time it happened', hit[0].created_at === NOW, hit[0].created_at);
+    check('and what had been sent by then',
+      JSON.parse(hit[0].detail).scrobbledBeforeCap === 20, hit[0].detail);
   }
 
   console.log('\n-- probing --');
   {
-    const h = await harness({ total: 120, job: { probing: 1 } });
+    const capAt = NOW - 30 * 3600;
+    const h = await harness({
+      total: 120,
+      job: { probing: 1, daily_window_start: capAt },
+    });
     await runTick(h.env, NOW);
     check('a probe is small', h.fake.sent[0].entries.length === PROBE_BATCH_SIZE,
       h.fake.sent[0].entries.length);
@@ -306,6 +321,15 @@ async function main() {
     const job = await h.job();
     check('a successful probe clears the flag', job.probing === 0);
     check('and clears the stale reason', job.state_reason === null);
+
+    // Paired with `daily_cap_hit`, this bounds the real reset interval: the
+    // cap lifted somewhere between the previous failed probe and here.
+    const lifted = await h.sql.all<any>(
+      "SELECT * FROM audit WHERE job_id = ? AND event = 'daily_cap_lifted'", [h.jobId],
+    );
+    check('the recovery is recorded', lifted.length === 1, lifted.length);
+    check('with how long the cap lasted',
+      JSON.parse(lifted[0].detail).cappedForSeconds === NOW - capAt, lifted[0].detail);
   }
   {
     const h = await harness({

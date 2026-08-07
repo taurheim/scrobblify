@@ -835,6 +835,21 @@ async function runJob(
           [reason, nowSec],
         );
       } else if (state === 'daily_cap') {
+        /*
+          Recorded so the cap's reset behaviour can actually be measured. The
+          worker deliberately does not assume "midnight UTC" — it waits 24h and
+          probes — but which of a fixed clock or a rolling window it really is
+          determines whether that 24h wait is right or is costing every capped
+          user most of a day. Pairing this with the `daily_cap_lifted` record
+          below gives both the elapsed time and the wall-clock hour of each.
+        */
+        // eslint-disable-next-line no-await-in-loop
+        await audit(env.sql, lease.job.id, lease.generation, 'daily_cap_hit', {
+          scrobbledBeforeCap: lease.job.scrobbled_count,
+          sinceWindowStart: lease.job.daily_window_start
+            ? nowSec - lease.job.daily_window_start
+            : null,
+        }, nowSec);
         // eslint-disable-next-line no-await-in-loop
         await fencedJobUpdate(
           env.sql,
@@ -867,6 +882,16 @@ async function runJob(
 
     // A successful send clears the probe flag: the cap has demonstrably lifted.
     if (lease.job.probing) {
+      // The other half of the cap measurement. `daily_window_start` is the
+      // moment the cap was hit, so this is the first observed instant at which
+      // scrobbling was possible again — an upper bound on the true reset,
+      // bounded below by the probe interval.
+      // eslint-disable-next-line no-await-in-loop
+      await audit(env.sql, lease.job.id, lease.generation, 'daily_cap_lifted', {
+        cappedForSeconds: lease.job.daily_window_start
+          ? nowSec - lease.job.daily_window_start
+          : null,
+      }, nowSec);
       // eslint-disable-next-line no-await-in-loop
       await fencedJobUpdate(env.sql, lease, 'probing = 0, state_reason = NULL, updated_at = ?', [nowSec]);
       lease.job.probing = 0;

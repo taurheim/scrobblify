@@ -72,7 +72,7 @@
 
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn text :disabled="busy" @click="visible = false">Not now</v-btn>
+        <v-btn text :disabled="busy" @click="decline">Not now</v-btn>
         <v-btn color="primary" :loading="busy" @click="accept">
           Continue to Last.fm
         </v-btn>
@@ -113,6 +113,16 @@ export default Vue.extend({
   methods: {
     accept() {
       this.$emit('accept');
+    },
+    /*
+      Distinguished from dismissing the dialog by clicking outside it. If the
+      feature is declined the interesting question is whether the concept or
+      the consent copy is the problem, and only a deliberate "Not now" is
+      evidence the user read it.
+    */
+    decline() {
+      this.visible = false;
+      this.$emit('decline');
     },
   },
 });

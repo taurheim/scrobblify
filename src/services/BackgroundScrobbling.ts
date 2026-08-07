@@ -121,6 +121,35 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
 }
 
 /**
+ * How long a read-only status call may take before it is abandoned.
+ *
+ * These run during page load, and one of them gates the Resume button. `fetch`
+ * has no timeout of its own, so without this a worker that accepts a
+ * connection and then stalls would leave the promise pending indefinitely and
+ * the user staring at a page that never offers to resume their import.
+ *
+ * Uploads deliberately do not use this: abandoning one mid-flight tells us
+ * nothing about whether the server received it, which is exactly the state the
+ * design works hardest to avoid.
+ */
+const STATUS_TIMEOUT_MS = 8000;
+
+async function getWithTimeout(path: string, authorised: boolean): Promise<Response | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
+  try {
+    return authorised
+      ? await request(path, { signal: controller.signal })
+      : await fetch(`${API_BASE}${path}`, { signal: controller.signal });
+  } catch {
+    // Includes the abort. Every caller treats null as "don't offer it".
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Whether background mode can be offered at all.
  *
  * Returns null rather than throwing on any failure, so the caller's only
@@ -131,8 +160,8 @@ export async function fetchCapacity(): Promise<Capacity | null> {
     return null;
   }
   try {
-    const res = await fetch(`${API_BASE}/scrobblify/capacity`);
-    if (!res.ok) {
+    const res = await getWithTimeout('/scrobblify/capacity', false);
+    if (!res || !res.ok) {
       return null;
     }
     return await res.json();
@@ -146,7 +175,10 @@ export async function fetchJob(): Promise<JobStatus | null> {
     return null;
   }
   try {
-    const res = await request('/scrobblify/job');
+    const res = await getWithTimeout('/scrobblify/job', true);
+    if (!res) {
+      return null;
+    }
     if (res.status === 401) {
       clearSession();
       return null;

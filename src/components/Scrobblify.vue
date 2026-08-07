@@ -117,6 +117,7 @@
       :all-re-tagged="backgroundAllReTagged"
       :busy="backgroundBusy"
       v-on:accept="startBackgroundHandoff"
+      v-on:decline="onBackgroundDeclined"
     ></background-offer>
     <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
   </div>
@@ -200,12 +201,21 @@ export default Vue.extend({
     }
 
     await this.refreshBackgroundJob();
-    await this.probeBackgroundAvailability();
+
+    /*
+      Local state first, network second. `hasResumableState` is what puts the
+      Resume button on screen, and it is answered by IndexedDB in milliseconds;
+      awaiting a capacity probe before it would hold the button back for as
+      long as the network takes to fail. Background mode is an enhancement, so
+      it resolves whenever it resolves.
+    */
     try {
       this.hasResumableState = await this.stateManager.hasSavedState();
     } catch (e) {
       // IndexedDB not available — not critical, just skip resume
     }
+
+    this.probeBackgroundAvailability();
   },
   watch: {
     currentStep(step: number) {
@@ -291,6 +301,9 @@ export default Vue.extend({
      * Opens the offer for a queue the scrobble step is currently working on.
      */
     onBackgroundRequested(info: ProgressSnapshot) {
+      if (!this.backgroundAvailable || this.backgroundJob) {
+        return;
+      }
       const state = this.buildState(info);
       const remaining = uploadListFromState(state, Math.floor(Date.now() / 1000)).length;
       if (!this.canOfferBackground(remaining)) {
@@ -304,6 +317,18 @@ export default Vue.extend({
       trackEvent('background_offer_shown', {
         entry_point: 'scrobble_step',
         track_count: remaining,
+      });
+    },
+
+    /**
+     * A deliberate "Not now". Distinct from dismissing the dialog, so the
+     * decline rate measures people who read the consent copy and said no.
+     */
+    onBackgroundDeclined() {
+      trackEvent('background_offer_declined', {
+        entry_point: this.pendingSnapshot ? 'scrobble_step' : 'resume',
+        track_count: this.backgroundRemaining,
+        all_re_tagged: this.backgroundAllReTagged,
       });
     },
 
@@ -587,6 +612,13 @@ export default Vue.extend({
      * Offers background mode for an already-built state, if it qualifies.
      */
     offerBackgroundForState(state: ScrobbleState, entryPoint: string) {
+      // Cheap gates first. `uploadListFromState` deserialises and sorts the
+      // whole queue, which on a six-figure import is real work to do on the
+      // resume path — and pointless when the feature is off or a server job
+      // already owns these tracks.
+      if (!this.backgroundAvailable || this.backgroundJob) {
+        return;
+      }
       const remaining = uploadListFromState(state, Math.floor(Date.now() / 1000)).length;
       if (!this.canOfferBackground(remaining)) {
         return;
