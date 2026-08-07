@@ -359,6 +359,17 @@ export interface QueueOwner {
   owner: 'freezing' | 'server';
   /** Job id where known; handoff id during a freeze; '' for legacy records. */
   id: string;
+  /**
+   * Identifies the handoff attempt that wrote a `freezing` record.
+   *
+   * Releasing is otherwise unconditional, and two tabs can be attempting a
+   * handoff at once — the second one's freeze does not stop the first one's
+   * *orchestration*, only its send loop. Whichever failed first would then
+   * clear the other's freeze, unblocking every sibling in the middle of the
+   * window the freeze exists to protect. Absent on `server` records, which are
+   * never released speculatively.
+   */
+  attempt?: string;
 }
 
 export function setQueueOwner(record: QueueOwner | null): void {
@@ -397,7 +408,11 @@ export function queueOwner(): QueueOwner | null {
     }
     const parsed = JSON.parse(raw);
     if (parsed && (parsed.owner === 'server' || parsed.owner === 'freezing')) {
-      return { owner: parsed.owner, id: typeof parsed.id === 'string' ? parsed.id : '' };
+      return {
+        owner: parsed.owner,
+        id: typeof parsed.id === 'string' ? parsed.id : '',
+        ...(typeof parsed.attempt === 'string' ? { attempt: parsed.attempt } : {}),
+      };
     }
     // Unparseable. Treated as owned, because the alternative reading of a
     // corrupt stop signal is "carry on scrobbling".
@@ -409,6 +424,105 @@ export function queueOwner(): QueueOwner | null {
 
 export function serverOwnsQueue(): boolean {
   return queueOwner() !== null;
+}
+
+/** Identifies one handoff attempt, for the compare-and-clear below. */
+export function newFreezeAttempt(): string {
+  return `${Date.now()}.${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * How long a `freezing` record is assumed to belong to a tab still working.
+ *
+ * Covers the freeze wait plus a preflight, with room to spare. Beyond it the
+ * attempting tab has either redirected — in which case the record names a
+ * handoff and resolves against the server — or died.
+ */
+const FREEZE_ATTEMPT_FRESH_MS = 180000;
+
+/**
+ * Whether a `freezing` record may still belong to a tab that is mid-attempt.
+ *
+ * Startup reconciliation exists to clear freezes left by tabs that died, but
+ * it runs in *every* tab, including one opened while another tab is partway
+ * through a handover. Clearing that record would release every sibling into
+ * exactly the window the freeze protects. The attempt token carries the
+ * millisecond it was minted, so recency is decidable without extra state; a
+ * fresh record is left alone and reconciled on a later load instead.
+ *
+ * Records written before attempt tokens existed have no timestamp and are
+ * treated as stale, which is the behaviour they had.
+ */
+export function freezeAttemptIsFresh(record: QueueOwner, nowMs = Date.now()): boolean {
+  if (!record.attempt) {
+    return false;
+  }
+  const mintedAt = Number(record.attempt.split('.')[0]);
+  if (!Number.isFinite(mintedAt)) {
+    return false;
+  }
+  // A token from the future means a clock change; treated as fresh, since the
+  // conservative reading of an unusable timestamp is "someone is working".
+  return mintedAt > nowMs || nowMs - mintedAt < FREEZE_ATTEMPT_FRESH_MS;
+}
+
+/**
+ * Releases ownership once a handoff is known not to be running.
+ *
+ * Same hazard as `releaseQueueOwner`, from the other side of the redirect: the
+ * attempt token was minted in a page that no longer exists, so the match is on
+ * the handoff instead. A `server` record is always ours to clear here — we have
+ * just established that nothing is running — but a `freezing` record belonging
+ * to another tab that is mid-attempt right now must survive, or clearing it
+ * releases every sibling into the middle of that tab's window. A record naming
+ * a different handoff is unambiguously someone else's; one naming no handoff
+ * has not reached preflight yet, so recency is the only evidence available.
+ *
+ * Returns whether the record was cleared.
+ */
+export function releaseQueueOwnerIfUnclaimed(ownId: string): boolean {
+  const current = queueOwner();
+  if (!current) {
+    return false;
+  }
+  if (current.owner === 'freezing' && current.id !== ownId
+      && (current.id !== '' || freezeAttemptIsFresh(current))) {
+    return false;
+  }
+  setQueueOwner(null);
+  return true;
+}
+
+/**
+ * Releases a freeze this attempt owns, and only one this attempt owns.
+ *
+ * Every failure path in a handoff has to lift the freeze — a freeze nobody
+ * lifts leaves the user unable to scrobble anywhere, in any tab, until they
+ * clear site data. But an unconditional release is worse than no release,
+ * because by the time one attempt fails the record may belong to something
+ * else:
+ *
+ *   - a *second* handoff attempt, in another tab, now mid-window; or
+ *   - a `server` record, meaning a handoff already succeeded.
+ *
+ * Clearing either lets every sibling resume against a queue that is about to
+ * be, or already is, in the worker's hands — the duplicate this protocol
+ * exists to prevent. So the release matches on the attempt token and otherwise
+ * leaves the record alone; whoever owns it will release it on its own failure
+ * path, or it resolves through `hasLiveJob` on the next load.
+ *
+ * Returns whether the record was actually cleared.
+ */
+export function releaseQueueOwner(attempt: string): boolean {
+  const current = queueOwner();
+  if (!current) {
+    return false;
+  }
+  if (current.owner !== 'freezing' || current.attempt !== attempt) {
+    return false;
+  }
+  setQueueOwner(null);
+  return true;
 }
 
 /**
@@ -435,13 +549,115 @@ export function canCoordinateTabs(): boolean {
 const FREEZE_CHANNEL = 'scrobblify.freeze';
 
 /**
+ * Roster of tabs that have this origin open.
+ *
+ * Without it, "every sibling has stopped" is not an observable state: a
+ * freezing tab could only wait a fixed period and hope. That is not good
+ * enough here, because a sibling sitting in an in-flight Last.fm request —
+ * which has no timeout and can run for tens of seconds — would not have
+ * stopped or persisted when the window elapsed, and its tracks would be
+ * captured into the upload and sent a second time by the worker.
+ *
+ * Each tab writes a heartbeat under its own id and removes itself on unload.
+ * Entries older than `TAB_STALE_MS` are treated as gone, so a crashed or
+ * force-closed tab cannot block a handoff forever.
+ */
+const TAB_ROSTER_KEY = 'scrobblify.background.tabs';
+const TAB_HEARTBEAT_MS = 2000;
+const TAB_STALE_MS = 8000;
+
+/**
  * How long a freezing tab waits for its siblings to stop and persist.
  *
- * Sized against one in-flight Last.fm batch plus an IndexedDB write. Too short
- * and a sibling's just-sent tracks are captured into the upload and scrobbled
- * again by the worker; too long and the offer dialog appears to hang.
+ * Only an upper bound now: the wait ends as soon as every rostered sibling has
+ * answered. It is generous because the thing being waited for is an in-flight
+ * Last.fm request, and abandoning that wait is what produces duplicates.
  */
-const FREEZE_WAIT_MS = 4000;
+const FREEZE_WAIT_MS = 45000;
+
+/**
+ * Pause between claiming the freeze and confirming the claim held.
+ *
+ * Long enough for a simultaneous write from another tab to have landed in
+ * localStorage, short enough to be invisible. It does not need to cover the
+ * other tab's whole attempt — only the gap between its write and ours.
+ */
+const FREEZE_CLAIM_SETTLE_MS = 150;
+
+function readRoster(): Record<string, number> {
+  try {
+    const raw = window.localStorage.getItem(TAB_ROSTER_KEY);
+    if (!raw) { return {}; }
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRoster(roster: Record<string, number>): void {
+  try {
+    window.localStorage.setItem(TAB_ROSTER_KEY, JSON.stringify(roster));
+  } catch {
+    // A tab that cannot register is a tab a freezing sibling cannot wait for.
+    // `canCoordinateTabs()` gates the whole feature on localStorage working,
+    // so this is the already-refused case rather than a new one.
+  }
+}
+
+/** Rostered tabs other than this one that have checked in recently. */
+function liveSiblings(selfId: string): string[] {
+  const now = Date.now();
+  return Object.entries(readRoster())
+    .filter(([id, seen]) => id !== selfId && Number.isFinite(seen) && now - seen < TAB_STALE_MS)
+    .map(([id]) => id);
+}
+
+let tabId = '';
+
+/** This tab's roster identity, generated once. */
+export function thisTabId(): string {
+  if (!tabId) {
+    tabId = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}`;
+  }
+  return tabId;
+}
+
+/**
+ * Joins the roster and keeps this tab's heartbeat current.
+ *
+ * Returns a teardown function that removes this tab, so a normal close does
+ * not leave a phantom sibling that every future handoff has to wait out.
+ */
+export function joinTabRoster(): () => void {
+  const id = thisTabId();
+  const beat = () => {
+    const roster = readRoster();
+    const now = Date.now();
+    roster[id] = now;
+    Object.keys(roster).forEach((k) => {
+      if (now - roster[k] >= TAB_STALE_MS) {
+        delete roster[k];
+      }
+    });
+    writeRoster(roster);
+  };
+  beat();
+  const timer = window.setInterval(beat, TAB_HEARTBEAT_MS);
+
+  const leave = () => {
+    const roster = readRoster();
+    delete roster[id];
+    writeRoster(roster);
+  };
+  window.addEventListener('pagehide', leave);
+
+  return () => {
+    window.clearInterval(timer);
+    window.removeEventListener('pagehide', leave);
+    leave();
+  };
+}
 
 /**
  * Registers this tab as a participant in the freeze protocol.
@@ -449,10 +665,11 @@ const FREEZE_WAIT_MS = 4000;
  * `onFreeze` must stop scrobbling *and persist progress* before it resolves —
  * the freezing tab re-reads the queue from IndexedDB afterwards, and anything
  * this tab sent but did not record would be uploaded and sent a second time.
+ * It must resolve `false` if it could not stop, which aborts the handoff.
  *
  * Returns a teardown function.
  */
-export function respondToFreezeRequests(onFreeze: () => Promise<void>): () => void {
+export function respondToFreezeRequests(onFreeze: () => Promise<boolean>): () => void {
   let channel: BroadcastChannel | null = null;
   try {
     if (typeof BroadcastChannel !== 'undefined') {
@@ -461,22 +678,28 @@ export function respondToFreezeRequests(onFreeze: () => Promise<void>): () => vo
         if (!event.data || event.data.type !== 'freeze') {
           return;
         }
+        let stopped = false;
         try {
-          await onFreeze();
+          stopped = await onFreeze();
         } catch (e) {
           trackError('background.freezeResponder', e);
-          // Deliberately not acknowledged. A freezing sibling that receives no
-          // ack still waits out its full window, which is the safe outcome;
-          // acking a failed halt would tell it this tab had stopped when it
-          // had not.
-          return;
+          stopped = false;
         }
         try {
           const reply = new BroadcastChannel(FREEZE_CHANNEL);
-          reply.postMessage({ type: 'frozen', id: event.data.id });
+          // Answered either way, and the answer is honest. A silent failure
+          // would be indistinguishable from a tab that had closed, and the
+          // freezing tab would proceed against a sibling that is still
+          // sending.
+          reply.postMessage({
+            type: stopped ? 'frozen' : 'freeze_failed',
+            id: event.data.id,
+            tab: thisTabId(),
+          });
           reply.close();
         } catch {
-          // The freezing tab falls back to waiting out its window.
+          // The freezing tab waits out its window and refuses on the missing
+          // acknowledgement.
         }
       };
     }
@@ -506,22 +729,78 @@ export function respondToFreezeRequests(onFreeze: () => Promise<void>): () => vo
  * still stop at their next send. The broadcast is what makes tabs that *are*
  * listening stop now rather than one batch later.
  *
- * Returns the number of siblings that acknowledged. Callers must re-read the
- * queue from IndexedDB afterwards regardless: a sibling persists its progress
- * before acking, and that progress is only visible on disk.
+ * Returns whether every sibling that is actually open confirmed it had stopped
+ * *and persisted*. A fixed wait was not enough: an in-flight Last.fm request
+ * has no timeout, so a sibling can still be sending when any chosen window
+ * elapses. The roster makes "everyone has answered" observable, and anything
+ * short of a full set of acknowledgements is a refusal — proceeding while a
+ * sibling may still be sending is the duplicate this whole protocol exists to
+ * prevent.
+ *
+ * Callers must re-read the queue from IndexedDB afterwards regardless: a
+ * sibling persists its progress before acking, and that progress is only
+ * visible on disk.
+ *
+ * `attempt` identifies the caller so that only it can release the freeze, and
+ * so that a second attempt running concurrently in another tab is refused
+ * outright rather than allowed to interleave with this one.
  */
-export async function freezeOtherTabs(): Promise<number> {
-  setQueueOwner({ owner: 'freezing', id: '' });
+export async function freezeOtherTabs(attempt: string): Promise<boolean> {
+  /*
+    Mutual exclusion between handoff attempts.
+
+    Freezing siblings stops their *send loops*; it does not stop another tab's
+    handoff orchestration, which does not scrobble. So two tabs can reach here
+    together, each freeze the other's loop, and both proceed to snapshot and
+    upload the same queue — two jobs, every track sent twice.
+
+    localStorage has no atomic compare-and-set, so this is the usual
+    write-then-verify: refuse if someone else already holds it, claim it, let
+    any simultaneous write land, then confirm the record is still ours. A tab
+    that loses the race sees the winner's token and backs out.
+  */
+  const existing = queueOwner();
+  if (existing && existing.attempt !== attempt) {
+    return false;
+  }
+  setQueueOwner({ owner: 'freezing', id: '', attempt });
+  await new Promise<void>((resolve) => { window.setTimeout(resolve, FREEZE_CLAIM_SETTLE_MS); });
+  const claimed = queueOwner();
+  if (!claimed || claimed.owner !== 'freezing' || claimed.attempt !== attempt) {
+    return false;
+  }
+
+  const expected = new Set(liveSiblings(thisTabId()));
+  if (expected.size === 0) {
+    return true;
+  }
 
   const requestId = `${Date.now()}.${Math.random().toString(36).slice(2)}`;
-  let acks = 0;
   let channel: BroadcastChannel | null = null;
+  let failed = false;
+  const acked = new Set<string>();
+  let settle: (() => void) | null = null;
+
   try {
     if (typeof BroadcastChannel !== 'undefined') {
       channel = new BroadcastChannel(FREEZE_CHANNEL);
       channel.onmessage = (event: MessageEvent) => {
-        if (event.data && event.data.type === 'frozen' && event.data.id === requestId) {
-          acks += 1;
+        const { data } = event;
+        if (!data || data.id !== requestId) {
+          return;
+        }
+        if (data.type === 'freeze_failed') {
+          failed = true;
+          if (settle) { settle(); }
+          return;
+        }
+        if (data.type === 'frozen' && typeof data.tab === 'string') {
+          acked.add(data.tab);
+          // A tab that joined after the roster was read still counts: it
+          // answered, so it stopped.
+          if (Array.from(expected).every((id) => acked.has(id)) && settle) {
+            settle();
+          }
         }
       };
       channel.postMessage({ type: 'freeze', id: requestId });
@@ -530,14 +809,37 @@ export async function freezeOtherTabs(): Promise<number> {
     channel = null;
   }
 
-  // The window is waited out in full rather than returning on the first ack:
-  // there is no way to know how many tabs are open, so "everyone has answered"
-  // is not a state that can be observed.
-  await new Promise((resolve) => { window.setTimeout(resolve, FREEZE_WAIT_MS); });
-  if (channel) {
-    channel.close();
+  if (!channel) {
+    // No way to ask, and siblings are known to exist. Refuse rather than
+    // guess.
+    return false;
   }
-  return acks;
+
+  await new Promise<void>((resolve) => {
+    let done = false;
+    let timer = 0;
+    const finish = () => {
+      if (done) { return; }
+      done = true;
+      window.clearTimeout(timer);
+      resolve();
+    };
+    settle = finish;
+    timer = window.setTimeout(finish, FREEZE_WAIT_MS);
+  });
+  channel.close();
+
+  if (failed) {
+    return false;
+  }
+  /*
+    A sibling that never answered may simply have closed. Its roster entry is
+    the only evidence either way, so it is re-read: an entry that has gone
+    stale means the tab is gone, while a fresh one means it is open and did not
+    stop.
+  */
+  const stillLive = new Set(liveSiblings(thisTabId()));
+  return Array.from(expected).every((id) => acked.has(id) || !stillLive.has(id));
 }
 
 /**
@@ -922,6 +1224,29 @@ export async function isHandoffActive(
 }
 
 /**
+ * The job id a handoff produced, or an empty string if it has none yet.
+ *
+ * Kept separate from `isHandoffActive` so its two-valued answer stays simple.
+ * The distinction matters because ownership records are later resolved with
+ * `hasLiveJob(id)`, which compares the id against the *job* the server reports
+ * — storing a handoff id there guarantees a permanent mismatch, and the
+ * mismatch is deliberately read as "unknown", so the tab would stay blocked
+ * for the thirty days a finished job is reported.
+ */
+export async function jobIdForHandoff(handoffId: string): Promise<string> {
+  const res = await getWithTimeout(`/scrobblify/handoff/${handoffId}`, true);
+  if (!res || !res.ok) {
+    return '';
+  }
+  try {
+    const body = await res.json();
+    return typeof body.jobId === 'string' ? body.jobId : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Resolves an ownership marker of either kind.
  *
  * The two ambiguous moments leave different identifiers on different
@@ -956,7 +1281,7 @@ export async function jobAction(jobId: string, action: 'pause' | 'resume' | 'can
  * `null` means the request itself failed, and callers must never read that as
  * "the job is not running".
  */
-export async function exportJob(jobId: string): Promise<any | null> {
+export async function exportJob(jobId: string, claim: string): Promise<any | null> {
   // An export is retried in a loop behind a spinner, so an unbounded request
   // does not merely delay one attempt — it stalls the whole retry budget and
   // the user waits forever. The window is wider than `STATUS_TIMEOUT_MS`
@@ -964,7 +1289,16 @@ export async function exportJob(jobId: string): Promise<any | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), EXPORT_TIMEOUT_MS);
   try {
-    const res = await request(`/scrobblify/job/${jobId}/export`, { signal: controller.signal });
+    // The claim identifies this take-back. The server allows a retry only from
+    // the tab that made the original claim; without it, two tabs could read
+    // the queue at once and one could cancel — deleting the blobs — while the
+    // other was still reading.
+    const res = await request(`/scrobblify/job/${jobId}/export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claim }),
+      signal: controller.signal,
+    });
     if (!res.ok && res.status !== 409) {
       return null;
     }
@@ -974,6 +1308,18 @@ export async function exportJob(jobId: string): Promise<any | null> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * A fresh export claim token.
+ *
+ * One per take-back, held for the life of the retry loop so every retry
+ * presents the same value.
+ */
+export function newExportClaim(): string {
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**

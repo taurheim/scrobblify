@@ -461,13 +461,21 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     }
     const action = jobActionMatch[2];
 
-    if (action === 'export' && request.method === 'GET') {
-      return exportJob(env, job, nowSec);
-    }
     if (request.method !== 'POST') {
       return json(env, { ok: false, reason: 'method_not_allowed' }, 405);
     }
 
+    if (action === 'export') {
+      // POST rather than GET: it carries a claim token in the body, and it is
+      // not idempotent — it moves the job into `exporting`.
+      let exportBody: any = null;
+      try {
+        exportBody = await request.json();
+      } catch {
+        exportBody = null;
+      }
+      return exportJob(env, job, nowSec, exportBody);
+    }
     if (action === 'cancel') {
       // Order matters: the export is built from the blob, so the blob is only
       // deleted after the caller has had the chance to take it. Deleting first
@@ -536,7 +544,12 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
  * cursor-relative list would make the client skip that many of the tracks it
  * still needs.
  */
-async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Response> {
+async function exportJob(
+  env: ApiEnv,
+  job: JobRow,
+  nowSec: number,
+  body: any,
+): Promise<Response> {
   /*
     Quiescence is decided here, by the only party that can decide it.
 
@@ -594,54 +607,95 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
     resumes them, and they are scrobbled twice.
 
     The CAS closes it by moving the job into `exporting`, which `resume`
-    refuses and the scheduler never selects. `locked_until` carries the claim
-    deadline so an abandoned take-back reverts to `paused` rather than
-    stranding the job.
+    refuses and the scheduler never selects.
 
-    Re-claiming from `exporting` deliberately ignores that deadline. It is a
-    claim expiry, not a lease held by anything running — nothing schedules an
-    `exporting` job — and honouring it would refuse the client's own retries
-    for the full ten minutes, which is longer than the client retries for. The
-    take-back would dead-end on its own first success.
+    The claim is *identified*, not merely held. Allowing any request to
+    re-claim from `exporting` — which is what "the client retries, so let it
+    back in" originally bought — let two tabs read concurrently. One could then
+    save and cancel, deleting the blobs, while the other was still reading
+    chunks; the reader skips what it cannot find and returns a silently partial
+    queue that overwrites the complete local save. A retry must present the
+    same token, and the client sends one per take-back.
+
+    `export_prev_state` records where to go back to, because reverting an
+    abandoned claim to `paused` would clear a `needs_attention` the user still
+    has to act on. `locked_until` is the claim expiry so an abandoned take-back
+    reverts rather than stranding the job; a retry with the matching token
+    ignores it, since it is not a lease held by anything running.
   */
+  const claimToken = typeof body?.claim === 'string' && body.claim.length >= 16
+    ? body.claim
+    : null;
+  if (!claimToken) {
+    return json(env, { ok: false, reason: 'claim_required' }, 400);
+  }
   const claimed = await env.sql.run(
-    `UPDATE jobs SET state = 'exporting', locked_until = ?, updated_at = ?
+    `UPDATE jobs
+        SET state = 'exporting',
+            export_claim = ?,
+            export_prev_state = CASE WHEN state = 'exporting' THEN export_prev_state ELSE state END,
+            locked_until = ?,
+            updated_at = ?
       WHERE id = ?
         AND (
           (state IN ('paused', 'needs_attention', 'needs_reauth') AND locked_until <= ?)
-          OR state = 'exporting'
+          OR (state = 'exporting' AND export_claim = ?)
         )
         AND NOT EXISTS (
           SELECT 1 FROM batches b WHERE b.job_id = jobs.id AND b.state = 'sending'
         )`,
-    [nowSec + EXPORT_CLAIM_SECONDS, nowSec, job.id, nowSec],
+    [claimToken, nowSec + EXPORT_CLAIM_SECONDS, nowSec, job.id, nowSec, claimToken],
   );
   if (claimed.changes === 0) {
-    // Either it is running again, or it went terminal. Both are answers the
-    // client must retry against rather than read a stale queue from.
+    // Running again, gone terminal, or claimed by another take-back. All are
+    // answers the client must retry against rather than read a stale queue.
     return json(env, { ok: false, reason: 'not_quiescent', detail: 'not_claimable' }, 409);
   }
 
+  /*
+    Re-read after the claim, and use *this* row for everything below.
+
+    `job` was loaded before the on-demand drain, and reconciling a stale batch
+    is precisely what advances `cursor`. Exporting from the pre-drain cursor
+    hands back tracks the drain just confirmed as scrobbled, which the client
+    then cancels and re-sends locally — the exact duplicate the drain existed
+    to prevent.
+  */
+  const fresh = await env.sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [job.id]);
+  if (!fresh) {
+    return json(env, { ok: false, reason: 'not_found' }, 404);
+  }
+  const claimedJob = fresh;
+
   const failures = await env.sql.all<any>(
     'SELECT track_index, artist, track, album, reason, ignore_code FROM failures WHERE job_id = ? ORDER BY track_index',
-    [job.id],
+    [claimedJob.id],
   );
   const failedIndex = new Set<number>(failures.map((f) => f.track_index));
 
   const chunks = await env.sql.all<any>(
     'SELECT * FROM chunks WHERE job_id = ? AND end_index > ? ORDER BY chunk_index',
-    [job.id, job.cursor],
+    [claimedJob.id, claimedJob.cursor],
   );
 
   const tracks: unknown[] = [];
   for (const chunk of chunks) {
     // eslint-disable-next-line no-await-in-loop
-    const found = await readChunkFor(env.sql, env.blobs, job.id, Math.max(chunk.start_index, job.cursor));
+    const found = await readChunkFor(
+      env.sql, env.blobs, claimedJob.id, Math.max(chunk.start_index, claimedJob.cursor),
+    );
     if (!found) {
-      // eslint-disable-next-line no-continue
-      continue;
+      /*
+        A chunk that cannot be read is not a gap to skip over.
+
+        Skipping it silently drops every track it held from the exported
+        queue, and the client saves that queue over its own complete state
+        before cancelling the job — so the tracks are lost from both sides at
+        once. Refusing leaves the job intact and the client retrying.
+      */
+      return json(env, { ok: false, reason: 'export_incomplete' }, 503);
     }
-    const from = Math.max(0, job.cursor - chunk.start_index);
+    const from = Math.max(0, claimedJob.cursor - chunk.start_index);
     found.tracks.slice(from).forEach((t, i) => {
       const absolute = chunk.start_index + from + i;
       if (failedIndex.has(absolute)) {
@@ -682,25 +736,40 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
     ranges usually covers the lot. Capped, and the cap is reported, so a client
     that receives a truncated list can widen its reservation instead of
     trusting an incomplete one.
+
+    *Every* batch row counts, including abandoned ones. The row is written
+    before the POST, so an abandoned batch is precisely the case where the
+    request may have reached Last.fm and the response was lost — its seconds
+    are the ones that most need reserving.
   */
   const submitted = await env.sql.all<{ assigned_timestamps: string }>(
-    "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state <> 'abandoned'",
-    [job.id],
+    'SELECT assigned_timestamps FROM batches WHERE job_id = ?',
+    [claimedJob.id],
   );
   const usedSeconds: number[] = [];
+  let usedIncomplete = false;
   submitted.forEach((row) => {
     try {
       const parsed = JSON.parse(row.assigned_timestamps);
-      if (Array.isArray(parsed)) {
-        parsed.forEach((v) => {
-          if (Number.isFinite(v) && v > 0) {
-            usedSeconds.push(Number(v));
-          }
-        });
+      if (!Array.isArray(parsed)) {
+        usedIncomplete = true;
+        return;
       }
+      parsed.forEach((v) => {
+        // Rows hold serialised `AssignedTrack` objects. A bare number is
+        // accepted too so that a future shape change cannot quietly turn this
+        // into a no-op the way reading the objects as numbers already did.
+        const sec = typeof v === 'number' ? v : (v && Number(v.timestampSec));
+        if (Number.isFinite(sec) && sec > 0) {
+          usedSeconds.push(Number(sec));
+        } else {
+          usedIncomplete = true;
+        }
+      });
     } catch {
-      // A batch whose timestamps cannot be read is reported as truncation
-      // below rather than silently skipped.
+      // Unreadable. Reported as incomplete rather than silently skipped: a
+      // client told the list is complete will allocate into the gap.
+      usedIncomplete = true;
     }
   });
   const usedRanges = collapseToRanges(usedSeconds, MAX_EXPORTED_RANGES);
@@ -714,10 +783,10 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
       know where our range starts in order to reserve one below it rather than
       walking through ours. See `stateFromExport`.
     */
-    syntheticFloorSec: job.synthetic_floor ?? 0,
+    syntheticFloorSec: claimedJob.synthetic_floor ?? 0,
     usedRanges: usedRanges.ranges,
-    usedRangesTruncated: usedRanges.truncated,
-    scrobbledByServer: job.scrobbled_count,
+    usedRangesTruncated: usedRanges.truncated || usedIncomplete,
+    scrobbledByServer: claimedJob.scrobbled_count,
     state: {
       totalTracks: tracks.length,
       completedIndices: [],

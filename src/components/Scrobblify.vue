@@ -207,6 +207,7 @@ export default Vue.extend({
       releaseOwnershipListener: null as (() => void) | null,
       /** Teardown for the cross-tab freeze responder. Not reactive. */
       releaseFreezeResponder: null as (() => void) | null,
+      releaseTabRoster: null as (() => void) | null,
       /**
        * Set when we cannot establish whether the server owns the queue. A
        * belt-and-braces gate on Resume alongside `hasResumableState`: that flag
@@ -273,16 +274,30 @@ export default Vue.extend({
 
     this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
       this.ownershipBlocked = next !== null;
+      const step = this.$refs.scrobbleStep as any;
       if (next) {
         this.hasResumableState = false;
-        const step = this.$refs.scrobbleStep as any;
         if (step && step.haltForHandoff) {
           // Deliberately not awaited: this is an event handler, and the halt
           // resolves only once the in-flight batch finishes.
           Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
         }
+      } else if (step && step.releaseHandoffHalt) {
+        /*
+          Ownership was released, so whatever stopped this tab did not happen.
+          Without this the halt outlives it: a failed preflight in another tab
+          leaves every sibling `handoffHalted`, and "Resume" cannot restart
+          them because the flag is checked at the top of the send loop.
+        */
+        step.releaseHandoffHalt();
+        this.hasResumableState = true;
       }
     });
+
+    // Registered so other tabs can tell how many siblings a freeze must wait
+    // for. Without a roster, "everyone has stopped" is not observable and a
+    // freezing tab can only guess at a timeout.
+    this.releaseTabRoster = background.joinTabRoster();
 
     /*
       This tab answers other tabs' freeze requests. Handing over is decided in
@@ -294,10 +309,38 @@ export default Vue.extend({
     this.releaseFreezeResponder = background.respondToFreezeRequests(async () => {
       const step = this.$refs.scrobbleStep as any;
       if (step && step.haltForHandoff) {
-        await step.haltForHandoff();
+        /*
+          The boolean is load-bearing. `haltForHandoff` returns false when the
+          loop was still running after its polling budget — which is exactly
+          the in-flight Last.fm request case — and answering "stopped" then
+          would let the sibling upload a queue this tab is still sending from.
+        */
+        if (!await step.haltForHandoff()) {
+          return false;
+        }
+        /*
+          Persisted here, synchronously with the acknowledgement, rather than
+          via the usual `auto-save` event: that only emits, and the freezing
+          tab re-reads IndexedDB the moment this resolves. An unawaited save
+          would not have landed.
+
+          `saveStateIfAhead` rather than `saveState` because several tabs
+          persist at once during a freeze and a plain put is last-writer-wins;
+          the slowest snapshot would otherwise erase the furthest progress.
+        */
+        try {
+          const snapshot = step.progressSnapshot();
+          if (snapshot) {
+            await this.stateManager.saveStateIfAhead(this.buildState(snapshot));
+          }
+        } catch (e) {
+          trackError('background.freezePersist', e);
+          return false;
+        }
       }
       this.hasResumableState = false;
       this.ownershipBlocked = true;
+      return true;
     });
 
     if (unresolved) {
@@ -341,6 +384,11 @@ export default Vue.extend({
     }
     if (this.releaseFreezeResponder) {
       this.releaseFreezeResponder();
+    }
+    if (this.releaseTabRoster) {
+      // Leaves the roster, so a closed tab does not make every future handoff
+      // wait out the full window for an acknowledgement that cannot come.
+      this.releaseTabRoster();
     }
   },
   watch: {
@@ -419,6 +467,17 @@ export default Vue.extend({
      */
     async reconcileQueueOwner(owner: background.QueueOwner) {
       if (owner.owner === 'freezing') {
+        /*
+          A freeze that was written moments ago belongs to a tab that is still
+          working through its handover. This runs on every load, including in a
+          tab the user opened *during* that handover, and clearing the record
+          would release every sibling into the window it exists to protect.
+          Left alone and reconciled on a later load instead.
+        */
+        if (background.freezeAttemptIsFresh(owner)) {
+          this.backgroundNotice = 'A handover is starting in another tab, so scrobbling here is paused for a moment.';
+          return;
+        }
         // No handoff id means it never got as far as preflight, so nothing was
         // ever reserved and the freeze can simply lift.
         if (!owner.id) {
@@ -793,7 +852,9 @@ export default Vue.extend({
       this.ownershipBlocked = false;
       background.clearPendingHandoff();
       background.clearOwnershipUnresolved();
-      background.setQueueOwner(null);
+      // Scoped: this tab's own freeze, or a `server` record we have just
+      // disproved. A freeze another tab is actively holding stays.
+      background.releaseQueueOwnerIfUnclaimed(pendingId || '');
       background.clearHandoffLineage();
 
       const step = this.$refs.scrobbleStep as any;
@@ -964,7 +1025,10 @@ export default Vue.extend({
         this.backgroundJob = null;
         this.hasResumableState = true;
         this.ownershipBlocked = false;
-        background.setQueueOwner(null);
+        // The cancel is confirmed, so the record naming this job is ours to
+        // clear — but a freeze another tab is holding for a *different*
+        // handover is not.
+        background.releaseQueueOwnerIfUnclaimed(jobId);
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         background.clearHandoffLineage();
@@ -996,6 +1060,10 @@ export default Vue.extend({
      */
     async exportWhenQuiescent(jobId: string): Promise<any> {
       let lastReason = 'unreachable';
+      // One claim for the whole loop. The server accepts a retry only from the
+      // claimant, so generating a fresh one per attempt would lock the
+      // take-back out of its own claim.
+      const claim = background.newExportClaim();
       /*
         Budgeted to outlast a lease *and* a missed sweep.
 
@@ -1009,7 +1077,7 @@ export default Vue.extend({
       */
       for (let i = 0; i < 120; i += 1) {
         // eslint-disable-next-line no-await-in-loop
-        const exported = await background.exportJob(jobId);
+        const exported = await background.exportJob(jobId, claim);
         if (exported && exported.ok) {
           return exported;
         }

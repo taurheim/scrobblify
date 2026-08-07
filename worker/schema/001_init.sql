@@ -222,7 +222,9 @@ CREATE TABLE IF NOT EXISTS batches (
   start_index         INTEGER NOT NULL,
   entry_count         INTEGER NOT NULL,
   state               TEXT NOT NULL,
-  -- JSON array of unix seconds, positionally aligned with the batch entries.
+  -- JSON array of serialised `AssignedTrack` objects, positionally aligned
+  -- with the batch entries. Each carries `timestampSec` — the second actually
+  -- submitted — alongside the track and its index in the job's blob.
   assigned_timestamps TEXT NOT NULL,
   -- JSON array of ignore codes, positionally aligned. NULL until a response is
   -- parsed. Entries whose fate is unknown after a lost response stay behind

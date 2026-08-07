@@ -880,6 +880,71 @@ async function main() {
       job.failed_count === MAX_RECORDED_FAILURES_PER_JOB + 50, job.failed_count);
   }
 
+  console.log('\n-- a lapsed export claim is reverted, not stranded --');
+  {
+    /*
+      `exporting` is deliberately neither schedulable nor resumable. A client
+      that closed its tab midway through a take-back would therefore park the
+      job forever, so the sweep reverts a claim whose deadline has passed —
+      and reverts it to the state it was claimed from, because sending a
+      `needs_attention` job to `paused` would quietly clear something the user
+      still has to act on.
+    */
+    const h = await harness({ total: 10 });
+    await h.sql.run(
+      `UPDATE jobs SET state = 'exporting', export_claim = 'abandoned-claim',
+          export_prev_state = 'needs_attention', locked_until = ? WHERE id = ?`,
+      [NOW - 1, h.jobId],
+    );
+    await runTick(h.env, NOW);
+    const job = await h.job();
+    check('reverted to the state it was claimed from',
+      job.state === 'needs_attention', job.state);
+    check('the claim is cleared', job.export_claim === null, job.export_claim);
+    check('and so is its deadline', job.locked_until === 0, job.locked_until);
+
+    // A claim that has not lapsed is left alone: the take-back is still going.
+    const live = await harness({ total: 10 });
+    await live.sql.run(
+      `UPDATE jobs SET state = 'exporting', export_claim = 'live-claim',
+          export_prev_state = 'paused', locked_until = ? WHERE id = ?`,
+      [NOW + 300, live.jobId],
+    );
+    await runTick(live.env, NOW);
+    check('a claim still inside its deadline is untouched',
+      (await live.job()).state === 'exporting');
+  }
+
+  console.log('\n-- a parked job with a stale batch can still be drained --');
+  {
+    /*
+      Drain selection used to require `paused`. A batch left `sending` while
+      failure escalation moved the job to `needs_attention` could then never
+      be reconciled, so the take-back's export sat at 409 `batch_in_flight`
+      forever. Reconciling is read-only against Last.fm, so it is safe from
+      any parked state.
+    */
+    const h = await harness({ total: 10 });
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, sent_at, created_at)
+       VALUES (?, ?, (SELECT generation FROM jobs WHERE id = ?), 0, 2, 'sending', ?, ?, ?)`,
+      [randomId(), h.jobId, h.jobId, JSON.stringify([]), NOW - 10_000, NOW - 10_000],
+    );
+    await h.sql.run(
+      "UPDATE jobs SET state = 'needs_attention', locked_until = 0 WHERE id = ?",
+      [h.jobId],
+    );
+    await runTick(h.env, NOW);
+    const stillSending = await h.sql.first<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM batches WHERE job_id = ? AND state = 'sending'",
+      [h.jobId],
+    );
+    check('the stale batch was settled', stillSending!.n === 0, stillSending!.n);
+    check('and the job stayed parked where it was',
+      (await h.job()).state === 'needs_attention');
+  }
+
   console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);
   process.exit(failures === 0 ? 0 : 1);
 }

@@ -1109,9 +1109,23 @@ async function drainPausedJobs(
     that closed its tab midway would otherwise park the job permanently. The
     claim deadline lives in `locked_until`, so a lapsed one is exactly a
     lapsed lease.
+
+    It reverts to whatever it was claimed from. Sending it to `paused`
+    unconditionally would clear a `needs_attention` or `needs_reauth` the user
+    still has to act on, turning a job that is waiting for them into one that
+    merely looks idle.
   */
   const reverted = await env.sql.run(
-    `UPDATE jobs SET state = 'paused', locked_until = 0, updated_at = ?
+    `UPDATE jobs
+        SET state = CASE
+              WHEN export_prev_state IN ('paused', 'needs_attention', 'needs_reauth')
+                THEN export_prev_state
+              ELSE 'paused'
+            END,
+            export_claim = NULL,
+            export_prev_state = NULL,
+            locked_until = 0,
+            updated_at = ?
       WHERE state = 'exporting' AND locked_until <= ?`,
     [nowSec, nowSec],
   );
@@ -1208,8 +1222,9 @@ async function drainOneJob(
       report.errors.push(`drain ${jobId}: ${(error as Error).message}`);
     }
   }
-  // Released back to `paused`, not `active`: draining must never restart a
-  // job the user stopped.
+  // Only the lease is released; the state is left exactly as acquired.
+  // Draining must never restart a job the user stopped, and must not clear a
+  // `needs_attention` they still have to act on.
   await env.sql.run(
     `UPDATE jobs SET locked_until = 0, updated_at = ?
       WHERE id = ? AND generation = ?`,

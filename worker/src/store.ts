@@ -115,6 +115,10 @@ export interface JobRow {
   probing: number;
   /** Lowest synthetic scrobble second used so far. See `002_synthetic_floor.sql`. */
   synthetic_floor: number;
+  /** Token identifying the take-back holding an `exporting` claim. */
+  export_claim: string | null;
+  /** State to restore when an `exporting` claim lapses or completes. */
+  export_prev_state: string | null;
   created_at: number;
   updated_at: number;
   credential_expires_at: number;
@@ -199,6 +203,21 @@ export async function acquireJob(
  * Fencing is identical to the normal path: the generation is bumped, so any
  * write from a superseded tick is rejected.
  */
+/**
+ * Job states a drain may reconcile from.
+ *
+ * All three are parked: the user has stopped the job, or it is waiting on
+ * them. None of them send. Reconciling is read-only against Last.fm, so it is
+ * safe from any of them — and restricting it to `paused` meant a job that
+ * escalated to `needs_attention` while a batch was still `sending` could never
+ * be drained, so its take-back sat at 409 `batch_in_flight` forever.
+ *
+ * Inlined into SQL rather than bound, because the list is a constant and
+ * SQLite cannot bind an IN list.
+ */
+export const DRAINABLE_STATES = ['paused', 'needs_attention', 'needs_reauth'] as const;
+const DRAINABLE_STATES_SQL = `('${DRAINABLE_STATES.join("', '")}')`;
+
 export async function acquireJobForDrain(
   sql: Sql,
   jobId: string,
@@ -212,7 +231,7 @@ export async function acquireJobForDrain(
             updated_at = ?
       WHERE id = ?
         AND locked_until < ?
-        AND state = 'paused'
+        AND state IN ${DRAINABLE_STATES_SQL}
       RETURNING *`,
     [nowSec + leaseSeconds, nowSec, jobId, nowSec],
   );
@@ -224,7 +243,7 @@ export async function acquireJobForDrain(
 }
 
 /**
- * Paused jobs holding a batch old enough to be worth reconciling.
+ * Parked jobs holding a batch old enough to be worth reconciling.
  *
  * The grace period is the caller's, so this stays honest about the fact that
  * "still sending" and "response lost" are indistinguishable until enough time
@@ -238,7 +257,7 @@ export async function selectDrainableJobs(
 ): Promise<JobRow[]> {
   return sql.all<JobRow>(
     `SELECT j.* FROM jobs j
-      WHERE j.state = 'paused'
+      WHERE j.state IN ${DRAINABLE_STATES_SQL}
         AND j.locked_until < ?
         AND EXISTS (
           SELECT 1 FROM batches b

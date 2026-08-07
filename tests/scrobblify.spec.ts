@@ -928,6 +928,15 @@ test.describe('Rate limit handling', () => {
   }
 
   test('gives up and saves instead of retrying a rate limit forever', async ({ page }) => {
+    /*
+      Needs more than the default 30s budget. Not because anything is slow, but
+      because of what the test does: it drives ~50 minutes of simulated time
+      through the backoff ladder in 30-second steps, and every step costs a
+      real round-trip to the page. That is upwards of 150 round-trips, which
+      lands just over 30s of wall clock — so the default made this a coin flip
+      that had nothing to do with the behaviour under test.
+    */
+    test.setTimeout(180000);
     // Regression: the old handler paused a flat 60s and retried the same track
     // indefinitely. Two production users sat through 200+ consecutive retries.
     //

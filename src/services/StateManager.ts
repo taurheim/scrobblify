@@ -161,6 +161,49 @@ export default class StateManager {
     });
   }
 
+  /**
+   * Saves only if the incoming state is at least as far along as the stored one.
+   *
+   * The record is shared by every tab on the origin, and a plain `put` is
+   * last-writer-wins. During a freeze, several tabs persist at once and the
+   * slowest commit lands last — so a tab that had scrobbled 110 tracks could
+   * overwrite one that had scrobbled 130, and the handoff would then upload
+   * twenty tracks that were already sent. The same happens with a single tab
+   * whenever a stale auto-save resolves late.
+   *
+   * `originalSucceededCount` is the cumulative total across every session of
+   * the import, so it is monotonic by construction and is the right ordering
+   * key. Ties fall back to the shorter remaining queue.
+   *
+   * Read and write share one `readwrite` transaction, which IndexedDB runs to
+   * completion against the store before starting another — so this is a real
+   * compare-and-set rather than a racy read-then-write.
+   *
+   * Returns whether the write happened.
+   */
+  public async saveStateIfAhead(state: ScrobbleState): Promise<boolean> {
+    const db = await this.openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(STATE_KEY);
+      let wrote = false;
+      req.onsuccess = () => {
+        const existing = req.result as ScrobbleState | undefined;
+        const ahead = !existing
+          || (state.originalSucceededCount || 0) > (existing.originalSucceededCount || 0)
+          || ((state.originalSucceededCount || 0) === (existing.originalSucceededCount || 0)
+            && state.tracks.length <= existing.tracks.length);
+        if (ahead) {
+          store.put(state, STATE_KEY);
+          wrote = true;
+        }
+      };
+      tx.oncomplete = () => { db.close(); resolve(wrote); };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    });
+  }
+
   public async loadState(): Promise<ScrobbleState | null> {
     const db = await this.openDB();
     return new Promise((resolve, reject) => {

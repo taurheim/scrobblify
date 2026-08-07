@@ -12,10 +12,13 @@ import { encryptCredential, sha256Hex, randomId, signPayload } from '../src/cryp
 import { issueSession, SESSION_TTL_SECONDS } from '../src/session';
 import { ALGORITHM_VERSION } from '../src/handoff';
 import { handleRequest, ApiEnv, MIN_TRACKS_FOR_BACKGROUND } from '../src/api';
+import { assignTimestamps } from '../src/timestamps';
 
 const NOW = 1_800_000_000;
 const SIGNING = 'signing-key-for-tests-0123456789';
 const CRED = 'credential-secret-for-tests-01234';
+/** Export claim token. The endpoint requires one of at least 16 characters. */
+const EXPORT_CLAIM = 'export-claim-token-for-tests';
 const APP = 'https://savas.ca/scrobble';
 const CB = 'https://api.savas.ca/scrobblify/auth/callback';
 
@@ -457,7 +460,7 @@ async function main() {
     );
     const token = await issueSession('listener', SIGNING, NOW);
     const body: any = await (await handleRequest(env,
-      req(`/scrobblify/job/${id}/export`, { token }))).json();
+      req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
 
     // The export exists so a user can finish client-side. Without the tracks
     // it is unusable, which would defeat the whole escape hatch.
@@ -505,7 +508,7 @@ async function main() {
     });
     const token = await issueSession('listener', SIGNING, NOW);
     const body: any = await (await handleRequest(env,
-      req(`/scrobblify/job/${id}/export`, { token }))).json();
+      req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
 
     check('re-tagged tracks come back flagged',
       body.state.tracks.every((t: any) => t.reTagged === true), body.state.tracks[0]);
@@ -526,9 +529,12 @@ async function main() {
     const blobs = new MemoryBlobs();
     const env = makeEnv(sql, blobs);
     const token = await issueSession('listener', SIGNING, NOW);
+    const exportReq = (jobId: string, claim: string) => req(`/scrobblify/job/${jobId}/export`, {
+      method: 'POST', token, body: JSON.stringify({ claim }),
+    });
 
     const active = await seedJob(sql, blobs, 'listener', { total: 100, state: 'active' });
-    const activeRes = await handleRequest(env, req(`/scrobblify/job/${active}/export`, { token }));
+    const activeRes = await handleRequest(env, exportReq(active, EXPORT_CLAIM));
     check('an active job cannot be exported', activeRes.status === 409, activeRes.status);
     check('and it is left active',
       (await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [active]))!.state === 'active');
@@ -537,27 +543,66 @@ async function main() {
     const blobs2 = new MemoryBlobs();
     const env2 = makeEnv(sql2, blobs2);
     const id = await seedJob(sql2, blobs2, 'listener', { total: 100, state: 'paused' });
-    const first = await handleRequest(env2, req(`/scrobblify/job/${id}/export`, { token }));
+
+    const unclaimed = await handleRequest(env2, req(`/scrobblify/job/${id}/export`, {
+      method: 'POST', token, body: JSON.stringify({}),
+    }));
+    check('an export without a claim is refused', unclaimed.status === 400, unclaimed.status);
+
+    const first = await handleRequest(env2, exportReq(id, EXPORT_CLAIM));
     check('a paused job exports', first.status === 200, first.status);
     const claimed = await sql2.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]);
     check('and is claimed into exporting', claimed!.state === 'exporting', claimed!.state);
     check('with a claim deadline that expires',
       claimed!.locked_until > NOW, claimed!.locked_until);
+    check('recording where to go back to', claimed!.export_prev_state === 'paused',
+      claimed!.export_prev_state);
 
     // The client retries this endpoint on a 409, and a retry is the same
     // take-back continuing — refusing it would strand the user.
-    const second = await handleRequest(env2, req(`/scrobblify/job/${id}/export`, { token }));
-    check('re-exporting a claimed job is allowed', second.status === 200, second.status);
+    const second = await handleRequest(env2, exportReq(id, EXPORT_CLAIM));
+    check('re-exporting with the same claim is allowed', second.status === 200, second.status);
+
+    /*
+      A second tab must not read concurrently. It could otherwise save and
+      cancel — deleting the blobs — while the first was still reading chunks,
+      and the first would return a silently partial queue that overwrites the
+      complete local save.
+    */
+    const other = await handleRequest(env2, exportReq(id, `${EXPORT_CLAIM}-other`));
+    check('but another claim cannot barge in', other.status === 409, other.status);
 
     const resumed = await handleRequest(env2,
       req(`/scrobblify/job/${id}/resume`, { method: 'POST', token }));
-    check('but it cannot be resumed out from under the export',
+    check('and it cannot be resumed out from under the export',
       resumed.status === 409, resumed.status);
 
     // Cancel is the take-back *completing*, so it must still work.
     const cancelled = await handleRequest(env2,
       req(`/scrobblify/job/${id}/cancel`, { method: 'POST', token }));
     check('cancel still works from exporting', cancelled.status === 200, cancelled.status);
+  }
+
+  console.log('\n-- an abandoned export claim reverts to where it came from --');
+  {
+    /*
+      `exporting` is neither schedulable nor resumable, so a client that closed
+      its tab midway would park the job permanently. Reverting to `paused`
+      unconditionally would instead clear a `needs_attention` the user still
+      has to act on, turning a job waiting for them into one that looks idle.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const token = await issueSession('listener', SIGNING, NOW);
+    const id = await seedJob(sql, blobs, 'listener', { total: 100, state: 'needs_attention' });
+    await handleRequest(env, req(`/scrobblify/job/${id}/export`, {
+      method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }),
+    }));
+    const held = await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]);
+    check('claimed from needs_attention', held!.state === 'exporting', held!.state);
+    check('remembering where to return it to',
+      held!.export_prev_state === 'needs_attention', held!.export_prev_state);
   }
 
   console.log('\n-- the export reports every second it used --');
@@ -574,26 +619,50 @@ async function main() {
     const blobs = new MemoryBlobs();
     const env = makeEnv(sql, blobs);
     const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 40, state: 'paused' });
+    /*
+      Seeded through `assignTimestamps` rather than by hand. An earlier version
+      of this test inserted bare number arrays, which is not the shape the
+      scheduler writes — it stores serialised `AssignedTrack` objects. The
+      export's parser was reading numbers, matched nothing, and returned an
+      empty `usedRanges`; the test passed anyway, because the fixture was the
+      only place that shape existed. Anything that asserts on this column has
+      to be built the way production builds it.
+    */
+    const forSend = (starts: number[]) => starts.map((ts, i) => ({
+      artist: 'A', track: `T${ts}`, index: i, originalTimestampSec: ts,
+    }));
+    const first = assignTimestamps(forSend([1000, 1001, 1002]), NOW, 0);
+    const second = assignTimestamps(forSend([5000, 1003]), NOW, 0);
     await sql.run(
       `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
           assigned_timestamps, created_at)
        VALUES (?, ?, 0, 0, 3, 'settled', ?, ?)`,
-      [randomId(), id, JSON.stringify([1000, 1001, 1002]), NOW],
+      [randomId(), id, JSON.stringify(first.assigned), NOW],
     );
     await sql.run(
       `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
           assigned_timestamps, created_at)
        VALUES (?, ?, 0, 3, 2, 'settled', ?, ?)`,
-      [randomId(), id, JSON.stringify([5000, 1003]), NOW],
+      [randomId(), id, JSON.stringify(second.assigned), NOW],
     );
     const token = await issueSession('listener', SIGNING, NOW);
     const body: any = await (await handleRequest(env,
-      req(`/scrobblify/job/${id}/export`, { token }))).json();
+      req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
 
+    const expected = [...first.assigned, ...second.assigned]
+      .map((a) => a.timestampSec)
+      .sort((a, b) => a - b);
+    const covered = (ts: number) => body.usedRanges
+      .some((r: any) => ts >= r.from && ts <= r.to);
+    check('every second the worker actually assigned is reported',
+      expected.every(covered), { expected, got: body.usedRanges });
+    check('and something was reported at all — an empty list is the H5 bug',
+      Array.isArray(body.usedRanges) && body.usedRanges.length > 0, body.usedRanges);
     check('contiguous seconds collapse into one range',
-      JSON.stringify(body.usedRanges) === JSON.stringify([
-        { from: 1000, to: 1003 }, { from: 5000, to: 5000 },
-      ]), body.usedRanges);
+      body.usedRanges.length < expected.length, body.usedRanges);
+    check('ranges are well formed and ascending',
+      body.usedRanges.every((r: any, i: number) => r.from <= r.to
+        && (i === 0 || r.from > body.usedRanges[i - 1].to)), body.usedRanges);
     check('a complete list is not reported as truncated',
       body.usedRangesTruncated === false, body.usedRangesTruncated);
   }
