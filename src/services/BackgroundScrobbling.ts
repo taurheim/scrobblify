@@ -26,6 +26,8 @@ const HANDOFF_STORAGE_KEY = 'scrobblify.background.handoff';
  */
 const UNRESOLVED_STORAGE_KEY = 'scrobblify.background.unresolved';
 const LINEAGE_STORAGE_KEY = 'scrobblify.background.lineage';
+const SERVER_OWNS_STORAGE_KEY = 'scrobblify.background.serverOwns';
+const OWNERSHIP_CHANNEL = 'scrobblify.ownership';
 
 export interface Capacity {
   available: boolean;
@@ -134,21 +136,40 @@ export function clearPendingHandoff(): void {
  * unresolved finalise reads IndexedDB, finds a queue, and cheerfully offers
  * "Resume" — while a worker may be scrobbling the very same tracks.
  *
+ * The kind is recorded alongside the id because the two ambiguous moments
+ * produce different identifiers: a lost finalise leaves a *handoff* id, while
+ * an unconfirmed cancel during take-back leaves a *job* id. They are separate
+ * namespaces on separate endpoints, so resolving one as the other yields a
+ * permanent 404 — an unresolvable marker that hides the user's queue forever.
+ *
  * Absence of the marker means "resolved". Only a positive answer from the
  * server clears it.
  */
-export function setOwnershipUnresolved(handoffId: string): void {
+export interface OwnershipMarker {
+  kind: 'handoff' | 'job';
+  id: string;
+}
+
+export function setOwnershipUnresolved(kind: 'handoff' | 'job', id: string): void {
   try {
-    window.localStorage.setItem(UNRESOLVED_STORAGE_KEY, handoffId);
+    window.localStorage.setItem(UNRESOLVED_STORAGE_KEY, JSON.stringify({ kind, id }));
   } catch {
     // Private browsing. Nothing better is available; the in-memory path still
     // refuses to resume for the life of this page.
   }
 }
 
-export function getOwnershipUnresolved(): string | null {
+export function getOwnershipUnresolved(): OwnershipMarker | null {
   try {
-    return window.localStorage.getItem(UNRESOLVED_STORAGE_KEY);
+    const raw = window.localStorage.getItem(UNRESOLVED_STORAGE_KEY);
+    if (!raw) { return null; }
+    // Markers written before the kind existed were always handoff ids.
+    if (raw.charAt(0) !== '{') {
+      return { kind: 'handoff', id: raw };
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.id !== 'string' || !parsed.id) { return null; }
+    return { kind: parsed.kind === 'job' ? 'job' : 'handoff', id: parsed.id };
   } catch {
     return null;
   }
@@ -178,6 +199,17 @@ export function clearOwnershipUnresolved(): void {
 export interface HandoffLineage {
   originalTotalTracks: number;
   originalSucceededCount: number;
+  /**
+   * The browser's own re-tag high-water mark at the moment of the handoff, and
+   * the clock it was taken against.
+   *
+   * Needed because the browser's earlier band is invisible to the server: a
+   * take-back that reserved a range using only the server's floor could land
+   * back on seconds *this browser* used before handing over, which Last.fm
+   * discards as silently as any other collision.
+   */
+  reTagCursorSec?: number;
+  handedOverAtSec?: number;
 }
 
 export function setHandoffLineage(lineage: HandoffLineage): void {
@@ -196,7 +228,12 @@ export function getHandoffLineage(): HandoffLineage | null {
     const total = Number(parsed.originalTotalTracks);
     const succeeded = Number(parsed.originalSucceededCount);
     if (!Number.isFinite(total) || !Number.isFinite(succeeded)) { return null; }
-    return { originalTotalTracks: total, originalSucceededCount: succeeded };
+    return {
+      originalTotalTracks: total,
+      originalSucceededCount: succeeded,
+      reTagCursorSec: Number.isFinite(parsed.reTagCursorSec) ? parsed.reTagCursorSec : 0,
+      handedOverAtSec: Number.isFinite(parsed.handedOverAtSec) ? parsed.handedOverAtSec : 0,
+    };
   } catch {
     // Corrupt or unreadable. Cosmetic, so degrade rather than throw.
     return null;
@@ -209,6 +246,87 @@ export function clearHandoffLineage(): void {
   } catch {
     // Nothing to do.
   }
+}
+
+/**
+ * Origin-wide "the server owns the queue" flag.
+ *
+ * Handing over is a decision made in one tab that binds every tab. Another tab
+ * opened earlier still holds the queue in memory and, before this existed,
+ * would happily keep scrobbling — or offer a Resume — against a job that may
+ * run unattended for weeks. Clearing IndexedDB does not reach it.
+ *
+ * localStorage is the coordination point rather than `BroadcastChannel` alone,
+ * because it is also read on startup: a tab opened *after* the handover has no
+ * message to receive. The channel is layered on top so that tabs already open
+ * react immediately rather than at their next send.
+ *
+ * Deliberately conservative and origin-wide: this is a stop signal, and a
+ * false stop costs a delay while a missed one costs duplicate scrobbles.
+ */
+export function setServerOwnsQueue(owns: boolean): void {
+  try {
+    if (owns) {
+      window.localStorage.setItem(SERVER_OWNS_STORAGE_KEY, '1');
+    } else {
+      window.localStorage.removeItem(SERVER_OWNS_STORAGE_KEY);
+    }
+  } catch {
+    // Private browsing. The in-page listener below still covers open tabs.
+  }
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const channel = new BroadcastChannel(OWNERSHIP_CHANNEL);
+      channel.postMessage({ serverOwns: owns });
+      channel.close();
+    }
+  } catch {
+    // Unsupported. `storage` events still reach other tabs.
+  }
+}
+
+export function serverOwnsQueue(): boolean {
+  try {
+    return window.localStorage.getItem(SERVER_OWNS_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Calls back when another tab hands the queue to the server, so a loop already
+ * running here stops before its next send rather than at its next reload.
+ *
+ * Returns a teardown function.
+ */
+export function onServerOwnershipChange(handler: (owns: boolean) => void): () => void {
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === SERVER_OWNS_STORAGE_KEY) {
+      handler(event.newValue === '1');
+    }
+  };
+  window.addEventListener('storage', onStorage);
+
+  let channel: BroadcastChannel | null = null;
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      channel = new BroadcastChannel(OWNERSHIP_CHANNEL);
+      channel.onmessage = (event: MessageEvent) => {
+        if (event.data && typeof event.data.serverOwns === 'boolean') {
+          handler(event.data.serverOwns);
+        }
+      };
+    }
+  } catch {
+    channel = null;
+  }
+
+  return () => {
+    window.removeEventListener('storage', onStorage);
+    if (channel) {
+      channel.close();
+    }
+  };
 }
 
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
@@ -265,6 +383,66 @@ export async function fetchCapacity(): Promise<Capacity | null> {
       return null;
     }
     return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the server currently owns any queue for this user.
+ *
+ * Tri-state, like `isHandoffActive`. `false` means the server answered and
+ * there is no live job; `null` means we could not establish that and the
+ * caller must assume the server might own it.
+ *
+ * Distinct from `fetchJob`, which folds every failure into `null` because its
+ * only job is to render a status card. Ownership decisions cannot use that.
+ */
+/**
+ * Set when the worker rejects our session token. Sessions last 14 days, and an
+ * unresolved handoff outlives one easily; without surfacing this the user would
+ * see an endless "couldn't check" message with no way to act on it.
+ */
+let sessionExpired = false;
+
+export function isSessionExpired(): boolean {
+  return sessionExpired;
+}
+
+/**
+ * Job states in which the server has definitively stopped scrobbling. Anything
+ * else — including states added later — counts as live, so an unknown state
+ * errs towards withholding Resume rather than towards duplicates.
+ */
+const TERMINAL_JOB_STATES = ['completed', 'failed', 'cancelled'];
+
+export async function hasLiveJob(): Promise<boolean | null> {
+  if (!isBackgroundConfigured()) {
+    return false;
+  }
+  if (!getSession()) {
+    // No session means this browser never linked to the service, so it cannot
+    // have handed anything over from here.
+    return false;
+  }
+  const res = await getWithTimeout('/scrobblify/job', true);
+  if (!res) {
+    return null;
+  }
+  if (res.status === 401) {
+    sessionExpired = true;
+    return null;
+  }
+  if (!res.ok) {
+    return null;
+  }
+  try {
+    const body = await res.json();
+    const job = body.job ?? null;
+    if (!job) {
+      return false;
+    }
+    return !TERMINAL_JOB_STATES.includes(job.state);
   } catch {
     return null;
   }
@@ -439,29 +617,12 @@ export async function uploadAndFinalize(
  *
  * Older workers do not send `resolved`. They are treated as unresolved unless
  * they say `active`, because their `false` cannot be trusted to be terminal.
- */
-/**
- * Set when the worker rejects our session token. Sessions last 14 days, and an
- * unresolved handoff outlives one easily; without surfacing this the user would
- * see an endless "couldn't check" message with no way to act on it.
- */
-let sessionExpired = false;
-
-export function isSessionExpired(): boolean {
-  return sessionExpired;
-}
-
-/**
- * Whether the server owns a handed-over queue.
  *
- * Tri-state on purpose. `true` and `false` are answers; `null` means we do not
- * know, and every caller must treat it as "assume the server might own this"
- * rather than "no job". A timeout is applied because this gates the Resume
- * button, and an unbounded request would leave the user stuck on a spinner.
- *
- * A 401 is reported through `sessionExpired` rather than folded into `null`:
- * it is permanent until the user re-links, so retrying cannot help and the UI
- * needs to offer a different remedy.
+ * A timeout is applied because this gates the Resume button, and an unbounded
+ * request would leave the user stuck on a spinner. A 401 is reported through
+ * `sessionExpired` rather than folded into `null`: it is permanent until the
+ * user re-authenticates, so retrying cannot help and the UI needs to offer a
+ * different remedy.
  */
 export async function isHandoffActive(
   handoffId: string,
@@ -486,6 +647,21 @@ export async function isHandoffActive(
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolves an ownership marker of either kind.
+ *
+ * The two ambiguous moments leave different identifiers on different
+ * endpoints, so the marker carries its own kind and this dispatches on it.
+ */
+export async function resolveOwnershipMarker(
+  marker: OwnershipMarker,
+): Promise<boolean | null> {
+  if (marker.kind === 'job') {
+    return hasLiveJob();
+  }
+  return isHandoffActive(marker.id);
 }
 
 export async function jobAction(jobId: string, action: 'pause' | 'resume' | 'cancel'): Promise<boolean> {
@@ -548,5 +724,63 @@ export function consumeRedirectFragment(): { session: string; handoffId: string 
   } catch (e) {
     trackError('background.consumeRedirectFragment', e);
     return null;
+  }
+}
+
+/**
+ * Starts a re-authentication so an expired browser session can be replaced.
+ *
+ * This creates no job and reserves no capacity — it exists purely so that a
+ * user whose token aged out can answer the ownership question again. Without
+ * it the client's refusal to resume on an unanswered question is permanent.
+ *
+ * Returns the URL to send the browser to, or null if the service is
+ * unreachable or not configured.
+ */
+export async function startReauth(username: string): Promise<string | null> {
+  if (!isBackgroundConfigured()) {
+    return null;
+  }
+  try {
+    const res = await fetch(`${API_BASE}/scrobblify/auth/signin`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+    const body = await res.json();
+    if (!res.ok || !body.ok) {
+      return null;
+    }
+    return body.authoriseUrl as string;
+  } catch (e) {
+    trackError('background.startReauth', e);
+    return null;
+  }
+}
+
+/**
+ * Consumes a re-authentication redirect.
+ *
+ * Separate from `consumeRedirectFragment` because that one also expects a
+ * handoff id and stores it as pending — doing so here would make the client
+ * try to finalise an upload that was never started.
+ */
+export function consumeReauthFragment(): boolean {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('signin') !== 'ok') {
+      return false;
+    }
+    const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const session = hash.get('session');
+    if (!session) {
+      return false;
+    }
+    setSession(session);
+    window.history.replaceState(null, '', window.location.pathname);
+    return true;
+  } catch (e) {
+    trackError('background.consumeReauthFragment', e);
+    return false;
   }
 }

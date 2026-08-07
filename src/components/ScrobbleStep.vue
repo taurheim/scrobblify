@@ -145,6 +145,7 @@ import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError } from '@/services/Analytics';
 import RateLimitTracker, { DAILY_LIMIT } from '@/services/RateLimitTracker';
 import { canCompress } from '@/services/BackgroundScrobbling';
+import * as background from '@/services/BackgroundScrobbling';
 
 /**
  * Below this, finishing in the browser takes about a day and the extra moving
@@ -576,6 +577,24 @@ export default Vue.extend({
         // so a halt landing during a backoff would otherwise be undone.
         if (this.handoffHalted) {
           this.endPacing();
+          return;
+        }
+
+        /*
+          Another tab may have handed this queue to the server since the last
+          iteration. That tab clears IndexedDB, but nothing about that reaches
+          the copy already loaded here, so without this check a second tab
+          keeps scrobbling tracks the worker is also sending — for weeks,
+          unattended. Read every iteration rather than cached, because the
+          whole point is that it changes underneath us.
+        */
+        if (background.serverOwnsQueue()) {
+          this.endPacing();
+          this.handoffHalted = true;
+          this.paused = true;
+          this.manuallyPaused = true;
+          this.pauseReason = 'Your import was handed to the background service in another tab, so scrobbling here has stopped.';
+          trackEvent('scrobble_stopped_server_owns');
           return;
         }
 

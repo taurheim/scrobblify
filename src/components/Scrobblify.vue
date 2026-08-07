@@ -48,6 +48,11 @@
 
     <v-alert v-if="backgroundNotice" type="warning" class="mb-4">
       {{ backgroundNotice }}
+      <div v-if="showReauth" class="mt-3">
+        <v-btn color="primary" :loading="reauthBusy" @click="reauthenticate">
+          Sign in to the background service
+        </v-btn>
+      </div>
     </v-alert>
 
     <v-alert
@@ -189,6 +194,8 @@ export default Vue.extend({
       pendingState: null as ScrobbleState | null,
       /** Retained so the listener can be removed again. Not reactive state. */
       onPageShow: null as ((event: PageTransitionEvent) => void) | null,
+      /** Teardown for the cross-tab ownership subscription. Not reactive. */
+      releaseOwnershipListener: null as (() => void) | null,
       /**
        * Set when we cannot establish whether the server owns the queue. A
        * belt-and-braces gate on Resume alongside `hasResumableState`: that flag
@@ -196,6 +203,12 @@ export default Vue.extend({
        * ownership question would re-expose the duplicate path.
        */
       ownershipBlocked: false,
+      /**
+       * Shown only when the block is caused by an expired bearer token, which
+       * is the one unresolved case the user can actually fix themselves.
+       */
+      showReauth: false,
+      reauthBusy: false,
     };
   },
   async mounted() {
@@ -204,6 +217,11 @@ export default Vue.extend({
     // Ordering matters. A handoff coming back from Last.fm must be finished
     // before anything reads local state, because the upload derives its bytes
     // from that state and completing the handoff is what clears it.
+    //
+    // A re-authentication return is consumed first, and only for its token: it
+    // owns no handoff and must not be mistaken for one.
+    const reauthed = background.consumeReauthFragment();
+
     const resumed = await this.resumeHandoffIfReturning();
     if (resumed) {
       return;
@@ -222,15 +240,43 @@ export default Vue.extend({
 
     try {
       const saved = await this.stateManager.hasSavedState();
-      this.hasResumableState = saved && !unresolved;
+      this.hasResumableState = saved && !unresolved && !background.serverOwnsQueue();
     } catch (e) {
       // IndexedDB not available — not critical, just skip resume
     }
 
+    /*
+      A tab opened after another tab handed the queue over has no message to
+      receive, so the durable flag is read here as well as listened for.
+    */
+    if (background.serverOwnsQueue()) {
+      this.ownershipBlocked = true;
+    }
+
+    this.releaseOwnershipListener = background.onServerOwnershipChange((owns) => {
+      this.ownershipBlocked = owns;
+      if (owns) {
+        this.hasResumableState = false;
+        const step = this.$refs.scrobbleStep as any;
+        if (step && step.haltForHandoff) {
+          // Deliberately not awaited: this is an event handler, and the halt
+          // resolves only once the in-flight batch finishes.
+          Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
+        }
+      }
+    });
+
     if (unresolved) {
       await this.resolveOwnership(unresolved);
     }
-
+    if (reauthed) {
+      trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
+    } else if (new URLSearchParams(window.location.search).get('signin') === 'failed') {
+      this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
+      this.showReauth = true;
+      this.stripQuery();
+      trackEvent('background_reauth_failed');
+    }
     this.probeBackgroundAvailability();
 
     /*
@@ -255,6 +301,9 @@ export default Vue.extend({
   beforeDestroy() {
     if (this.onPageShow) {
       window.removeEventListener('pageshow', this.onPageShow);
+    }
+    if (this.releaseOwnershipListener) {
+      this.releaseOwnershipListener();
     }
   },
   watch: {
@@ -328,8 +377,9 @@ export default Vue.extend({
      * leaves the marker in place and Resume withheld, because at this scale an
      * unnecessary delay is recoverable and a duplicated import is not.
      */
-    async resolveOwnership(handoffId: string) {
-      const active = await background.isHandoffActive(handoffId);
+    async resolveOwnership(marker: background.OwnershipMarker) {
+      this.showReauth = false;
+      const active = await background.resolveOwnershipMarker(marker);
 
       if (active === true) {
         try {
@@ -360,6 +410,13 @@ export default Vue.extend({
       if (active === false) {
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
+        // Released origin-wide: this is a definitive "the browser owns it"
+        // answer, so other tabs may scrobble again too.
+        background.setServerOwnsQueue(false);
+        // Cleared alongside the marker: this is a definitive "the browser owns
+        // it" answer, so leaving the gate closed would hide a queue we have
+        // just proved is safe to resume.
+        this.ownershipBlocked = false;
         try {
           this.hasResumableState = await this.stateManager.hasSavedState();
         } catch (e) {
@@ -372,10 +429,35 @@ export default Vue.extend({
       // Unresolved. Withhold Resume rather than risk a duplicate import.
       this.hasResumableState = false;
       this.ownershipBlocked = true;
+      this.showReauth = background.isSessionExpired();
       this.backgroundNotice = background.isSessionExpired()
-        ? 'Your link to the background service has expired, so this browser can\'t check whether it finished your import. Sign in to the background service again to unlock scrobbling here.'
+        ? 'Your link to the background service has expired, so this browser can\'t check whether it finished your import. Sign in again to unlock scrobbling here.'
         : 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
       trackEvent('background_ownership_unresolved', { session_expired: background.isSessionExpired() });
+    },
+
+    /**
+     * Replaces an expired bearer token so the ownership question can be asked
+     * again.
+     *
+     * The block is deliberately *not* lifted here — only the answer that comes
+     * back after the redirect may do that.
+     */
+    async reauthenticate() {
+      const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
+      if (!username) {
+        this.backgroundNotice = 'Sign in to Last.fm first, then try again.';
+        return;
+      }
+      this.reauthBusy = true;
+      trackEvent('background_reauth_started');
+      const url = await background.startReauth(username);
+      if (!url) {
+        this.reauthBusy = false;
+        this.backgroundNotice = 'Couldn\'t reach the background service to sign in. Please try again in a few minutes.';
+        return;
+      }
+      window.location.href = url;
     },
 
     /**
@@ -479,6 +561,8 @@ export default Vue.extend({
       background.setHandoffLineage({
         originalTotalTracks: state.originalTotalTracks || state.totalTracks,
         originalSucceededCount: state.originalSucceededCount || 0,
+        reTagCursorSec: state.lastReTagTimestampSec || 0,
+        handedOverAtSec: Math.floor(Date.now() / 1000),
       });
 
       const result = await beginHandoff(this.stateManager, state, username, entryPoint);
@@ -516,33 +600,51 @@ export default Vue.extend({
         return;
       }
 
-      const handoffId = background.getOwnershipUnresolved() || background.getPendingHandoff();
-      if (handoffId) {
-        const active = await background.isHandoffActive(handoffId);
-        if (active !== false) {
-          // Either the server owns the queue, or we cannot tell. Both mean the
-          // loop must stay stopped. Record the ambiguity durably so a reload
-          // does not quietly offer Resume instead.
-          background.setOwnershipUnresolved(handoffId);
-          this.backgroundBusy = false;
-          this.showBackgroundOffer = false;
-          this.hasResumableState = false;
-          this.ownershipBlocked = true;
-          await this.refreshBackgroundJob();
-          this.backgroundNotice = active === true
-            ? 'Your import was handed over and is running on the server, so scrobbling in this tab is switched off.'
-            : 'We couldn\'t check whether the background service took over your import, so scrobbling in this tab is on hold. Please refresh in a few minutes.';
-          trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore', resolved: String(active) });
-          return;
+      /*
+        Absence of a handoff id proves nothing. A *successful* handoff clears
+        it — that is the last thing `completeHandoff` does — so the case where
+        the server definitely owns the queue looks identical to the case where
+        nothing ever started. The server is asked either way.
+      */
+      const marker = background.getOwnershipUnresolved();
+      const pendingId = background.getPendingHandoff();
+      let owned: boolean | null;
+      if (marker) {
+        owned = await background.resolveOwnershipMarker(marker);
+      } else if (pendingId) {
+        owned = await background.isHandoffActive(pendingId);
+      } else {
+        owned = await background.hasLiveJob();
+      }
+
+      if (owned !== false) {
+        // Either the server owns the queue, or we cannot tell. Both mean the
+        // loop must stay stopped. Record the ambiguity durably so a reload
+        // does not quietly offer Resume instead.
+        const fallbackId = (marker && marker.id) || pendingId;
+        if (fallbackId) {
+          background.setOwnershipUnresolved(marker ? marker.kind : 'handoff', fallbackId);
         }
+        this.backgroundBusy = false;
+        this.showBackgroundOffer = false;
+        this.hasResumableState = false;
+        this.ownershipBlocked = true;
+        await this.refreshBackgroundJob();
+        this.backgroundNotice = owned === true
+          ? 'Your import was handed over and is running on the server, so scrobbling in this tab is switched off.'
+          : 'We couldn\'t check whether the background service took over your import, so scrobbling in this tab is on hold. Please refresh in a few minutes.';
+        trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore', resolved: String(owned) });
+        return;
       }
 
       // The server has definitively not taken the queue, so this tab still
       // owns it and can carry on.
       this.backgroundBusy = false;
       this.showBackgroundOffer = false;
+      this.ownershipBlocked = false;
       background.clearPendingHandoff();
       background.clearOwnershipUnresolved();
+      background.setServerOwnsQueue(false);
       background.clearHandoffLineage();
 
       const step = this.$refs.scrobbleStep as any;
@@ -698,7 +800,7 @@ export default Vue.extend({
           the cancel's result is unknown *and* the page is reloaded, nothing
           else would record that ambiguity and Resume would reappear.
         */
-        background.setOwnershipUnresolved(jobId);
+        background.setOwnershipUnresolved('job', jobId);
 
         // Only a *confirmed* cancel releases local ownership. A cancel whose
         // request never arrived leaves the job alive, and showing "Resume"
@@ -712,6 +814,8 @@ export default Vue.extend({
 
         this.backgroundJob = null;
         this.hasResumableState = true;
+        this.ownershipBlocked = false;
+        background.setServerOwnsQueue(false);
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         background.clearHandoffLineage();
@@ -743,7 +847,13 @@ export default Vue.extend({
      */
     async exportWhenQuiescent(jobId: string): Promise<any> {
       let lastReason = 'unreachable';
-      for (let i = 0; i < 20; i += 1) {
+      /*
+        Budgeted to outlast a lease. A tick that sees the pause between batches
+        returns without releasing, so its lease can stand for the full 180
+        seconds; a shorter budget here would report "did not stop in time" for
+        what is really just a job stopping normally.
+      */
+      for (let i = 0; i < 80; i += 1) {
         // eslint-disable-next-line no-await-in-loop
         const exported = await background.exportJob(jobId);
         if (exported && exported.ok) {

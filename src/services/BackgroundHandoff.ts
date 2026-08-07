@@ -208,6 +208,10 @@ export async function completeHandoff(
   if (outcome.status === 'active') {
     // The worker owns these tracks now. Local state must go, or the next visit
     // offers a "Resume" that would scrobble everything a second time.
+    //
+    // Announced origin-wide *before* the clear, because other tabs are holding
+    // this queue in memory and clearing IndexedDB says nothing to them.
+    api.setServerOwnsQueue(true);
     try {
       await stateManager.clearState();
     } catch (e) {
@@ -215,7 +219,7 @@ export async function completeHandoff(
       // reload would offer to resume it alongside the running job. Record the
       // uncertainty durably so startup refuses rather than offers.
       trackError('background.clearAfterHandoff', e);
-      api.setOwnershipUnresolved(handoffId);
+      api.setOwnershipUnresolved('handoff', handoffId);
     }
     api.clearPendingHandoff();
     trackEvent('background_handoff_completed', { track_count: tracks.length });
@@ -236,11 +240,12 @@ export async function completeHandoff(
     return { outcome: { status: 'failed', reason: 'finalize failed' }, safeToResumeLocally: true };
   }
   if (active === true) {
+    api.setServerOwnsQueue(true);
     try {
       await stateManager.clearState();
     } catch (e) {
       trackError('background.clearAfterHandoff', e);
-      api.setOwnershipUnresolved(handoffId);
+      api.setOwnershipUnresolved('handoff', handoffId);
     }
     api.clearPendingHandoff();
     trackEvent('background_handoff_completed', { track_count: tracks.length, recovered: true });
@@ -252,8 +257,11 @@ export async function completeHandoff(
   // import can be retried the moment the server answers.
   //
   // Recorded durably because the recovery we ask for is a reload, and
-  // component state does not survive one.
-  api.setOwnershipUnresolved(handoffId);
+  // component state does not survive one. Other tabs are stopped too: an
+  // unknown outcome may well be a live job, and a stopped tab is recoverable
+  // where a duplicated import is not.
+  api.setServerOwnsQueue(true);
+  api.setOwnershipUnresolved('handoff', handoffId);
   trackEvent('background_handoff_unresolved');
   return { outcome, safeToResumeLocally: false };
 }
@@ -321,24 +329,39 @@ export function stateFromExport(
     second and collides repeats deliberately.
   */
   const nowSec = Math.floor(Date.now() / 1000);
+  const lineage = api.getHandoffLineage();
+  const priorTotal = lineage ? lineage.originalTotalTracks : 0;
+  const priorSucceeded = lineage ? lineage.originalSucceededCount : 0;
+
   const serverFloor = Number.isFinite(exported.syntheticFloorSec) && exported.syntheticFloorSec > 0
     ? exported.syntheticFloorSec
     : 0;
-  const reservedFloor = serverFloor ? serverFloor - RETAG_BACKFILL_SECONDS : 0;
+
+  /*
+    The reservation has to clear *two* used ranges, not one.
+
+    The server's is bounded below by `syntheticFloorSec`. This browser's own
+    earlier band is invisible to the server, though, and it sits wherever the
+    six hours before the handoff were — so a reservation derived from the
+    server's floor alone can land straight back on seconds this browser
+    already used. Last.fm discards those exactly as silently.
+
+    So the reservation is placed below the lower of the two, and the browser's
+    band is bounded conservatively: it can never have started earlier than six
+    hours before the handoff.
+  */
+  const browserBandStart = lineage && lineage.handedOverAtSec
+    ? lineage.handedOverAtSec - RETAG_BACKFILL_SECONDS
+    : 0;
+  const usedFrom = [serverFloor, browserBandStart].filter((v) => v > 0);
+  const lowestUsed = usedFrom.length ? Math.min(...usedFrom) : 0;
+
+  const reservedCeiling = lowestUsed ? lowestUsed - 1 : 0;
+  const reservedFloor = reservedCeiling ? reservedCeiling - RETAG_BACKFILL_SECONDS : 0;
   // Only usable if the whole reserved range is still inside Last.fm's window;
   // a long-running job can push its floor close enough to the limit that there
   // is no room beneath it, and an out-of-window timestamp is rejected outright.
   const reservedUsable = reservedFloor > nowSec - RETAG_WINDOW_LIMIT_SECONDS;
-
-  /*
-    Progress is reported against the size of the *whole* import, so the counts
-    from before the handoff have to be folded back in. `getHandoffLineage` is
-    the durable copy taken before local state was destroyed; when it is missing
-    the numbers still make sense, they just describe the remainder.
-  */
-  const lineage = api.getHandoffLineage();
-  const priorTotal = lineage ? lineage.originalTotalTracks : 0;
-  const priorSucceeded = lineage ? lineage.originalSucceededCount : 0;
 
   return {
     userName: username,
@@ -355,7 +378,7 @@ export function stateFromExport(
     sendTimestamps: [],
     lastReTagTimestampSec: 0,
     ...(reservedUsable
-      ? { reTagFloorSec: reservedFloor, reTagCeilingSec: serverFloor - 1 }
+      ? { reTagFloorSec: reservedFloor, reTagCeilingSec: reservedCeiling }
       : {}),
     burstCount: 0,
     dailyCount: 0,

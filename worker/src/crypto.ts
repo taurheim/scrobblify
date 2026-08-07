@@ -111,10 +111,21 @@ export async function verifyPayload<T>(value: string, signingKey: string): Promi
 }
 
 export interface HandoffState {
-  /** Handoff row id. */
+  /** Handoff row id. Empty for a `signin` state, which owns no handoff. */
   h: string;
   /** Expiry, unix seconds. */
   exp: number;
+  /**
+   * `signin` marks a state that exists only to re-issue a browser session for
+   * a user whose bearer token expired. It creates no job and reserves no slot,
+   * and its callback discards the Last.fm session key immediately.
+   *
+   * Absent on the ordinary handoff state, so states signed before this field
+   * existed still verify and still mean "handoff".
+   */
+  k?: 'signin';
+  /** Username the signin state was requested for. Only set when `k` is set. */
+  u?: string;
 }
 
 /**

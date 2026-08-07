@@ -174,6 +174,71 @@ export async function acquireJob(
 }
 
 /**
+ * Claims a *paused* job so its unsettled batches can be reconciled.
+ *
+ * Pausing is not the same as being finished. A tick that lost its Last.fm
+ * response leaves a batch in `sending`, and only reconciliation can decide
+ * whether those scrobbles landed. But `acquireJob` requires `active`, and
+ * `selectDueJobs` only returns `active`, so a job paused with a batch in that
+ * state would never be looked at again — and `exportJob` refuses to export
+ * while one exists, which would make "take my progress back" permanently
+ * impossible without first resuming the very job the user is trying to stop.
+ *
+ * Fencing is identical to the normal path: the generation is bumped, so any
+ * write from a superseded tick is rejected.
+ */
+export async function acquireJobForDrain(
+  sql: Sql,
+  jobId: string,
+  nowSec: number,
+  leaseSeconds: number,
+): Promise<JobLease | null> {
+  const rows = await sql.all<JobRow>(
+    `UPDATE jobs
+        SET generation = generation + 1,
+            locked_until = ?,
+            updated_at = ?
+      WHERE id = ?
+        AND locked_until < ?
+        AND state = 'paused'
+      RETURNING *`,
+    [nowSec + leaseSeconds, nowSec, jobId, nowSec],
+  );
+  if (rows.length === 0) {
+    return null;
+  }
+  const job = rows[0];
+  return { job, generation: job.generation };
+}
+
+/**
+ * Paused jobs holding a batch old enough to be worth reconciling.
+ *
+ * The grace period is the caller's, so this stays honest about the fact that
+ * "still sending" and "response lost" are indistinguishable until enough time
+ * has passed.
+ */
+export async function selectDrainableJobs(
+  sql: Sql,
+  nowSec: number,
+  staleBefore: number,
+  limit: number,
+): Promise<JobRow[]> {
+  return sql.all<JobRow>(
+    `SELECT j.* FROM jobs j
+      WHERE j.state = 'paused'
+        AND j.locked_until < ?
+        AND EXISTS (
+          SELECT 1 FROM batches b
+           WHERE b.job_id = j.id AND b.state = 'sending' AND b.sent_at <= ?
+        )
+      ORDER BY j.updated_at ASC
+      LIMIT ?`,
+    [nowSec, staleBefore, limit],
+  );
+}
+
+/**
  * Runs an UPDATE against `jobs` conditioned on the lease still being current.
  *
  * Every write a tick makes must go through here (or carry the same

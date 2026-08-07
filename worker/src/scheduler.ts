@@ -29,6 +29,8 @@ import {
   releaseJob,
   renewLease,
   selectDueJobs,
+  selectDrainableJobs,
+  acquireJobForDrain,
   readControl,
   canRun,
   tripBreaker,
@@ -1074,5 +1076,81 @@ export async function runTick(env: SchedulerEnv, nowSec: number): Promise<TickRe
     }
   }
 
+  await drainPausedJobs(env, nowSec, report);
+
   return report;
+}
+
+/**
+ * Settles batches left in flight on jobs the user has since paused.
+ *
+ * Pausing stops new sends but cannot un-send a batch whose response was lost.
+ * Those sit in `sending` until reconciliation decides their fate — and the
+ * normal path can never do it, because both `selectDueJobs` and `acquireJob`
+ * require `active`. Without this pass a paused job with one lost response
+ * would refuse to export forever, which is the escape hatch the whole feature
+ * promises.
+ *
+ * Nothing is ever *sent* here. The pass only asks Last.fm what it already has.
+ */
+async function drainPausedJobs(
+  env: SchedulerEnv,
+  nowSec: number,
+  report: TickReport,
+): Promise<void> {
+  const drainable = await selectDrainableJobs(
+    env.sql, nowSec, nowSec - RECONCILE_GRACE_SECONDS, MAX_JOBS_PER_TICK,
+  );
+
+  for (const job of drainable) {
+    // eslint-disable-next-line no-await-in-loop
+    const lease = await acquireJobForDrain(
+      env.sql, job.id, Math.floor(Date.now() / 1000), LEASE_SECONDS,
+    );
+    if (!lease) {
+      // Resumed or claimed elsewhere between selection and now.
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+    try {
+      if (!lease.job.session_key_ct || !lease.job.session_key_iv) {
+        // No credential left, so the batches can never be resolved against
+        // Last.fm. Abandoning them is what lets the export proceed; their
+        // tracks stay after the cursor and are handed back, which risks a
+        // duplicate but never a loss — the safe direction for a job the user
+        // has already asked to stop.
+        // eslint-disable-next-line no-await-in-loop
+        await env.sql.run(
+          `UPDATE batches SET state = 'abandoned', settled_at = ?
+            WHERE job_id = ? AND state = 'sending'`,
+          [nowSec, lease.job.id],
+        );
+        // eslint-disable-next-line no-await-in-loop
+        await audit(env.sql, lease.job.id, lease.generation, 'drain_abandoned_no_credential', null, nowSec);
+      } else {
+        // eslint-disable-next-line no-await-in-loop
+        const sessionKey = await decryptCredential(
+          { ciphertext: lease.job.session_key_ct, iv: lease.job.session_key_iv },
+          env.credentialSecret,
+          lease.job.id,
+        );
+        if (sessionKey) {
+          // eslint-disable-next-line no-await-in-loop
+          await reconcile(env, lease, sessionKey, nowSec);
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof FencedError)) {
+        report.errors.push(`drain ${job.id}: ${(error as Error).message}`);
+      }
+    }
+    // Released back to `paused`, not `active`: draining must never restart a
+    // job the user stopped.
+    // eslint-disable-next-line no-await-in-loop
+    await env.sql.run(
+      `UPDATE jobs SET locked_until = 0, updated_at = ?
+        WHERE id = ? AND generation = ?`,
+      [nowSec, lease.job.id, lease.generation],
+    );
+  }
 }

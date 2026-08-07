@@ -21,10 +21,18 @@ import {
   MAX_TRACKS_PER_JOB,
 } from './handoff';
 import { issueSession, authenticate } from './session';
-import { normalizeUsername, randomId } from './crypto';
+import {
+  normalizeUsername, randomId, signHandoffState, verifyHandoffState,
+} from './crypto';
 
 /** Remaining tracks below which background mode is not worth the trade-offs. */
 export const MIN_TRACKS_FOR_BACKGROUND = 2700;
+
+/**
+ * Lifetime of a re-authentication state. Short: it exists only to survive one
+ * round trip through Last.fm, and it is not tied to a row that could expire it.
+ */
+const SIGNIN_TTL_SECONDS = 900;
 
 export interface ApiEnv {
   sql: Sql;
@@ -181,12 +189,65 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     });
   }
 
+  // ---- re-authentication, for a browser session that has expired ----
+  //
+  // Without this a user whose bearer token aged out cannot ask whether a job
+  // is running, and the client — which refuses to resume on an unanswered
+  // ownership question — leaves them permanently unable to scrobble anywhere.
+  //
+  // It reserves no slot and creates no job. The Last.fm session key its
+  // callback receives is discarded, not stored: proving who you are is all
+  // this flow needs.
+  if (path === '/scrobblify/auth/signin' && request.method === 'POST') {
+    const body = await readJson(request);
+    if (!body || typeof body.username !== 'string' || !body.username.trim()) {
+      return json(env, { ok: false, reason: 'bad_request' }, 400);
+    }
+    const state = await signHandoffState(
+      { h: '', exp: nowSec + SIGNIN_TTL_SECONDS, k: 'signin', u: normalizeUsername(body.username) },
+      env.signingKey,
+    );
+    return json(env, { ok: true, authoriseUrl: authoriseUrl(env, state) });
+  }
+
   // ---- step 2/3: Last.fm returns the user here ----
   if (path === '/scrobblify/auth/callback' && request.method === 'GET') {
+    const stateParam = url.searchParams.get('state') ?? '';
+    const tokenParam = url.searchParams.get('token') ?? '';
+
+    // Signin states are handled before `handleCallback`, which assumes every
+    // state owns a handoff row.
+    const signinState = await verifyHandoffState(stateParam, env.signingKey, nowSec);
+    if (signinState && signinState.k === 'signin') {
+      const target = new URL(env.appUrl);
+      if (!tokenParam) {
+        target.searchParams.set('signin', 'failed');
+        return Response.redirect(target.toString(), 302);
+      }
+      let identity: { sessionKey: string; username: string };
+      try {
+        identity = await env.lastfm.getSession(tokenParam);
+      } catch {
+        target.searchParams.set('signin', 'failed');
+        return Response.redirect(target.toString(), 302);
+      }
+      // The username is checked even though nothing is written: issuing a
+      // session for whoever happened to authorise would hand one account
+      // read access to another's job status.
+      if (!signinState.u || normalizeUsername(identity.username) !== signinState.u) {
+        target.searchParams.set('signin', 'failed');
+        return Response.redirect(target.toString(), 302);
+      }
+      const session = await issueSession(normalizeUsername(identity.username), env.signingKey, nowSec);
+      target.searchParams.set('signin', 'ok');
+      target.hash = `session=${encodeURIComponent(session)}`;
+      return Response.redirect(target.toString(), 302);
+    }
+
     const result = await handleCallback(
       env.sql,
       env.lastfm,
-      { state: url.searchParams.get('state') ?? '', token: url.searchParams.get('token') ?? '' },
+      { state: stateParam, token: tokenParam },
       env.signingKey,
       env.credentialSecret,
       nowSec,
