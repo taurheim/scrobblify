@@ -440,12 +440,44 @@ export async function uploadAndFinalize(
  * Older workers do not send `resolved`. They are treated as unresolved unless
  * they say `active`, because their `false` cannot be trusted to be terminal.
  */
-export async function isHandoffActive(handoffId: string): Promise<boolean | null> {
+/**
+ * Set when the worker rejects our session token. Sessions last 14 days, and an
+ * unresolved handoff outlives one easily; without surfacing this the user would
+ * see an endless "couldn't check" message with no way to act on it.
+ */
+let sessionExpired = false;
+
+export function isSessionExpired(): boolean {
+  return sessionExpired;
+}
+
+/**
+ * Whether the server owns a handed-over queue.
+ *
+ * Tri-state on purpose. `true` and `false` are answers; `null` means we do not
+ * know, and every caller must treat it as "assume the server might own this"
+ * rather than "no job". A timeout is applied because this gates the Resume
+ * button, and an unbounded request would leave the user stuck on a spinner.
+ *
+ * A 401 is reported through `sessionExpired` rather than folded into `null`:
+ * it is permanent until the user re-links, so retrying cannot help and the UI
+ * needs to offer a different remedy.
+ */
+export async function isHandoffActive(
+  handoffId: string,
+): Promise<boolean | null> {
+  const res = await getWithTimeout(`/scrobblify/handoff/${handoffId}`, true);
+  if (!res) {
+    return null;
+  }
+  if (res.status === 401) {
+    sessionExpired = true;
+    return null;
+  }
+  if (!res.ok) {
+    return null;
+  }
   try {
-    const res = await request(`/scrobblify/handoff/${handoffId}`);
-    if (!res.ok) {
-      return null;
-    }
     const body = await res.json();
     if (body.active === true) {
       return true;
@@ -465,10 +497,21 @@ export async function jobAction(jobId: string, action: 'pause' | 'resume' | 'can
   }
 }
 
+/**
+ * Fetches a job export.
+ *
+ * A 409 is a routine, retryable answer rather than an error: the server
+ * refuses to export while a batch is still in flight, because those tracks
+ * would be handed back *and* scrobbled. Its body carries the reason, so it is
+ * returned to the caller instead of being flattened into `null`.
+ *
+ * `null` means the request itself failed, and callers must never read that as
+ * "the job is not running".
+ */
 export async function exportJob(jobId: string): Promise<any | null> {
   try {
     const res = await request(`/scrobblify/job/${jobId}/export`);
-    if (!res.ok) {
+    if (!res.ok && res.status !== 409) {
       return null;
     }
     return await res.json();

@@ -26,6 +26,16 @@ export default new Vuex.Store({
     // High-water mark of the re-tagged-play timestamp allocator, carried across
     // a resume so a later run cannot reuse seconds an earlier one already sent.
     reTagCursorSec: 0,
+    /*
+      A re-tag range reserved below a background job's own allocations, set only
+      when resuming work handed back by the server. The server allocates
+      synthetic seconds downwards from the present while this browser allocates
+      upwards, so without a reserved range the two would overlap — and Last.fm
+      discards a repeat of (artist, track, timestamp) silently, reporting it as
+      accepted. Zero means "no reservation, use the usual six-hour window".
+    */
+    reTagFloorSec: 0,
+    reTagCeilingSec: 0,
   },
   mutations: {
     setValidScrobbles(state: any, tracks: SpotifyListen[]) {
@@ -42,6 +52,10 @@ export default new Vuex.Store({
     },
     setReTagCursorSec(state: any, seconds: number) {
       state.reTagCursorSec = seconds;
+    },
+    setReTagReservedRange(state: any, range: { floorSec: number; ceilingSec: number }) {
+      state.reTagFloorSec = range.floorSec;
+      state.reTagCeilingSec = range.ceilingSec;
     },
     trackScrobbled(state: any) {
       state.tracksScrobbled += 1;

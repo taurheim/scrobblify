@@ -202,6 +202,14 @@ const MAX_CONSECUTIVE_FAILURES = 10;
 // how many times it is resumed.
 const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
 
+/**
+ * Outer bound on how far back a re-tagged scrobble may be placed, matching the
+ * worker's `WINDOW_SECONDS`. Only consulted for a *reserved* range handed over
+ * by a background job, since the ordinary six-hour window is always well
+ * inside it.
+ */
+const RETAG_WINDOW_LIMIT_SECONDS = 13 * 86400;
+
 // Last.fm ignoredMessage code 5: the account is out of scrobbles for the day.
 // Retrying is pointless until tomorrow.
 const IGNORE_CODE_DAILY_LIMIT = 5;
@@ -263,6 +271,11 @@ export default Vue.extend({
       pauseReason: '',
       countdown: 0,
       countdownTimer: null as number | null,
+      /**
+       * Settles the promise `pauseWithCountdown` returned, so that cancelling a
+       * countdown from outside releases the loop rather than stranding it.
+       */
+      countdownResolve: null as (() => void) | null,
       // Preventive pacing is a *stretch* of throttled sends, not a single
       // pause: it is entered once when the rolling window fills and left once
       // the window has room again. Telemetry and UI both describe the stretch,
@@ -367,10 +380,9 @@ export default Vue.extend({
     this.syncRateLimitCounters();
   },
   beforeDestroy() {
-    if (this.countdownTimer) {
-      clearInterval(this.countdownTimer);
-      this.countdownTimer = null;
-    }
+    // Routed through `cancelCountdown` so an unmount mid-countdown also settles
+    // the promise the loop is awaiting, rather than leaving it pending forever.
+    this.cancelCountdown();
   },
   methods: {
     /**
@@ -649,8 +661,28 @@ export default Vue.extend({
         // would be stored as a second, phantom play.
         if (track.reTagged && pendingReTagTimestampSec === undefined) {
           const nowSec = Math.floor(Date.now() / MS_PER_SECOND);
-          const earliestSec = nowSec - RETAG_BACKFILL_SECONDS;
-          reTagCursorSec = Math.min(nowSec, Math.max(reTagCursorSec + 1, earliestSec));
+          /*
+            Normally the walk starts six hours back and climbs towards the
+            present. After a background job hands work back it starts in a
+            range reserved *below* everything the server used instead, because
+            the server allocates downwards from the present and a collision
+            between the two would be discarded by Last.fm without an error.
+
+            The reservation is abandoned the moment the cursor would reach the
+            server's floor: running out of reserved room is better handled by
+            returning to the normal window — where a collision is merely
+            possible — than by pinning every remaining track to one second,
+            where it is certain.
+          */
+          const reserved = this.reservedReTagRange();
+          const withinReservation = reserved !== null && reTagCursorSec + 1 < reserved.ceilingSec;
+          const earliestSec = withinReservation
+            ? (reserved as { floorSec: number }).floorSec
+            : nowSec - RETAG_BACKFILL_SECONDS;
+          const latestSec = withinReservation
+            ? Math.min(nowSec, (reserved as { ceilingSec: number }).ceilingSec)
+            : nowSec;
+          reTagCursorSec = Math.min(latestSec, Math.max(reTagCursorSec + 1, earliestSec));
           this.reTagCursorSec = reTagCursorSec;
           pendingReTagTimestampSec = reTagCursorSec;
         }
@@ -843,6 +875,17 @@ export default Vue.extend({
       this.countdown = Math.ceil(durationMs / MS_PER_SECOND);
 
       return new Promise((resolve) => {
+        /*
+          Held so that *whoever* stops the countdown also releases the loop.
+          The interval used to be the only thing that could resolve this, which
+          meant an external `cancelCountdown()` — exactly what a handoff does —
+          cleared the timer and left the loop awaiting a promise that nothing
+          could ever settle. The loop then never cleared `loopActive`, so the
+          handoff timed out and, worse, the orphaned loop made every later
+          Resume a no-op.
+        */
+        this.countdownResolve = resolve;
+
         // Driven off a wall-clock deadline rather than by decrementing a
         // counter: background tabs throttle setInterval, which would otherwise
         // stretch a 30-minute backoff into something much longer.
@@ -852,27 +895,37 @@ export default Vue.extend({
           // control to the loop, which then sees `handoffHalted` and stops.
           if (this.handoffHalted) {
             this.cancelCountdown();
-            resolve();
             return;
           }
           const remainingMs = deadline - Date.now();
           this.countdown = Math.max(0, Math.ceil(remainingMs / MS_PER_SECOND));
           if (remainingMs <= 0) {
-            this.cancelCountdown();
             this.paused = false;
             this.pauseReason = '';
-            resolve();
+            this.cancelCountdown();
           }
         }, 1000);
       });
     },
 
+    /**
+     * Stops a countdown and hands control back to whatever is awaiting it.
+     *
+     * Resolving here rather than in the interval is what makes the countdown
+     * safe to cancel from outside. Idempotent: the resolver is dropped once
+     * called, so a second cancel does nothing.
+     */
     cancelCountdown() {
       if (this.countdownTimer) {
         clearInterval(this.countdownTimer);
         this.countdownTimer = null;
       }
       this.countdown = 0;
+      const resolve = this.countdownResolve;
+      this.countdownResolve = null;
+      if (resolve) {
+        resolve();
+      }
     },
 
     manualPause() {
@@ -952,6 +1005,28 @@ export default Vue.extend({
 
     saveAndExit() {
       this.$emit('save-and-exit', this.progressSnapshot());
+    },
+
+    /**
+     * The re-tag range reserved below a background job's own allocations.
+     *
+     * Returns null in the ordinary case, where this browser has the window to
+     * itself and allocates in `(now - 6h, now]`. Non-null only after a job has
+     * handed work back, and only while the reservation is still inside
+     * Last.fm's 13-day limit — a stale one would produce timestamps too old to
+     * be accepted, which is a worse failure than a possible collision.
+     */
+    reservedReTagRange(): { floorSec: number; ceilingSec: number } | null {
+      const floorSec = (this.$store.state.reTagFloorSec as number) || 0;
+      const ceilingSec = (this.$store.state.reTagCeilingSec as number) || 0;
+      if (!floorSec || !ceilingSec || ceilingSec <= floorSec) {
+        return null;
+      }
+      const nowSec = Math.floor(Date.now() / MS_PER_SECOND);
+      if (floorSec <= nowSec - RETAG_WINDOW_LIMIT_SECONDS) {
+        return null;
+      }
+      return { floorSec, ceilingSec };
     },
 
     progressSnapshot() {

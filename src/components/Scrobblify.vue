@@ -51,7 +51,7 @@
     </v-alert>
 
     <v-alert
-      v-if="hasResumableState && currentStep <= 2 && !backgroundJob"
+      v-if="hasResumableState && currentStep <= 2 && !backgroundJob && !ownershipBlocked"
       type="info"
       prominent
       class="mb-4"
@@ -189,6 +189,13 @@ export default Vue.extend({
       pendingState: null as ScrobbleState | null,
       /** Retained so the listener can be removed again. Not reactive state. */
       onPageShow: null as ((event: PageTransitionEvent) => void) | null,
+      /**
+       * Set when we cannot establish whether the server owns the queue. A
+       * belt-and-braces gate on Resume alongside `hasResumableState`: that flag
+       * is recomputed in several places, and any one of them forgetting the
+       * ownership question would re-expose the duplicate path.
+       */
+      ownershipBlocked: false,
     };
   },
   async mounted() {
@@ -205,23 +212,24 @@ export default Vue.extend({
     await this.refreshBackgroundJob();
 
     /*
-      Local state first, network second. `hasResumableState` is what puts the
-      Resume button on screen, and it is answered by IndexedDB in milliseconds;
-      awaiting a capacity probe before it would hold the button back for as
-      long as the network takes to fail. Background mode is an enhancement, so
-      it resolves whenever it resolves.
+      Ownership is settled before resumability is ever assigned. `mounted` is
+      async, so every `await` below is a point at which Vue can render; setting
+      `hasResumableState = true` first and checking ownership afterwards would
+      put a Resume button on screen for the whole duration of a status request,
+      which is exactly the window in which the server may own the queue.
     */
+    const unresolved = background.getOwnershipUnresolved();
+
     try {
-      this.hasResumableState = await this.stateManager.hasSavedState();
+      const saved = await this.stateManager.hasSavedState();
+      this.hasResumableState = saved && !unresolved;
     } catch (e) {
       // IndexedDB not available — not critical, just skip resume
     }
 
-    // ...but ownership is not an enhancement, so it *is* awaited. A previous
-    // visit may have ended without establishing whether the server took the
-    // queue, and offering Resume in that state is how the tab and the worker
-    // end up scrobbling the same tracks.
-    await this.resolveOwnership();
+    if (unresolved) {
+      await this.resolveOwnership(unresolved);
+    }
 
     this.probeBackgroundAvailability();
 
@@ -320,12 +328,7 @@ export default Vue.extend({
      * leaves the marker in place and Resume withheld, because at this scale an
      * unnecessary delay is recoverable and a duplicated import is not.
      */
-    async resolveOwnership() {
-      const handoffId = background.getOwnershipUnresolved();
-      if (!handoffId) {
-        return;
-      }
-
+    async resolveOwnership(handoffId: string) {
       const active = await background.isHandoffActive(handoffId);
 
       if (active === true) {
@@ -333,7 +336,18 @@ export default Vue.extend({
           await this.stateManager.clearState();
           this.hasResumableState = false;
         } catch (e) {
+          /*
+            The queue is still on disk and the server is scrobbling it. The
+            marker must survive: clearing it here would leave a resumable
+            local copy with nothing recording that it is unsafe, which is the
+            original duplicate path this whole mechanism exists to close.
+          */
           trackError('background.resolveOwnershipClear', e);
+          this.hasResumableState = false;
+          await this.refreshBackgroundJob();
+          this.backgroundNotice = 'Your import is running on the server. This browser could not clear its old copy, so scrobbling here stays off to avoid sending anything twice.';
+          trackEvent('background_ownership_resolved', { outcome: 'server_owns_clear_failed' });
+          return;
         }
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
@@ -346,14 +360,22 @@ export default Vue.extend({
       if (active === false) {
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
+        try {
+          this.hasResumableState = await this.stateManager.hasSavedState();
+        } catch (e) {
+          // Nothing to restore the button for.
+        }
         trackEvent('background_ownership_resolved', { outcome: 'client_owns' });
         return;
       }
 
       // Unresolved. Withhold Resume rather than risk a duplicate import.
       this.hasResumableState = false;
-      this.backgroundNotice = 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
-      trackEvent('background_ownership_unresolved');
+      this.ownershipBlocked = true;
+      this.backgroundNotice = background.isSessionExpired()
+        ? 'Your link to the background service has expired, so this browser can\'t check whether it finished your import. Sign in to the background service again to unlock scrobbling here.'
+        : 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
+      trackEvent('background_ownership_unresolved', { session_expired: background.isSessionExpired() });
     },
 
     /**
@@ -477,26 +499,50 @@ export default Vue.extend({
     /**
      * Undoes the "navigating away" state after a bfcache restore.
      *
-     * Reaching here means the user went to Last.fm and came back without
-     * authorising, so no job can exist: the upload only happens after the
-     * callback returns. The handoff row the server is holding is `pending_upload`
-     * and gets reaped on its own.
+     * Handing over deliberately leaves the tab busy and the loop halted while
+     * it redirects, so the dialog cannot be submitted twice. A bfcache restore
+     * brings that state back with no `mounted()` to undo it, leaving a
+     * permanently stuck page.
      *
-     * The one case that must not be released is an *unresolved* handoff from
-     * some earlier attempt, where the server may genuinely own the queue.
-     * That check is cheap and local, so it is done before anything is undone.
+     * It is tempting to assume that coming *back* means authorisation never
+     * happened, so no job can exist. That is false: the user can authorise,
+     * land on the callback page, and then press Back far enough to reach this
+     * entry — at which point the server owns the queue and this page still
+     * holds it in memory. So nothing is released without the server agreeing.
+     * Unknown stays halted.
      */
-    recoverFromBfcache() {
-      if (background.getOwnershipUnresolved()) {
-        return;
-      }
+    async recoverFromBfcache() {
       if (!this.backgroundBusy && !this.showBackgroundOffer) {
         return;
       }
 
+      const handoffId = background.getOwnershipUnresolved() || background.getPendingHandoff();
+      if (handoffId) {
+        const active = await background.isHandoffActive(handoffId);
+        if (active !== false) {
+          // Either the server owns the queue, or we cannot tell. Both mean the
+          // loop must stay stopped. Record the ambiguity durably so a reload
+          // does not quietly offer Resume instead.
+          background.setOwnershipUnresolved(handoffId);
+          this.backgroundBusy = false;
+          this.showBackgroundOffer = false;
+          this.hasResumableState = false;
+          this.ownershipBlocked = true;
+          await this.refreshBackgroundJob();
+          this.backgroundNotice = active === true
+            ? 'Your import was handed over and is running on the server, so scrobbling in this tab is switched off.'
+            : 'We couldn\'t check whether the background service took over your import, so scrobbling in this tab is on hold. Please refresh in a few minutes.';
+          trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore', resolved: String(active) });
+          return;
+        }
+      }
+
+      // The server has definitively not taken the queue, so this tab still
+      // owns it and can carry on.
       this.backgroundBusy = false;
       this.showBackgroundOffer = false;
       background.clearPendingHandoff();
+      background.clearOwnershipUnresolved();
       background.clearHandoffLineage();
 
       const step = this.$refs.scrobbleStep as any;
@@ -505,7 +551,7 @@ export default Vue.extend({
       }
 
       this.backgroundNotice = 'The handover wasn\'t completed, so nothing was started. Your progress is still here — carry on in this tab, or try handing it over again.';
-      trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore' });
+      trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore', resolved: 'false' });
     },
 
     /**
@@ -614,10 +660,10 @@ export default Vue.extend({
      *     the snapshot are still in the returned queue and would be scrobbled
      *     again locally.
      *
-     * So the job is *paused* first and confirmed stopped, and only then
-     * exported. A paused job is not claimed by `acquireJob`, and a tick
-     * already in flight re-reads the state before each batch, so a confirmed
-     * pause means the cursor is no longer moving.
+     * So the job is *paused* first, and the export itself refuses to run until
+     * the server can see that nothing is in flight — no lease held and no
+     * batch in `sending`. Quiescence is a server-side fact, so the server is
+     * what decides it; the client only retries until it gets an answer.
      */
     async takeBackProgress() {
       if (!this.backgroundJob) { return; }
@@ -628,16 +674,10 @@ export default Vue.extend({
           throw new Error('The background import could not be paused.');
         }
 
-        // Confirm rather than assume. `pause` returning 200 means the row was
-        // updated, but a tick already holding the lease finishes its current
-        // batch first; exporting before it settles would snapshot a cursor
-        // that is still moving.
-        const settled = await this.awaitJobQuiescent(jobId);
-        if (!settled) {
-          throw new Error('The background import did not stop in time.');
-        }
-
-        const exported = await background.exportJob(jobId);
+        // A Last.fm request can take fifteen seconds, and a batch mid-flight is
+        // still after the cursor, so it would be exported *and* sent. The
+        // server rejects the export with 409 until that settles.
+        const exported = await this.exportWhenQuiescent(jobId);
         const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
         const restored = stateFromExport(
           exported,
@@ -651,6 +691,15 @@ export default Vue.extend({
         // to save would destroy the only copy of the queue.
         await this.stateManager.saveState(restored);
 
+        /*
+          From here until the cancel is confirmed, both sides may believe they
+          own the queue: the tracks are on disk locally and the job is still
+          alive on the server. Marked durably before the attempt, because if
+          the cancel's result is unknown *and* the page is reloaded, nothing
+          else would record that ambiguity and Resume would reappear.
+        */
+        background.setOwnershipUnresolved(jobId);
+
         // Only a *confirmed* cancel releases local ownership. A cancel whose
         // request never arrived leaves the job alive, and showing "Resume"
         // then invites the user to scrobble everything a second time.
@@ -663,6 +712,8 @@ export default Vue.extend({
 
         this.backgroundJob = null;
         this.hasResumableState = true;
+        background.clearOwnershipUnresolved();
+        background.clearPendingHandoff();
         background.clearHandoffLineage();
         this.backgroundNotice = 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
         trackEvent('background_job_reclaimed', { job_id: jobId });
@@ -679,34 +730,30 @@ export default Vue.extend({
     },
 
     /**
-     * Waits for a paused job to stop moving.
+     * Exports a paused job, waiting for the server to agree it is safe.
      *
-     * "Paused" in the database and "not currently sending" are different
-     * things: a tick that already holds the lease finishes its batch first. A
-     * stable cursor across consecutive polls is the observable proof that it
-     * has, which is what makes the export that follows a true snapshot.
+     * The server returns 409 while a lease is held or a batch is still in
+     * `sending`, because those tracks are both after the cursor (so they would
+     * be exported) and in flight to Last.fm (so they would also be scrobbled).
+     * Only the server can see either condition.
+     *
+     * A `null`/error result is a *failure*, never proof of quiescence — the
+     * previous version inferred quiescence from a status call returning
+     * nothing, which reads an unreachable server as "the job is gone".
      */
-    async awaitJobQuiescent(jobId: string): Promise<boolean> {
-      let lastCursor = -1;
-      let stableReads = 0;
+    async exportWhenQuiescent(jobId: string): Promise<any> {
+      let lastReason = 'unreachable';
       for (let i = 0; i < 20; i += 1) {
         // eslint-disable-next-line no-await-in-loop
-        const job = await background.fetchJob();
-        if (!job || job.id !== jobId) {
-          // The job is gone entirely, so nothing is scrobbling it.
-          return true;
+        const exported = await background.exportJob(jobId);
+        if (exported && exported.ok) {
+          return exported;
         }
-        if (job.state === 'paused' || job.state === 'needs_attention' || job.state === 'needs_reauth') {
-          stableReads = job.scrobbled === lastCursor ? stableReads + 1 : 0;
-          lastCursor = job.scrobbled;
-          if (stableReads >= 2) {
-            return true;
-          }
-        }
+        lastReason = (exported && exported.detail) || 'unreachable';
         // eslint-disable-next-line no-await-in-loop
-        await new Promise((resolve) => { setTimeout(resolve, 1500); });
+        await new Promise((resolve) => { setTimeout(resolve, 3000); });
       }
-      return false;
+      throw new Error(`The background import did not stop in time (${lastReason}).`);
     },
 
     /**
@@ -787,6 +834,10 @@ export default Vue.extend({
 
       this.restoreRateLimitWindow(state, api.getUserName() || state.userName || null);
       this.$store.commit('setReTagCursorSec', state.lastReTagTimestampSec || 0);
+      this.$store.commit('setReTagReservedRange', {
+        floorSec: state.reTagFloorSec || 0,
+        ceilingSec: state.reTagCeilingSec || 0,
+      });
 
       // Restore remaining (not yet completed) tracks to store
       const allScrobbles = StateManager.deserializeScrobbles(state.tracks);
@@ -895,6 +946,17 @@ export default Vue.extend({
         originalSucceededCount: info.originalSucceededCount,
         sendTimestamps: info.sendTimestamps || [],
         lastReTagTimestampSec: info.lastReTagTimestampSec || 0,
+        /*
+          Carried through every save so a reserved range survives pause/resume
+          cycles. Losing it would silently return the allocator to the shared
+          six-hour window and reintroduce the overlap with the server's range.
+        */
+        ...((this.$store.state.reTagFloorSec as number)
+          ? {
+            reTagFloorSec: this.$store.state.reTagFloorSec as number,
+            reTagCeilingSec: this.$store.state.reTagCeilingSec as number,
+          }
+          : {}),
         burstCount: info.burstCount,
         dailyCount: info.dailyCount,
         dailyCountDate: new Date().toISOString().split('T')[0],

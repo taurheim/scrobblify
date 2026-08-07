@@ -42,6 +42,28 @@ export interface ScrobbleState {
    */
   lastReTagTimestampSec?: number;
   /**
+   * Start of a re-tag range reserved for this browser, when one is needed.
+   *
+   * Normally the allocator works in `(now - 6h, now]`. That is unsafe after a
+   * background job hands work back, because the server allocates its own
+   * synthetic seconds *downwards* from the present while this allocator walks
+   * *upwards* — so the browser would march straight through seconds the server
+   * already used, and Last.fm silently discards a repeat of
+   * `(artist, track, timestamp)` while still reporting it accepted.
+   *
+   * When set, this replaces `now - 6h` as the lower bound, placing the walk
+   * entirely below anything the server touched. Absent for every state that
+   * never went through a handoff.
+   */
+  reTagFloorSec?: number;
+  /**
+   * Exclusive upper bound matching `reTagFloorSec` — the server's lowest used
+   * second. The allocator stops honouring the reserved range if it ever gets
+   * this far, since running out of room is better handled by falling back to
+   * the normal window than by stamping everything the same.
+   */
+  reTagCeilingSec?: number;
+  /**
    * Second at which a background handoff pinned its ordering.
    *
    * The upload digest is committed to the server *before* the redirect to

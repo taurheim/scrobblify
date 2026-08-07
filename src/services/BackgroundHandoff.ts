@@ -31,6 +31,20 @@ import type { UploadTrack, HandoffOutcome } from '@/services/BackgroundScrobblin
 const WINDOW_SECONDS = 13 * 86400;
 
 /**
+ * Runway reserved for the browser's re-tag allocator below the server's range.
+ * Matches `RETAG_BACKFILL_SECONDS` in `ScrobbleStep`, which is what the
+ * allocator uses when it has the window to itself.
+ */
+const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
+
+/**
+ * How far back a re-tagged scrobble may be placed at all. Same 13-day bound as
+ * `WINDOW_SECONDS`; named separately because it bounds the *reserved range*
+ * rather than the preserve-or-restamp decision.
+ */
+const RETAG_WINDOW_LIMIT_SECONDS = WINDOW_SECONDS;
+
+/**
  * Converts one `Scrobble` into the worker's wire format.
  *
  * A re-tagged track's `timestamp` is not a listen time — it is a placeholder
@@ -289,24 +303,32 @@ export function stateFromExport(
     : 0;
 
   /*
-    The re-tag allocator's high-water mark, carried across the ownership
-    change. Getting this wrong loses plays silently.
+    The browser's re-tag allocator and the server's run in opposite
+    directions. The server marches synthetic seconds *downwards* from just
+    below its clock; the browser marches *upwards*. A browser that resumed with
+    its usual `(now - 6h, now]` window would therefore walk straight through
+    the seconds the server just used, and Last.fm silently discards a repeat of
+    (artist, track, timestamp) while still reporting it accepted — so a
+    repeated song would vanish with no error anywhere.
 
-    The two allocators run in opposite directions: the worker assigns synthetic
-    seconds marching *downwards* from just below its clock, the browser marches
-    *upwards* from six hours back. So a browser that restarted from zero after a
-    take-back would walk straight through the range the worker just used. Last.fm
-    silently discards a repeat of (artist, track, timestamp) while still
-    reporting it as accepted, so a repeated song landing on a reused second
-    would vanish with no error anywhere.
+    `syntheticFloorSec` is the lowest second the server used. Reserving the six
+    hours immediately below it gives the browser a range that is both disjoint
+    from the server's and as roomy as the one it normally gets.
 
-    `exportedAt` is an upper bound on every second the worker can have used —
-    each was at most its own clock at the time, and that is never later than
-    this. Starting above it is therefore clear of all of them.
+    Seeding the high-water mark to the server's clock instead — the obvious
+    move — would be worse than doing nothing: it starts the cursor at `now`,
+    where the `min(nowSec, …)` clamp pins every subsequent track to the same
+    second and collides repeats deliberately.
   */
-  const serverBoundarySec = Number.isFinite(exported.exportedAt) && exported.exportedAt > 0
-    ? exported.exportedAt
-    : Math.floor(Date.now() / 1000);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const serverFloor = Number.isFinite(exported.syntheticFloorSec) && exported.syntheticFloorSec > 0
+    ? exported.syntheticFloorSec
+    : 0;
+  const reservedFloor = serverFloor ? serverFloor - RETAG_BACKFILL_SECONDS : 0;
+  // Only usable if the whole reserved range is still inside Last.fm's window;
+  // a long-running job can push its floor close enough to the limit that there
+  // is no room beneath it, and an out-of-window timestamp is rejected outright.
+  const reservedUsable = reservedFloor > nowSec - RETAG_WINDOW_LIMIT_SECONDS;
 
   /*
     Progress is reported against the size of the *whole* import, so the counts
@@ -331,7 +353,10 @@ export function stateFromExport(
     ),
     originalSucceededCount: priorSucceeded + scrobbledByServer,
     sendTimestamps: [],
-    lastReTagTimestampSec: serverBoundarySec,
+    lastReTagTimestampSec: 0,
+    ...(reservedUsable
+      ? { reTagFloorSec: reservedFloor, reTagCeilingSec: serverFloor - 1 }
+      : {}),
     burstCount: 0,
     dailyCount: 0,
     dailyCountDate: new Date().toISOString().slice(0, 10),

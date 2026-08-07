@@ -395,6 +395,39 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
  * still needs.
  */
 async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Response> {
+  /*
+    Quiescence is decided here, by the only party that can decide it.
+
+    A take-back exports the tracks after `job.cursor` and then cancels. If a
+    tick is midway through a batch at that moment, the batch's tracks are still
+    after the cursor — it only advances once the batch settles — so they are
+    exported *and* being sent. Last.fm accepts them, the browser resumes them,
+    and the user gets duplicates.
+
+    The client cannot detect this. It was previously inferred from the progress
+    counter holding still across a few polls, which proves nothing: a Last.fm
+    request can take fifteen seconds, during which the counter is legitimately
+    frozen and a batch is very much in flight.
+
+    Two conditions settle it, and both are server-side facts:
+      - no lease is held, so no tick is running or about to write; and
+      - no batch is in `sending`, so nothing is awaiting Last.fm or waiting to
+        be reconciled after a lost response.
+
+    Refusing is safe and cheap — the client retries — whereas exporting one
+    second early is an irreversible duplicate.
+  */
+  if (job.locked_until > nowSec) {
+    return json(env, { ok: false, reason: 'not_quiescent', detail: 'lease_held' }, 409);
+  }
+  const inFlight = await env.sql.first<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM batches WHERE job_id = ? AND state = 'sending'",
+    [job.id],
+  );
+  if (inFlight && inFlight.n > 0) {
+    return json(env, { ok: false, reason: 'not_quiescent', detail: 'batch_in_flight' }, 409);
+  }
+
   const failures = await env.sql.all<any>(
     'SELECT track_index, artist, track, album, reason, ignore_code FROM failures WHERE job_id = ? ORDER BY track_index',
     [job.id],
@@ -444,6 +477,13 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
   return json(env, {
     ok: true,
     exportedAt: nowSec,
+    /*
+      The lowest synthetic second this job used. The client's own re-tag
+      allocator runs *upwards* while this one runs downwards, so it needs to
+      know where our range starts in order to reserve one below it rather than
+      walking through ours. See `stateFromExport`.
+    */
+    syntheticFloorSec: job.synthetic_floor ?? 0,
     scrobbledByServer: job.scrobbled_count,
     state: {
       totalTracks: tracks.length,
