@@ -18,6 +18,9 @@ import {
   DAILY_CAP_BACKOFF_SECONDS,
   PROBE_BATCH_SIZE,
   MAX_BATCHES_PER_JOB_PER_TICK,
+  MAX_RECORDED_FAILURES_PER_JOB,
+  RECONCILE_GRACE_SECONDS,
+  matchOutcomes,
 } from '../src/scheduler';
 import { BatchScrobbleResult, ScrobbleEntry } from '../../src/shared/lastfm/protocol';
 
@@ -78,6 +81,8 @@ interface SentBatch {
 type Script =
   | { kind: 'accept' }
   | { kind: 'ignore'; from: number; code: number; message: string }
+  /** Last.fm returns fewer entries than we submitted. */
+  | { kind: 'truncate'; entries: number }
   | { kind: 'throw'; message: string };
 
 class FakeLastFm {
@@ -99,11 +104,15 @@ class FakeLastFm {
     }
     const outcomes = entries.map((e, i) => {
       const ignored = step.kind === 'ignore' && i >= step.from;
+      // A truncated response has no entry at this position, so the parser's
+      // "accepted" is a guess, not an observation.
+      const present = step.kind !== 'truncate' || i < step.entries;
       return {
         index: i,
         accepted: !ignored,
         ignoredCode: ignored ? step.code : 0,
         ignoredMessage: ignored ? step.message : '',
+        present,
       };
     });
     return {
@@ -622,6 +631,229 @@ async function main() {
     check('and neither exceeded its per-tick budget',
       h.fake.sent.filter((s) => s.sessionKey === 'sk-abc').length
         === MAX_BATCHES_PER_JOB_PER_TICK, h.fake.sent.length);
+  }
+
+  console.log('\n-- a truncated response is not evidence of acceptance --');
+  {
+    // Last.fm returns HTTP 200 with only 10 of 50 entries. The parser fills
+    // the gap with "accepted" so an interactive client does not report false
+    // failures — but the worker advances a durable cursor, so believing it
+    // would mark 40 never-stored tracks as scrobbled and skip them forever.
+    const h = await harness({ total: 50, script: [{ kind: 'truncate', entries: 10 }] });
+    await runTick(h.env, NOW);
+    check('the first batch commits only what was observed',
+      h.fake.sent.length === 2, h.fake.sent.length);
+    const resent = h.fake.sent[1].entries;
+    check('the unobserved entries are sent again rather than skipped',
+      resent.length === 40, resent.length);
+    check('and they resume exactly where observation stopped',
+      resent[0].track === 'Track 10', resent[0].track);
+    const job = await h.job();
+    check('every track ends up accounted for', job.cursor === 50, job.cursor);
+    check('and none is double-counted',
+      job.scrobbled_count === 50, job.scrobbled_count);
+  }
+
+  console.log('\n-- a rejected timestamp is our bug, not a dropped track --');
+  {
+    // Codes 3 and 4 mean our own assignment is wrong. Recording them as
+    // permanent failures would let a broken clock silently discard an entire
+    // import while reporting it finished.
+    const h = await harness({
+      total: 100,
+      script: [{ kind: 'ignore', from: 0, code: 3, message: 'Timestamp too old' }],
+    });
+    await runTick(h.env, NOW);
+    const job = await h.job();
+    check('nothing is discarded', job.cursor === 0, job.cursor);
+    check('nothing is counted as failed', job.failed_count === 0, job.failed_count);
+    check('no track is written off permanently',
+      (await h.sql.all<any>('SELECT * FROM failures WHERE job_id = ?', [h.jobId])).length === 0);
+    check('the job is parked for a human',
+      job.state === 'needs_attention', job.state);
+    check('it does not keep resending', h.fake.sent.length === 1, h.fake.sent.length);
+    const audits = await h.sql.all<any>(
+      "SELECT * FROM audit WHERE job_id = ? AND event = 'timestamp_rejected'", [h.jobId],
+    );
+    check('and the bug is surfaced in the audit log', audits.length === 1, audits.length);
+  }
+
+  console.log('\n-- an unrecognised ignore code is not terminal --');
+  {
+    const h = await harness({
+      total: 100,
+      script: [{ kind: 'ignore', from: 20, code: 99, message: 'Something new' }],
+    });
+    await runTick(h.env, NOW);
+    const job = await h.job();
+    check('nothing is written off on a code we do not understand',
+      job.failed_count === 0, job.failed_count);
+    check('the unknown entries are retried rather than skipped',
+      h.fake.sent[1] && h.fake.sent[1].entries[0].track === 'Track 20',
+      h.fake.sent[1] && h.fake.sent[1].entries[0].track);
+  }
+
+  console.log('\n-- outcomes and the cursor commit together --');
+  {
+    // The worst bug this file guards: a batch marked settled while the cursor
+    // still points at its first entry is invisible to reconciliation (which
+    // only looks at `sending`), so every later tick re-sends all 50.
+    const h = await harness({ total: 50 });
+    const realBatch = h.env.sql.batch.bind(h.env.sql);
+    let failNext = true;
+    (h.env.sql as any).batch = async (statements: any[]) => {
+      // Fail the commit that carries the cursor, i.e. the one after the send.
+      if (failNext && statements.some((s) => String(s.query).includes("state = ?"))) {
+        failNext = false;
+        throw new Error('D1 write quota exceeded');
+      }
+      return realBatch(statements);
+    };
+    await runTick(h.env, NOW);
+    (h.env.sql as any).batch = realBatch;
+
+    const batches = await h.sql.all<any>('SELECT * FROM batches WHERE job_id = ?', [h.jobId]);
+    const job = await h.job();
+    check('the batch is left reconcilable rather than settled',
+      batches.every((b) => b.state === 'sending'), batches.map((b) => b.state));
+    check('the cursor did not move', job.cursor === 0, job.cursor);
+
+    // The next tick must reconcile, not blindly resend.
+    h.fake.recent = h.fake.sent[0].entries.map((e) => ({
+      artist: e.artist, track: e.track, timestampSec: e.timestampSec,
+    }));
+    const before = h.fake.sent.length;
+    await runTick(h.env, NOW + RECONCILE_GRACE_SECONDS + 600);
+    check('the recovered batch is not sent again',
+      h.fake.sent.length === before, h.fake.sent.length - before);
+    check('and the cursor catches up from reconciliation',
+      (await h.job()).cursor === 50, (await h.job()).cursor);
+  }
+
+  console.log('\n-- reconciliation never rewinds the cursor --');
+  {
+    // A batch stuck in `sending` can be reconciled long after later batches
+    // moved the cursor past it. Writing `start_index + advance` there would
+    // rewind it and re-send everything in between.
+    const h = await harness({ total: 200 });
+    await runTick(h.env, NOW);
+    const job = await h.job();
+    check('the job made progress first', job.cursor === 200, job.cursor);
+
+    // Re-arm the first batch as if its outcome had never been recorded.
+    const first = await h.sql.first<any>(
+      'SELECT * FROM batches WHERE job_id = ? ORDER BY start_index ASC', [h.jobId],
+    );
+    await h.sql.run(
+      "UPDATE jobs SET state = 'active', cursor = 200, locked_until = 0, next_eligible_at = 0 WHERE id = ?",
+      [h.jobId],
+    );
+    await h.sql.run("UPDATE batches SET state = 'sending' WHERE id = ?", [first.id]);
+    h.fake.recent = JSON.parse(first.assigned_timestamps).map((a: any) => ({
+      artist: a.artist, track: a.track, timestampSec: a.timestampSec,
+    }));
+
+    await runTick(h.env, NOW + RECONCILE_GRACE_SECONDS + 600);
+    const after = await h.job();
+    check('the cursor is not rewound', after.cursor >= 200, after.cursor);
+    check('and the count does not exceed the track total',
+      after.scrobbled_count <= after.total_tracks,
+      [after.scrobbled_count, after.total_tracks]);
+  }
+
+  console.log('\n-- reconciliation waits for Last.fm to catch up --');
+  {
+    const h = await harness({ total: 50 });
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+         assigned_timestamps, sent_at, created_at)
+       VALUES ('b-fresh', ?, 1, 0, 50, 'sending', '[]', ?, ?)`,
+      [h.jobId, NOW, NOW],
+    );
+    await runTick(h.env, NOW + 5);
+    check('a batch sent seconds ago is not reconciled yet',
+      h.fake.recentCalls === 0, h.fake.recentCalls);
+  }
+
+  console.log('\n-- reconciliation matches artist as well as track --');
+  {
+    // Two different artists routinely share a track name, and the user's own
+    // listening lands in the same window. Matching on track alone marks a
+    // genuinely unsent track as accepted and skips it forever.
+    const assigned = [
+      { artist: 'Artist A', track: 'Intro', index: 0, timestampSec: 100, preservedOriginal: false },
+    ];
+    const outcomes = matchOutcomes(assigned as any, [
+      { artist: 'Artist B', track: 'Intro', timestampSec: 100 },
+    ]);
+    check('a same-timestamp, same-title, different-artist scrobble is not a match',
+      outcomes[0].s === 'unknown', outcomes[0]);
+    const rewritten = matchOutcomes(assigned as any, [
+      { artist: 'artist  a', track: 'INTRO', timestampSec: 100 },
+    ]);
+    check('but Last.fm rewriting case and spacing still matches',
+      rewritten[0].s === 'accepted', rewritten[0]);
+  }
+
+  console.log('\n-- one stored scrobble cannot satisfy two entries --');
+  {
+    const assigned = [
+      { artist: 'A', track: 'T', index: 0, timestampSec: 100, preservedOriginal: true },
+      { artist: 'A', track: 'T', index: 1, timestampSec: 100, preservedOriginal: true },
+    ];
+    const outcomes = matchOutcomes(assigned as any, [
+      { artist: 'A', track: 'T', timestampSec: 100 },
+    ]);
+    check('the first entry matches', outcomes[0].s === 'accepted', outcomes[0]);
+    check('the second stays unknown rather than claiming the same scrobble',
+      outcomes[1].s === 'unknown', outcomes[1]);
+  }
+
+  console.log('\n-- a cancelled job stops immediately --');
+  {
+    // Cancelling does not bump the generation, so fencing alone does not see
+    // it. Without an explicit check the tick keeps scrobbling for three more
+    // batches after the user pressed stop.
+    const h = await harness({ total: 1000 });
+    const realSend = h.fake.scrobbleBatch.bind(h.fake);
+    (h.fake as any).scrobbleBatch = async (e: ScrobbleEntry[], k: string) => {
+      const out = await realSend(e, k);
+      await h.sql.run("UPDATE jobs SET state = 'cancelled' WHERE id = ?", [h.jobId]);
+      return out;
+    };
+    await runTick(h.env, NOW);
+    check('only the in-flight batch was sent', h.fake.sent.length === 1, h.fake.sent.length);
+    const job = await h.job();
+    check('and the cancellation was not overwritten',
+      job.state === 'cancelled', job.state);
+  }
+
+  console.log('\n-- an unexpected throw does not wedge the job --');
+  {
+    const h = await harness({ total: 100 });
+    (h.env.blobs as any).get = async () => { throw new Error('R2 exploded'); };
+    const report = await runTick(h.env, NOW);
+    check('the tick survives', report.errors.length === 1, report.errors);
+    const job = await h.job();
+    check('the lease is released', job.locked_until === 0, job.locked_until);
+    check('the failure is counted', job.consecutive_failures === 1, job.consecutive_failures);
+    check('and it backs off instead of retrying immediately',
+      job.next_eligible_at > NOW, job.next_eligible_at);
+  }
+
+  console.log('\n-- recorded failures are capped --');
+  {
+    const h = await harness({
+      total: 100,
+      script: [{ kind: 'ignore', from: 0, code: 1, message: 'Artist ignored' }],
+      job: { failed_count: MAX_RECORDED_FAILURES_PER_JOB },
+    });
+    await runTick(h.env, NOW);
+    const rows = await h.sql.all<any>('SELECT * FROM failures WHERE job_id = ?', [h.jobId]);
+    check('no detail rows are written past the cap', rows.length === 0, rows.length);
+    const job = await h.job();
+    check('but the count is still exact',
+      job.failed_count === MAX_RECORDED_FAILURES_PER_JOB + 50, job.failed_count);
   }
 
   console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);

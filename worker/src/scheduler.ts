@@ -22,8 +22,10 @@ import {
   JobRow,
   JobLease,
   FencedError,
+  FENCE_PREDICATE,
   acquireJob,
   fencedJobUpdate,
+  fencedBatch,
   releaseJob,
   renewLease,
   selectDueJobs,
@@ -110,7 +112,7 @@ export interface TickReport {
   errors: string[];
 }
 
-type EntryState = 'accepted' | 'failed' | 'capped' | 'unknown';
+type EntryState = 'accepted' | 'failed' | 'capped' | 'unknown' | 'bad_timestamp';
 
 interface EntryOutcome {
   /** Index in the job's blob. */
@@ -162,6 +164,12 @@ function terminalPrefixLength(outcomes: EntryOutcome[]): number {
 }
 
 function classifyOutcome(outcome: ScrobbleOutcome): { state: EntryState; code?: number } {
+  // Last.fm returned no entry at this position, so "accepted" is the parser's
+  // assumption rather than an observation. Advancing over it would report a
+  // never-stored track as scrobbled and skip it permanently.
+  if (!outcome.present) {
+    return { state: 'unknown' };
+  }
   if (outcome.accepted) {
     return { state: 'accepted' };
   }
@@ -172,34 +180,61 @@ function classifyOutcome(outcome: ScrobbleOutcome): { state: EntryState; code?: 
   if (typeof code === 'number' && isPermanentIgnore(code)) {
     return { state: 'failed', code };
   }
-  // Codes 3 and 4 mean our own timestamp assignment is wrong. They are recorded
-  // as failures so the job makes progress, but they are a bug signal, not a
-  // property of the user's data, and the audit entry is what surfaces them.
-  return { state: 'failed', code };
+  // Codes 3 and 4 mean *our* timestamp assignment is wrong, not that the track
+  // is unscrobbleable. Recording them as failures would let a broken clock or
+  // a defective assignment quietly discard an entire import while reporting it
+  // complete, so they are non-terminal: the job stalls and is parked for a
+  // human instead.
+  if (code === IgnoreCode.TimestampTooOld || code === IgnoreCode.TimestampTooNew) {
+    return { state: 'bad_timestamp', code };
+  }
+  // An unrecognised non-zero code is not evidence of anything. Treat it as
+  // unknown rather than inventing a terminal outcome for it.
+  return { state: 'unknown', code };
 }
 
 /**
- * Records the tracks Last.fm refused, so the completion page can show them.
+ * Hard ceiling on individually-recorded failures per job.
+ *
+ * D1's free tier allows 100k row writes per day across every job. A malformed
+ * 100k-track import that Last.fm rejects wholesale would, at one row per
+ * track, exhaust the entire day's budget by itself and stall every other
+ * user's job. Past this point the count on the job row is still exact; only
+ * the per-track detail list stops growing.
+ */
+export const MAX_RECORDED_FAILURES_PER_JOB = 2000;
+
+/**
+ * Statements recording the tracks Last.fm refused, so the completion page can
+ * show them.
  *
  * Deliberately not `INSERT OR REPLACE`: a re-sent track that failed once and
  * succeeded later should keep neither row silently overwritten nor duplicated,
  * and the first recorded reason is the more informative one.
+ *
+ * Returned rather than executed so the caller can commit them in the same
+ * transaction as the cursor they belong to.
  */
-async function recordFailures(
-  sql: Sql,
-  jobId: string,
+function failureStatements(
+  lease: JobLease,
   entries: { index: number; track: JobTrack; reason: string; code?: number }[],
   nowSec: number,
-): Promise<void> {
-  if (entries.length === 0) {
-    return;
+): { query: string; params: unknown[] }[] {
+  const room = MAX_RECORDED_FAILURES_PER_JOB - (lease.job.failed_count ?? 0);
+  if (room <= 0) {
+    return [];
   }
-  await sql.batch(entries.map((e) => ({
+  return entries.slice(0, room).map((e) => ({
     query: `INSERT OR IGNORE INTO failures
               (job_id, track_index, artist, track, album, reason, ignore_code, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?
+             WHERE EXISTS (
+               SELECT 1 FROM jobs
+                WHERE id = ? AND generation = ?
+                  AND state NOT IN ('completed', 'failed', 'cancelled')
+             )`,
     params: [
-      jobId,
+      lease.job.id,
       e.index,
       e.track.artist,
       e.track.track,
@@ -207,9 +242,27 @@ async function recordFailures(
       e.reason,
       e.code ?? null,
       nowSec,
+      lease.job.id,
+      lease.generation,
     ],
-  })));
+  }));
 }
+
+/**
+ * How long after a send we wait before believing Last.fm's recent-tracks feed.
+ *
+ * A scrobble that was accepted milliseconds before the tick died may not be
+ * queryable yet. Reconciling too early sees nothing, concludes the batch was
+ * lost, and re-sends all 50 — the exact duplicate storm reconciliation exists
+ * to prevent.
+ */
+export const RECONCILE_GRACE_SECONDS = 120;
+
+/** Reconciliations attempted per job per tick, to bound subrequest use. */
+export const MAX_RECONCILES_PER_TICK = 3;
+
+/** Pages of `user.getRecentTracks` fetched for one reconciliation window. */
+export const MAX_RECONCILE_PAGES = 3;
 
 /**
  * Resolves batches left in `sending` by a tick that died mid-flight.
@@ -218,9 +271,10 @@ async function recordFailures(
  * does: the batch may have been stored by Last.fm, in which case re-sending it
  * blind duplicates up to 50 plays.
  *
- * The lookup key is the set of timestamps *we* assigned. They are unique by
- * construction, which is exactly why the worker assigns them — the user's own
- * timestamps are frequently all identical and could never identify a batch.
+ * The lookup key is the set of timestamps *we* assigned, matched together with
+ * artist and track. Timestamps alone are not a key: a preserved original can
+ * repeat across batches, and an unrelated scrobble the user made by hand can
+ * land on a second we also used.
  */
 async function reconcile(
   env: SchedulerEnv,
@@ -229,8 +283,11 @@ async function reconcile(
   nowSec: number,
 ): Promise<void> {
   const stale = await env.sql.all<any>(
-    "SELECT * FROM batches WHERE job_id = ? AND state = 'sending' ORDER BY start_index ASC",
-    [lease.job.id],
+    `SELECT * FROM batches
+      WHERE job_id = ? AND state = 'sending' AND sent_at <= ?
+      ORDER BY start_index ASC
+      LIMIT ?`,
+    [lease.job.id, nowSec - RECONCILE_GRACE_SECONDS, MAX_RECONCILES_PER_TICK],
   );
   if (stale.length === 0) {
     return;
@@ -250,12 +307,7 @@ async function reconcile(
     let lookupFailed = false;
     try {
       // eslint-disable-next-line no-await-in-loop
-      seen = await env.lastfm.getRecentTracks(
-        lease.job.username,
-        window.fromSec,
-        window.toSec,
-        sessionKey,
-      );
+      seen = await fetchWindow(env, lease.job.username, window, sessionKey);
     } catch (e) {
       // An inconclusive lookup must not be read as "nothing was stored".
       // Leaving the batch in `sending` costs another reconciliation next tick;
@@ -267,47 +319,24 @@ async function reconcile(
       continue;
     }
 
-    const byTimestamp = new Map<number, { artist: string; track: string }>();
-    seen.forEach((s) => byTimestamp.set(s.timestampSec, s));
-
-    const outcomes: EntryOutcome[] = assigned.map((a) => {
-      const hit = byTimestamp.get(a.timestampSec);
-      if (!hit) {
-        return { i: a.index, s: 'unknown' as EntryState, t: a.timestampSec };
-      }
-      // Last.fm rewrites what it stores, so this comparison is loose on
-      // purpose. A false match drops one scrobble from a batch already known
-      // to be ambiguous; a false miss duplicates the whole batch.
-      const sameTrack = normalizeForMatch(hit.track) === normalizeForMatch(a.track);
-      return {
-        i: a.index,
-        s: sameTrack ? ('accepted' as EntryState) : ('unknown' as EntryState),
-        t: a.timestampSec,
-      };
-    });
-
-    const accepted = outcomes.filter((o) => o.s === 'accepted').length;
+    const outcomes = matchOutcomes(assigned, seen);
     const advance = terminalPrefixLength(outcomes);
+    const committed = outcomes.slice(0, advance);
+    const accepted = committed.filter((o) => o.s === 'accepted').length;
 
     // eslint-disable-next-line no-await-in-loop
-    await env.sql.run(
-      `UPDATE batches
-          SET state = 'reconciled', outcomes = ?, accepted_count = ?, settled_at = ?
-        WHERE id = ? AND state = 'sending'`,
-      [JSON.stringify(outcomes), accepted, nowSec, batch.id],
-    );
-
-    if (advance > 0) {
-      // eslint-disable-next-line no-await-in-loop
-      await fencedJobUpdate(
-        env.sql,
-        lease,
-        'cursor = ?, scrobbled_count = scrobbled_count + ?, updated_at = ?',
-        [batch.start_index + advance, accepted, nowSec],
-      );
-      lease.job.cursor = batch.start_index + advance;
-      lease.job.scrobbled_count += accepted;
-    }
+    await commitBatch(env, lease, nowSec, {
+      batchId: batch.id,
+      batchState: 'reconciled',
+      outcomes,
+      acceptedInBatch: outcomes.filter((o) => o.s === 'accepted').length,
+      ignoredInBatch: outcomes.filter((o) => o.s !== 'accepted').length,
+      startIndex: batch.start_index,
+      advance,
+      accepted,
+      failed: 0,
+      failureRows: [],
+    });
 
     // eslint-disable-next-line no-await-in-loop
     await audit(env.sql, lease.job.id, lease.generation, 'reconciled', {
@@ -315,6 +344,167 @@ async function reconcile(
       recovered: accepted,
       unresolved: outcomes.length - accepted,
     }, nowSec);
+  }
+}
+
+/**
+ * Fetches a reconciliation window, paginating.
+ *
+ * `user.getRecentTracks` returns at most 200 entries per page. A batch mixing
+ * a nearly-expired preserved timestamp with near-present synthetic ones spans
+ * most of the 13-day window, and an active listener has far more than 200
+ * scrobbles in that span — so a single page silently omits exactly the entries
+ * we are trying to confirm, and every unconfirmed entry gets re-sent.
+ */
+async function fetchWindow(
+  env: SchedulerEnv,
+  username: string,
+  window: { fromSec: number; toSec: number },
+  sessionKey: string,
+): Promise<{ artist: string; track: string; timestampSec: number }[]> {
+  const all: { artist: string; track: string; timestampSec: number }[] = [];
+  let to = window.toSec;
+  for (let page = 0; page < MAX_RECONCILE_PAGES; page += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const rows = await env.lastfm.getRecentTracks(username, window.fromSec, to, sessionKey);
+    all.push(...rows);
+    if (rows.length < 200) {
+      break;
+    }
+    // Walk backwards through the window. `to` is exclusive, so using the oldest
+    // timestamp seen (rather than one below it) would re-fetch the same page.
+    const oldest = Math.min(...rows.map((r) => r.timestampSec));
+    if (oldest <= window.fromSec + 1) {
+      break;
+    }
+    to = oldest;
+  }
+  return all;
+}
+
+/**
+ * Decides, per entry, whether Last.fm already has it.
+ *
+ * Matching is on (timestamp, artist, track) as a *multiset*, because none of
+ * the three is a key on its own:
+ *
+ *  - a timestamp can repeat across batches, since a preserved original is only
+ *    deduplicated within the batch that preserved it;
+ *  - the user's own listening lands in the same window;
+ *  - Last.fm rewrites names, so exact comparison finds nothing.
+ *
+ * Consuming a match removes it, so two entries cannot both claim one stored
+ * scrobble — which is how a genuinely unsent track used to be skipped.
+ */
+export function matchOutcomes(
+  assigned: AssignedTrack[],
+  seen: { artist: string; track: string; timestampSec: number }[],
+): EntryOutcome[] {
+  const pool = new Map<number, { artist: string; track: string }[]>();
+  seen.forEach((s) => {
+    const bucket = pool.get(s.timestampSec);
+    if (bucket) {
+      bucket.push(s);
+    } else {
+      pool.set(s.timestampSec, [s]);
+    }
+  });
+
+  return assigned.map((a) => {
+    const bucket = pool.get(a.timestampSec);
+    const hit = bucket
+      ? bucket.findIndex((s) => normalizeForMatch(s.track) === normalizeForMatch(a.track)
+        && normalizeForMatch(s.artist) === normalizeForMatch(a.artist))
+      : -1;
+    if (!bucket || hit < 0) {
+      return { i: a.index, s: 'unknown' as EntryState, t: a.timestampSec };
+    }
+    bucket.splice(hit, 1);
+    return { i: a.index, s: 'accepted' as EntryState, t: a.timestampSec };
+  });
+}
+
+interface BatchCommit {
+  batchId: string;
+  batchState: 'settled' | 'reconciled';
+  outcomes: EntryOutcome[];
+  acceptedInBatch: number;
+  ignoredInBatch: number;
+  startIndex: number;
+  advance: number;
+  accepted: number;
+  failed: number;
+  failureRows: { index: number; track: JobTrack; reason: string; code?: number }[];
+}
+
+/**
+ * Commits a batch's outcomes, its failure rows and the cursor together.
+ *
+ * These used to be three separate statements, and the gaps between them were
+ * the worst bug in the scheduler: a crash after the batch was marked settled
+ * but before the cursor moved left a batch that reconciliation no longer
+ * selects (it only looks at `sending`) sitting behind a cursor that still
+ * points at its first entry — so the next tick re-sent all 50, and the tick
+ * after that did it again.
+ *
+ * The cursor is committed with `MAX`, never assignment. Reconciliation of an
+ * old batch can complete long after later batches have moved the cursor past
+ * it, and writing `start_index + advance` there would rewind it and re-send
+ * everything in between. Counters are advanced only when the cursor actually
+ * moves, in the same statement, so a rewound commit cannot double-count.
+ */
+async function commitBatch(
+  env: SchedulerEnv,
+  lease: JobLease,
+  nowSec: number,
+  c: BatchCommit,
+): Promise<void> {
+  const newCursor = c.startIndex + c.advance;
+  const statements: { query: string; params?: unknown[] }[] = [
+    {
+      query: `UPDATE batches
+                 SET state = ?, outcomes = ?, accepted_count = ?, ignored_count = ?, settled_at = ?
+               WHERE id = ? AND state = 'sending' AND ${FENCE_PREDICATE}`,
+      params: [
+        c.batchState,
+        JSON.stringify(c.outcomes),
+        c.acceptedInBatch,
+        c.ignoredInBatch,
+        nowSec,
+        c.batchId,
+        lease.job.id,
+        lease.generation,
+      ],
+    },
+    ...failureStatements(lease, c.failureRows, nowSec),
+  ];
+
+  if (c.advance > 0) {
+    statements.push({
+      query: `UPDATE jobs
+                 SET scrobbled_count = scrobbled_count + (CASE WHEN ? > cursor THEN ? ELSE 0 END),
+                     failed_count = failed_count + (CASE WHEN ? > cursor THEN ? ELSE 0 END),
+                     consecutive_failures = 0,
+                     cursor = MAX(cursor, ?),
+                     updated_at = ?
+               WHERE id = ? AND generation = ?
+                 AND state NOT IN ('completed', 'failed', 'cancelled')`,
+      params: [
+        newCursor, c.accepted,
+        newCursor, c.failed,
+        newCursor, nowSec,
+        lease.job.id, lease.generation,
+      ],
+    });
+  }
+
+  await fencedBatch(env.sql, lease, nowSec, statements);
+
+  if (c.advance > 0 && newCursor > lease.job.cursor) {
+    lease.job.cursor = newCursor;
+    lease.job.scrobbled_count += c.accepted;
+    lease.job.failed_count += c.failed;
+    lease.job.consecutive_failures = 0;
   }
 }
 
@@ -356,17 +546,24 @@ async function sendBatch(
   const assigned = assignment.assigned.map((a) => ({ ...a, index: startIndex + a.index }));
   const batchId = randomId();
 
-  // Step 1: the mapping is durable *before* the send. This row is the only
-  // thing that can identify these scrobbles after a crash.
-  await env.sql.run(
-    `INSERT INTO batches
-       (id, job_id, generation, start_index, entry_count, state, assigned_timestamps, sent_at, created_at)
-     VALUES (?, ?, ?, ?, ?, 'sending', ?, ?, ?)`,
-    [batchId, job.id, lease.generation, startIndex, assigned.length, JSON.stringify(assigned), nowSec, nowSec],
-  );
-  await fencedJobUpdate(env.sql, lease, 'synthetic_floor = ?, updated_at = ?', [
-    assignment.syntheticFloor,
-    nowSec,
+  // Step 1: the mapping is durable *before* the send, and in the same
+  // transaction as the synthetic floor it consumed. Splitting them lets a
+  // crash in between hand the same seconds to a later batch, at which point
+  // reconciliation can match one batch against another's scrobbles.
+  await fencedBatch(env.sql, lease, nowSec, [
+    {
+      query: `INSERT INTO batches
+                (id, job_id, generation, start_index, entry_count, state, assigned_timestamps, sent_at, created_at)
+              VALUES (?, ?, ?, ?, ?, 'sending', ?, ?, ?)`,
+      params: [batchId, job.id, lease.generation, startIndex, assigned.length,
+        JSON.stringify(assigned), nowSec, nowSec],
+    },
+    {
+      query: `UPDATE jobs SET synthetic_floor = ?, updated_at = ?
+               WHERE id = ? AND generation = ?
+                 AND state NOT IN ('completed', 'failed', 'cancelled')`,
+      params: [assignment.syntheticFloor, nowSec, job.id, lease.generation],
+    },
   ]);
   lease.job.synthetic_floor = assignment.syntheticFloor;
 
@@ -417,55 +614,56 @@ async function sendBatch(
     return { i: assigned[i].index, s: c.state, c: c.code, t: assigned[i].timestampSec };
   });
 
-  const accepted = outcomes.filter((o) => o.s === 'accepted').length;
-  const failedEntries = outcomes
-    .map((o, i) => ({ o, i }))
-    .filter((x) => x.o.s === 'failed');
   const capped = outcomes.some((o) => o.s === 'capped');
   const advance = terminalPrefixLength(outcomes);
 
-  await env.sql.run(
-    `UPDATE batches
-        SET state = 'settled', outcomes = ?, accepted_count = ?, ignored_count = ?, settled_at = ?
-      WHERE id = ?`,
-    [JSON.stringify(outcomes), accepted, outcomes.length - accepted, nowSec, batchId],
-  );
+  // Only the committed prefix is counted. Entries past the first non-terminal
+  // one will be sent again, so counting them here makes `scrobbled_count`
+  // exceed `total_tracks` and lists tracks as failed that later succeed.
+  const committed = outcomes.slice(0, advance);
+  const accepted = committed.filter((o) => o.s === 'accepted').length;
+  const failedEntries = committed
+    .map((o, i) => ({ o, i }))
+    .filter((x) => x.o.s === 'failed');
 
-  await recordFailures(
-    env.sql,
-    job.id,
-    failedEntries.map((x) => ({
+  await commitBatch(env, lease, nowSec, {
+    batchId,
+    batchState: 'settled',
+    outcomes,
+    acceptedInBatch: outcomes.filter((o) => o.s === 'accepted').length,
+    ignoredInBatch: outcomes.filter((o) => o.s !== 'accepted').length,
+    startIndex,
+    advance,
+    accepted,
+    failed: failedEntries.length,
+    failureRows: failedEntries.map((x) => ({
       index: outcomes[x.i].i,
       track: tracks[x.i],
       reason: result.outcomes[x.i].ignoredMessage || 'Rejected by Last.fm',
       code: outcomes[x.i].c,
     })),
-    nowSec,
-  );
-
-  if (advance > 0) {
-    await fencedJobUpdate(
-      env.sql,
-      lease,
-      `cursor = ?, scrobbled_count = scrobbled_count + ?, failed_count = failed_count + ?,
-       consecutive_failures = 0, updated_at = ?`,
-      [startIndex + advance, accepted, failedEntries.length, nowSec],
-    );
-    lease.job.cursor = startIndex + advance;
-    lease.job.scrobbled_count += accepted;
-    lease.job.failed_count += failedEntries.length;
-  }
+  });
 
   // A timestamp Last.fm calls too old or too new is our bug, not the user's
-  // data. Surfacing it is the only way it ever gets found.
-  const badTimestamps = outcomes.filter(
-    (o) => o.c === IgnoreCode.TimestampTooOld || o.c === IgnoreCode.TimestampTooNew,
-  );
+  // data, and it is never terminal — so if a whole batch comes back that way
+  // the job would otherwise re-send it forever. Park it for a human instead.
+  const badTimestamps = outcomes.filter((o) => o.s === 'bad_timestamp');
   if (badTimestamps.length > 0) {
     await audit(env.sql, job.id, lease.generation, 'timestamp_rejected', {
       count: badTimestamps.length,
       sample: badTimestamps.slice(0, 3),
     }, nowSec);
+  }
+  if (advance === 0 && badTimestamps.length > 0) {
+    return {
+      sent: assigned.length,
+      accepted: 0,
+      failed: 0,
+      stop: {
+        state: 'needs_attention',
+        reason: 'Last.fm rejected every timestamp in a batch; assignment is wrong',
+      },
+    };
   }
 
   if (capped) {
@@ -496,9 +694,15 @@ async function runJob(
   job: JobRow,
   nowSec: number,
 ): Promise<JobOutcome | null> {
-  const lease = await acquireJob(env.sql, job.id, nowSec, LEASE_SECONDS);
+  // Acquisition uses wall time rather than the tick's frozen `nowSec`. Jobs
+  // later in the tick are claimed minutes after it started, and a lease
+  // computed from the start time can be expired before it is even taken.
+  const lease = await acquireJob(
+    env.sql, job.id, Math.floor(Date.now() / 1000), LEASE_SECONDS,
+  );
   if (!lease) {
-    // Another tick has it. Losing this race costs one job, not the tick.
+    // Another tick has it, or the user paused it between selection and now.
+    // Losing this race costs one job, not the tick.
     return null;
   }
 
@@ -569,6 +773,18 @@ async function runJob(
       break;
     }
 
+    // Re-read the user's intent before every send. A pause or cancel arriving
+    // mid-tick does not bump the generation, so fencing does not see it, and
+    // this loop would otherwise keep scrobbling for up to three more batches
+    // after the user pressed stop.
+    // eslint-disable-next-line no-await-in-loop
+    const current = await env.sql.first<{ state: string }>(
+      'SELECT state FROM jobs WHERE id = ?', [lease.job.id],
+    );
+    if (!current || current.state !== 'active') {
+      return { batchesSent, scrobbled, failed };
+    }
+
     // eslint-disable-next-line no-await-in-loop
     const chunk = await readChunkFor(env.sql, env.blobs, lease.job.id, lease.job.cursor);
     if (!chunk) {
@@ -588,6 +804,7 @@ async function runJob(
       break;
     }
 
+    const cursorBefore = lease.job.cursor;
     // eslint-disable-next-line no-await-in-loop
     const result = await sendBatch(env, lease, sessionKey, slice, lease.job.cursor, nowSec);
     batchesSent += result.sent > 0 ? 1 : 0;
@@ -609,6 +826,14 @@ async function runJob(
            live_username = NULL, locked_until = 0, updated_at = ?`,
           [reason, nowSec],
         );
+      } else if (state === 'needs_attention') {
+        // eslint-disable-next-line no-await-in-loop
+        await fencedJobUpdate(
+          env.sql,
+          lease,
+          "state = 'needs_attention', state_reason = ?, locked_until = 0, updated_at = ?",
+          [reason, nowSec],
+        );
       } else if (state === 'daily_cap') {
         // eslint-disable-next-line no-await-in-loop
         await fencedJobUpdate(
@@ -625,6 +850,21 @@ async function runJob(
       return { batchesSent, scrobbled, failed };
     }
 
+    // A send that committed nothing must end the tick for this job. Otherwise
+    // the loop reads the same cursor, builds the same batch and sends it
+    // again — up to four identical batches per tick, forever. Counting it as
+    // a failed attempt gives it backoff and, eventually, a human.
+    if (lease.job.cursor <= cursorBefore) {
+      // eslint-disable-next-line no-await-in-loop
+      await failJobAttempt(
+        env.sql,
+        lease,
+        'Batch produced no terminal outcome; nothing could be committed',
+        nowSec,
+      );
+      return { batchesSent, scrobbled, failed };
+    }
+
     // A successful send clears the probe flag: the cap has demonstrably lifted.
     if (lease.job.probing) {
       // eslint-disable-next-line no-await-in-loop
@@ -632,8 +872,12 @@ async function runJob(
       lease.job.probing = 0;
     }
 
+    // Renewal uses wall time, not the tick's frozen `nowSec`. Every batch
+    // spends real seconds waiting on Last.fm, so writing `tickStart + 180`
+    // each time renews nothing: after a few slow requests the lease is already
+    // expired in real terms, another tick claims the job, and both send.
     // eslint-disable-next-line no-await-in-loop
-    await renewLease(env.sql, lease, nowSec, LEASE_SECONDS);
+    await renewLease(env.sql, lease, Math.floor(Date.now() / 1000), LEASE_SECONDS);
   }
 
   if (lease.job.cursor >= lease.job.total_tracks) {
@@ -691,6 +935,35 @@ async function failJobAttempt(
 }
 
 /**
+ * Backs a job off after an unexpected throw, without a lease.
+ *
+ * `failJobAttempt` needs a live lease, and by the time an exception reaches
+ * `runTick` we may not have one — the throw could have come from acquisition
+ * itself. This is deliberately unfenced and matches on the job id alone, but
+ * it only ever adds backoff, so the worst a stale caller can do is delay a job
+ * by a few minutes.
+ */
+async function releaseFailedJob(
+  sql: Sql,
+  jobId: string,
+  reason: string,
+  nowSec: number,
+): Promise<void> {
+  await sql.run(
+    `UPDATE jobs
+        SET consecutive_failures = consecutive_failures + 1,
+            state_reason = ?,
+            state = CASE WHEN consecutive_failures + 1 >= ? THEN 'needs_attention' ELSE state END,
+            locked_until = 0,
+            last_run_at = ?,
+            next_eligible_at = MAX(next_eligible_at, ?),
+            updated_at = ?
+      WHERE id = ? AND state = 'active'`,
+    [reason, MAX_CONSECUTIVE_FAILURES, nowSec, nowSec + 300, nowSec, jobId],
+  );
+}
+
+/**
  * One cron tick.
  */
 export async function runTick(env: SchedulerEnv, nowSec: number): Promise<TickReport> {
@@ -726,6 +999,18 @@ export async function runTick(env: SchedulerEnv, nowSec: number): Promise<TickRe
       await audit(env.sql, job.id, null, 'tick_error', {
         message: error instanceof Error ? error.message : String(error),
       }, nowSec);
+      // An unexpected throw leaves the lease held and no backoff recorded, so
+      // the job would come straight back every tick, throw again, and — being
+      // the least recently run — crowd out healthy jobs indefinitely. Release
+      // it through the normal failure path so it backs off and is eventually
+      // parked for a human.
+      // eslint-disable-next-line no-await-in-loop
+      await releaseFailedJob(
+        env.sql,
+        job.id,
+        error instanceof Error ? error.message : String(error),
+        nowSec,
+      );
       // eslint-disable-next-line no-continue
       continue;
     }

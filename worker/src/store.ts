@@ -162,6 +162,7 @@ export async function acquireJob(
             updated_at = ?
       WHERE id = ?
         AND locked_until < ?
+        AND state = 'active'
       RETURNING *`,
     [nowSec + leaseSeconds, nowSec, jobId, nowSec],
   );
@@ -177,6 +178,11 @@ export async function acquireJob(
  *
  * Every write a tick makes must go through here (or carry the same
  * `AND generation = ?` predicate), or fencing is decorative.
+ *
+ * Terminal states are additionally protected. Fencing alone does not save
+ * them: cancelling a job does *not* bump the generation, so a tick still
+ * holding a valid lease would happily overwrite `cancelled` with `completed`
+ * — telling the user their import finished when they had stopped it.
  */
 export async function fencedJobUpdate(
   sql: Sql,
@@ -185,10 +191,68 @@ export async function fencedJobUpdate(
   params: unknown[],
 ): Promise<void> {
   const result = await sql.run(
-    `UPDATE jobs SET ${setClause} WHERE id = ? AND generation = ?`,
+    `UPDATE jobs SET ${setClause}
+      WHERE id = ? AND generation = ?
+        AND state NOT IN ('completed', 'failed', 'cancelled')`,
     [...params, lease.job.id, lease.generation],
   );
   if (result.changes === 0) {
+    throw new FencedError(lease.job.id, lease.generation);
+  }
+}
+
+/**
+ * A statement guarded by the same predicate as `fencedJobUpdate`, for use
+ * inside a `batch`.
+ *
+ * Writes to `batches`, `failures` and the cursor must commit together or not
+ * at all. Issuing them as separate statements leaves a window in which the
+ * batch is recorded as settled while the cursor still points at its start —
+ * and the next tick then re-sends all 50 entries, every tick, forever.
+ */
+export function fencedStatement(
+  lease: JobLease,
+  query: string,
+  params: unknown[],
+): { query: string; params: unknown[] } {
+  return { query, params: [...params, lease.job.id, lease.generation] };
+}
+
+/**
+ * The guard clause dependent tables use to inherit the job's fence.
+ *
+ * A row in `batches` or `failures` belongs to a job, so conditioning its write
+ * on that job's generation is what stops a superseded tick's delayed write
+ * from resurrecting a batch a newer tick has already reconciled.
+ */
+export const FENCE_PREDICATE = `job_id IN (
+  SELECT id FROM jobs
+   WHERE id = ? AND generation = ?
+     AND state NOT IN ('completed', 'failed', 'cancelled')
+)`;
+
+/**
+ * Applies statements atomically, failing loudly if the lease was lost.
+ *
+ * The sentinel is what makes fencing detectable: `batch` reports rows changed
+ * per statement, so a sentinel that changed nothing means the fence predicate
+ * did not hold, and because D1 batches are transactional none of the other
+ * statements took effect either.
+ */
+export async function fencedBatch(
+  sql: Sql,
+  lease: JobLease,
+  nowSec: number,
+  statements: { query: string; params?: unknown[] }[],
+): Promise<void> {
+  const sentinel = {
+    query: `UPDATE jobs SET updated_at = ?
+             WHERE id = ? AND generation = ?
+               AND state NOT IN ('completed', 'failed', 'cancelled')`,
+    params: [nowSec, lease.job.id, lease.generation],
+  };
+  const results = await sql.batch([...statements, sentinel]);
+  if (results.length === 0 || results[results.length - 1].changes === 0) {
     throw new FencedError(lease.job.id, lease.generation);
   }
 }

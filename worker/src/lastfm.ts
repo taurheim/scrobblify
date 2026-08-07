@@ -30,6 +30,15 @@ const API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
  */
 const REQUEST_TIMEOUT_MS = 15_000;
 
+/**
+ * Minimum spacing between requests from this worker to Last.fm.
+ *
+ * Last.fm's published guidance is roughly five calls per second per IP,
+ * averaged. 250ms keeps a full tick comfortably under that while still letting
+ * eight jobs make progress inside one invocation.
+ */
+export const MIN_REQUEST_SPACING_MS = 250;
+
 export interface LastFmCredentials {
   apiKey: string;
   sharedSecret: string;
@@ -38,10 +47,32 @@ export interface LastFmCredentials {
 export class LastFmClient {
   constructor(private readonly credentials: LastFmCredentials) {}
 
+  /**
+   * Wall-clock time the next request may be issued.
+   *
+   * Error 29 is an *IP* limit, and every job on this worker shares one egress
+   * IP. Without spacing, a tick running eight jobs fires up to forty scrobble
+   * calls plus reconciliation lookups back to back, trips the limit, and opens
+   * the global breaker for everyone — including the jobs that were behaving.
+   * `INTER_BATCH_DELAY_SECONDS` does not help: it only delays that job's *next
+   * tick*, not the requests within this one.
+   */
+  private nextRequestAt = 0;
+
+  private async throttle(): Promise<void> {
+    const now = Date.now();
+    const wait = this.nextRequestAt - now;
+    if (wait > 0) {
+      await new Promise((resolve) => { setTimeout(resolve, wait); });
+    }
+    this.nextRequestAt = Math.max(now, this.nextRequestAt) + MIN_REQUEST_SPACING_MS;
+  }
+
   private async request(
     params: { [key: string]: string },
     signed: boolean,
   ): Promise<any> {
+    await this.throttle();
     const requestParams: { [key: string]: string } = {
       ...params,
       api_key: this.credentials.apiKey,

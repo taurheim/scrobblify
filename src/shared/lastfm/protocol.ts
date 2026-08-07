@@ -70,6 +70,19 @@ export interface ScrobbleOutcome {
    * will fail to recognise its own writes.
    */
   corrected?: CorrectedNames;
+  /**
+   * False when Last.fm's response contained no entry at this position and the
+   * outcome above is an assumption rather than an observation.
+   *
+   * The assumption is "accepted", which is right for an interactive client —
+   * an unrecognised response must not turn a working scrobble into a reported
+   * failure the user then retries by hand. It is *wrong* for anything that
+   * advances a durable cursor over this array: fabricating acceptance for a
+   * truncated response would mark up to 50 never-stored tracks as done and
+   * skip them permanently. Such callers must treat `present === false` as
+   * unknown and re-derive the truth from Last.fm.
+   */
+  present: boolean;
 }
 
 export interface BatchScrobbleResult {
@@ -177,9 +190,11 @@ function readCorrected(node: any): string | undefined {
  *
  * `expectedCount` matters: if the response is unparseable or truncated we must
  * still return one outcome per entry, because the caller advances its cursor
- * over this array. Missing entries default to *accepted* for the same reason
+ * over this array. Missing entries default to *accepted*, for the same reason
  * the single-track parser always has — an unrecognised response must never
- * turn a working scrobble into a reported failure.
+ * turn a working scrobble into a reported failure — but they are flagged with
+ * `present: false` so a caller that cannot afford that assumption can reject
+ * it. See `ScrobbleOutcome.present`.
  */
 export function parseScrobbleResponse(response: any, expectedCount: number): BatchScrobbleResult {
   const scrobbles = (response && response.scrobbles) || {};
@@ -212,6 +227,7 @@ export function parseScrobbleResponse(response: any, expectedCount: number): Bat
       accepted: code === IgnoreCode.Accepted,
       ignoredCode: code,
       ignoredMessage: ignored['#text'] || '',
+      present: entry !== undefined && entry !== null,
     };
     if (hasCorrection) {
       outcome.corrected = corrected;
