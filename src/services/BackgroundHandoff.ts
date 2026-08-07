@@ -133,33 +133,72 @@ export async function beginHandoff(
     return { ok: false, reason: capacity ? 'at_capacity' : 'unavailable' };
   }
 
+  /*
+    Every other tab is stopped *before* the queue is read, and the queue is
+    then re-read from disk.
+
+    Both halves matter. Freezing after the snapshot leaves a sibling free to
+    scrobble tracks that the snapshot still lists as pending, which the worker
+    then sends again. Re-reading is what incorporates the progress a sibling
+    persisted while stopping — that progress exists only on disk, never in the
+    `state` this was called with.
+
+    From here on, every failure path must release the freeze, or the user is
+    left unable to scrobble anywhere.
+  */
+  const acks = await api.freezeOtherTabs();
+  let frozenState = state;
+  try {
+    const reloaded = await stateManager.loadState();
+    if (reloaded) {
+      frozenState = reloaded;
+    }
+  } catch (e) {
+    // Reading back is what makes a sibling's progress visible. Without it we
+    // would upload tracks that may already have been sent.
+    trackError('background.reloadAfterFreeze', e);
+    api.setQueueOwner(null);
+    return { ok: false, reason: 'reload_failed' };
+  }
+  if (acks > 0) {
+    trackEvent('background_handoff_froze_tabs', { tabs: acks });
+  }
+
   // Pinned so the post-redirect derivation reproduces this exact ordering.
   // Without it the sort key would be re-evaluated minutes later against a
   // moved clock, and a track sitting on the window boundary could change
   // queues — producing different bytes than the digest we just committed to.
   const orderEpoch = Math.floor(Date.now() / 1000);
-  const tracks = uploadListFromState(state, orderEpoch);
+  const tracks = uploadListFromState(frozenState, orderEpoch);
 
   if (tracks.length < capacity.minTracks) {
+    api.setQueueOwner(null);
     return { ok: false, reason: 'too_small' };
   }
   if (tracks.length > capacity.maxTracks) {
+    api.setQueueOwner(null);
     return { ok: false, reason: 'too_large' };
   }
 
   // Persisted *first*. If the tab dies between here and the upload, the queue
   // is still on disk and the user resumes locally as they always could.
   try {
-    await stateManager.saveState({ ...state, handoffOrderEpoch: orderEpoch });
+    await stateManager.saveState({ ...frozenState, handoffOrderEpoch: orderEpoch });
   } catch (e) {
     trackError('background.persistBeforeHandoff', e);
+    api.setQueueOwner(null);
     return { ok: false, reason: 'save_failed' };
   }
 
   const pre = await api.preflight(username, tracks, capacity.chunkTracks);
   if (!pre) {
+    api.setQueueOwner(null);
     return { ok: false, reason: 'preflight_failed' };
   }
+
+  // The freeze now names the handoff it is holding for, so a tab that finds a
+  // stale record has something to resolve it against.
+  api.setQueueOwner({ owner: 'freezing', id: pre.handoffId });
 
   trackEvent('background_handoff_started', {
     entry_point: entryPoint,
@@ -192,6 +231,14 @@ export async function completeHandoff(
     // The queue is gone but the handoff exists, so we cannot upload and cannot
     // prove the job is inactive either. Ask the server rather than guess.
     const active = await api.isHandoffActive(handoffId);
+    // Either answer other than a definitive "no" leaves the queue owned
+    // elsewhere, and a sibling tab that still holds it in memory has to be
+    // told. This branch previously fell through without announcing anything.
+    if (active !== false) {
+      api.setQueueOwner({ owner: 'server', id: handoffId });
+    } else {
+      api.setQueueOwner(null);
+    }
     return {
       outcome: active ? { status: 'active', jobId: handoffId } : { status: 'unknown', handoffId },
       safeToResumeLocally: false,
@@ -209,9 +256,10 @@ export async function completeHandoff(
     // The worker owns these tracks now. Local state must go, or the next visit
     // offers a "Resume" that would scrobble everything a second time.
     //
-    // Announced origin-wide *before* the clear, because other tabs are holding
-    // this queue in memory and clearing IndexedDB says nothing to them.
-    api.setServerOwnsQueue(true);
+    // The freeze becomes an ownership record naming the job, so a later visit
+    // can reconcile it against terminal job status rather than being blocked
+    // by a flag nothing ever clears.
+    api.setQueueOwner({ owner: 'server', id: outcome.jobId });
     try {
       await stateManager.clearState();
     } catch (e) {
@@ -219,7 +267,7 @@ export async function completeHandoff(
       // reload would offer to resume it alongside the running job. Record the
       // uncertainty durably so startup refuses rather than offers.
       trackError('background.clearAfterHandoff', e);
-      api.setOwnershipUnresolved('handoff', handoffId);
+      api.setOwnershipUnresolved('job', outcome.jobId);
     }
     api.clearPendingHandoff();
     trackEvent('background_handoff_completed', { track_count: tracks.length });
@@ -227,6 +275,9 @@ export async function completeHandoff(
   }
 
   if (outcome.status === 'failed') {
+    // Nothing is running anywhere, so the freeze must lift or every tab is
+    // left unable to scrobble a queue that is entirely theirs.
+    api.setQueueOwner(null);
     api.clearPendingHandoff();
     trackEvent('background_handoff_failed', { reason: outcome.reason });
     return { outcome, safeToResumeLocally: true };
@@ -235,12 +286,13 @@ export async function completeHandoff(
   // `unknown`: one more question to the server before deciding.
   const active = await api.isHandoffActive(handoffId);
   if (active === false) {
+    api.setQueueOwner(null);
     api.clearPendingHandoff();
     trackEvent('background_handoff_failed', { reason: 'finalize_lost_but_inactive' });
     return { outcome: { status: 'failed', reason: 'finalize failed' }, safeToResumeLocally: true };
   }
   if (active === true) {
-    api.setServerOwnsQueue(true);
+    api.setQueueOwner({ owner: 'server', id: handoffId });
     try {
       await stateManager.clearState();
     } catch (e) {
@@ -257,10 +309,10 @@ export async function completeHandoff(
   // import can be retried the moment the server answers.
   //
   // Recorded durably because the recovery we ask for is a reload, and
-  // component state does not survive one. Other tabs are stopped too: an
+  // component state does not survive one. Other tabs stay stopped too: an
   // unknown outcome may well be a live job, and a stopped tab is recoverable
   // where a duplicated import is not.
-  api.setServerOwnsQueue(true);
+  api.setQueueOwner({ owner: 'server', id: handoffId });
   api.setOwnershipUnresolved('handoff', handoffId);
   trackEvent('background_handoff_unresolved');
   return { outcome, safeToResumeLocally: false };
@@ -338,22 +390,39 @@ export function stateFromExport(
     : 0;
 
   /*
-    The reservation has to clear *two* used ranges, not one.
+    The reservation has to clear *every* second either side has used, not one
+    band each.
 
-    The server's is bounded below by `syntheticFloorSec`. This browser's own
-    earlier band is invisible to the server, though, and it sits wherever the
-    six hours before the handoff were — so a reservation derived from the
-    server's floor alone can land straight back on seconds this browser
-    already used. Last.fm discards those exactly as silently.
+    Three histories matter, and only the first was previously consulted:
 
-    So the reservation is placed below the lower of the two, and the browser's
-    band is bounded conservatively: it can never have started earlier than six
-    hours before the handoff.
+      - the server's current descending band, bounded by `syntheticFloorSec`;
+      - every second the server actually submitted, which `usedRanges` carries
+        — this covers preserved originals and any band abandoned by a wrap,
+        neither of which the floor describes;
+      - this browser's own earlier bands, invisible to the server, accumulated
+        across however many times the queue has been resumed.
+
+    The reservation is placed below the lowest second any of them used. Landing
+    on one is not an error the user would ever see: Last.fm discards a repeat
+    of (artist, track, timestamp) while reporting it accepted, so the play
+    simply disappears.
+
+    A truncated `usedRanges` is still sound for this purpose: the server drops
+    the *highest* ranges, and only the lowest bound constrains the choice.
   */
   const browserBandStart = lineage && lineage.handedOverAtSec
     ? lineage.handedOverAtSec - RETAG_BACKFILL_SECONDS
     : 0;
-  const usedFrom = [serverFloor, browserBandStart].filter((v) => v > 0);
+  const exportedRanges: { from: number; to: number }[] = Array.isArray(exported.usedRanges)
+    ? exported.usedRanges.filter((r: any) => r && Number.isFinite(r.from) && r.from > 0)
+    : [];
+  const priorRanges = (lineage && lineage.reTagUsedRanges) || [];
+  const usedFrom = [
+    serverFloor,
+    browserBandStart,
+    ...exportedRanges.map((r) => r.from),
+    ...priorRanges.map((r) => r.from),
+  ].filter((v) => v > 0);
   const lowestUsed = usedFrom.length ? Math.min(...usedFrom) : 0;
 
   const reservedCeiling = lowestUsed ? lowestUsed - 1 : 0;

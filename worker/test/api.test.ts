@@ -449,7 +449,7 @@ async function main() {
     const sql = freshSql();
     const blobs = new MemoryBlobs();
     const env = makeEnv(sql, blobs);
-    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 40 });
+    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 40, state: 'paused' });
     await sql.run(
       `INSERT INTO failures (job_id, track_index, artist, track, album, reason, ignore_code, created_at)
        VALUES (?, 55, 'Artist 55', 'Track 55', 'Album', 'Artist ignored', 1, ?)`,
@@ -500,7 +500,9 @@ async function main() {
     const sql = freshSql();
     const blobs = new MemoryBlobs();
     const env = makeEnv(sql, blobs);
-    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 40, reTagged: true });
+    const id = await seedJob(sql, blobs, 'listener', {
+      total: 100, cursor: 40, reTagged: true, state: 'paused',
+    });
     const token = await issueSession('listener', SIGNING, NOW);
     const body: any = await (await handleRequest(env,
       req(`/scrobblify/job/${id}/export`, { token }))).json();
@@ -509,6 +511,91 @@ async function main() {
       body.state.tracks.every((t: any) => t.reTagged === true), body.state.tracks[0]);
     check('and never with a 1970 timestamp',
       body.state.tracks.every((t: any) => t.timestamp > 1e12), body.state.tracks[0]);
+  }
+
+  console.log('\n-- the export claims quiescence rather than observing it --');
+  {
+    /*
+      Checking quiescence and then reading was a time-of-check/time-of-use
+      hole: a second tab pressing "resume on the server" in between makes the
+      job active, a tick sends a batch, and the export the first tab saved
+      still lists those tracks as pending. It cancels, the browser resumes
+      them, and they are scrobbled twice.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const token = await issueSession('listener', SIGNING, NOW);
+
+    const active = await seedJob(sql, blobs, 'listener', { total: 100, state: 'active' });
+    const activeRes = await handleRequest(env, req(`/scrobblify/job/${active}/export`, { token }));
+    check('an active job cannot be exported', activeRes.status === 409, activeRes.status);
+    check('and it is left active',
+      (await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [active]))!.state === 'active');
+
+    const sql2 = freshSql();
+    const blobs2 = new MemoryBlobs();
+    const env2 = makeEnv(sql2, blobs2);
+    const id = await seedJob(sql2, blobs2, 'listener', { total: 100, state: 'paused' });
+    const first = await handleRequest(env2, req(`/scrobblify/job/${id}/export`, { token }));
+    check('a paused job exports', first.status === 200, first.status);
+    const claimed = await sql2.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]);
+    check('and is claimed into exporting', claimed!.state === 'exporting', claimed!.state);
+    check('with a claim deadline that expires',
+      claimed!.locked_until > NOW, claimed!.locked_until);
+
+    // The client retries this endpoint on a 409, and a retry is the same
+    // take-back continuing — refusing it would strand the user.
+    const second = await handleRequest(env2, req(`/scrobblify/job/${id}/export`, { token }));
+    check('re-exporting a claimed job is allowed', second.status === 200, second.status);
+
+    const resumed = await handleRequest(env2,
+      req(`/scrobblify/job/${id}/resume`, { method: 'POST', token }));
+    check('but it cannot be resumed out from under the export',
+      resumed.status === 409, resumed.status);
+
+    // Cancel is the take-back *completing*, so it must still work.
+    const cancelled = await handleRequest(env2,
+      req(`/scrobblify/job/${id}/cancel`, { method: 'POST', token }));
+    check('cancel still works from exporting', cancelled.status === 200, cancelled.status);
+  }
+
+  console.log('\n-- the export reports every second it used --');
+  {
+    /*
+      `synthetic_floor` describes only the current descending band. Preserved
+      original timestamps are not in it, and neither is a band abandoned by a
+      wrap. The browser's re-tag allocator reserves below everything it is
+      told about, so anything omitted here is a second it may reuse — and
+      Last.fm discards a repeat of (artist, track, timestamp) while reporting
+      it accepted.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 40, state: 'paused' });
+    await sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, created_at)
+       VALUES (?, ?, 0, 0, 3, 'settled', ?, ?)`,
+      [randomId(), id, JSON.stringify([1000, 1001, 1002]), NOW],
+    );
+    await sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, created_at)
+       VALUES (?, ?, 0, 3, 2, 'settled', ?, ?)`,
+      [randomId(), id, JSON.stringify([5000, 1003]), NOW],
+    );
+    const token = await issueSession('listener', SIGNING, NOW);
+    const body: any = await (await handleRequest(env,
+      req(`/scrobblify/job/${id}/export`, { token }))).json();
+
+    check('contiguous seconds collapse into one range',
+      JSON.stringify(body.usedRanges) === JSON.stringify([
+        { from: 1000, to: 1003 }, { from: 5000, to: 5000 },
+      ]), body.usedRanges);
+    check('a complete list is not reported as truncated',
+      body.usedRangesTruncated === false, body.usedRangesTruncated);
   }
 
   console.log('\n-- unknown routes --');

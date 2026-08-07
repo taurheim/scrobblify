@@ -35,6 +35,17 @@ export type JobState =
   | 'pending'
   | 'active'
   | 'paused'
+  /**
+   * A take-back is reading the queue out. Not schedulable and not resumable:
+   * the export names the tracks after the cursor, and the client cancels once
+   * it has them, so anything sent between those two moments is both handed
+   * back and already scrobbled. Checking quiescence without claiming it left
+   * that window open to any other tab pressing Resume.
+   *
+   * `locked_until` doubles as the claim deadline, so an abandoned take-back
+   * falls back to `paused` instead of stranding the job.
+   */
+  | 'exporting'
   | 'needs_reauth'
   | 'needs_attention'
   | 'completed'
@@ -52,6 +63,7 @@ export const SLOT_CONSUMING_STATES: JobState[] = [
   'pending',
   'active',
   'paused',
+  'exporting',
   'needs_reauth',
   'needs_attention',
 ];

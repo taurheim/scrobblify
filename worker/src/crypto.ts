@@ -126,6 +126,12 @@ export interface HandoffState {
   k?: 'signin';
   /** Username the signin state was requested for. Only set when `k` is set. */
   u?: string;
+  /**
+   * Nonce echoed back to the initiating browser, which compares it against the
+   * copy it kept. Binds the return to one browser, so a completed signin link
+   * cannot be handed to somebody else.
+   */
+  n?: string;
 }
 
 /**

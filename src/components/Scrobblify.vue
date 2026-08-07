@@ -152,6 +152,15 @@ import {
 } from '@/services/BackgroundHandoff';
 import { trackEvent, trackError, resetUser } from '@/services/Analytics';
 
+/**
+ * How far back the browser's re-tag allocator reaches.
+ *
+ * Must match `RETAG_BACKFILL_SECONDS` in `ScrobbleStep`, which is what
+ * actually allocates. Used here only to bound a band whose exact extent was
+ * not recorded, so an over-estimate is the safe direction.
+ */
+const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
+
 interface ProgressSnapshot {
   scrobbledTracks: number;
   originalTotalTracks: number;
@@ -196,6 +205,8 @@ export default Vue.extend({
       onPageShow: null as ((event: PageTransitionEvent) => void) | null,
       /** Teardown for the cross-tab ownership subscription. Not reactive. */
       releaseOwnershipListener: null as (() => void) | null,
+      /** Teardown for the cross-tab freeze responder. Not reactive. */
+      releaseFreezeResponder: null as (() => void) | null,
       /**
        * Set when we cannot establish whether the server owns the queue. A
        * belt-and-braces gate on Resume alongside `hasResumableState`: that flag
@@ -237,25 +248,32 @@ export default Vue.extend({
       which is exactly the window in which the server may own the queue.
     */
     const unresolved = background.getOwnershipUnresolved();
+    const owner = background.queueOwner();
 
     try {
       const saved = await this.stateManager.hasSavedState();
-      this.hasResumableState = saved && !unresolved && !background.serverOwnsQueue();
+      this.hasResumableState = saved && !unresolved && !owner;
     } catch (e) {
       // IndexedDB not available — not critical, just skip resume
     }
 
     /*
-      A tab opened after another tab handed the queue over has no message to
-      receive, so the durable flag is read here as well as listened for.
+      A tab opened after another tab took the queue has no message to receive,
+      so the durable record is read here as well as listened for.
+
+      A `server` record is reconciled rather than obeyed forever. Jobs run for
+      weeks and then finish; without this the flag that stopped every tab
+      during the import would keep stopping them long after the worker was
+      done, and there would be no way back.
     */
-    if (background.serverOwnsQueue()) {
+    if (owner) {
       this.ownershipBlocked = true;
+      await this.reconcileQueueOwner(owner);
     }
 
-    this.releaseOwnershipListener = background.onServerOwnershipChange((owns) => {
-      this.ownershipBlocked = owns;
-      if (owns) {
+    this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
+      this.ownershipBlocked = next !== null;
+      if (next) {
         this.hasResumableState = false;
         const step = this.$refs.scrobbleStep as any;
         if (step && step.haltForHandoff) {
@@ -264,6 +282,22 @@ export default Vue.extend({
           Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
         }
       }
+    });
+
+    /*
+      This tab answers other tabs' freeze requests. Handing over is decided in
+      one tab and binds them all, and the decision is made *before* the queue
+      is snapshotted — so this must stop scrobbling and persist what it has
+      before acknowledging, or its just-sent tracks are captured in the
+      sibling's upload and scrobbled a second time by the worker.
+    */
+    this.releaseFreezeResponder = background.respondToFreezeRequests(async () => {
+      const step = this.$refs.scrobbleStep as any;
+      if (step && step.haltForHandoff) {
+        await step.haltForHandoff();
+      }
+      this.hasResumableState = false;
+      this.ownershipBlocked = true;
     });
 
     if (unresolved) {
@@ -304,6 +338,9 @@ export default Vue.extend({
     }
     if (this.releaseOwnershipListener) {
       this.releaseOwnershipListener();
+    }
+    if (this.releaseFreezeResponder) {
+      this.releaseFreezeResponder();
     }
   },
   watch: {
@@ -364,6 +401,68 @@ export default Vue.extend({
     },
 
     /**
+     * Decides whether an ownership record still reflects reality.
+     *
+     * A boolean flag set at handover was a one-way door: jobs complete, fail
+     * or are cancelled, and nothing was left to clear it. A user whose import
+     * finished would find every tab permanently refusing to scrobble, with no
+     * marker to resolve and nothing to press.
+     *
+     * Only a definitive "that job is over" lifts it. `null` — unreachable,
+     * unauthenticated, or answering about some other job — leaves it in place,
+     * because the alternative reading of silence is "scrobble a queue the
+     * worker may still be sending".
+     *
+     * A `freezing` record is different: it means a tab began a handover and
+     * never finished. That tab is gone, and no job exists to ask about, so it
+     * is resolved through the handoff it names.
+     */
+    async reconcileQueueOwner(owner: background.QueueOwner) {
+      if (owner.owner === 'freezing') {
+        // No handoff id means it never got as far as preflight, so nothing was
+        // ever reserved and the freeze can simply lift.
+        if (!owner.id) {
+          background.setQueueOwner(null);
+          this.ownershipBlocked = false;
+          trackEvent('background_freeze_released', { reason: 'no_handoff' });
+          return;
+        }
+        const active = await background.isHandoffActive(owner.id);
+        if (active === false) {
+          background.setQueueOwner(null);
+          this.ownershipBlocked = false;
+          trackEvent('background_freeze_released', { reason: 'handoff_inactive' });
+          return;
+        }
+        if (active === true) {
+          background.setQueueOwner({ owner: 'server', id: owner.id });
+        }
+        this.backgroundNotice = 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until we can tell whether it took effect. Please refresh in a few minutes.';
+        return;
+      }
+
+      const live = await background.hasLiveJob(owner.id);
+      if (live === false) {
+        background.setQueueOwner(null);
+        this.ownershipBlocked = false;
+        try {
+          this.hasResumableState = await this.stateManager.hasSavedState();
+        } catch (e) {
+          // Nothing to restore the button for.
+        }
+        trackEvent('background_ownership_released', { reason: 'job_finished' });
+        return;
+      }
+      if (live === null && background.isSessionExpired()) {
+        // Sessions last 14 days and jobs can run for five weeks, so this is
+        // an expected end state rather than an error. It needs an action, not
+        // an apology.
+        this.showReauth = true;
+        this.backgroundNotice = 'Your link to the background service has expired, so this browser can\'t check whether your import finished. Sign in again to unlock scrobbling here.';
+      }
+    },
+
+    /**
      * Settles a handoff whose outcome was never established.
      *
      * A previous visit may have uploaded a queue and then lost the finalise
@@ -382,6 +481,14 @@ export default Vue.extend({
       const active = await background.resolveOwnershipMarker(marker);
 
       if (active === true) {
+        /*
+          Announced before the clear. A marker left by an older client carries
+          no ownership record, so this may be the first moment any tab learns
+          the server owns the queue — and a sibling still holding it in memory
+          learns nothing from IndexedDB being emptied.
+        */
+        background.setQueueOwner({ owner: 'server', id: marker.id });
+        this.ownershipBlocked = true;
         try {
           await this.stateManager.clearState();
           this.hasResumableState = false;
@@ -412,7 +519,7 @@ export default Vue.extend({
         background.clearPendingHandoff();
         // Released origin-wide: this is a definitive "the browser owns it"
         // answer, so other tabs may scrobble again too.
-        background.setServerOwnsQueue(false);
+        background.setQueueOwner(null);
         // Cleared alongside the marker: this is a definitive "the browser owns
         // it" answer, so leaving the gate closed would hide a queue we have
         // just proved is safe to resume.
@@ -473,6 +580,20 @@ export default Vue.extend({
      */
     async probeBackgroundAvailability() {
       if (!background.isBackgroundConfigured() || !background.canCompress()) {
+        return;
+      }
+      /*
+        No durable stop, no offer.
+
+        A handover binds every tab, and the only signal that reaches a tab
+        opened later — or restored from the bfcache after the broadcast went
+        out — is the localStorage record. Without it a sibling reads the queue
+        as unowned and scrobbles it alongside the worker, silently, for weeks.
+        Declining the feature costs a user with disabled storage nothing they
+        had before.
+      */
+      if (!background.canCoordinateTabs()) {
+        trackEvent('background_unavailable', { reason: 'no_durable_storage' });
         return;
       }
       try {
@@ -558,11 +679,35 @@ export default Vue.extend({
 
       // Recorded before the redirect. The saved state is destroyed once the
       // server takes ownership, and it is the only place this lineage lives.
+      const handedOverAtSec = Math.floor(Date.now() / 1000);
+      /*
+        The band this browser's re-tag allocator could have used, banked so a
+        later take-back reserves below it rather than through it.
+
+        Recorded only when re-tagging actually happened — every banked band
+        costs six hours out of Last.fm's thirteen-day window, and a queue with
+        no re-tagged tracks used none of it.
+
+        Where the state carries an explicit reservation that is the exact band;
+        otherwise the allocator ran upwards from six hours back, so the six
+        hours ending at the handoff bound it.
+      */
+      const priorLineage = background.getHandoffLineage();
+      const usedBand = state.lastReTagTimestampSec
+        ? {
+          from: state.reTagFloorSec || handedOverAtSec - RETAG_BACKFILL_SECONDS,
+          to: state.reTagCeilingSec || handedOverAtSec,
+        }
+        : null;
       background.setHandoffLineage({
         originalTotalTracks: state.originalTotalTracks || state.totalTracks,
         originalSucceededCount: state.originalSucceededCount || 0,
         reTagCursorSec: state.lastReTagTimestampSec || 0,
-        handedOverAtSec: Math.floor(Date.now() / 1000),
+        handedOverAtSec,
+        reTagUsedRanges: background.mergeReTagRange(
+          priorLineage ? priorLineage.reTagUsedRanges : [],
+          usedBand,
+        ),
       });
 
       const result = await beginHandoff(this.stateManager, state, username, entryPoint);
@@ -625,6 +770,10 @@ export default Vue.extend({
         if (fallbackId) {
           background.setOwnershipUnresolved(marker ? marker.kind : 'handoff', fallbackId);
         }
+        // Other tabs are told too. This path is reached from the bfcache, so
+        // the freeze this tab set before redirecting may be all that is
+        // standing between a sibling and a live job.
+        background.setQueueOwner({ owner: 'server', id: fallbackId || '' });
         this.backgroundBusy = false;
         this.showBackgroundOffer = false;
         this.hasResumableState = false;
@@ -644,7 +793,7 @@ export default Vue.extend({
       this.ownershipBlocked = false;
       background.clearPendingHandoff();
       background.clearOwnershipUnresolved();
-      background.setServerOwnsQueue(false);
+      background.setQueueOwner(null);
       background.clearHandoffLineage();
 
       const step = this.$refs.scrobbleStep as any;
@@ -815,7 +964,7 @@ export default Vue.extend({
         this.backgroundJob = null;
         this.hasResumableState = true;
         this.ownershipBlocked = false;
-        background.setServerOwnsQueue(false);
+        background.setQueueOwner(null);
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         background.clearHandoffLineage();
@@ -848,12 +997,17 @@ export default Vue.extend({
     async exportWhenQuiescent(jobId: string): Promise<any> {
       let lastReason = 'unreachable';
       /*
-        Budgeted to outlast a lease. A tick that sees the pause between batches
-        returns without releasing, so its lease can stand for the full 180
-        seconds; a shorter budget here would report "did not stop in time" for
-        what is really just a job stopping normally.
+        Budgeted to outlast a lease *and* a missed sweep.
+
+        A tick that sees the pause between batches returns without releasing,
+        so its lease can stand for the full 180 seconds. Beyond that, a batch
+        left `sending` can only be settled by a drain — which the export
+        endpoint now asks for directly, but which refuses to touch a batch
+        inside its 120-second grace period. 120 retries at 3 seconds covers
+        the lease, the grace period and a slow request each time round,
+        without which a perfectly normal stop is reported as a failure.
       */
-      for (let i = 0; i < 80; i += 1) {
+      for (let i = 0; i < 120; i += 1) {
         // eslint-disable-next-line no-await-in-loop
         const exported = await background.exportJob(jobId);
         if (exported && exported.ok) {

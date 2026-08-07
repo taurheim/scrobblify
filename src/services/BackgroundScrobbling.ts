@@ -9,7 +9,7 @@
  * The one exception is `finalizeHandoff`, whose failure mode is genuinely
  * dangerous — see `HandoffOutcome`.
  */
-import { trackError } from '@/services/Analytics';
+import { trackError, trackEvent } from '@/services/Analytics';
 
 /**
  * Absent in local development, in which case background mode simply is not
@@ -195,6 +195,9 @@ export function clearOwnershipUnresolved(): void {
  *
  * Purely cosmetic: every consumer treats a missing record as "no lineage" and
  * falls back to the remaining count.
+ *
+ * The one exception is `reTagUsedRanges`, which is correctness-bearing — see
+ * its own note.
  */
 export interface HandoffLineage {
   originalTotalTracks: number;
@@ -210,6 +213,61 @@ export interface HandoffLineage {
    */
   reTagCursorSec?: number;
   handedOverAtSec?: number;
+  /**
+   * Every re-tag range this browser has used across the whole lineage.
+   *
+   * A single inferred band was not enough: a queue resumed several times uses
+   * a different six hours each time, and only the most recent was ever
+   * reconstructable. Accumulating them is what stops a later reservation
+   * landing on an earlier one.
+   */
+  reTagUsedRanges?: { from: number; to: number }[];
+}
+
+/**
+ * How many re-tag ranges the lineage keeps.
+ *
+ * Only the *lowest* bound actually constrains the next reservation, so the
+ * list is trimmed from the top. The rest are kept because they make a
+ * misallocation diagnosable after the fact, which a single number would not.
+ */
+const MAX_LINEAGE_RANGES = 32;
+
+/**
+ * Last.fm's accepted-timestamp window. A range entirely older than this can no
+ * longer collide with anything, because nothing may be scrobbled into it.
+ */
+const RETAG_WINDOW_LIMIT_SECONDS = 13 * 86400;
+
+function sanitizeRanges(raw: unknown): { from: number; to: number }[] {
+  if (!Array.isArray(raw)) { return []; }
+  const cutoff = Math.floor(Date.now() / 1000) - RETAG_WINDOW_LIMIT_SECONDS;
+  return raw
+    .filter((r): r is { from: number; to: number } => !!r
+      && Number.isFinite((r as any).from) && Number.isFinite((r as any).to)
+      && (r as any).from > 0 && (r as any).to >= (r as any).from
+      && (r as any).to > cutoff)
+    .map((r) => ({ from: Math.floor(r.from), to: Math.floor(r.to) }))
+    .sort((a, b) => a.from - b.from)
+    .slice(0, MAX_LINEAGE_RANGES);
+}
+
+/**
+ * Adds a range to a lineage's re-tag history.
+ *
+ * Exported so the handoff path and the take-back path record ranges the same
+ * way; they run in different components and had no shared home for this.
+ */
+export function mergeReTagRange(
+  existing: { from: number; to: number }[] | undefined,
+  range: { from: number; to: number } | null,
+): { from: number; to: number }[] {
+  const all = sanitizeRanges(existing);
+  if (range && Number.isFinite(range.from) && Number.isFinite(range.to)
+    && range.from > 0 && range.to >= range.from) {
+    all.push({ from: Math.floor(range.from), to: Math.floor(range.to) });
+  }
+  return sanitizeRanges(all);
 }
 
 export function setHandoffLineage(lineage: HandoffLineage): void {
@@ -233,6 +291,7 @@ export function getHandoffLineage(): HandoffLineage | null {
       originalSucceededCount: succeeded,
       reTagCursorSec: Number.isFinite(parsed.reTagCursorSec) ? parsed.reTagCursorSec : 0,
       handedOverAtSec: Number.isFinite(parsed.handedOverAtSec) ? parsed.handedOverAtSec : 0,
+      reTagUsedRanges: sanitizeRanges(parsed.reTagUsedRanges),
     };
   } catch {
     // Corrupt or unreadable. Cosmetic, so degrade rather than throw.
@@ -242,19 +301,51 @@ export function getHandoffLineage(): HandoffLineage | null {
 
 export function clearHandoffLineage(): void {
   try {
-    window.localStorage.removeItem(LINEAGE_STORAGE_KEY);
+    /*
+      The re-tag history outlives the lineage that carried it.
+
+      Every caller clears this because the queue has come *back* to the
+      browser, which is precisely when it is about to allocate re-tags again —
+      and the ranges are the only record of which seconds earlier cycles
+      consumed. Dropping them would let the next reservation land on them, and
+      Last.fm discards those plays without reporting an error.
+
+      The counts really are cosmetic and are dropped. If nothing is left worth
+      keeping the key goes too.
+    */
+    const existing = getHandoffLineage();
+    const ranges = existing ? sanitizeRanges(existing.reTagUsedRanges) : [];
+    if (ranges.length === 0) {
+      window.localStorage.removeItem(LINEAGE_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(LINEAGE_STORAGE_KEY, JSON.stringify({
+      originalTotalTracks: 0,
+      originalSucceededCount: 0,
+      reTagUsedRanges: ranges,
+    }));
   } catch {
     // Nothing to do.
   }
 }
 
 /**
- * Origin-wide "the server owns the queue" flag.
+ * Origin-wide queue ownership.
  *
  * Handing over is a decision made in one tab that binds every tab. Another tab
  * opened earlier still holds the queue in memory and, before this existed,
  * would happily keep scrobbling — or offer a Resume — against a job that may
  * run unattended for weeks. Clearing IndexedDB does not reach it.
+ *
+ * Two owners, and the distinction is load-bearing:
+ *
+ *   `freezing` — a tab is *preparing* a handoff. Set before the snapshot is
+ *     taken, because everything from the snapshot to activation is a window in
+ *     which another tab's sends would be captured into the upload and then
+ *     scrobbled a second time by the worker. Released if the handoff fails.
+ *
+ *   `server` — the worker owns it. `id` is the job id where known, so startup
+ *     can reconcile against terminal job status instead of blocking forever.
  *
  * localStorage is the coordination point rather than `BroadcastChannel` alone,
  * because it is also read on startup: a tab opened *after* the handover has no
@@ -264,20 +355,28 @@ export function clearHandoffLineage(): void {
  * Deliberately conservative and origin-wide: this is a stop signal, and a
  * false stop costs a delay while a missed one costs duplicate scrobbles.
  */
-export function setServerOwnsQueue(owns: boolean): void {
+export interface QueueOwner {
+  owner: 'freezing' | 'server';
+  /** Job id where known; handoff id during a freeze; '' for legacy records. */
+  id: string;
+}
+
+export function setQueueOwner(record: QueueOwner | null): void {
   try {
-    if (owns) {
-      window.localStorage.setItem(SERVER_OWNS_STORAGE_KEY, '1');
+    if (record) {
+      window.localStorage.setItem(SERVER_OWNS_STORAGE_KEY, JSON.stringify(record));
     } else {
       window.localStorage.removeItem(SERVER_OWNS_STORAGE_KEY);
     }
   } catch {
-    // Private browsing. The in-page listener below still covers open tabs.
+    // Private browsing. `canCoordinateTabs` refuses to offer the feature at
+    // all in that case, so this is a lost stop signal for a handoff that
+    // should never have been possible rather than a silent duplicate path.
   }
   try {
     if (typeof BroadcastChannel !== 'undefined') {
       const channel = new BroadcastChannel(OWNERSHIP_CHANNEL);
-      channel.postMessage({ serverOwns: owns });
+      channel.postMessage({ queueOwner: record });
       channel.close();
     }
   } catch {
@@ -285,24 +384,172 @@ export function setServerOwnsQueue(owns: boolean): void {
   }
 }
 
-export function serverOwnsQueue(): boolean {
+export function queueOwner(): QueueOwner | null {
   try {
-    return window.localStorage.getItem(SERVER_OWNS_STORAGE_KEY) === '1';
+    const raw = window.localStorage.getItem(SERVER_OWNS_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    // A record written before this carried an id. Treated as server-owned with
+    // an unknown job, which reconciles through `hasLiveJob` instead.
+    if (raw === '1') {
+      return { owner: 'server', id: '' };
+    }
+    const parsed = JSON.parse(raw);
+    if (parsed && (parsed.owner === 'server' || parsed.owner === 'freezing')) {
+      return { owner: parsed.owner, id: typeof parsed.id === 'string' ? parsed.id : '' };
+    }
+    // Unparseable. Treated as owned, because the alternative reading of a
+    // corrupt stop signal is "carry on scrobbling".
+    return { owner: 'server', id: '' };
+  } catch {
+    return null;
+  }
+}
+
+export function serverOwnsQueue(): boolean {
+  return queueOwner() !== null;
+}
+
+/**
+ * Whether an origin-wide stop can actually be made durable.
+ *
+ * A `BroadcastChannel` message only reaches contexts that are listening right
+ * now. Without localStorage a tab opened later, or restored from the bfcache
+ * after the message went out, reads the queue as unowned and scrobbles a queue
+ * the worker is already sending. That is a silent duplicate generator, so the
+ * feature is not offered at all rather than offered without a working stop.
+ */
+export function canCoordinateTabs(): boolean {
+  try {
+    const probe = `${SERVER_OWNS_STORAGE_KEY}.probe`;
+    window.localStorage.setItem(probe, '1');
+    const ok = window.localStorage.getItem(probe) === '1';
+    window.localStorage.removeItem(probe);
+    return ok;
   } catch {
     return false;
   }
 }
 
+const FREEZE_CHANNEL = 'scrobblify.freeze';
+
 /**
- * Calls back when another tab hands the queue to the server, so a loop already
+ * How long a freezing tab waits for its siblings to stop and persist.
+ *
+ * Sized against one in-flight Last.fm batch plus an IndexedDB write. Too short
+ * and a sibling's just-sent tracks are captured into the upload and scrobbled
+ * again by the worker; too long and the offer dialog appears to hang.
+ */
+const FREEZE_WAIT_MS = 4000;
+
+/**
+ * Registers this tab as a participant in the freeze protocol.
+ *
+ * `onFreeze` must stop scrobbling *and persist progress* before it resolves —
+ * the freezing tab re-reads the queue from IndexedDB afterwards, and anything
+ * this tab sent but did not record would be uploaded and sent a second time.
+ *
+ * Returns a teardown function.
+ */
+export function respondToFreezeRequests(onFreeze: () => Promise<void>): () => void {
+  let channel: BroadcastChannel | null = null;
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      channel = new BroadcastChannel(FREEZE_CHANNEL);
+      channel.onmessage = async (event: MessageEvent) => {
+        if (!event.data || event.data.type !== 'freeze') {
+          return;
+        }
+        try {
+          await onFreeze();
+        } catch (e) {
+          trackError('background.freezeResponder', e);
+          // Deliberately not acknowledged. A freezing sibling that receives no
+          // ack still waits out its full window, which is the safe outcome;
+          // acking a failed halt would tell it this tab had stopped when it
+          // had not.
+          return;
+        }
+        try {
+          const reply = new BroadcastChannel(FREEZE_CHANNEL);
+          reply.postMessage({ type: 'frozen', id: event.data.id });
+          reply.close();
+        } catch {
+          // The freezing tab falls back to waiting out its window.
+        }
+      };
+    }
+  } catch {
+    channel = null;
+  }
+
+  return () => {
+    if (channel) {
+      channel.close();
+    }
+  };
+}
+
+/**
+ * Stops every other tab before a snapshot is taken.
+ *
+ * This is the ordering the whole cross-tab argument rests on. Announcing the
+ * handover *after* activation leaves the entire snapshot → redirect → upload →
+ * finalise window — minutes, including a trip through Last.fm — during which a
+ * sibling tab keeps scrobbling. Its tracks are captured in the upload and then
+ * sent again by the worker, and because Last.fm silently discards a repeated
+ * (artist, track, timestamp) the loss is invisible on both ends.
+ *
+ * The durable `freezing` record is written first, so tabs that are not
+ * listening — opened later, or restored from the bfcache after the broadcast —
+ * still stop at their next send. The broadcast is what makes tabs that *are*
+ * listening stop now rather than one batch later.
+ *
+ * Returns the number of siblings that acknowledged. Callers must re-read the
+ * queue from IndexedDB afterwards regardless: a sibling persists its progress
+ * before acking, and that progress is only visible on disk.
+ */
+export async function freezeOtherTabs(): Promise<number> {
+  setQueueOwner({ owner: 'freezing', id: '' });
+
+  const requestId = `${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  let acks = 0;
+  let channel: BroadcastChannel | null = null;
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      channel = new BroadcastChannel(FREEZE_CHANNEL);
+      channel.onmessage = (event: MessageEvent) => {
+        if (event.data && event.data.type === 'frozen' && event.data.id === requestId) {
+          acks += 1;
+        }
+      };
+      channel.postMessage({ type: 'freeze', id: requestId });
+    }
+  } catch {
+    channel = null;
+  }
+
+  // The window is waited out in full rather than returning on the first ack:
+  // there is no way to know how many tabs are open, so "everyone has answered"
+  // is not a state that can be observed.
+  await new Promise((resolve) => { window.setTimeout(resolve, FREEZE_WAIT_MS); });
+  if (channel) {
+    channel.close();
+  }
+  return acks;
+}
+
+/**
+ * Calls back when another tab takes or releases the queue, so a loop already
  * running here stops before its next send rather than at its next reload.
  *
  * Returns a teardown function.
  */
-export function onServerOwnershipChange(handler: (owns: boolean) => void): () => void {
+export function onServerOwnershipChange(handler: (owner: QueueOwner | null) => void): () => void {
   const onStorage = (event: StorageEvent) => {
     if (event.key === SERVER_OWNS_STORAGE_KEY) {
-      handler(event.newValue === '1');
+      handler(queueOwner());
     }
   };
   window.addEventListener('storage', onStorage);
@@ -312,8 +559,8 @@ export function onServerOwnershipChange(handler: (owns: boolean) => void): () =>
     if (typeof BroadcastChannel !== 'undefined') {
       channel = new BroadcastChannel(OWNERSHIP_CHANNEL);
       channel.onmessage = (event: MessageEvent) => {
-        if (event.data && typeof event.data.serverOwns === 'boolean') {
-          handler(event.data.serverOwns);
+        if (event.data && 'queueOwner' in event.data) {
+          handler(event.data.queueOwner || null);
         }
       };
     }
@@ -352,6 +599,9 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
  */
 const STATUS_TIMEOUT_MS = 8000;
 
+/** Wider than a status check: an export carries the whole remaining queue. */
+const EXPORT_TIMEOUT_MS = 30000;
+
 async function getWithTimeout(path: string, authorised: boolean): Promise<Response | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
@@ -389,11 +639,11 @@ export async function fetchCapacity(): Promise<Capacity | null> {
 }
 
 /**
- * Whether the server currently owns any queue for this user.
+ * Whether the server currently owns the queue identified by `jobId`.
  *
- * Tri-state, like `isHandoffActive`. `false` means the server answered and
- * there is no live job; `null` means we could not establish that and the
- * caller must assume the server might own it.
+ * Tri-state, like `isHandoffActive`. `false` means the server answered about
+ * *this* job and it is finished; `null` means we could not establish that and
+ * the caller must assume the server might own it.
  *
  * Distinct from `fetchJob`, which folds every failure into `null` because its
  * only job is to render a status card. Ownership decisions cannot use that.
@@ -416,14 +666,22 @@ export function isSessionExpired(): boolean {
  */
 const TERMINAL_JOB_STATES = ['completed', 'failed', 'cancelled'];
 
-export async function hasLiveJob(): Promise<boolean | null> {
+/**
+ * `jobId` may be empty for a legacy record that predates ids being stored. In
+ * that case any live job counts, which is the conservative reading.
+ *
+ * A missing session returns `null`, never `false`. It used to return `false`
+ * on the reasoning that a browser with no session never handed anything over —
+ * but `fetchJob` clears the session on a 401, so an expired session became a
+ * definitive "no job" and unblocked a queue the worker was still sending.
+ */
+export async function hasLiveJob(jobId = ''): Promise<boolean | null> {
   if (!isBackgroundConfigured()) {
     return false;
   }
   if (!getSession()) {
-    // No session means this browser never linked to the service, so it cannot
-    // have handed anything over from here.
-    return false;
+    sessionExpired = true;
+    return null;
   }
   const res = await getWithTimeout('/scrobblify/job', true);
   if (!res) {
@@ -440,7 +698,17 @@ export async function hasLiveJob(): Promise<boolean | null> {
     const body = await res.json();
     const job = body.job ?? null;
     if (!job) {
+      // The endpoint reports this user's jobs, so "none at all" answers for
+      // any id. It reports finished jobs for 30 days, so a genuinely recent
+      // job cannot hide behind this.
       return false;
+    }
+    // Answering about a *different* job says nothing about the marked one.
+    // The endpoint returns one job per user, so this is a mismatched or
+    // superseded id rather than a lookup failure — and guessing "finished"
+    // here is what exposes a live queue.
+    if (jobId && job.id !== jobId) {
+      return null;
     }
     return !TERMINAL_JOB_STATES.includes(job.state);
   } catch {
@@ -458,6 +726,10 @@ export async function fetchJob(): Promise<JobStatus | null> {
       return null;
     }
     if (res.status === 401) {
+      // Recorded before the token is dropped. Without this the ownership
+      // resolution that follows sees no session, cannot tell why, and the UI
+      // has no re-authentication button to offer.
+      sessionExpired = true;
       clearSession();
       return null;
     }
@@ -659,7 +931,7 @@ export async function resolveOwnershipMarker(
   marker: OwnershipMarker,
 ): Promise<boolean | null> {
   if (marker.kind === 'job') {
-    return hasLiveJob();
+    return hasLiveJob(marker.id);
   }
   return isHandoffActive(marker.id);
 }
@@ -685,14 +957,22 @@ export async function jobAction(jobId: string, action: 'pause' | 'resume' | 'can
  * "the job is not running".
  */
 export async function exportJob(jobId: string): Promise<any | null> {
+  // An export is retried in a loop behind a spinner, so an unbounded request
+  // does not merely delay one attempt — it stalls the whole retry budget and
+  // the user waits forever. The window is wider than `STATUS_TIMEOUT_MS`
+  // because an export carries the whole remaining queue.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), EXPORT_TIMEOUT_MS);
   try {
-    const res = await request(`/scrobblify/job/${jobId}/export`);
+    const res = await request(`/scrobblify/job/${jobId}/export`, { signal: controller.signal });
     if (!res.ok && res.status !== 409) {
       return null;
     }
     return await res.json();
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -734,18 +1014,38 @@ export function consumeRedirectFragment(): { session: string; handoffId: string 
  * user whose token aged out can answer the ownership question again. Without
  * it the client's refusal to resume on an unanswered question is permanent.
  *
+ * A single-use nonce is generated here and kept locally. Without it the
+ * returned URL is a bearer credential that works in *any* browser: an attacker
+ * could complete a signin for their own account and send the resulting link to
+ * a victim, whose client would then store the attacker's session and ask the
+ * ownership question against the attacker's jobs.
+ *
  * Returns the URL to send the browser to, or null if the service is
  * unreachable or not configured.
  */
+const REAUTH_NONCE_KEY = 'scrobblify.background.reauthNonce';
+
 export async function startReauth(username: string): Promise<string | null> {
   if (!isBackgroundConfigured()) {
+    return null;
+  }
+  let nonce: string;
+  try {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    nonce = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+    window.sessionStorage.setItem(REAUTH_NONCE_KEY, nonce);
+  } catch (e) {
+    // Without somewhere to keep the nonce the return cannot be bound to this
+    // browser, and an unbound return is the attack above. Refuse.
+    trackError('background.startReauthNonce', e);
     return null;
   }
   try {
     const res = await fetch(`${API_BASE}/scrobblify/auth/signin`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username }),
+      body: JSON.stringify({ username, nonce }),
     });
     const body = await res.json();
     if (!res.ok || !body.ok) {
@@ -764,6 +1064,10 @@ export async function startReauth(username: string): Promise<string | null> {
  * Separate from `consumeRedirectFragment` because that one also expects a
  * handoff id and stores it as pending — doing so here would make the client
  * try to finalise an upload that was never started.
+ *
+ * The nonce is compared before the session is stored, and cleared either way:
+ * a return this browser did not initiate is discarded, and a replayed one
+ * cannot be used twice.
  */
 export function consumeReauthFragment(): boolean {
   try {
@@ -773,11 +1077,21 @@ export function consumeReauthFragment(): boolean {
     }
     const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
     const session = hash.get('session');
-    if (!session) {
+    const returned = hash.get('nonce');
+    let expected: string | null = null;
+    try {
+      expected = window.sessionStorage.getItem(REAUTH_NONCE_KEY);
+      window.sessionStorage.removeItem(REAUTH_NONCE_KEY);
+    } catch {
+      expected = null;
+    }
+    window.history.replaceState(null, '', window.location.pathname);
+    if (!session || !returned || !expected || returned !== expected) {
+      trackEvent('background_reauth_rejected');
       return false;
     }
     setSession(session);
-    window.history.replaceState(null, '', window.location.pathname);
+    sessionExpired = false;
     return true;
   } catch (e) {
     trackError('background.consumeReauthFragment', e);

@@ -581,18 +581,25 @@ export default Vue.extend({
         }
 
         /*
-          Another tab may have handed this queue to the server since the last
-          iteration. That tab clears IndexedDB, but nothing about that reaches
-          the copy already loaded here, so without this check a second tab
-          keeps scrobbling tracks the worker is also sending — for weeks,
-          unattended. Read every iteration rather than cached, because the
-          whole point is that it changes underneath us.
+          Another tab may have taken this queue since the last iteration —
+          either handing it to the server, or freezing it in preparation. That
+          tab clears IndexedDB, but nothing about that reaches the copy already
+          loaded here, so without this check a second tab keeps scrobbling
+          tracks the worker is also sending — for weeks, unattended. Read every
+          iteration rather than cached, because the whole point is that it
+          changes underneath us.
+
+          Progress is saved before returning. A freezing tab re-reads the queue
+          from disk precisely so that whatever this tab managed to send is
+          excluded from its upload; stopping without recording those sends
+          would hand them to the worker to send again.
         */
         if (background.serverOwnsQueue()) {
           this.endPacing();
           this.handoffHalted = true;
           this.paused = true;
           this.manuallyPaused = true;
+          this.autoSave();
           this.pauseReason = 'Your import was handed to the background service in another tab, so scrobbling here has stopped.';
           trackEvent('scrobble_stopped_server_owns');
           return;

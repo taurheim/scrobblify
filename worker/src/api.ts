@@ -21,6 +21,7 @@ import {
   MAX_TRACKS_PER_JOB,
 } from './handoff';
 import { issueSession, authenticate } from './session';
+import { drainJobOnDemand } from './scheduler';
 import {
   normalizeUsername, randomId, signHandoffState, verifyHandoffState,
 } from './crypto';
@@ -33,6 +34,58 @@ export const MIN_TRACKS_FOR_BACKGROUND = 2700;
  * round trip through Last.fm, and it is not tied to a row that could expire it.
  */
 const SIGNIN_TTL_SECONDS = 900;
+
+/**
+ * How long a take-back holds a job in `exporting` before it reverts to
+ * `paused`. Long enough for a client to read a large export and cancel;
+ * short enough that an abandoned take-back does not park a job for hours.
+ */
+const EXPORT_CLAIM_SECONDS = 600;
+
+/**
+ * How many used-timestamp ranges an export will carry.
+ *
+ * The descending allocator produces dense runs, so this is generous in
+ * practice. Exceeding it is reported rather than hidden, because a client that
+ * believes an incomplete list is complete will allocate straight into a gap it
+ * was never told about.
+ */
+const MAX_EXPORTED_RANGES = 512;
+
+/**
+ * Collapses unix seconds into inclusive ranges.
+ *
+ * Returns `truncated` when the ranges did not fit, in which case the caller
+ * must treat the list as a lower bound on what was used.
+ */
+export function collapseToRanges(
+  seconds: number[],
+  limit: number,
+): { ranges: { from: number; to: number }[]; truncated: boolean } {
+  if (seconds.length === 0) {
+    return { ranges: [], truncated: false };
+  }
+  const sorted = Array.from(new Set(seconds)).sort((a, b) => a - b);
+  const ranges: { from: number; to: number }[] = [];
+  let from = sorted[0];
+  let to = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i] === to + 1) {
+      to = sorted[i];
+    } else {
+      ranges.push({ from, to });
+      from = sorted[i];
+      to = sorted[i];
+    }
+  }
+  ranges.push({ from, to });
+  if (ranges.length <= limit) {
+    return { ranges, truncated: false };
+  }
+  // Truncated from the *top*: the client reserves below everything it knows
+  // about, so the lowest ranges are the ones that bound its choice.
+  return { ranges: ranges.slice(0, limit), truncated: true };
+}
 
 export interface ApiEnv {
   sql: Sql;
@@ -203,8 +256,20 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     if (!body || typeof body.username !== 'string' || !body.username.trim()) {
       return json(env, { ok: false, reason: 'bad_request' }, 400);
     }
+    // The nonce binds the return to the browser that started it. Without it
+    // the callback URL is a bearer credential usable anywhere, so an attacker
+    // could sign in as themselves and hand the finished link to a victim.
+    if (typeof body.nonce !== 'string' || body.nonce.length < 16) {
+      return json(env, { ok: false, reason: 'bad_request' }, 400);
+    }
     const state = await signHandoffState(
-      { h: '', exp: nowSec + SIGNIN_TTL_SECONDS, k: 'signin', u: normalizeUsername(body.username) },
+      {
+        h: '',
+        exp: nowSec + SIGNIN_TTL_SECONDS,
+        k: 'signin',
+        u: normalizeUsername(body.username),
+        n: body.nonce,
+      },
       env.signingKey,
     );
     return json(env, { ok: true, authoriseUrl: authoriseUrl(env, state) });
@@ -240,7 +305,10 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       }
       const session = await issueSession(normalizeUsername(identity.username), env.signingKey, nowSec);
       target.searchParams.set('signin', 'ok');
-      target.hash = `session=${encodeURIComponent(session)}`;
+      // The nonce is echoed back so the initiating browser can prove this
+      // return is its own. It travels in the fragment with the token, so it
+      // never reaches a server log.
+      target.hash = `session=${encodeURIComponent(session)}&nonce=${encodeURIComponent(signinState.n ?? '')}`;
       return Response.redirect(target.toString(), 302);
     }
 
@@ -426,12 +494,25 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
 
     // Resume clears the failure counter as well as the state: a user who has
     // fixed whatever was wrong should not inherit nine strikes.
-    await env.sql.run(
+    //
+    // `exporting` is deliberately not resumable — a take-back is reading the
+    // queue out, and restarting underneath it produces the duplicates the
+    // claim exists to prevent. The refusal is reported rather than swallowed,
+    // or the UI would show "resumed" for a job that did not move.
+    const resumed = await env.sql.run(
       `UPDATE jobs SET state = 'active', state_reason = NULL, consecutive_failures = 0,
               next_eligible_at = ?, updated_at = ?
         WHERE id = ? AND state IN ('paused', 'needs_attention')`,
       [nowSec, nowSec, job.id],
     );
+    if (resumed.changes === 0) {
+      const current = await env.sql.first<JobRow>('SELECT state FROM jobs WHERE id = ?', [job.id]);
+      return json(env, {
+        ok: false,
+        reason: current && current.state === 'exporting' ? 'exporting' : 'bad_state',
+        state: current ? current.state : null,
+      }, 409);
+    }
     return json(env, { ok: true });
   }
 
@@ -478,7 +559,10 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
     Refusing is safe and cheap — the client retries — whereas exporting one
     second early is an irreversible duplicate.
   */
-  if (job.locked_until > nowSec) {
+  if (job.locked_until > nowSec && job.state !== 'exporting') {
+    // `exporting` is the exception: that deadline is this take-back's own
+    // claim, not a tick's lease, so refusing on it would make the export
+    // dead-end on its own first success.
     return json(env, { ok: false, reason: 'not_quiescent', detail: 'lease_held' }, 409);
   }
   const inFlight = await env.sql.first<{ n: number }>(
@@ -486,7 +570,56 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
     [job.id],
   );
   if (inFlight && inFlight.n > 0) {
-    return json(env, { ok: false, reason: 'not_quiescent', detail: 'batch_in_flight' }, 409);
+    // Asked for directly rather than waited for. The sweep runs every five
+    // minutes, and a take-back that has to sit through one is a spinner no
+    // user will stay for. The drain honours the same grace period, so this
+    // only settles batches that are genuinely stale.
+    await drainJobOnDemand(env, job.id, nowSec);
+    const stillInFlight = await env.sql.first<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM batches WHERE job_id = ? AND state = 'sending'",
+      [job.id],
+    );
+    if (stillInFlight && stillInFlight.n > 0) {
+      return json(env, { ok: false, reason: 'not_quiescent', detail: 'batch_in_flight' }, 409);
+    }
+  }
+
+  /*
+    Quiescence is *claimed*, not merely observed.
+
+    Checking and then reading was a time-of-check/time-of-use hole: a second
+    tab pressing "Resume on the server" between the check and the read makes
+    the job active again, a tick sends a batch, and the export the first tab
+    saves still lists those tracks as pending. It then cancels, the browser
+    resumes them, and they are scrobbled twice.
+
+    The CAS closes it by moving the job into `exporting`, which `resume`
+    refuses and the scheduler never selects. `locked_until` carries the claim
+    deadline so an abandoned take-back reverts to `paused` rather than
+    stranding the job.
+
+    Re-claiming from `exporting` deliberately ignores that deadline. It is a
+    claim expiry, not a lease held by anything running — nothing schedules an
+    `exporting` job — and honouring it would refuse the client's own retries
+    for the full ten minutes, which is longer than the client retries for. The
+    take-back would dead-end on its own first success.
+  */
+  const claimed = await env.sql.run(
+    `UPDATE jobs SET state = 'exporting', locked_until = ?, updated_at = ?
+      WHERE id = ?
+        AND (
+          (state IN ('paused', 'needs_attention', 'needs_reauth') AND locked_until <= ?)
+          OR state = 'exporting'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM batches b WHERE b.job_id = jobs.id AND b.state = 'sending'
+        )`,
+    [nowSec + EXPORT_CLAIM_SECONDS, nowSec, job.id, nowSec],
+  );
+  if (claimed.changes === 0) {
+    // Either it is running again, or it went terminal. Both are answers the
+    // client must retry against rather than read a stale queue from.
+    return json(env, { ok: false, reason: 'not_quiescent', detail: 'not_claimable' }, 409);
   }
 
   const failures = await env.sql.all<any>(
@@ -535,6 +668,43 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
     });
   }
 
+  /*
+    Every second this job actually submitted, not just the synthetic band.
+
+    `synthetic_floor` describes the *current* descending band and says nothing
+    about preserved originals, nor about seconds used before a wrap. A client
+    allocating a re-tag onto one of those loses the play silently, because
+    Last.fm discards a repeat of (artist, track, timestamp) while reporting it
+    accepted.
+
+    Collapsed into ranges rather than listed: a job submits up to ~160k
+    timestamps, and the descending allocator makes them dense, so a handful of
+    ranges usually covers the lot. Capped, and the cap is reported, so a client
+    that receives a truncated list can widen its reservation instead of
+    trusting an incomplete one.
+  */
+  const submitted = await env.sql.all<{ assigned_timestamps: string }>(
+    "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state <> 'abandoned'",
+    [job.id],
+  );
+  const usedSeconds: number[] = [];
+  submitted.forEach((row) => {
+    try {
+      const parsed = JSON.parse(row.assigned_timestamps);
+      if (Array.isArray(parsed)) {
+        parsed.forEach((v) => {
+          if (Number.isFinite(v) && v > 0) {
+            usedSeconds.push(Number(v));
+          }
+        });
+      }
+    } catch {
+      // A batch whose timestamps cannot be read is reported as truncation
+      // below rather than silently skipped.
+    }
+  });
+  const usedRanges = collapseToRanges(usedSeconds, MAX_EXPORTED_RANGES);
+
   return json(env, {
     ok: true,
     exportedAt: nowSec,
@@ -545,6 +715,8 @@ async function exportJob(env: ApiEnv, job: JobRow, nowSec: number): Promise<Resp
       walking through ours. See `stateFromExport`.
     */
     syntheticFloorSec: job.synthetic_floor ?? 0,
+    usedRanges: usedRanges.ranges,
+    usedRangesTruncated: usedRanges.truncated,
     scrobbledByServer: job.scrobbled_count,
     state: {
       totalTracks: tracks.length,
