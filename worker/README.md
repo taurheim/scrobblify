@@ -7,7 +7,44 @@ Design: [`docs/superpowers/specs/2026-07-26-background-scrobbling-design.md`](..
 
 ## Status
 
-Feasibility spike only (`src/spike.ts`). Not deployed.
+Implemented and tested, **not yet deployed**. `api.savas.ca` does not resolve,
+so the registered Last.fm callback goes nowhere and `wrangler.toml` still has a
+placeholder `database_id`.
+
+```powershell
+npm test   # typechecks, then runs every suite against a real SQLite schema
+```
+
+## Deploying
+
+Steps 1–3 create infrastructure and only need doing once.
+
+```powershell
+npx wrangler login
+
+# 1. D1. Copy the printed database_id into wrangler.toml.
+npx wrangler d1 create scrobblify
+
+# 2. R2, for the uploaded track blobs.
+npx wrangler r2 bucket create scrobblify
+
+# 3. Schema. Every file in schema/, in order.
+npx wrangler d1 execute scrobblify --remote --file schema/001_init.sql
+npx wrangler d1 execute scrobblify --remote --file schema/002_synthetic_floor.sql
+
+# 4. Secrets (see below).
+# 5. Deploy, then point api.savas.ca at the worker via a Cloudflare route.
+npx wrangler deploy
+
+# 6. Confirm the Last.fm credentials actually work against the live API.
+curl https://api.savas.ca/verify
+```
+
+The SPA reads its API base from `VUE_APP_BACKGROUND_API` in `.env.production`.
+Setting it does not switch the feature on by itself: the client asks
+`/scrobblify/capacity` on load and stays silent unless the worker answers, so
+deploying the SPA before the worker degrades to the old behaviour rather than
+offering a handoff that cannot complete.
 
 ## Secrets
 
@@ -23,17 +60,23 @@ Copy-Item .dev.vars.example .dev.vars
 npx wrangler dev --local
 ```
 
-Production, once `api.savas.ca` exists:
+Production:
 
 ```powershell
 npx wrangler secret put LASTFM_API_KEY
 npx wrangler secret put LASTFM_SHARED_SECRET
-npx wrangler secret put CREDENTIAL_ENC_KEY
-npx wrangler secret put HANDOFF_SIGNING_KEY
+npx wrangler secret put CREDENTIAL_SECRET
+npx wrangler secret put SIGNING_KEY
 ```
 
+These four names are the ones `src/index.ts` reads. `src/spike.ts` predates the
+worker and reads `CREDENTIAL_ENC_KEY` / `HANDOFF_SIGNING_KEY` for the same two
+keys; it is not deployed, so ignore those unless you are running the spike.
+
 `wrangler secret put` prompts for the value on stdin rather than taking it as an
-argument, which keeps it out of shell history.
+argument, which keeps it out of shell history. It also writes to the *deployed*
+environment only — setting a secret locally does not set it in production, or
+vice versa.
 
 ### Generating the two random keys
 
@@ -41,7 +84,7 @@ argument, which keeps it out of shell history.
 node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 ```
 
-`CREDENTIAL_ENC_KEY` encrypts stored Last.fm session keys, so a D1 dump alone
+`CREDENTIAL_SECRET` encrypts stored Last.fm session keys, so a D1 dump alone
 yields no usable credentials. **Rotating it strands every existing job** — the
 stored keys become undecryptable and affected users must re-authorise. Treat it
 as append-only until there is a re-encryption path.

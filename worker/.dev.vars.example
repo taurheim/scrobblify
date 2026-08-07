@@ -19,10 +19,19 @@ LASTFM_SHARED_SECRET=
 # AES-GCM key encrypting Last.fm session keys at rest, so D1 never holds a
 # usable credential on its own. Base64, 32 bytes. Generate with:
 #   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
-CREDENTIAL_ENC_KEY=
+CREDENTIAL_SECRET=
 
-# --- Handoff state signing --------------------------------------------------
-# HMAC key for the single-use `state` in the auth callback, which binds a
-# handoff to an expected Last.fm username and payload digest. Generate the
-# same way as above.
+# --- Signing ----------------------------------------------------------------
+# HMAC key for two things: the single-use `state` in the auth callback (which
+# binds a handoff to an expected Last.fm username and payload digest) and the
+# bearer session tokens the SPA uses to read job status. Generate the same way
+# as above.
+SIGNING_KEY=
+
+# --- The feasibility spike only ---------------------------------------------
+# `src/spike.ts` predates the real worker and reads two differently named
+# variables for the same two keys. It is not deployed and nothing else uses
+# these; set them only if you want to run `wrangler dev --config
+# wrangler.spike.toml`. Give them the same values as the two above.
+CREDENTIAL_ENC_KEY=
 HANDOFF_SIGNING_KEY=

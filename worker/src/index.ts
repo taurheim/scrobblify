@@ -48,6 +48,34 @@ class R2Blobs implements BlobStore {
   }
 }
 
+/**
+ * Secrets that must be present and non-trivial for the worker to be safe.
+ *
+ * An unset Cloudflare secret arrives as `undefined`, and every consumer here
+ * feeds it to `TextEncoder.encode()`, which happily turns that into the bytes
+ * of the literal string "undefined". Nothing would throw: session tokens would
+ * be signed with a key an attacker can guess, and stored Last.fm credentials
+ * would be encrypted with one. The failure is silent and total, so it is
+ * checked explicitly rather than left to be noticed.
+ *
+ * The names below are the ones this file reads. `src/spike.ts` uses different
+ * names for the same two keys and is not deployed.
+ */
+const REQUIRED_SECRETS: (keyof Env)[] = [
+  'LASTFM_API_KEY',
+  'LASTFM_SHARED_SECRET',
+  'SIGNING_KEY',
+  'CREDENTIAL_SECRET',
+];
+
+/** The names of any missing secrets. Never their values. */
+function missingSecrets(env: Env): string[] {
+  return REQUIRED_SECRETS.filter((name) => {
+    const value = env[name];
+    return typeof value !== 'string' || value.trim().length < 16;
+  }) as string[];
+}
+
 function buildEnv(env: Env): ApiEnv {
   return {
     sql: new D1Sql(env.DB),
@@ -67,6 +95,17 @@ function buildEnv(env: Env): ApiEnv {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const missing = missingSecrets(env);
+    if (missing.length > 0) {
+      // Refusing every request is the point. Serving them would mint session
+      // tokens signed with a guessable key and encrypt users' Last.fm
+      // credentials with one, and both are unrecoverable after the fact.
+      console.error('refusing to serve; unset or too-short secrets:', missing.join(', '));
+      return new Response(JSON.stringify({ ok: false, reason: 'misconfigured' }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     const api = buildEnv(env);
     try {
       return await handleRequest(api, request);
@@ -82,6 +121,14 @@ export default {
   },
 
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const missing = missingSecrets(env);
+    if (missing.length > 0) {
+      // A tick with the wrong credential secret cannot decrypt anything, so
+      // every job would record a failure and eventually park itself for a
+      // human. Doing nothing leaves them recoverable.
+      console.error('skipping tick; unset or too-short secrets:', missing.join(', '));
+      return;
+    }
     const api = buildEnv(env);
     const nowSec = api.now();
     ctx.waitUntil((async () => {
