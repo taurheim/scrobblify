@@ -1,14 +1,12 @@
 {
-  "name": "worker",
+  "name": "scrobblify-worker",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Background scrobbling worker for scrobblify",
+  "private": true,
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node scripts/run-tests.mjs",
+    "dev": "wrangler dev --local"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
     "wrangler": "^4.114.0"
