@@ -116,6 +116,17 @@ Pacing waits under `PACING_COUNTDOWN_THRESHOLD_MS` (10s) are a plain sleep that
 leaves the scrobbling UI up; only longer waits show the paused panel and
 countdown.
 
+A stretch does **not** end at the first track that needs no wait. One free slot
+is just the slot that track is about to consume, after which the window is full
+again, so `msUntilBurstSafe()` alternates between a small positive wait and zero
+from one track to the next. Exiting on the first zero therefore replaced "one
+event per track" with "one begin/end *pair* per track" — a 34% reduction where
+~100x was intended. `PACING_EXIT_CLEAR_TRACKS` (3) requires a streak of
+genuinely unimpeded tracks instead, which saturation cannot produce. **The
+`paced_tracks` and `scrobble_pacing_ended` data from 2026-08-04 to 2026-08-10 is
+flap-inflated** — median `paced_tracks` of 1 and ~55% single-track stretches are
+the bug, not user behaviour, and are not comparable with later data.
+
 ### Measuring completion
 
 Do **not** build completion percentages from `scrobbled_tracks / total_tracks`.
@@ -247,3 +258,28 @@ track arrays cheaply. Renaming those fields would silently make them reactive
 and tank performance on big histories.
 
 Warnings (mostly `no-explicit-any`) do not fail the build; only errors do.
+
+## Running the tests
+
+Playwright is the only test framework here — there are no unit tests. Analytics
+is disabled on `localhost`, so **a test can never observe a PostHog event**;
+assert on the UI instead.
+
+`playwright.config.ts` sets `reuseExistingServer: true` on port 8080. If a
+`vue-cli-service serve` is already running there **from another checkout or
+worktree, Playwright will happily test that checkout's code instead of yours**
+and say nothing. This has already produced three "verified" results that were
+really the other tree's build. Before trusting a local run — especially one
+verifying a fix — confirm what owns the port:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "ProcessId = $((Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess)" |
+  Select-Object -ExpandProperty CommandLine
+```
+
+or run against a scratch config on its own port with `reuseExistingServer:
+false`. CI is unaffected, since it starts from nothing.
+
+Verify a regression test actually catches its bug with
+`git stash push -- <source file>`, re-run, `git stash pop`. A test that passes
+both ways is testing nothing.
