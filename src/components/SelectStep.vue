@@ -514,16 +514,30 @@ export default Vue.extend({
       this.$store.commit('setOriginalTotalTracks', scrobbles.length);
       this.$store.commit('setResumedScrobbleCount', 0);
       /*
-        The re-tag state belongs to the import that produced it, not to the
-        browser. A reservation names seconds allocated around a *previous*
-        queue, and a block records that a previous take-back lost track of
-        them; neither says anything about these tracks. Carried into a fresh
-        import, the reservation would misdirect the allocator and the block
-        would refuse to send perfectly safe plays.
+        The re-tag lineage is deliberately **not** reset here.
+
+        It looks like per-import state and it is not. Every value in it
+        describes seconds already written to the user's Last.fm timeline, and
+        that timeline is shared by every import this browser has ever run.
+        Last.fm silently discards a repeat of (artist, track, timestamp) while
+        reporting it accepted, so a fresh import that starts allocating from
+        the top of the window again will walk straight back over seconds the
+        previous import used — and if the two selections share a track, that
+        play is lost with no error anywhere.
+
+        So the cursor stays where it is, and a block stays in force. Both are
+        already bounded in time rather than by import: the cursor only matters
+        while its seconds are inside Last.fm's thirteen-day window, and the
+        block carries an absolute expiry for the same reason. Keeping them
+        costs at worst a delay; clearing them costs plays.
+
+        The one exception is the pending second, which is cleared. Unlike the
+        rest of the lineage it names a *particular track* — the one that was at
+        the head of the previous queue — and there is no such track here. Left
+        set, it would be handed to whatever track happens to be first now,
+        which is a collision rather than the deduplication it exists for.
       */
-      this.$store.commit('setReTagReservedRange', { floorSec: 0, ceilingSec: 0 });
-      this.$store.commit('setReTagBlocked', 0);
-      this.$store.commit('setReTagCursorSec', 0);
+      this.$store.commit('setPendingReTagSec', 0);
       trackEvent('tracks_selected', {
         selected_count: selected.length,
         total_count: this.totalTrackCount,

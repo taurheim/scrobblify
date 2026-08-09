@@ -52,6 +52,19 @@ export default new Vuex.Store({
       more. A boolean would have blocked those tracks forever.
     */
     reTagBlockedUntilSec: 0,
+    /*
+      Synthetic second already handed to Last.fm for the track at the head of
+      the queue, when its outcome is not yet known. 0 when nothing is pending.
+
+      A re-tagged send that reaches Last.fm but loses its response has to be
+      retried with the *identical* (artist, track, timestamp) tuple: an
+      identical resend is deduplicated, whereas a fresh second is stored as a
+      second, phantom play the user never listened to. The loop already keeps
+      this across retries in memory — but a halt can persist and hand the queue
+      away between the send and its outcome, and then the memory is gone. So it
+      travels with the saved state.
+    */
+    pendingReTagSec: 0,
   },
   mutations: {
     setValidScrobbles(state: any, tracks: SpotifyListen[]) {
@@ -75,6 +88,9 @@ export default new Vuex.Store({
     },
     setReTagBlocked(state: any, blockedUntilSec: number) {
       state.reTagBlockedUntilSec = blockedUntilSec;
+    },
+    setPendingReTagSec(state: any, seconds: number) {
+      state.pendingReTagSec = seconds;
     },
     trackScrobbled(state: any) {
       state.tracksScrobbled += 1;

@@ -122,9 +122,10 @@
             :background-available="backgroundAvailable"
             :sending-blocked="sendingBlocked"
             :persist-progress="onAutoSave"
+            :persist-progress-if-ahead="onAutoSaveIfAhead"
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
-            v-on:auto-save="onAutoSave"
+            v-on:auto-save="onAutoSaveBestEffort"
             v-on:background="onBackgroundRequested"
           ></scrobble-step>
         </v-stepper-content>
@@ -184,6 +185,11 @@ interface ProgressSnapshot {
   originalSucceededCount: number;
   sendTimestamps: number[];
   lastReTagTimestampSec: number;
+  /**
+   * Synthetic second already sent for the track at the head of the queue,
+   * while its outcome is unknown. Absent when nothing is in flight.
+   */
+  pendingReTagTimestampSec?: number;
   burstCount: number;
   dailyCount: number;
 }
@@ -1491,6 +1497,13 @@ export default Vue.extend({
         ceilingSec: state.reTagCeilingSec || 0,
       });
       this.$store.commit('setReTagBlocked', state.reTagBlockedUntilSec || 0);
+      /*
+        Restored *before* the queue, so the first track of the resumed run is
+        retried with the second it may already have been sent under. Absent for
+        every state saved while nothing was in flight, which is almost all of
+        them.
+      */
+      this.$store.commit('setPendingReTagSec', state.pendingReTagTimestampSec || 0);
 
       // Restore remaining (not yet completed) tracks to store
       const allScrobbles = StateManager.deserializeScrobbles(state.tracks);
@@ -1616,6 +1629,15 @@ export default Vue.extend({
         ...((this.$store.state.reTagBlockedUntilSec as number)
           ? { reTagBlockedUntilSec: this.$store.state.reTagBlockedUntilSec as number }
           : {}),
+        /*
+          The in-flight synthetic second, when there is one. Taken from the
+          snapshot rather than the store because it belongs to a specific
+          track — the one now at the head of the remaining queue — and the
+          snapshot is what fixes which track that is.
+        */
+        ...(info.pendingReTagTimestampSec
+          ? { pendingReTagTimestampSec: info.pendingReTagTimestampSec }
+          : {}),
         burstCount: info.burstCount,
         dailyCount: info.dailyCount,
         dailyCountDate: new Date().toISOString().split('T')[0],
@@ -1647,7 +1669,42 @@ export default Vue.extend({
         trackEvent('session_saved', this.saveProps(info, true));
       } catch (e) {
         trackError('scrobblify.onAutoSave', e);
+        /*
+          Reported *and* rethrown. Callers that merely want a best-effort save
+          catch it and carry on, but the halt path awaits this to decide
+          whether the queue on disk is safe for a sibling to upload — and a
+          rejection that has been swallowed here is indistinguishable from a
+          write that landed. That is precisely the confusion that lets a freeze
+          read stale progress and hand already-sent tracks to the worker.
+        */
+        throw e;
       }
+    },
+    /**
+     * Durable save that refuses to move progress backwards.
+     *
+     * Used by halts, where several tabs persist within milliseconds of each
+     * other and a plain `put` would let the slowest one erase the furthest
+     * progress. See `StateManager.saveStateIfAhead`.
+     */
+    async onAutoSaveIfAhead(info: ProgressSnapshot) {
+      try {
+        await this.stateManager.saveStateIfAhead(this.buildState(info));
+        trackEvent('session_saved', this.saveProps(info, true));
+      } catch (e) {
+        trackError('scrobblify.onAutoSaveIfAhead', e);
+        throw e;
+      }
+    },
+    /**
+     * The `auto-save` *event* handler.
+     *
+     * An emit gives the child nothing to await, so it cannot act on a failure
+     * and a rejection here would only surface as an unhandled one. The props
+     * above are the channel that carries failure; this stays best-effort.
+     */
+    onAutoSaveBestEffort(info: ProgressSnapshot) {
+      this.onAutoSave(info).catch(() => { /* already reported by onAutoSave */ });
     },
     async onSaveAndExit(info: ProgressSnapshot) {
       const state = this.buildState(info);

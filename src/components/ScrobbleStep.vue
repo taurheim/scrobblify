@@ -192,6 +192,18 @@ const PACING_COUNTDOWN_THRESHOLD_MS = 10 * MS_PER_SECOND;
 
 const MAX_CONSECUTIVE_FAILURES = 10;
 
+/**
+ * How long a tab refused the send lock waits before trying again.
+ *
+ * The wait resolves on its own — the winner finishes, or is closed and the
+ * browser releases its lock — so there is nothing for the user to press. Short
+ * enough that closing the other tab feels immediate, long enough to be free:
+ * `ifAvailable` makes a failed attempt a synchronous "no" rather than a queued
+ * request, so this never accumulates waiters behind a loop that may run for
+ * weeks.
+ */
+const SEND_LOCK_RETRY_MS = 5 * MS_PER_SECOND;
+
 // Re-tagged plays (see Scrobble.reTagged) are stamped at send time, starting
 // this far back and stepping forward one second per scrobble. Last.fm rejects
 // timestamps in the future and anything older than 14 days, so the cursor is
@@ -266,6 +278,24 @@ export default Vue.extend({
       type: Function,
       default: null,
     },
+    /**
+     * Durable save that refuses to move progress backwards, for halts.
+     *
+     * A halt is the one moment several tabs persist at once, and a plain `put`
+     * is last-writer-wins — the slowest tab's snapshot lands last and erases
+     * the furthest progress, which the freezing tab then uploads and the
+     * worker scrobbles a second time. Distinct from `persistProgress`, which
+     * is used where this tab is the only writer and a monotonic guard would
+     * silently discard a legitimately shorter queue.
+     *
+     * Unlike `persistProgress` this one **rejects** when the write fails.
+     * Reporting a halt as safely persisted when it was not is precisely how a
+     * freeze reads stale progress.
+     */
+    persistProgressIfAhead: {
+      type: Function,
+      default: null,
+    },
   },
   data() {
     return {
@@ -279,6 +309,10 @@ export default Vue.extend({
       // High-water mark of the send-time timestamp allocator for re-tagged
       // plays. Persisted so a resume cannot reuse an earlier run's seconds.
       reTagCursorSec: 0,
+      // Synthetic second already given to the track at the head of the queue,
+      // while its outcome is unknown. Persisted with progress so a resume
+      // retries the identical tuple rather than minting a phantom play.
+      pendingReTagSec: 0,
       paused: false,
       // True only while the send loop is actually executing. `scrobbling`
       // stays set across a pause so the paused view keeps rendering, so it
@@ -287,6 +321,12 @@ export default Vue.extend({
       // Set while a background handoff is being negotiated, so the paused view
       // explains itself instead of offering a "Resume" that would race it.
       handoffHalted: false,
+      // Set when a halt could not durably persist. `haltForHandoff` reports
+      // "not stopped" while it holds, so a freeze refuses rather than
+      // uploading a queue whose latest sends never reached disk.
+      persistFailed: false,
+      // Pending re-attempt of the send lock, while another tab holds it.
+      sendLockRetryTimer: null as number | null,
       // Set when `scrobble()` refused because ownership was unresolved. The
       // watcher below uses it to retry once it resolves, so a transient
       // outage costs a pause rather than a dead end.
@@ -351,17 +391,6 @@ export default Vue.extend({
     },
   },
   computed: {
-    /**
-     * Second after which re-tagging becomes safe again, or 0 if it is safe now.
-     *
-     * Evaluated against the clock rather than stored as a boolean, so a block
-     * left over from an unreadable take-back lifts by itself once the seconds
-     * it protects have slid out of Last.fm's window.
-     */
-    reTagBlockedUntilSec(): number {
-      const until = (this.$store.state.reTagBlockedUntilSec as number) || 0;
-      return until > Math.floor(Date.now() / MS_PER_SECOND) ? until : 0;
-    },
     tracksToScrobble(): Scrobble[] {
       return this.$store.state.selectedScrobbles;
     },
@@ -445,6 +474,10 @@ export default Vue.extend({
     // Routed through `cancelCountdown` so an unmount mid-countdown also settles
     // the promise the loop is awaiting, rather than leaving it pending forever.
     this.cancelCountdown();
+    if (this.sendLockRetryTimer !== null) {
+      window.clearTimeout(this.sendLockRetryTimer);
+      this.sendLockRetryTimer = null;
+    }
   },
   methods: {
     /**
@@ -621,6 +654,14 @@ export default Vue.extend({
         this.paused = true;
         this.scrobbling = true;
         this.loopActive = false;
+        /*
+          Retried rather than left as a dead end. The winning tab may simply be
+          closed — the browser releases a Web Lock when its context dies, but
+          nothing notifies the tab that was refused, so without this the user
+          is left on a panel whose only exit is a reload. `ifAvailable` makes
+          each retry free, so polling costs nothing while the winner runs.
+        */
+        this.scheduleSendLockRetry();
         return;
       }
       try {
@@ -632,6 +673,30 @@ export default Vue.extend({
         // never drops would block every future handoff in every tab.
         releaseSendLock();
       }
+    },
+
+    /**
+     * Re-attempts the send lock after another tab held it.
+     *
+     * The refusal is not an error state and has no button, because the thing
+     * to wait for resolves by itself: the winning tab finishes, or is closed
+     * and the browser releases its lock. Cleared in `beforeDestroy` so a
+     * navigating tab does not leave a timer re-entering a dead component.
+     */
+    scheduleSendLockRetry() {
+      if (this.sendLockRetryTimer !== null) {
+        return;
+      }
+      this.sendLockRetryTimer = window.setTimeout(() => {
+        this.sendLockRetryTimer = null;
+        // Anything that has since taken precedence wins: a halt, a queue the
+        // server now owns, a user who stopped, or a loop already running.
+        if (this.handoffHalted || this.loopActive || this.manuallyPaused
+          || this.stopped || this.completed) {
+          return;
+        }
+        this.scrobble();
+      }, SEND_LOCK_RETRY_MS);
     },
 
     async runScrobbleLoop(tracker: RateLimitTracker) {
@@ -661,9 +726,27 @@ export default Vue.extend({
         this.reTagCursorSec,
         (this.$store.state.reTagCursorSec as number) || 0,
       );
-      // Held across retries of the current track; cleared only once the track
-      // is finally consumed. See the allocation site below.
-      let pendingReTagTimestampSec: number | undefined;
+      /*
+        Held across retries of the current track; cleared only once the track
+        is finally consumed. Mirrored into `this.pendingReTagSec` so it lands
+        in every snapshot — a halt can hand the queue away between a send and
+        its outcome, and a retry that picks a *different* second turns a lost
+        response into a phantom duplicate play. See the allocation site below.
+
+        Seeded from a previous run only when the track it belongs to is still
+        the one at the head of the queue and is still re-tagged. A saved second
+        applied to some other track would be a fresh collision rather than the
+        deduplication it exists to produce.
+      */
+      const savedPendingSec = (this.$store.state.pendingReTagSec as number) || 0;
+      const headTrack = tracks[this.scrobbledTracks];
+      let pendingReTagTimestampSec: number | undefined = (
+        savedPendingSec > 0 && headTrack && headTrack.reTagged
+      ) ? savedPendingSec : undefined;
+      this.pendingReTagSec = pendingReTagTimestampSec || 0;
+      if (savedPendingSec > 0 && !pendingReTagTimestampSec) {
+        this.$store.commit('setPendingReTagSec', 0);
+      }
 
       if (this.scrobbledTracks === 0 && this.previouslyScrobbled === 0) {
         trackEvent('scrobble_started', this.progressProps());
@@ -680,6 +763,12 @@ export default Vue.extend({
         // so a halt landing during a backoff would otherwise be undone.
         if (this.handoffHalted) {
           this.endPacing();
+          // Persisted before returning, not left to the halting side. Only a
+          // freeze *responder* saves on this tab's behalf; a halt driven by a
+          // remote-ownership event has no responder and no acknowledgement, so
+          // without this the tracks sent since the last save exist only in
+          // memory and the queue that gets uploaded still contains them.
+          await this.persistForHalt();
           return;
         }
 
@@ -758,6 +847,7 @@ export default Vue.extend({
         // already in the list about to be uploaded.
         if (this.handoffHalted) {
           this.endPacing();
+          await this.persistForHalt();
           return;
         }
 
@@ -805,11 +895,12 @@ export default Vue.extend({
           seconds it protects are all in the past and slide out of Last.fm's
           window on their own.
         */
-        if (track.reTagged && this.reTagBlockedUntilSec > 0) {
+        const blockedUntilSec = track.reTagged ? this.reTagBlockedUntilSec() : 0;
+        if (blockedUntilSec > 0) {
           this.endPacing();
           this.stopped = true;
           this.paused = true;
-          this.pauseReason = `Some of your plays are too old to scrobble with their original times, and Scrobblify can't yet tell which substitute times are safe to use. They're still saved — come back after ${new Date(this.reTagBlockedUntilSec * MS_PER_SECOND).toLocaleDateString()} and they'll go through.`;
+          this.pauseReason = `Some of your plays are too old to scrobble with their original times, and Scrobblify can't yet tell which substitute times are safe to use. They're still saved — come back after ${new Date(blockedUntilSec * MS_PER_SECOND).toLocaleDateString()} and they'll go through.`;
           await this.autoSave();
           this.trackStopped('retag_blocked', { track_index: i });
           return;
@@ -841,6 +932,10 @@ export default Vue.extend({
           reTagCursorSec = Math.min(latestSec, Math.max(reTagCursorSec + 1, earliestSec));
           this.reTagCursorSec = reTagCursorSec;
           pendingReTagTimestampSec = reTagCursorSec;
+          // Recorded *before* the send, not after. The dangerous case is a
+          // request that reaches Last.fm and loses its response, so the second
+          // has to be durable from the moment it could have been used.
+          this.pendingReTagSec = reTagCursorSec;
         }
 
         try {
@@ -1010,6 +1105,7 @@ export default Vue.extend({
         if (!retrySameTrack) {
           this.scrobbledTracks += 1;
           pendingReTagTimestampSec = undefined;
+          this.pendingReTagSec = 0;
           if (recoveredFromRateLimit) {
             trackEvent('scrobble_rate_limit_recovered', this.progressProps({
               burst_count: this.burstCount,
@@ -1117,7 +1213,25 @@ export default Vue.extend({
      * handoff: proceeding while the loop is still sending is worse than not
      * offering the feature at all.
      */
+    /**
+     * Second after which re-tagging becomes safe again, or 0 if it is safe now.
+     *
+     * Evaluated against the clock rather than stored as a boolean, so a block
+     * left over from an unreadable take-back lifts by itself once the seconds
+     * it protects have slid out of Last.fm's window.
+     *
+     * A method, not a computed, and that is load-bearing. `Date.now()` is not
+     * a reactive dependency, so Vue would cache the first answer and never
+     * recompute it — in a tab left open across the deadline the block would
+     * never lift, which is the one thing the deadline exists to guarantee.
+     */
+    reTagBlockedUntilSec(): number {
+      const until = (this.$store.state.reTagBlockedUntilSec as number) || 0;
+      return until > Math.floor(Date.now() / MS_PER_SECOND) ? until : 0;
+    },
+
     async haltForHandoff(): Promise<boolean> {
+      this.persistFailed = false;
       if (!this.scrobbling || !this.loopActive) {
         // Nothing is sending, so there is nothing to stop. Still flagged, so
         // the paused view explains itself and "Resume Now" stays disabled.
@@ -1139,7 +1253,15 @@ export default Vue.extend({
         // eslint-disable-next-line no-await-in-loop
         await this.sleep(100);
       }
-      return !this.loopActive;
+      /*
+        Stopping is necessary but not sufficient. The caller's next act is to
+        read this queue back off disk and upload it, so a loop that exited
+        without landing its final save has left the tracks it just sent inside
+        that upload. Reporting them as stopped would hand those plays to the
+        worker to send a second time — so an unconfirmed save is answered the
+        same way an unstopped loop is.
+      */
+      return !this.loopActive && !this.persistFailed;
     },
 
     /**
@@ -1173,6 +1295,54 @@ export default Vue.extend({
       this.$emit('auto-save', snapshot);
     },
 
+    /**
+     * Persists before the loop returns because a handoff is taking the queue.
+     *
+     * Separate from `autoSave` in both directions.
+     *
+     * It writes with `saveStateIfAhead`, because a halt is the one moment
+     * several tabs persist at once and a plain `put` is last-writer-wins: the
+     * slowest tab's snapshot lands last and erases the furthest progress,
+     * which the freezing tab then uploads and the worker scrobbles again.
+     *
+     * And it **records failure** rather than swallowing it. `autoSave` can
+     * afford to swallow — nothing is waiting on it and the user still has the
+     * tab. Here the freezing tab is about to re-read IndexedDB and treat what
+     * it finds as this tab's final word, so a write that did not land must not
+     * be reported as one that did. `haltForHandoff` consults `persistFailed`
+     * and answers "not stopped", which makes the freeze refuse rather than
+     * upload a stale queue.
+     */
+    async persistForHalt(): Promise<boolean> {
+      const snapshot = this.progressSnapshot();
+      this.autoSaved = true;
+      const persist = this.persistProgressIfAhead || this.persistProgress;
+      if (!persist) {
+        // No awaitable channel at all: an emit cannot be confirmed, so this
+        // has to count as unconfirmed rather than quietly as success.
+        this.$emit('auto-save', snapshot);
+        this.persistFailed = true;
+        return false;
+      }
+      // One retry. IndexedDB failures here are usually a transient blocked
+      // transaction from a sibling persisting at the same moment, which is
+      // exactly the situation a halt creates.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await persist(snapshot);
+          this.persistFailed = false;
+          return true;
+        } catch {
+          // eslint-disable-next-line no-await-in-loop
+          await this.sleep(150);
+        }
+      }
+      this.persistFailed = true;
+      trackEvent('scrobble_halt_persist_failed', this.progressProps());
+      return false;
+    },
+
     saveAndExit() {
       this.$emit('save-and-exit', this.progressSnapshot());
     },
@@ -1193,7 +1363,7 @@ export default Vue.extend({
         refuses to send re-tagged tracks at all while this holds; this keeps
         any other reader from describing a reservation that does not exist.
       */
-      if (this.reTagBlockedUntilSec > 0) {
+      if (this.reTagBlockedUntilSec() > 0) {
         return null;
       }
       const floorSec = (this.$store.state.reTagFloorSec as number) || 0;
@@ -1216,6 +1386,7 @@ export default Vue.extend({
         originalSucceededCount: this.totalSucceeded,
         sendTimestamps: tracker.getSendTimestamps(),
         lastReTagTimestampSec: this.reTagCursorSec,
+        pendingReTagTimestampSec: this.pendingReTagSec || undefined,
         burstCount: tracker.burstCount,
         dailyCount: tracker.dailyCount,
       };

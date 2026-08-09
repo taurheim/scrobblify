@@ -42,6 +42,19 @@ export interface ScrobbleState {
    */
   lastReTagTimestampSec?: number;
   /**
+   * Synthetic second already handed to Last.fm for the first remaining track,
+   * whose outcome was never observed. Absent in the ordinary case.
+   *
+   * A re-tagged send that reaches Last.fm and loses its response must be
+   * retried with the *identical* `(artist, track, timestamp)` tuple: Last.fm
+   * deduplicates an identical resend, but stores a different second as a
+   * second, phantom play that the user never listened to. The send loop keeps
+   * this in memory across retries, which is enough until a halt persists and
+   * hands the queue to another tab or to the worker between the send and its
+   * outcome. Carrying it here is what makes that resumable rather than lossy.
+   */
+  pendingReTagTimestampSec?: number;
+  /**
    * Start of a re-tag range reserved for this browser, when one is needed.
    *
    * Normally the allocator works in `(now - 6h, now]`. That is unsafe after a
