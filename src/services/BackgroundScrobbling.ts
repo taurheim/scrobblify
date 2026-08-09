@@ -271,12 +271,10 @@ const RETAG_WINDOW_LIMIT_SECONDS = 13 * 86400;
  * be scrobbled into those seconds any more, so their absence cannot mislead a
  * gap search.
  */
-function capRanges(raw: unknown): {
-  ranges: { from: number; to: number }[]; droppedBelowSec: number;
-} {
-  if (!Array.isArray(raw)) { return { ranges: [], droppedBelowSec: 0 }; }
+function validRanges(raw: unknown): { from: number; to: number }[] {
+  if (!Array.isArray(raw)) { return []; }
   const cutoff = Math.floor(Date.now() / 1000) - RETAG_WINDOW_LIMIT_SECONDS;
-  const valid = raw
+  return raw
     .filter((r): r is { from: number; to: number } => !!r
       && Number.isFinite((r as any).from) && Number.isFinite((r as any).to)
       && (r as any).from > 0 && (r as any).to >= (r as any).from
@@ -284,6 +282,12 @@ function capRanges(raw: unknown): {
     .map((r) => ({ from: Math.floor(r.from), to: Math.floor(r.to) }))
     // Highest first, so the cap drops the oldest rather than the newest.
     .sort((a, b) => b.to - a.to);
+}
+
+function capRanges(raw: unknown): {
+  ranges: { from: number; to: number }[]; droppedBelowSec: number;
+} {
+  const valid = validRanges(raw);
   const kept = valid.slice(0, MAX_LINEAGE_RANGES);
   // Stored ascending, which is how every consumer expects to read them.
   kept.sort((a, b) => a.from - b.from);
@@ -318,7 +322,7 @@ export function mergeReTagRange(
   range: { from: number; to: number } | null,
   existingKnownFromSec: unknown = 0,
 ): { ranges: { from: number; to: number }[]; knownFromSec: number } {
-  const all = sanitizeRanges(existing);
+  const all = validRanges(existing);
   if (range && Number.isFinite(range.from) && Number.isFinite(range.to)
     && range.from > 0 && range.to >= range.from) {
     all.push({ from: Math.floor(range.from), to: Math.floor(range.to) });
@@ -359,7 +363,15 @@ export function mergeExportedRanges(
   existingKnownFromSec: unknown = 0,
   exportedFloorSec: unknown = 0,
 ): { ranges: { from: number; to: number }[]; knownFromSec: number } {
-  const capped = capRanges([...sanitizeRanges(existing), ...sanitizeRanges(exported)]);
+  /*
+    Validated but *not* capped on the way in. Capping each side separately and
+    then capping the union discards the intermediate losses silently: 200
+    exported ranges would be cut to 128 before the union ever saw them, and the
+    outer cap — seeing only 128 — would report nothing dropped and mark a
+    partial history complete. One cap, at the end, is the only one whose floor
+    describes the whole set.
+  */
+  const capped = capRanges([...validRanges(existing), ...validRanges(exported)]);
   return {
     ranges: capped.ranges,
     knownFromSec: combineKnownFrom(
@@ -420,8 +432,13 @@ export function clearHandoffLineage(
       which are not in the stored lineage — the job that owned them is about
       to be cancelled, so this is the last moment they can be recorded.
 
-      The counts really are cosmetic and are dropped. If nothing is left worth
-      keeping the key goes too.
+      The counts really are cosmetic and are dropped. The key goes only when
+      there is nothing correctness-bearing left at all — which means no ranges
+      *and* no floor. A job whose assigned-timestamp rows were all unreadable
+      produces exactly that combination: no ranges, but a floor that says the
+      seconds below it are unknown rather than free. Deleting on the range
+      count alone would throw that away and let the next cycle treat an
+      unknown history as an empty one.
     */
     const existing = getHandoffLineage();
     const capped = keepRanges
@@ -431,7 +448,7 @@ export function clearHandoffLineage(
       keepRanges ? keepKnownFromSec : (existing && existing.reTagKnownFromSec),
       capped.droppedBelowSec,
     );
-    if (capped.ranges.length === 0) {
+    if (capped.ranges.length === 0 && knownFrom === 0) {
       window.localStorage.removeItem(LINEAGE_STORAGE_KEY);
       return;
     }
@@ -640,6 +657,154 @@ export function releaseQueueOwnerIfUnclaimed(ownId: string): boolean {
 }
 
 /**
+ * The one coordination primitive the browser itself keeps honest.
+ *
+ * Every other mechanism here is advisory: a roster entry is a timestamp a tab
+ * writes about itself, an acknowledgement is a message a tab chooses to send.
+ * Both assume the sibling is running normally, and a backgrounded tab is not —
+ * its timers are throttled to roughly once a minute, so its heartbeat goes
+ * stale within `TAB_STALE_MS` while its send loop keeps issuing `fetch`es,
+ * which are not throttled. That tab is invisible to the roster and still
+ * scrobbling, which is precisely the tab a freeze must not step over.
+ *
+ * A lock has none of that. It is held by the browser on the tab's behalf, so
+ * throttling cannot make it lapse, and it is released automatically if the tab
+ * crashes — no liveness heuristic, no staleness window.
+ */
+const SEND_LOCK_NAME = 'scrobblify.sending';
+
+type LockManagerLike = {
+  request: (
+    name: string,
+    options: { mode: 'shared' | 'exclusive'; signal?: AbortSignal },
+    body: () => Promise<void>,
+  ) => Promise<void>;
+};
+
+function lockManager(): LockManagerLike | null {
+  try {
+    const { locks } = navigator as unknown as { locks?: LockManagerLike };
+    return locks && typeof locks.request === 'function' ? locks : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Nothing was taken, so nothing has to be given back. */
+function noRelease(): void {
+  // Intentionally empty.
+}
+
+/**
+ * Held by a tab for as long as it is inside its send loop.
+ *
+ * Shared, so any number of tabs may scrobble at once when nothing is handing
+ * over — this is a gate for the freeze, not a global serialisation of sending.
+ *
+ * Resolves to a release function. When the API is missing this is a no-op:
+ * `canCoordinateTabs()` already refuses to offer the handoff in that browser,
+ * so there is no freeze for the lock to gate, and local scrobbling must carry
+ * on working exactly as it always did.
+ */
+export async function acquireSendLock(): Promise<() => void> {
+  const locks = lockManager();
+  if (!locks) {
+    return noRelease;
+  }
+  return new Promise<() => void>((granted) => {
+    let release: () => void = noRelease;
+    let released = false;
+    locks.request(SEND_LOCK_NAME, { mode: 'shared' }, () => new Promise<void>((done) => {
+      release = () => {
+        if (released) { return; }
+        released = true;
+        done();
+      };
+      granted(release);
+    })).catch(() => {
+      // Nothing to release, and nothing to gate: report success so the send
+      // loop is never blocked by a coordination failure.
+      granted(noRelease);
+    });
+  });
+}
+
+/** Exclusive holds, keyed by the attempt that took them. */
+let sendExclusive: { attempt: string; release: () => void } | null = null;
+
+/**
+ * Waits until no tab is inside its send loop, and keeps it that way.
+ *
+ * The grant *is* the proof that every sibling released — there is no roster to
+ * consult and no acknowledgement to time out. Requests for the shared mode
+ * made while this one is pending queue *behind* it, so a tab that starts
+ * scrobbling mid-freeze waits rather than slipping in.
+ *
+ * The hold is kept until `releaseQueueOwner`, which covers the snapshot and
+ * the upload. A redirect ends it the moment the page unloads, which is the
+ * right boundary: from there the durable ownership record is what stops
+ * siblings, and it outlives any tab.
+ *
+ * Resolves false if the lock could not be taken within `timeoutMs`, which the
+ * caller must treat as a refusal — a sibling that never let go is a sibling
+ * that may still be sending.
+ */
+export async function acquireSendExclusive(
+  attempt: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const locks = lockManager();
+  if (!locks) {
+    // Unsupported browsers never reach here: `canCoordinateTabs()` withholds
+    // the feature. Refuse rather than assume, so a future caller that forgets
+    // that gate fails closed.
+    return false;
+  }
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  return new Promise<boolean>((settle) => {
+    let decided = false;
+    locks.request(
+      SEND_LOCK_NAME,
+      { mode: 'exclusive', signal: controller.signal },
+      () => new Promise<void>((done) => {
+        window.clearTimeout(timer);
+        decided = true;
+        let released = false;
+        sendExclusive = {
+          attempt,
+          release: () => {
+            if (released) { return; }
+            released = true;
+            done();
+          },
+        };
+        settle(true);
+      }),
+    ).catch(() => {
+      window.clearTimeout(timer);
+      if (!decided) {
+        settle(false);
+      }
+    });
+  });
+}
+
+/**
+ * Drops an exclusive hold, and only one this attempt owns.
+ *
+ * Same reasoning as the ownership record it travels with: releasing another
+ * tab's hold would let siblings back into the middle of that tab's window.
+ */
+export function releaseSendExclusive(attempt: string): void {
+  if (sendExclusive && sendExclusive.attempt === attempt) {
+    const held = sendExclusive;
+    sendExclusive = null;
+    held.release();
+  }
+}
+
+/**
  * Releases a freeze this attempt owns, and only one this attempt owns.
  *
  * Every failure path in a handoff has to lift the freeze — a freeze nobody
@@ -657,9 +822,14 @@ export function releaseQueueOwnerIfUnclaimed(ownId: string): boolean {
  * leaves the record alone; whoever owns it will release it on its own failure
  * path, or it resolves through `hasLiveJob` on the next load.
  *
+ * The exclusive hold goes with it. Dropping the record while still holding the
+ * lock would leave every sibling unable to start a send loop with nothing
+ * left to tell them why.
+ *
  * Returns whether the record was actually cleared.
  */
 export function releaseQueueOwner(attempt: string): boolean {
+  releaseSendExclusive(attempt);
   const current = queueOwner();
   if (!current) {
     return false;
@@ -679,8 +849,16 @@ export function releaseQueueOwner(attempt: string): boolean {
  * after the message went out, reads the queue as unowned and scrobbles a queue
  * the worker is already sending. That is a silent duplicate generator, so the
  * feature is not offered at all rather than offered without a working stop.
+ *
+ * The Web Locks API is required for the same reason from the other direction:
+ * without it a freeze cannot establish that no sibling is mid-send, only that
+ * no sibling *said* it was, and a throttled background tab says nothing while
+ * continuing to scrobble.
  */
 export function canCoordinateTabs(): boolean {
+  if (!lockManager()) {
+    return false;
+  }
   try {
     const probe = `${SERVER_OWNS_STORAGE_KEY}.probe`;
     window.localStorage.setItem(probe, '1');
@@ -918,7 +1096,17 @@ export async function freezeOtherTabs(attempt: string): Promise<boolean> {
 
   const expected = new Set(liveSiblings(thisTabId()));
   if (expected.size === 0) {
-    return true;
+    /*
+      No sibling *that we can see*. That is not the same as no sibling: a
+      backgrounded tab's heartbeat is throttled to about once a minute, so it
+      goes stale inside `TAB_STALE_MS` while its send loop keeps issuing
+      un-throttled `fetch`es. The roster reports it gone at exactly the moment
+      it is most dangerous.
+
+      So an empty roster still has to be proven, by taking the lock every
+      sending tab holds. The grant is the proof; a timeout is a refusal.
+    */
+    return acquireSendExclusive(attempt, FREEZE_WAIT_MS);
   }
 
   const requestId = `${Date.now()}.${Math.random().toString(36).slice(2)}`;
@@ -985,7 +1173,18 @@ export async function freezeOtherTabs(attempt: string): Promise<boolean> {
     stop.
   */
   const stillLive = new Set(liveSiblings(thisTabId()));
-  return Array.from(expected).every((id) => acked.has(id) || !stillLive.has(id));
+  if (!Array.from(expected).every((id) => acked.has(id) || !stillLive.has(id))) {
+    return false;
+  }
+
+  /*
+    The acknowledgements say every sibling stopped *and persisted*. The lock
+    says no tab is inside a send loop at all — including one that never
+    answered because it was throttled, and one that was opened after the
+    roster was read. Both are needed: the ack carries the persistence
+    guarantee, the lock carries the liveness one.
+  */
+  return acquireSendExclusive(attempt, FREEZE_WAIT_MS);
 }
 
 /**

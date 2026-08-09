@@ -532,6 +532,15 @@ export function stateFromExport(
     ...(reserved
       ? { reTagFloorSec: reserved.from, reTagCeilingSec: reserved.to }
       : {}),
+    /*
+      A missing reservation has two very different causes, and they must not
+      look alike downstream. `findFreeRange` returning nothing means the
+      window is full; `unusable` means we do not know what is in it. Only the
+      second forbids re-tagging outright — with an unreadable history the
+      default six-hour window is the *most* likely place for a collision, and
+      a collision is a play Last.fm discards while reporting success.
+    */
+    ...(unusable ? { reTagBlocked: true } : {}),
     burstCount: 0,
     dailyCount: 0,
     dailyCountDate: new Date().toISOString().slice(0, 10),

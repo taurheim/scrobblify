@@ -120,6 +120,7 @@
           <scrobble-step
             ref="scrobbleStep"
             :background-available="backgroundAvailable"
+            :sending-blocked="sendingBlocked"
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
             v-on:auto-save="onAutoSave"
@@ -247,6 +248,9 @@ export default Vue.extend({
        * holding back rather than silently refusing to work.
        */
       authorityUnknown: false,
+      /** Pending automatic retry of the ownership check, and its backoff. */
+      authorityRetryTimer: null as number | null,
+      authorityRetryCount: 0,
       /**
        * Shown only when the block is caused by an expired bearer token, which
        * is the one unresolved case the user can actually fix themselves.
@@ -319,6 +323,7 @@ export default Vue.extend({
     await this.enforceServerAuthority().catch(() => {
       this.authorityPending = false;
       this.authorityUnknown = true;
+      this.scheduleAuthorityRetry();
     });
 
     this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
@@ -439,6 +444,10 @@ export default Vue.extend({
       // wait out the full window for an acknowledgement that cannot come.
       this.releaseTabRoster();
     }
+    if (this.authorityRetryTimer) {
+      window.clearTimeout(this.authorityRetryTimer);
+      this.authorityRetryTimer = null;
+    }
   },
   watch: {
     currentStep(step: number) {
@@ -446,6 +455,23 @@ export default Vue.extend({
     },
   },
   computed: {
+    /*
+      Whether this browser is allowed to send at all.
+
+      The Resume alert was gated on the same conditions, but a hidden button is
+      not a guard: Upload and Select advance to the scrobble step through their
+      own completion handlers, so a user who imports a fresh file reaches the
+      send loop without ever passing the alert. That is the same browser and
+      the same account, and if a worker holds this user's queue those sends
+      land underneath it.
+
+      `ownershipBlocked` is a known remote owner; the other two are "we do not
+      know yet" and "we could not find out". All three withhold sending,
+      because the only safe default when ownership is unresolved is silence.
+    */
+    sendingBlocked(): boolean {
+      return this.ownershipBlocked || this.authorityPending || this.authorityUnknown;
+    },
     jobAlertType(): string {
       if (!this.backgroundJob) { return 'info'; }
       if (this.backgroundJob.state === 'completed') { return 'success'; }
@@ -629,6 +655,9 @@ export default Vue.extend({
       */
       this.authorityUnknown = true;
       this.hasResumableState = false;
+      // Self-clearing: a blip must not leave the app permanently unable to
+      // scrobble just because nobody pressed the retry button.
+      this.scheduleAuthorityRetry();
       trackEvent('background_authority_check', { result: 'unknown' });
     },
 
@@ -639,6 +668,33 @@ export default Vue.extend({
       this.authorityPending = true;
       this.authorityUnknown = false;
       await this.enforceServerAuthority();
+    },
+
+    /**
+     * Keeps retrying the ownership check until it gets an answer.
+     *
+     * Refusing to send while ownership is unknown is the right default, but on
+     * its own it converts a momentary network blip into a page that will not
+     * scrobble until the user notices a button and presses it. Scrobbling
+     * locally is this app's entire purpose, so the refusal has to be
+     * self-clearing.
+     *
+     * Backs off to a minute and then stays there — a genuine outage should not
+     * be hammered, but it should be noticed promptly whenever it ends.
+     */
+    scheduleAuthorityRetry(): void {
+      if (this.authorityRetryTimer) {
+        return;
+      }
+      const delay = Math.min(60000, 2000 * (2 ** Math.min(this.authorityRetryCount, 5)));
+      this.authorityRetryCount += 1;
+      this.authorityRetryTimer = window.setTimeout(async () => {
+        this.authorityRetryTimer = null;
+        if (!this.authorityUnknown) {
+          return;
+        }
+        await this.retryAuthority();
+      }, delay);
     },
 
     /**
@@ -1349,6 +1405,7 @@ export default Vue.extend({
         // an unanswered question.
         this.authorityPending = false;
         this.authorityUnknown = true;
+        this.scheduleAuthorityRetry();
       });
     },
     /**
@@ -1431,6 +1488,7 @@ export default Vue.extend({
         floorSec: state.reTagFloorSec || 0,
         ceilingSec: state.reTagCeilingSec || 0,
       });
+      this.$store.commit('setReTagBlocked', !!state.reTagBlocked);
 
       // Restore remaining (not yet completed) tracks to store
       const allScrobbles = StateManager.deserializeScrobbles(state.tracks);
@@ -1550,6 +1608,10 @@ export default Vue.extend({
             reTagCeilingSec: this.$store.state.reTagCeilingSec as number,
           }
           : {}),
+        // Carried for the same reason, and more urgently: dropping this one
+        // does not merely widen the search, it re-enables re-tagging that was
+        // established to be unsafe.
+        ...(this.$store.state.reTagBlocked ? { reTagBlocked: true } : {}),
         burstCount: info.burstCount,
         dailyCount: info.dailyCount,
         dailyCountDate: new Date().toISOString().split('T')[0],

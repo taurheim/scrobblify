@@ -604,20 +604,40 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
 
       if (cancelled.changes === 0) {
         /*
-          Either the job was already terminal — in which case cancelling is a
-          no-op and the caller got what it wanted — or an export holds it under
-          a different claim. Re-read to tell those apart, because reporting a
-          refused cancel as success is what would let the client go on to
-          discard its local copy.
+          The write was refused. Only two things can refuse it: the job was
+          already terminal, or an export holds it under a different claim.
+
+          Re-reading and asking "is it *still* exporting?" was wrong, because
+          a claim can lapse and revert the row to `paused` in between — and
+          then a cancel that never happened would be reported as success, and
+          the caller would go on to treat the queue as its own while the job
+          sat resumable on the server. So the re-read only ever confirms the
+          benign case: anything not terminal is a refusal, whatever it looks
+          like now.
         */
         const current = await env.sql.first<JobRow>(
-          'SELECT state, export_claim FROM jobs WHERE id = ?', [job.id],
+          'SELECT state FROM jobs WHERE id = ?', [job.id],
         );
-        if (current && current.state === 'exporting' && current.export_claim
-          && current.export_claim !== offeredClaim) {
-          return json(env, { error: 'export_in_progress' }, 409);
+        if (!current) {
+          // Already purged. Nothing to cancel, and nothing left to clean up.
+          return json(env, { ok: true });
         }
-        return json(env, { ok: true });
+        if (current.state === 'cancelled') {
+          /*
+            A previous cancel updated the row and then died before it deleted
+            the blobs — the one ordering this handler deliberately allows. The
+            retry is what finishes the job, so the cleanup is repeated rather
+            than skipped. Deleting an already-deleted blob is a no-op.
+          */
+          await deleteJobBlobs(env.sql, env.blobs, job.id);
+          return json(env, { ok: true });
+        }
+        if (current.state === 'completed' || current.state === 'failed') {
+          // Terminal, so the caller got what it asked for. The blobs belong to
+          // those states' own lifecycle and are not this handler's to remove.
+          return json(env, { ok: true });
+        }
+        return json(env, { error: 'export_in_progress' }, 409);
       }
 
       await deleteJobBlobs(env.sql, env.blobs, job.id);

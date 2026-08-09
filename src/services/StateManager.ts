@@ -64,6 +64,16 @@ export interface ScrobbleState {
    */
   reTagCeilingSec?: number;
   /**
+   * Set when a take-back could not determine which seconds the job consumed.
+   *
+   * Distinct from an absent reservation, which merely means "allocate the
+   * usual way". This means no interval is known to be safe, so re-tagged
+   * tracks are sent with their real timestamps instead — Last.fm rejects the
+   * ones outside its window, which is a visible failure the user can act on,
+   * where a collision would be an invisible one they cannot.
+   */
+  reTagBlocked?: boolean;
+  /**
    * Second at which a background handoff pinned its ordering.
    *
    * The upload digest is committed to the server *before* the redirect to

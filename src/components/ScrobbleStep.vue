@@ -240,6 +240,18 @@ export default Vue.extend({
       type: Boolean,
       default: false,
     },
+    /**
+     * Set while this browser has not established that it owns the queue.
+     *
+     * Covers a known remote owner *and* an unresolved one. The parent gates
+     * its Resume alert on the same thing, but a fresh import walks into this
+     * step through the Upload and Select handlers without passing that alert,
+     * so the refusal has to live where the sending does.
+     */
+    sendingBlocked: {
+      type: Boolean,
+      default: false,
+    },
   },
   data() {
     return {
@@ -261,6 +273,10 @@ export default Vue.extend({
       // Set while a background handoff is being negotiated, so the paused view
       // explains itself instead of offering a "Resume" that would race it.
       handoffHalted: false,
+      // Set when `scrobble()` refused because ownership was unresolved. The
+      // watcher below uses it to retry once it resolves, so a transient
+      // outage costs a pause rather than a dead end.
+      blockedByAuthority: false,
       // A pause the loop will not resume from on its own. Distinguishes "wait a
       // moment" from "we've given up for now, come back later".
       stopped: false,
@@ -299,6 +315,26 @@ export default Vue.extend({
       errorMessage: '',
       errorDetails: '',
     };
+  },
+  watch: {
+    /*
+      Ownership resolved after a send was refused for not knowing it. The user
+      asked to scrobble and never withdrew that; re-entering here is what turns
+      a worker blip into a pause instead of a dead end.
+
+      Only when it resolves *favourably*, and only if the halt has not since
+      been taken by something with a better claim.
+    */
+    sendingBlocked(blocked: boolean) {
+      if (blocked || !this.blockedByAuthority) {
+        return;
+      }
+      this.blockedByAuthority = false;
+      if (this.handoffHalted || this.loopActive || this.manuallyPaused) {
+        return;
+      }
+      this.scrobble();
+    },
   },
   computed: {
     tracksToScrobble(): Scrobble[] {
@@ -515,6 +551,23 @@ export default Vue.extend({
       if (this.handoffHalted) {
         return;
       }
+      /*
+        Ownership is not this browser's to assume. Either a worker holds this
+        user's queue, or we have not yet established that one does not — and
+        sending under an active job produces duplicates Last.fm accepts
+        silently, which is the one failure with no recovery.
+      */
+      if (this.sendingBlocked) {
+        this.pauseReason = 'Checking whether your import is running in the background…';
+        this.paused = true;
+        this.scrobbling = true;
+        // Remembered so the watcher can pick the attempt back up the moment
+        // ownership resolves, rather than stranding the user at a panel whose
+        // only exit is a reload.
+        this.blockedByAuthority = true;
+        return;
+      }
+      this.blockedByAuthority = false;
       const tracker = this.rateLimitTracker();
       // Defensive: a previous run that was torn down mid-stretch would
       // otherwise suppress the next `beginPacing`.
@@ -524,10 +577,22 @@ export default Vue.extend({
       // paused view keeps rendering. This tracks whether the send loop is
       // actually executing, which is what a handoff has to wait for.
       this.loopActive = true;
+      /*
+        Held for the whole loop, including the gaps between tracks, so that a
+        freezing tab's exclusive request cannot be granted while this tab still
+        has a queue in hand. Taken here rather than around each send because
+        "between tracks" is not safe either: progress lives in memory until a
+        halt persists it.
+      */
+      const releaseSendLock = await background.acquireSendLock();
       try {
         await this.runScrobbleLoop(tracker);
       } finally {
         this.loopActive = false;
+        // Every exit path above persists before returning, so releasing here
+        // does not expose unsaved progress. Unconditional: a lock this tab
+        // never drops would block every future handoff in every tab.
+        releaseSendLock();
       }
     },
 
@@ -685,7 +750,8 @@ export default Vue.extend({
         // request actually reached Last.fm and only the response was lost, an
         // identical resend is silently deduplicated, whereas a fresh second
         // would be stored as a second, phantom play.
-        if (track.reTagged && pendingReTagTimestampSec === undefined) {
+        if (track.reTagged && pendingReTagTimestampSec === undefined
+          && !this.$store.state.reTagBlocked) {
           const nowSec = Math.floor(Date.now() / MS_PER_SECOND);
           /*
             Normally the walk starts six hours back and climbs towards the
@@ -1043,6 +1109,16 @@ export default Vue.extend({
      * be accepted, which is a worse failure than a possible collision.
      */
     reservedReTagRange(): { floorSec: number; ceilingSec: number } | null {
+      /*
+        No interval is known to be safe, so there is no reservation to report
+        and — crucially — no fallback to the ordinary window either. The
+        allocator's own guard handles the second half; this one keeps the
+        paused view and any other reader from describing a reservation that
+        does not exist.
+      */
+      if (this.$store.state.reTagBlocked) {
+        return null;
+      }
       const floorSec = (this.$store.state.reTagFloorSec as number) || 0;
       const ceilingSec = (this.$store.state.reTagCeilingSec as number) || 0;
       if (!floorSec || !ceilingSec || ceilingSec <= floorSec) {
