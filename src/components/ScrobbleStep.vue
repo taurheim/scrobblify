@@ -252,6 +252,20 @@ export default Vue.extend({
       type: Boolean,
       default: false,
     },
+    /**
+     * Awaitable durable save, used where an emit is not enough.
+     *
+     * `$emit` hands the parent a snapshot and returns immediately, so a loop
+     * that saved and then returned had no idea whether the write had landed.
+     * That was fine while nothing raced it, but the send lock is released when
+     * the loop returns — and a freezing tab that acquires it then re-reads
+     * IndexedDB would see progress from before the save and hand those tracks
+     * to the worker to send again.
+     */
+    persistProgress: {
+      type: Function,
+      default: null,
+    },
   },
   data() {
     return {
@@ -337,6 +351,17 @@ export default Vue.extend({
     },
   },
   computed: {
+    /**
+     * Second after which re-tagging becomes safe again, or 0 if it is safe now.
+     *
+     * Evaluated against the clock rather than stored as a boolean, so a block
+     * left over from an unreadable take-back lifts by itself once the seconds
+     * it protects have slid out of Last.fm's window.
+     */
+    reTagBlockedUntilSec(): number {
+      const until = (this.$store.state.reTagBlockedUntilSec as number) || 0;
+      return until > Math.floor(Date.now() / MS_PER_SECOND) ? until : 0;
+    },
     tracksToScrobble(): Scrobble[] {
       return this.$store.state.selectedScrobbles;
     },
@@ -585,6 +610,19 @@ export default Vue.extend({
         halt persists it.
       */
       const releaseSendLock = await background.acquireSendLock();
+      if (!releaseSendLock) {
+        /*
+          Another tab is already sending this queue. Both would allocate
+          synthetic seconds independently and collide, and Last.fm discards a
+          repeat of (artist, track, timestamp) while reporting it accepted —
+          so the plays would vanish with nothing to show for them.
+        */
+        this.pauseReason = 'Another Scrobblify tab is already scrobbling. Close it, or carry on there — running both would lose plays.';
+        this.paused = true;
+        this.scrobbling = true;
+        this.loopActive = false;
+        return;
+      }
       try {
         await this.runScrobbleLoop(tracker);
       } finally {
@@ -664,7 +702,8 @@ export default Vue.extend({
           this.handoffHalted = true;
           this.paused = true;
           this.manuallyPaused = true;
-          this.autoSave();
+          // eslint-disable-next-line no-await-in-loop
+          await this.autoSave();
           this.pauseReason = 'Your import was handed to the background service in another tab, so scrobbling here has stopped.';
           trackEvent('scrobble_stopped_server_owns');
           return;
@@ -679,7 +718,8 @@ export default Vue.extend({
         if (this.paused) {
           this.endPacing();
           if (this.manuallyPaused) {
-            this.autoSave();
+            // eslint-disable-next-line no-await-in-loop
+            await this.autoSave();
             this.trackStopped('manual', { track_index: i });
           }
           return;
@@ -729,7 +769,8 @@ export default Vue.extend({
           this.pauseReason = `You've reached Last.fm's daily limit of about ${DAILY_LIMIT} scrobbles. Come back in ${formatDuration(dailyWaitMs)} to continue where you left off.`;
           this.stopped = true;
           this.paused = true;
-          this.autoSave();
+          // eslint-disable-next-line no-await-in-loop
+          await this.autoSave();
           this.trackStopped('daily_limit', {
             daily_count: tracker.dailyCount,
             wait_ms: dailyWaitMs,
@@ -750,8 +791,31 @@ export default Vue.extend({
         // request actually reached Last.fm and only the response was lost, an
         // identical resend is silently deduplicated, whereas a fresh second
         // would be stored as a second, phantom play.
-        if (track.reTagged && pendingReTagTimestampSec === undefined
-          && !this.$store.state.reTagBlocked) {
+        /*
+          No interval is known to be safe, and this track needs one.
+
+          Sending it anyway — with its real, long-expired timestamp — would
+          get it rejected by Last.fm and then *consumed*: the loop advances
+          past permanent rejections, so the track would leave the queue and no
+          resume could ever retry it. A play held back is recoverable; a play
+          spent on a timestamp that was never going to work is not.
+
+          So the loop stops here instead, leaving this track and everything
+          after it in the queue. The block carries a deadline, because the
+          seconds it protects are all in the past and slide out of Last.fm's
+          window on their own.
+        */
+        if (track.reTagged && this.reTagBlockedUntilSec > 0) {
+          this.endPacing();
+          this.stopped = true;
+          this.paused = true;
+          this.pauseReason = `Some of your plays are too old to scrobble with their original times, and Scrobblify can't yet tell which substitute times are safe to use. They're still saved — come back after ${new Date(this.reTagBlockedUntilSec * MS_PER_SECOND).toLocaleDateString()} and they'll go through.`;
+          await this.autoSave();
+          this.trackStopped('retag_blocked', { track_index: i });
+          return;
+        }
+
+        if (track.reTagged && pendingReTagTimestampSec === undefined) {
           const nowSec = Math.floor(Date.now() / MS_PER_SECOND);
           /*
             Normally the walk starts six hours back and climbs towards the
@@ -801,7 +865,8 @@ export default Vue.extend({
               this.pauseReason = 'Last.fm says you have hit your daily scrobble limit. Your progress is saved — come back tomorrow and resume.';
               this.stopped = true;
               this.paused = true;
-              this.autoSave();
+              // eslint-disable-next-line no-await-in-loop
+              await this.autoSave();
               this.trackStopped('lastfm_daily_limit');
               return;
             }
@@ -835,7 +900,8 @@ export default Vue.extend({
             // processed — advance past this one before saving so the resume
             // doesn't re-send and re-count it.
             this.scrobbledTracks += 1;
-            this.autoSave();
+            // eslint-disable-next-line no-await-in-loop
+            await this.autoSave();
             this.trackStopped('repeated_rejections', {
               consecutive_failures: consecutiveFailures,
             });
@@ -881,7 +947,8 @@ export default Vue.extend({
               }));
               this.stopped = true;
               this.paused = true;
-              this.autoSave();
+              // eslint-disable-next-line no-await-in-loop
+              await this.autoSave();
               this.trackStopped('rate_limit_exhausted', {
                 rate_limit_pause_count: this.rateLimitPauseCount,
                 elapsed_since_first_rate_limit_ms: Date.now() - this.firstRateLimitAtMs,
@@ -930,7 +997,8 @@ export default Vue.extend({
               // The track is left unconsumed (scrobbledTracks is not advanced):
               // these were exceptions, not rejections, so a resume should retry
               // it rather than skip it.
-              this.autoSave();
+              // eslint-disable-next-line no-await-in-loop
+              await this.autoSave();
               this.trackStopped('repeated_failures', {
                 consecutive_failures: consecutiveFailures,
               });
@@ -1090,9 +1158,19 @@ export default Vue.extend({
      * Persist progress without downloading a file or navigating away, so the
      * user can close the tab and resume later. Used when we stop retrying.
      */
-    autoSave() {
-      this.$emit('auto-save', this.progressSnapshot());
+    async autoSave() {
+      const snapshot = this.progressSnapshot();
       this.autoSaved = true;
+      if (this.persistProgress) {
+        try {
+          await this.persistProgress(snapshot);
+        } catch {
+          // The parent reports it. Swallowed here so a failed save cannot
+          // leave the loop holding its lock.
+        }
+        return;
+      }
+      this.$emit('auto-save', snapshot);
     },
 
     saveAndExit() {
@@ -1111,12 +1189,11 @@ export default Vue.extend({
     reservedReTagRange(): { floorSec: number; ceilingSec: number } | null {
       /*
         No interval is known to be safe, so there is no reservation to report
-        and — crucially — no fallback to the ordinary window either. The
-        allocator's own guard handles the second half; this one keeps the
-        paused view and any other reader from describing a reservation that
-        does not exist.
+        and — crucially — no fallback to the ordinary window either. The loop
+        refuses to send re-tagged tracks at all while this holds; this keeps
+        any other reader from describing a reservation that does not exist.
       */
-      if (this.$store.state.reTagBlocked) {
+      if (this.reTagBlockedUntilSec > 0) {
         return null;
       }
       const floorSec = (this.$store.state.reTagFloorSec as number) || 0;

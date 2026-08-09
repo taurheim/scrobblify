@@ -676,8 +676,8 @@ const SEND_LOCK_NAME = 'scrobblify.sending';
 type LockManagerLike = {
   request: (
     name: string,
-    options: { mode: 'shared' | 'exclusive'; signal?: AbortSignal },
-    body: () => Promise<void>,
+    options: { mode: 'shared' | 'exclusive'; signal?: AbortSignal; ifAvailable?: boolean },
+    body: (lock: unknown) => Promise<void>,
   ) => Promise<void>;
 };
 
@@ -698,30 +698,47 @@ function noRelease(): void {
 /**
  * Held by a tab for as long as it is inside its send loop.
  *
- * Shared, so any number of tabs may scrobble at once when nothing is handing
- * over — this is a gate for the freeze, not a global serialisation of sending.
+ * Exclusive, not shared. Shared would have gated the freeze correctly while
+ * leaving a duplicate source untouched: two tabs restoring the same saved
+ * import and sending from it at once. They allocate synthetic seconds
+ * independently, so their re-tagged plays collide — and Last.fm discards a
+ * repeat of (artist, track, timestamp) while reporting it accepted. One sender
+ * per origin removes that whole class, and costs nothing, because a second tab
+ * scrobbling the same queue was never useful.
  *
- * Resolves to a release function. When the API is missing this is a no-op:
+ * Taken with `ifAvailable`, so a tab that loses the race is told immediately
+ * rather than left waiting behind a loop that may run for weeks.
+ *
+ * Resolves to a release function, or null when another tab is already sending.
+ * When the API is missing it resolves to a no-op release:
  * `canCoordinateTabs()` already refuses to offer the handoff in that browser,
- * so there is no freeze for the lock to gate, and local scrobbling must carry
- * on working exactly as it always did.
+ * and local scrobbling must carry on working exactly as it always did.
  */
-export async function acquireSendLock(): Promise<() => void> {
+export async function acquireSendLock(): Promise<(() => void) | null> {
   const locks = lockManager();
   if (!locks) {
     return noRelease;
   }
-  return new Promise<() => void>((granted) => {
-    let release: () => void = noRelease;
+  return new Promise<(() => void) | null>((granted) => {
     let released = false;
-    locks.request(SEND_LOCK_NAME, { mode: 'shared' }, () => new Promise<void>((done) => {
-      release = () => {
-        if (released) { return; }
-        released = true;
-        done();
-      };
-      granted(release);
-    })).catch(() => {
+    locks.request(
+      SEND_LOCK_NAME,
+      { mode: 'exclusive', ifAvailable: true },
+      (lock) => {
+        if (!lock) {
+          // Another tab holds it. Reported rather than queued.
+          granted(null);
+          return Promise.resolve();
+        }
+        return new Promise<void>((done) => {
+          granted(() => {
+            if (released) { return; }
+            released = true;
+            done();
+          });
+        });
+      },
+    ).catch(() => {
       // Nothing to release, and nothing to gate: report success so the send
       // loop is never blocked by a coordination failure.
       granted(noRelease);

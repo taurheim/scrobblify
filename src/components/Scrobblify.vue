@@ -121,6 +121,7 @@
             ref="scrobbleStep"
             :background-available="backgroundAvailable"
             :sending-blocked="sendingBlocked"
+            :persist-progress="onAutoSave"
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
             v-on:auto-save="onAutoSave"
@@ -1266,6 +1267,7 @@ export default Vue.extend({
           exported,
           username,
           this.backgroundJob.totalTracks || 0,
+          (this.$store.state.reTagBlockedUntilSec as number) || 0,
         );
         if (!restored) {
           throw new Error('The server did not return your remaining tracks.');
@@ -1488,7 +1490,7 @@ export default Vue.extend({
         floorSec: state.reTagFloorSec || 0,
         ceilingSec: state.reTagCeilingSec || 0,
       });
-      this.$store.commit('setReTagBlocked', !!state.reTagBlocked);
+      this.$store.commit('setReTagBlocked', state.reTagBlockedUntilSec || 0);
 
       // Restore remaining (not yet completed) tracks to store
       const allScrobbles = StateManager.deserializeScrobbles(state.tracks);
@@ -1611,7 +1613,9 @@ export default Vue.extend({
         // Carried for the same reason, and more urgently: dropping this one
         // does not merely widen the search, it re-enables re-tagging that was
         // established to be unsafe.
-        ...(this.$store.state.reTagBlocked ? { reTagBlocked: true } : {}),
+        ...((this.$store.state.reTagBlockedUntilSec as number)
+          ? { reTagBlockedUntilSec: this.$store.state.reTagBlockedUntilSec as number }
+          : {}),
         burstCount: info.burstCount,
         dailyCount: info.dailyCount,
         dailyCountDate: new Date().toISOString().split('T')[0],

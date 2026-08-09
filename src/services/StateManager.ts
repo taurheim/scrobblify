@@ -64,15 +64,20 @@ export interface ScrobbleState {
    */
   reTagCeilingSec?: number;
   /**
-   * Set when a take-back could not determine which seconds the job consumed.
+   * Second after which re-tagging is safe again; absent or 0 when it always
+   * was.
    *
+   * Set when a take-back could not determine which seconds the job consumed.
    * Distinct from an absent reservation, which merely means "allocate the
    * usual way". This means no interval is known to be safe, so re-tagged
-   * tracks are sent with their real timestamps instead — Last.fm rejects the
-   * ones outside its window, which is a visible failure the user can act on,
-   * where a collision would be an invisible one they cannot.
+   * tracks are held back rather than sent — they are left in the queue for a
+   * later run instead of being spent on timestamps that would collide.
+   *
+   * It expires because the unknown seconds are all in the past: once Last.fm's
+   * thirteen-day window has slid entirely past them, nothing can be scrobbled
+   * into them and the hazard is gone.
    */
-  reTagBlocked?: boolean;
+  reTagBlockedUntilSec?: number;
   /**
    * Second at which a background handoff pinned its ordering.
    *

@@ -375,6 +375,7 @@ export function stateFromExport(
   exported: any,
   username: string,
   fallbackOriginalTotal: number,
+  priorBlockedUntilSec = 0,
 ): ScrobbleState | null {
   const raw = exported && exported.state ? exported.state : null;
   const tracks = raw && Array.isArray(raw.tracks) ? raw.tracks : null;
@@ -515,6 +516,20 @@ export function stateFromExport(
       RETAG_BACKFILL_SECONDS,
     );
 
+  /*
+    No safe interval exists right now. The unknown or exhausted seconds are all
+    in the past, so the block lifts once Last.fm's window has slid entirely
+    past them — at which point nothing can be scrobbled into them at all.
+  */
+  const priorBlockedUntil = Number.isFinite(priorBlockedUntilSec)
+    && priorBlockedUntilSec > 0
+    ? Math.floor(priorBlockedUntilSec)
+    : 0;
+  const reTagBlockedUntilSec = Math.max(
+    reserved ? 0 : nowSec + RETAG_WINDOW_LIMIT_SECONDS,
+    priorBlockedUntil,
+  );
+
   return {
     userName: username,
     totalTracks: serialized.length,
@@ -535,12 +550,18 @@ export function stateFromExport(
     /*
       A missing reservation has two very different causes, and they must not
       look alike downstream. `findFreeRange` returning nothing means the
-      window is full; `unusable` means we do not know what is in it. Only the
-      second forbids re-tagging outright — with an unreadable history the
-      default six-hour window is the *most* likely place for a collision, and
-      a collision is a play Last.fm discards while reporting success.
+      window is full; `unusable` means we do not know what is in it. Either
+      way there is no safe interval, so both block — with an unreadable or an
+      exhausted history the default six-hour window is the *most* likely place
+      for a collision, and a collision is a play Last.fm discards while
+      reporting success.
+
+      Carried forward from the previous cycle too. A later export being
+      readable says nothing about the seconds an *earlier* one lost track of,
+      and those seconds keep mattering until they age out of Last.fm's window.
+      The later of the two deadlines wins.
     */
-    ...(unusable ? { reTagBlocked: true } : {}),
+    ...(reTagBlockedUntilSec > 0 ? { reTagBlockedUntilSec } : {}),
     burstCount: 0,
     dailyCount: 0,
     dailyCountDate: new Date().toISOString().slice(0, 10),

@@ -37,14 +37,21 @@ export default new Vuex.Store({
     reTagFloorSec: 0,
     reTagCeilingSec: 0,
     /*
+      Second after which re-tagging is safe again, or 0 when it always was.
+
       Set when a take-back could not establish *any* safe interval — the job's
       assigned timestamps were unreadable, so the seconds it consumed could be
       anywhere. A reservation of zero is indistinguishable from "no handoff
       happened", which sends the allocator back to its usual six-hour window,
       and that window is exactly where those unknown seconds are most likely to
       be. So the impossibility is carried explicitly instead.
+
+      A second rather than a boolean because the condition really does end. The
+      unknown seconds are all in the past, so once Last.fm's thirteen-day
+      window has slid entirely past them nothing can collide with them any
+      more. A boolean would have blocked those tracks forever.
     */
-    reTagBlocked: false,
+    reTagBlockedUntilSec: 0,
   },
   mutations: {
     setValidScrobbles(state: any, tracks: SpotifyListen[]) {
@@ -66,8 +73,8 @@ export default new Vuex.Store({
       state.reTagFloorSec = range.floorSec;
       state.reTagCeilingSec = range.ceilingSec;
     },
-    setReTagBlocked(state: any, blocked: boolean) {
-      state.reTagBlocked = blocked;
+    setReTagBlocked(state: any, blockedUntilSec: number) {
+      state.reTagBlockedUntilSec = blockedUntilSec;
     },
     trackScrobbled(state: any) {
       state.tracksScrobbled += 1;

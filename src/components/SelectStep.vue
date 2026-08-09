@@ -513,6 +513,17 @@ export default Vue.extend({
       // import that all later resume progress is measured against.
       this.$store.commit('setOriginalTotalTracks', scrobbles.length);
       this.$store.commit('setResumedScrobbleCount', 0);
+      /*
+        The re-tag state belongs to the import that produced it, not to the
+        browser. A reservation names seconds allocated around a *previous*
+        queue, and a block records that a previous take-back lost track of
+        them; neither says anything about these tracks. Carried into a fresh
+        import, the reservation would misdirect the allocator and the block
+        would refuse to send perfectly safe plays.
+      */
+      this.$store.commit('setReTagReservedRange', { floorSec: 0, ceilingSec: 0 });
+      this.$store.commit('setReTagBlocked', 0);
+      this.$store.commit('setReTagCursorSec', 0);
       trackEvent('tracks_selected', {
         selected_count: selected.length,
         total_count: this.totalTrackCount,
