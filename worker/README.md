@@ -11,6 +11,11 @@ Implemented and tested, **not yet deployed**. `api.savas.ca` does not resolve,
 so the registered Last.fm callback goes nowhere and `wrangler.toml` still has a
 placeholder `database_id`.
 
+Verified end to end against `wrangler dev --local`: the startup secret guard
+passes with all four names set, and `/scrobblify/capacity` and
+`/scrobblify/job/live` answer `200` once the three migrations are applied to the
+local D1.
+
 ```powershell
 npm test   # typechecks, then runs every suite against a real SQLite schema
 ```
@@ -37,9 +42,20 @@ npx wrangler d1 execute scrobblify --remote --file schema/003_export_claim.sql
 # 5. Deploy, then point api.savas.ca at the worker via a Cloudflare route.
 npx wrangler deploy
 
-# 6. Confirm the Last.fm credentials actually work against the live API.
-curl https://api.savas.ca/verify
+# 6. Smoke test. This is a public route, so no session is needed.
+curl https://api.savas.ca/scrobblify/capacity
 ```
+
+A `200` with `{"available":true,...}` proves three things at once: the worker is
+routed, all four secrets passed the startup guard in `src/index.ts` (a missing
+or short one returns `503 misconfigured` on **every** route), and D1 is reachable
+and migrated — the handler reads the control row and counts committed slots.
+
+`503` means secrets; `500` means D1 (usually an unapplied migration from step 3).
+
+Note that `/verify` belongs to the phase-0 feasibility spike (`src/spike.ts`,
+deployed only under `wrangler.spike.toml`). The real worker has no such route
+and will answer `401` for it, along with every other unknown path.
 
 ### 7. Rate-limit the public lookup
 
@@ -83,8 +99,21 @@ Local development:
 
 ```powershell
 Copy-Item .dev.vars.example .dev.vars
-# fill in the four values, then:
+# fill in the four values, then apply the schema to the local D1 once:
+npx wrangler d1 execute scrobblify --local --file schema/001_init.sql
+npx wrangler d1 execute scrobblify --local --file schema/002_synthetic_floor.sql
+npx wrangler d1 execute scrobblify --local --file schema/003_export_claim.sql
 npx wrangler dev --local
+```
+
+`--local` keeps its own D1 in `.wrangler/state`, separate from production and
+unaffected by step 3 of the deploy. Skipping it leaves every route answering
+`500`, because the tables the handlers read do not exist yet.
+
+Smoke test the same way as production:
+
+```powershell
+curl "http://127.0.0.1:8787/scrobblify/capacity"
 ```
 
 Production:
