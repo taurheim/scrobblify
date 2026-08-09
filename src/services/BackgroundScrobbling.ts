@@ -990,6 +990,50 @@ async function getWithTimeout(path: string, authorised: boolean): Promise<Respon
 }
 
 /**
+ * Whether the server is running, or about to run, anything at all for this
+ * Last.fm user. Tri-state: `null` means we could not find out.
+ *
+ * This is the only ownership question that survives losing local storage, and
+ * it is deliberately keyed on the username rather than on a session token,
+ * because a browser that has lost its session — or never had one, being a
+ * different device or profile — is exactly the case that a local record cannot
+ * answer for. Those browsers can still reach a saved import through IndexedDB
+ * and scrobble it underneath a running job.
+ *
+ * Unauthenticated for the same reason. Re-establishing a session means a
+ * Last.fm redirect, which is far too heavy to impose on every user at every
+ * load just to learn that they have no job; the client asks this first and
+ * only signs in when the answer is yes.
+ *
+ * The response carries a boolean and nothing else, so a `true` here cannot
+ * render a status card — `fetchJob` does that, once the user has signed in.
+ */
+export async function liveJobForUsername(username: string): Promise<boolean | null> {
+  if (!isBackgroundConfigured() || !username.trim()) {
+    return null;
+  }
+  try {
+    const res = await getWithTimeout(
+      `/scrobblify/job/live?username=${encodeURIComponent(username.trim())}`,
+      false,
+    );
+    if (!res || !res.ok) {
+      return null;
+    }
+    const body = await res.json();
+    // Only an explicit boolean counts. A malformed or partial body must not
+    // read as "nothing is running", which is the answer that unblocks
+    // scrobbling.
+    if (typeof body.live !== 'boolean') {
+      return null;
+    }
+    return body.live;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Whether background mode can be offered at all.
  *
  * Returns null rather than throwing on any failure, so the caller's only

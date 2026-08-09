@@ -171,6 +171,80 @@ async function main() {
     check('a paused worker advertises itself as unavailable', paused.available === false);
   }
 
+  console.log('\n-- the unauthenticated live-job lookup --');
+  {
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+
+    const none = await handleRequest(env, req('/scrobblify/job/live?username=listener'));
+    const noneBody: any = await none.json();
+    check('answers without a session', none.status === 200, none.status);
+    check('reports an unknown user as idle', noneBody.live === false, noneBody);
+
+    check('a missing username is rejected',
+      (await handleRequest(env, req('/scrobblify/job/live'))).status === 400);
+
+    const jobId = await seedJob(sql, blobs, 'listener');
+    const live: any = await (await handleRequest(env, req('/scrobblify/job/live?username=listener'))).json();
+    check('reports a running job as live', live.live === true, live);
+
+    // The whole point of answering without a session: this is the browser that
+    // lost its storage. A stale or junk token must not turn into a 401 here,
+    // or the browser it was built for is the one browser it cannot answer.
+    const stale = await handleRequest(
+      env, req('/scrobblify/job/live?username=listener', { token: 'expired-nonsense' }),
+    );
+    const staleBody: any = await stale.json();
+    check('a junk session token does not gate the answer', stale.status === 200, stale.status);
+    check('and it still reports the job', staleBody.live === true, staleBody);
+
+    check('is case- and whitespace-insensitive like every other username path',
+      ((await (await handleRequest(env, req('/scrobblify/job/live?username=%20LISTENER%20'))).json()) as any)
+        .live === true);
+
+    check('says nothing beyond the boolean',
+      Object.keys(live).sort().join(',') === 'live,ok', Object.keys(live));
+
+    // A paused job is resumable, so it is still the server's queue.
+    await sql.run("UPDATE jobs SET state = 'paused' WHERE id = ?", [jobId]);
+    check('a paused job still counts as live',
+      ((await (await handleRequest(env, req('/scrobblify/job/live?username=listener'))).json()) as any)
+        .live === true);
+
+    // `needs_reauth` clears the credential, so the worker cannot send: the
+    // browser is free to scrobble again, and must be told so.
+    await sql.run(
+      "UPDATE jobs SET state = 'needs_reauth', live_username = NULL WHERE id = ?", [jobId],
+    );
+    check('a job stalled on re-auth does not block the browser',
+      ((await (await handleRequest(env, req('/scrobblify/job/live?username=listener'))).json()) as any)
+        .live === false);
+
+    await sql.run(
+      "UPDATE jobs SET state = 'active', live_username = 'listener' WHERE id = ?", [jobId],
+    );
+    await sql.run(
+      "UPDATE jobs SET state = 'cancelled', live_username = NULL WHERE id = ?", [jobId],
+    );
+    check('a cancelled job releases the browser',
+      ((await (await handleRequest(env, req('/scrobblify/job/live?username=listener'))).json()) as any)
+        .live === false);
+
+    // A handover part-way through owns no job row yet, but the worker is about
+    // to start: reporting it idle reopens the window the check exists to close.
+    await sql.run(
+      `INSERT INTO handoffs (id, state, username, live_username, payload_digest,
+          track_count, chunk_count, declared_bytes, algorithm_version,
+          created_at, updated_at, expires_at)
+       VALUES ('h-live', 'issued', 'pending-user', 'pending-user', 'd', 5000, 1, 10, ?, ?, ?, ?)`,
+      [ALGORITHM_VERSION, NOW, NOW, NOW + 3600],
+    );
+    check('an in-flight handoff counts as live',
+      ((await (await handleRequest(env, req('/scrobblify/job/live?username=pending-user'))).json()) as any)
+        .live === true);
+  }
+
   console.log('\n-- preflight --');
   {
     const sql = freshSql();

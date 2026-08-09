@@ -41,6 +41,32 @@ npx wrangler deploy
 curl https://api.savas.ca/verify
 ```
 
+### 7. Rate-limit the public lookup
+
+`GET /scrobblify/job/live?username=…` answers without a session, by design:
+the browsers it exists to stop are exactly the ones that have lost their
+storage, and a Last.fm redirect is far too heavy to impose on every user at
+every page load just to discover they have no job. It returns a bare boolean
+and grants no control, but it does let someone ask whether a given Last.fm
+username uses the feature.
+
+Add a Cloudflare rate-limiting rule (Security → WAF → Rate limiting rules;
+one rule is included on the free plan):
+
+| Field | Value |
+| --- | --- |
+| If incoming requests match | `URI Path` equals `/scrobblify/job/live` |
+| Rate | 20 requests per 1 minute, per IP |
+| Action | Block for 1 minute |
+
+Genuine clients call this at most a couple of times per page load, so 20/min
+is far above real use and far below useful enumeration.
+
+**Not enforced with a counter in D1**, deliberately: a row written per request
+would let an enumerator burn the free tier's daily write quota on our behalf,
+which stops the scheduler and strands every running import. That is a worse
+outcome than the fact being leaked.
+
 The SPA reads its API base from `VUE_APP_BACKGROUND_API` in `.env.production`.
 Setting it does not switch the feature on by itself: the client asks
 `/scrobblify/capacity` on load and stays silent unless the worker answers, so

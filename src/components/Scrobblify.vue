@@ -272,6 +272,18 @@ export default Vue.extend({
       await this.reconcileQueueOwner(owner);
     }
 
+    /*
+      The authority check, after the local records have had their say so it can
+      correct them in either direction.
+
+      Deliberately not conditional on finding a local record: a browser with no
+      record is the case this exists for. It is also deliberately awaited
+      before the resume button can appear — `hasResumableState` above may
+      already be true, and offering Resume while the question is open is
+      offering the one action that starts duplicate scrobbling.
+    */
+    await this.enforceServerAuthority();
+
     this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
       this.ownershipBlocked = next !== null;
       const step = this.$refs.scrobbleStep as any;
@@ -446,6 +458,95 @@ export default Vue.extend({
       return this.backgroundAvailable
         && !this.backgroundJob
         && remaining >= 2700;
+    },
+
+    /**
+     * Asks the server, by username, whether anything is running for this user,
+     * and blocks the browser if so.
+     *
+     * This is the authority. Every other ownership signal in this component is
+     * a local record, and local records answer only for the browser that wrote
+     * them — not for a browser whose storage was cleared, not for a second
+     * device, not for another profile. All three of those can still open a
+     * saved import from IndexedDB and start sending it underneath a running
+     * job, and the duplicate scrobbles that follow are silent: Last.fm accepts
+     * a repeat of the same track and second and simply discards it.
+     *
+     * Keyed on the Last.fm username rather than a session token precisely
+     * because losing the session is one of the cases being caught. It runs
+     * unauthenticated for that reason, and returns a bare boolean, so a `true`
+     * can block but cannot render details — signing in is what unlocks those.
+     *
+     * Tri-state, and the three answers are not symmetrical:
+     *   `true`  — block, durably, and offer the sign-in that leads to control.
+     *   `false` — definitive. Safe to release a stale `server` record that a
+     *             finished job left behind.
+     *   `null`  — unreachable or unparseable. Change nothing. The local
+     *             records keep whatever they were already saying, so this is
+     *             never worse than not having asked.
+     */
+    async enforceServerAuthority(): Promise<void> {
+      if (!background.isBackgroundConfigured()) {
+        return;
+      }
+      const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
+      if (!username) {
+        return;
+      }
+      // Captured before the round-trip: the release below must prove that the
+      // record it clears is the one this answer was about, since another tab
+      // can establish a freeze while the request is in flight.
+      const observed = background.queueOwner();
+      const live = await background.liveJobForUsername(username);
+
+      if (live === true) {
+        /*
+          Written durably rather than held in memory. This tab may be the only
+          one that asked, and the record is what tells a tab opened tomorrow —
+          which will not repeat this check until its own next load — that the
+          queue is not its to send.
+
+          No id: this endpoint deliberately returns no job id, and a `server`
+          record whose id names something other than a job would be read as an
+          answer about that thing. The empty id is the legacy "any live job
+          counts" form, which is the conservative reading.
+        */
+        if (!observed || observed.owner === 'server') {
+          background.setQueueOwner({ owner: 'server', id: '' });
+        }
+        this.ownershipBlocked = true;
+        this.hasResumableState = false;
+        // With a valid session this renders the real status card, with pause,
+        // resume and take-back. Without one there is nothing to show but the
+        // block itself, so offer the sign-in that turns it into a status card.
+        await this.refreshBackgroundJob();
+        if (!this.backgroundJob) {
+          this.showReauth = true;
+          this.backgroundNotice = 'Your import is still running on the server, so scrobbling from this browser is switched off to stop the same tracks being sent twice. Sign in to check on it or bring it back here.';
+        }
+        trackEvent('background_authority_check', { result: 'live', signed_in: String(!!this.backgroundJob) });
+        return;
+      }
+
+      if (live === false) {
+        /*
+          Only a `server` record may be released on this answer. A `freezing`
+          record means a sibling tab is part-way through a handover *right
+          now* — the job legitimately does not exist yet, and reading that as
+          "nothing is running" would unblock every tab inside the exact window
+          the freeze exists to protect.
+        */
+        if (observed && observed.owner === 'server') {
+          background.releaseQueueOwnerIfSame(observed);
+          this.ownershipBlocked = false;
+          try {
+            this.hasResumableState = await this.stateManager.hasSavedState();
+          } catch (e) {
+            // Nothing to restore the button for.
+          }
+        }
+        trackEvent('background_authority_check', { result: 'idle' });
+      }
     },
 
     /**
@@ -1126,6 +1227,19 @@ export default Vue.extend({
       if (this.currentStep === 1) {
         this.currentStep = 2;
       }
+      /*
+        The username is only knowable now, so for a browser that arrived
+        without one — cleared storage, a new device, a fresh profile — this is
+        the first moment the server can be asked about them at all. That is
+        exactly the browser holding no local record of a handover, so skipping
+        the check here would leave the case it was built for uncovered.
+
+        Not awaited: `onAuthenticated` is an event handler and the step must
+        advance immediately. The check blocks scrobbling on its own when it
+        resolves, and reaching the send loop needs several more deliberate
+        steps than the one round-trip this takes.
+      */
+      this.enforceServerAuthority().catch(() => { /* leaves local records as they were */ });
     },
     /**
      * `state.totalTracks` is only the tracks left to do, so on its own it makes

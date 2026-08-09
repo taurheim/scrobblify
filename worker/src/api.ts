@@ -352,6 +352,67 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     return Response.redirect(target.toString(), 302);
   }
 
+  /*
+    ---- "is anything running for this user?", without a session ----
+
+    The one question the client must be able to answer before it scrobbles
+    anything, and the only one it cannot answer from local storage. A browser
+    that has cleared its storage, or a second device, or a different profile,
+    holds no record of a handover but can still reach a saved import — and
+    sending it while the worker is sending the same queue duplicates plays
+    silently, for as long as the job runs. Local records are a cache; this is
+    the truth.
+
+    It therefore cannot require a session, because losing the session is one
+    of the cases it exists to catch. `/auth/signin` re-establishes one, but
+    that is a Last.fm redirect: far too heavy to impose on every user at every
+    page load merely to discover that they have no job. So the client asks
+    this first, and only signs in when the answer is yes.
+
+    A boolean and nothing else. No job id, no counts, no dates, no state — it
+    confers no control and no detail, so answering it without a session grants
+    nothing that a session would have gated.
+
+    What it does leak is whether a given Last.fm username uses this feature.
+    That is accepted deliberately: the client's own Last.fm API secret ships
+    inside the browser bundle, so any "proof" of account ownership layered on
+    top of this would be checkable by the same attacker who would be
+    enumerating, and would buy nothing.
+
+    Enumeration is bounded by a Cloudflare rate-limiting rule at the edge
+    (see worker/README.md), *not* by a counter in D1. Writing a row per
+    request would let an enumerator exhaust the free tier's daily write quota
+    on our behalf, which stops the scheduler and is a considerably worse
+    outcome than the fact being leaked.
+  */
+  if (path === '/scrobblify/job/live' && request.method === 'GET') {
+    const lookup = (url.searchParams.get('username') ?? '').trim();
+    if (!lookup) {
+      return json(env, { ok: false, reason: 'bad_request' }, 400);
+    }
+    // Both tables, matching `reserveHandoffSlot`'s definition of "already
+    // live". A handoff that has not yet become a job still means the worker is
+    // about to start sending: reporting that as idle reopens the window this
+    // endpoint exists to close.
+    //
+    // `live_username` rather than a state list: it is NULL exactly while a job
+    // cannot send — terminal states clear it, and so does `needs_reauth`,
+    // which is entered only when the stored credential is gone or expired.
+    // `paused` and `needs_attention` keep it, correctly, because the user can
+    // resume them. Both columns carry unique indexes, so these are point
+    // lookups that cannot drift from the scheduler's own view.
+    const name = normalizeUsername(lookup);
+    const liveJob = await env.sql.first<{ id: string }>(
+      'SELECT id FROM jobs WHERE live_username = ? LIMIT 1',
+      [name],
+    );
+    const liveHandoff = liveJob ? null : await env.sql.first<{ id: string }>(
+      'SELECT id FROM handoffs WHERE live_username = ? LIMIT 1',
+      [name],
+    );
+    return json(env, { ok: true, live: liveJob !== null || liveHandoff !== null });
+  }
+
   // Everything below needs a session.
   const username = await authenticate(request, env.signingKey, nowSec);
   if (!username) {
