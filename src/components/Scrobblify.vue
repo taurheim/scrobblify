@@ -55,8 +55,23 @@
       </div>
     </v-alert>
 
+    <v-alert v-if="authorityUnknown" type="warning" class="mb-4">
+      <div>
+        <strong>Can't reach the background service.</strong>
+        Scrobbling is held back until it can confirm that an import isn't
+        already running on the server for your account — sending the same
+        tracks twice can't be undone.
+      </div>
+      <div class="mt-3">
+        <v-btn color="primary" :loading="authorityPending" @click="retryAuthority">
+          Try again
+        </v-btn>
+      </div>
+    </v-alert>
+
     <v-alert
-      v-if="hasResumableState && currentStep <= 2 && !backgroundJob && !ownershipBlocked"
+      v-if="hasResumableState && currentStep <= 2 && !backgroundJob && !ownershipBlocked
+        && !authorityPending && !authorityUnknown"
       type="info"
       prominent
       class="mb-4"
@@ -216,6 +231,23 @@ export default Vue.extend({
        */
       ownershipBlocked: false,
       /**
+       * True until the server has answered whether anything is running for
+       * this user, and again whenever that answer could not be obtained.
+       *
+       * Separate from `ownershipBlocked`, which means "the answer was yes".
+       * This one means "there is no answer", and it has to gate the same
+       * actions: the whole point of asking is defeated if Resume is live while
+       * the request is still in flight. `mounted` is async and Vue renders at
+       * every await, so that window is real rather than theoretical.
+       */
+      authorityPending: true,
+      /**
+       * Set when the authority question could not be answered at all. Distinct
+       * from a `false` answer, and surfaced so the user is told why the app is
+       * holding back rather than silently refusing to work.
+       */
+      authorityUnknown: false,
+      /**
        * Shown only when the block is caused by an expired bearer token, which
        * is the one unresolved case the user can actually fix themselves.
        */
@@ -280,9 +312,14 @@ export default Vue.extend({
       record is the case this exists for. It is also deliberately awaited
       before the resume button can appear — `hasResumableState` above may
       already be true, and offering Resume while the question is open is
-      offering the one action that starts duplicate scrobbling.
+      offering the one action that starts duplicate scrobbling. `authorityPending`
+      covers the same window in the template, since `mounted` renders at every
+      await it makes.
     */
-    await this.enforceServerAuthority();
+    await this.enforceServerAuthority().catch(() => {
+      this.authorityPending = false;
+      this.authorityUnknown = true;
+    });
 
     this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
       this.ownershipBlocked = next !== null;
@@ -487,17 +524,44 @@ export default Vue.extend({
      */
     async enforceServerAuthority(): Promise<void> {
       if (!background.isBackgroundConfigured()) {
+        // The feature does not exist for this build, so no queue of ours can
+        // be running anywhere. Nothing to withhold.
+        this.authorityPending = false;
+        this.authorityUnknown = false;
         return;
       }
-      const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
+      /*
+        The signed-in user if there is one, and otherwise the name carried by
+        the saved import itself.
+
+        The fallback matters: a browser that has lost its localStorage has also
+        lost its Last.fm login, but IndexedDB is a separate store and the queue
+        can easily outlive both. That browser is precisely the one this check
+        exists for, and without the fallback it is the one browser that never
+        gets asked about.
+      */
+      let username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
       if (!username) {
+        try {
+          const saved = await this.stateManager.loadState();
+          username = (saved && saved.userName) || '';
+        } catch (e) {
+          // Unreadable state. There is nothing to resume either, so the
+          // question is moot.
+        }
+      }
+      if (!username) {
+        this.authorityPending = false;
+        this.authorityUnknown = false;
         return;
       }
+
       // Captured before the round-trip: the release below must prove that the
       // record it clears is the one this answer was about, since another tab
       // can establish a freeze while the request is in flight.
       const observed = background.queueOwner();
       const live = await background.liveJobForUsername(username);
+      this.authorityPending = false;
 
       if (live === true) {
         /*
@@ -514,6 +578,7 @@ export default Vue.extend({
         if (!observed || observed.owner === 'server') {
           background.setQueueOwner({ owner: 'server', id: '' });
         }
+        this.authorityUnknown = false;
         this.ownershipBlocked = true;
         this.hasResumableState = false;
         // With a valid session this renders the real status card, with pause,
@@ -529,6 +594,7 @@ export default Vue.extend({
       }
 
       if (live === false) {
+        this.authorityUnknown = false;
         /*
           Only a `server` record may be released on this answer. A `freezing`
           record means a sibling tab is part-way through a handover *right
@@ -539,14 +605,40 @@ export default Vue.extend({
         if (observed && observed.owner === 'server') {
           background.releaseQueueOwnerIfSame(observed);
           this.ownershipBlocked = false;
-          try {
-            this.hasResumableState = await this.stateManager.hasSavedState();
-          } catch (e) {
-            // Nothing to restore the button for.
-          }
+        }
+        try {
+          this.hasResumableState = await this.stateManager.hasSavedState();
+        } catch (e) {
+          // Nothing to restore the button for.
         }
         trackEvent('background_authority_check', { result: 'idle' });
+        return;
       }
+
+      /*
+        No answer. Deliberately *not* treated as "nothing is running".
+
+        This is the case the whole mechanism exists for: a browser with no
+        local record is indistinguishable, from the inside, between "never
+        handed anything over" and "handed over from a device whose record I
+        have never seen". Only the server can tell those apart, so until it
+        does, the action that would start duplicate scrobbling stays withheld.
+
+        The user is told why, and given a retry, rather than left looking at an
+        app that silently refuses to work.
+      */
+      this.authorityUnknown = true;
+      this.hasResumableState = false;
+      trackEvent('background_authority_check', { result: 'unknown' });
+    },
+
+    /**
+     * Retries the authority question after it could not be answered.
+     */
+    async retryAuthority(): Promise<void> {
+      this.authorityPending = true;
+      this.authorityUnknown = false;
+      await this.enforceServerAuthority();
     },
 
     /**
@@ -868,15 +960,18 @@ export default Vue.extend({
           to: state.reTagCeilingSec || handedOverAtSec,
         }
         : null;
+      const mergedLineage = background.mergeReTagRange(
+        priorLineage ? priorLineage.reTagUsedRanges : [],
+        usedBand,
+        priorLineage ? priorLineage.reTagKnownFromSec : 0,
+      );
       background.setHandoffLineage({
         originalTotalTracks: state.originalTotalTracks || state.totalTracks,
         originalSucceededCount: state.originalSucceededCount || 0,
         reTagCursorSec: state.lastReTagTimestampSec || 0,
         handedOverAtSec,
-        reTagUsedRanges: background.mergeReTagRange(
-          priorLineage ? priorLineage.reTagUsedRanges : [],
-          usedBand,
-        ),
+        reTagUsedRanges: mergedLineage.ranges,
+        reTagKnownFromSec: mergedLineage.knownFromSec,
       });
 
       const result = await beginHandoff(this.stateManager, state, username, entryPoint);
@@ -1124,11 +1219,19 @@ export default Vue.extend({
           before anything is cleared. `stateFromExport` only *consults* them to
           pick this cycle's band; once the job is cancelled they exist nowhere
           else, and a second handover would then allocate over them.
+
+          Whatever the export could not fit is carried as a floor rather than
+          forgotten, so the next cycle's gap search knows where its knowledge
+          stops instead of treating a partial list as exhaustive.
         */
+        const priorForCarry = background.getHandoffLineage();
         const carriedLineage = background.mergeExportedRanges(
-          (background.getHandoffLineage() || {}).reTagUsedRanges,
+          priorForCarry ? priorForCarry.reTagUsedRanges : undefined,
           exported.usedRanges,
-          !!exported.usedRangesTruncated,
+          priorForCarry ? priorForCarry.reTagKnownFromSec : undefined,
+          exported.usedRangesIncomplete
+            ? Math.floor(Date.now() / 1000)
+            : exported.usedRangesFloorSec,
         );
         // Saved before the job is cancelled. Cancelling first and then failing
         // to save would destroy the only copy of the queue.
@@ -1162,7 +1265,7 @@ export default Vue.extend({
         background.releaseQueueOwnerIfUnclaimed(jobId);
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
-        background.clearHandoffLineage(carriedLineage);
+        background.clearHandoffLineage(carriedLineage.ranges, carriedLineage.knownFromSec);
         this.backgroundNotice = 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
         trackEvent('background_job_reclaimed', { job_id: jobId });
       } catch (e) {
@@ -1234,12 +1337,19 @@ export default Vue.extend({
         exactly the browser holding no local record of a handover, so skipping
         the check here would leave the case it was built for uncovered.
 
-        Not awaited: `onAuthenticated` is an event handler and the step must
-        advance immediately. The check blocks scrobbling on its own when it
-        resolves, and reaching the send loop needs several more deliberate
-        steps than the one round-trip this takes.
+        `authorityPending` is raised *synchronously*, before the await inside
+        the check can yield. This component deliberately supports the user
+        pressing Resume during the two-second authentication transition, so
+        leaving the flag down until the request resolved would leave Resume
+        live across exactly the window the check is meant to cover.
       */
-      this.enforceServerAuthority().catch(() => { /* leaves local records as they were */ });
+      this.authorityPending = true;
+      this.enforceServerAuthority().catch(() => {
+        // Leaves local records as they were, but never leaves the gate open on
+        // an unanswered question.
+        this.authorityPending = false;
+        this.authorityUnknown = true;
+      });
     },
     /**
      * `state.totalTracks` is only the tracks left to do, so on its own it makes
@@ -1267,6 +1377,17 @@ export default Vue.extend({
       trackEvent('user_logged_out');
     },
     async resumeFromSaved() {
+      /*
+        Checked here as well as in the template. The alert is one route to
+        this; a resumed session also arrives from the ownership listener and
+        from the import-file path, and a hidden button is not a guarantee that
+        the method cannot run. This is the action that begins sending, so it
+        carries its own refusal rather than trusting the view.
+      */
+      if (this.authorityPending || this.authorityUnknown || this.ownershipBlocked) {
+        this.backgroundNotice = 'Hold on — still checking whether an import is already running on the server for your account.';
+        return;
+      }
       try {
         const state = await this.stateManager.loadState();
         if (!state) { return; }

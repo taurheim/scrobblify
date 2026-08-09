@@ -82,9 +82,23 @@ export function collapseToRanges(
   if (ranges.length <= limit) {
     return { ranges, truncated: false };
   }
-  // Truncated from the *top*: the client reserves below everything it knows
-  // about, so the lowest ranges are the ones that bound its choice.
-  return { ranges: ranges.slice(0, limit), truncated: true };
+  /*
+    Truncated from the *bottom*, keeping the highest ranges.
+
+    This was the other way round, justified by the client reserving below
+    everything it knew about — true of the allocator that existed when this was
+    written, which only ever needed the single lowest bound. The client now
+    searches for a free gap walking *down* from the present, so the ranges it
+    collides with first are the highest ones, and dropping those handed it a
+    list whose most relevant entries were missing.
+
+    Keeping the top also makes truncation recoverable rather than fatal. Every
+    discarded range now lies strictly below the lowest one kept, so the region
+    above that is completely described: a client can bound its search there and
+    still be certain, instead of abandoning the reservation entirely. The
+    lowest kept `from` is returned as `usedRangesFloorSec` for exactly that.
+  */
+  return { ranges: ranges.slice(ranges.length - limit), truncated: true };
 }
 
 export interface ApiEnv {
@@ -390,27 +404,32 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     if (!lookup) {
       return json(env, { ok: false, reason: 'bad_request' }, 400);
     }
-    // Both tables, matching `reserveHandoffSlot`'s definition of "already
-    // live". A handoff that has not yet become a job still means the worker is
-    // about to start sending: reporting that as idle reopens the window this
-    // endpoint exists to close.
-    //
-    // `live_username` rather than a state list: it is NULL exactly while a job
-    // cannot send — terminal states clear it, and so does `needs_reauth`,
-    // which is entered only when the stored credential is gone or expired.
-    // `paused` and `needs_attention` keep it, correctly, because the user can
-    // resume them. Both columns carry unique indexes, so these are point
-    // lookups that cannot drift from the scheduler's own view.
+    /*
+      One statement, not two.
+
+      Ownership *migrates* between these tables: a handoff holds it from the
+      moment a slot is reserved, the job row takes it over at the exchange, and
+      the handoff drops it at finalise. Two separate reads can therefore
+      straddle that migration — see no job, then have finalise complete, then
+      see a handoff that has just been cleared — and report idle while the
+      worker is live. A single statement observes both tables in one snapshot,
+      which is the only way the question has a consistent answer at all.
+
+      `live_username` rather than a state list: it is NULL exactly while a job
+      cannot send — terminal states clear it, and so does `needs_reauth`, which
+      is entered only when the stored credential is gone or expired. `paused`
+      and `needs_attention` keep it, correctly, because the user can resume
+      them. Both columns carry unique indexes, so this stays two point lookups.
+    */
     const name = normalizeUsername(lookup);
-    const liveJob = await env.sql.first<{ id: string }>(
-      'SELECT id FROM jobs WHERE live_username = ? LIMIT 1',
-      [name],
+    const live = await env.sql.first<{ live: number }>(
+      `SELECT 1 AS live FROM jobs WHERE live_username = ?
+       UNION ALL
+       SELECT 1 AS live FROM handoffs WHERE live_username = ?
+       LIMIT 1`,
+      [name, name],
     );
-    const liveHandoff = liveJob ? null : await env.sql.first<{ id: string }>(
-      'SELECT id FROM handoffs WHERE live_username = ? LIMIT 1',
-      [name],
-    );
-    return json(env, { ok: true, live: liveJob !== null || liveHandoff !== null });
+    return json(env, { ok: true, live: live !== null });
   }
 
   // Everything below needs a session.
@@ -548,29 +567,59 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         under a client that is about to save it. That is the one irreversible
         outcome in this whole flow: the tracks exist nowhere else at that
         moment.
+
+        The check lives in the UPDATE rather than in an `if` above it. `job`
+        was read at the top of this handler, and a request that read `paused`
+        can be descheduled, have another request claim the export, and then
+        resume and act on a snapshot that is no longer true — skipping the
+        guard entirely and deleting the blobs the live export is reading.
+        Making the claim part of the write means the database decides, at the
+        moment of the write, on the row as it actually is.
+
+        A missing claim is passed as NULL, which no comparison matches, so
+        "no claim offered" cannot cancel a claimed export.
       */
-      if (job.state === 'exporting' && job.export_claim) {
-        let cancelBody: any = null;
-        try {
-          cancelBody = await request.json();
-        } catch {
-          cancelBody = null;
-        }
-        if (!cancelBody || cancelBody.claim !== job.export_claim) {
-          return json(env, { error: 'export_in_progress' }, 409);
-        }
+      let cancelBody: any = null;
+      try {
+        cancelBody = await request.json();
+      } catch {
+        cancelBody = null;
       }
+      const offeredClaim = cancelBody && typeof cancelBody.claim === 'string'
+        ? cancelBody.claim
+        : null;
+
       // Order matters: the export is built from the blob, so the blob is only
       // deleted after the caller has had the chance to take it. Deleting first
       // strands the user's progress permanently.
-      await env.sql.run(
+      const cancelled = await env.sql.run(
         `UPDATE jobs
             SET state = 'cancelled', state_reason = 'Cancelled by the user',
                 session_key_ct = NULL, session_key_iv = NULL, live_username = NULL,
                 locked_until = 0, completed_at = ?, purge_after = ?, updated_at = ?
-          WHERE id = ? AND state NOT IN ('completed', 'failed', 'cancelled')`,
-        [nowSec, nowSec + 30 * 86400, nowSec, job.id],
+          WHERE id = ? AND state NOT IN ('completed', 'failed', 'cancelled')
+            AND (state <> 'exporting' OR export_claim IS NULL OR export_claim = ?)`,
+        [nowSec, nowSec + 30 * 86400, nowSec, job.id, offeredClaim],
       );
+
+      if (cancelled.changes === 0) {
+        /*
+          Either the job was already terminal — in which case cancelling is a
+          no-op and the caller got what it wanted — or an export holds it under
+          a different claim. Re-read to tell those apart, because reporting a
+          refused cancel as success is what would let the client go on to
+          discard its local copy.
+        */
+        const current = await env.sql.first<JobRow>(
+          'SELECT state, export_claim FROM jobs WHERE id = ?', [job.id],
+        );
+        if (current && current.state === 'exporting' && current.export_claim
+          && current.export_claim !== offeredClaim) {
+          return json(env, { error: 'export_in_progress' }, 409);
+        }
+        return json(env, { ok: true });
+      }
+
       await deleteJobBlobs(env.sql, env.blobs, job.id);
       return json(env, { ok: true });
     }
@@ -868,7 +917,27 @@ async function exportJob(
     */
     syntheticFloorSec: claimedJob.synthetic_floor ?? 0,
     usedRanges: usedRanges.ranges,
+    /*
+      Kept as the union of both failure modes so that a cached older bundle,
+      which knows only this field, stays conservative and abandons its
+      reservation. Newer clients read the two fields below instead, which
+      distinguish cases that are not equally bad.
+    */
     usedRangesTruncated: usedRanges.truncated || usedIncomplete,
+    /*
+      Truncation is survivable: everything dropped lies below the lowest range
+      still present, so the region above `usedRangesFloorSec` is fully
+      described and a gap found there is genuinely free.
+    */
+    usedRangesFloorSec: usedRanges.ranges.length > 0 && usedRanges.truncated
+      ? usedRanges.ranges[0].from
+      : 0,
+    /*
+      Unreadable rows are not. Their seconds could be anywhere in the window,
+      including inside a gap that looks free, so there is no region a client
+      can trust and the reservation has to be abandoned.
+    */
+    usedRangesIncomplete: usedIncomplete,
     scrobbledByServer: claimedJob.scrobbled_count,
     state: {
       totalTracks: tracks.length,

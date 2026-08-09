@@ -11,7 +11,7 @@ import { BlobStore, gzip, uploadChunk, CHUNK_TRACKS } from '../src/chunks';
 import { encryptCredential, sha256Hex, randomId, signPayload } from '../src/crypto';
 import { issueSession, SESSION_TTL_SECONDS } from '../src/session';
 import { ALGORITHM_VERSION } from '../src/handoff';
-import { handleRequest, ApiEnv, MIN_TRACKS_FOR_BACKGROUND } from '../src/api';
+import { handleRequest, ApiEnv, MIN_TRACKS_FOR_BACKGROUND, collapseToRanges } from '../src/api';
 import { assignTimestamps } from '../src/timestamps';
 
 const NOW = 1_800_000_000;
@@ -740,6 +740,45 @@ async function main() {
         && (i === 0 || r.from > body.usedRanges[i - 1].to)), body.usedRanges);
     check('a complete list is not reported as truncated',
       body.usedRangesTruncated === false, body.usedRangesTruncated);
+    check('a complete list is not reported as incomplete',
+      body.usedRangesIncomplete === false, body.usedRangesIncomplete);
+    check('a complete list needs no floor',
+      body.usedRangesFloorSec === 0, body.usedRangesFloorSec);
+  }
+
+  console.log('\n-- truncation drops the oldest ranges, not the newest --');
+  {
+    /*
+      The client searches for a free gap walking *down* from the present, so
+      the ranges it collides with first are the highest. Truncating from the
+      top removed exactly the entries that constrain it — the same
+      direction-of-retention bug that `sanitizeRanges` had on the client.
+
+      Keeping the top instead also makes truncation survivable: everything
+      dropped lies below the lowest surviving range, so the region above it is
+      completely described and the client can bound its search there rather
+      than abandoning the reservation.
+    */
+    const spaced: number[] = [];
+    for (let i = 0; i < 40; i += 1) {
+      // Deliberately non-adjacent so every second becomes its own range.
+      spaced.push(1_700_000_000 + i * 10);
+    }
+    const collapsed = collapseToRanges(spaced, 8);
+    check('reports truncation', collapsed.truncated === true);
+    check('keeps exactly the limit', collapsed.ranges.length === 8, collapsed.ranges.length);
+    check('keeps the highest ranges',
+      collapsed.ranges[collapsed.ranges.length - 1].to === 1_700_000_000 + 39 * 10,
+      collapsed.ranges);
+    check('drops the lowest ranges',
+      collapsed.ranges[0].from === 1_700_000_000 + 32 * 10, collapsed.ranges);
+    check('everything dropped lies below everything kept',
+      spaced.filter((s) => s < collapsed.ranges[0].from).length === 32);
+
+    const whole = collapseToRanges(spaced, 100);
+    check('an untruncated list is returned in full', whole.ranges.length === 40);
+    check('and is not flagged', whole.truncated === false);
+    check('an empty list is not truncation', collapseToRanges([], 8).truncated === false);
   }
 
   console.log('\n-- cancelling during an export needs that export\'s claim --');
@@ -776,6 +815,57 @@ async function main() {
       { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }));
     check('the claimant may cancel', ok.status === 200, ok.status);
     check('and the job is cancelled', (await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]))!.state === 'cancelled');
+  }
+
+  console.log('\n-- a cancel that read a stale state cannot delete a live export --');
+  {
+    /*
+      The handler loads the job once, at the top, and every action below works
+      from that snapshot. A cancel can therefore read `paused`, be descheduled
+      while another request claims the export, and resume holding a view of the
+      row that is no longer true — sailing past a guard written as an `if` and
+      deleting the blobs the live export is still reading.
+
+      Reproduced by mutating the row *between* the handler's read and its
+      write, which is exactly what the real interleaving does. The claim
+      condition lives in the UPDATE, so the database rejects it on the row as
+      it actually is rather than as the handler last saw it.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 0, state: 'paused' });
+    const token = await issueSession('listener', SIGNING, NOW);
+
+    let armed = true;
+    const racingSql: Sql = {
+      all: (q, p) => sql.all(q, p),
+      run: (q, p) => sql.run(q, p),
+      batch: (s) => sql.batch(s),
+      async first<T>(q: string, p?: unknown[]): Promise<T | null> {
+        const row = await sql.first<T>(q, p);
+        // The handler's own dispatch read is the one that must go stale.
+        if (armed && q.includes('SELECT * FROM jobs WHERE id = ?')) {
+          armed = false;
+          await sql.run(
+            "UPDATE jobs SET state = 'exporting', export_claim = ? WHERE id = ?",
+            ['a-live-export-claim', id],
+          );
+        }
+        return row;
+      },
+    };
+    const env = makeEnv(racingSql, blobs);
+
+    const blobsBefore = blobs.data.size;
+    check('the job has blobs to lose', blobsBefore > 0, blobsBefore);
+
+    const raced = await handleRequest(env, req(`/scrobblify/job/${id}/cancel`,
+      { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }));
+    check('the racing cancel is refused', raced.status === 409, raced.status);
+    check('the job is left exporting',
+      (await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]))!.state === 'exporting');
+    check('and the export still has its blobs to read',
+      blobs.data.size === blobsBefore, { before: blobsBefore, after: blobs.data.size });
   }
 
   console.log('\n-- unknown routes --');

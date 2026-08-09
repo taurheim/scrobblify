@@ -453,8 +453,17 @@ export function stateFromExport(
     uses the space that repeated cycles free up rather than only the space
     below them.
 
-    A truncated `usedRanges` is reported, and a truncated list is treated as
-    the failure it is: the gaps it appears to leave may be occupied.
+    Truncation and unreadability are reported separately and are not equally
+    bad. A truncated list drops only its lowest ranges, so everything above the
+    lowest one that survived is still completely described and a gap found
+    there is genuinely free — the search floor simply rises to meet it.
+    Unreadable rows are fatal: their seconds could sit anywhere, including
+    inside a gap that looks empty, so there is nothing left to trust and the
+    reservation is abandoned.
+
+    An older worker sends neither field. It also truncated from the wrong end,
+    so its list cannot be bounded this way; `usedRangesTruncated` alone is
+    therefore still read as fatal.
   */
   const browserBandStart = lineage && lineage.handedOverAtSec
     ? lineage.handedOverAtSec - RETAG_BACKFILL_SECONDS
@@ -475,12 +484,34 @@ export function stateFromExport(
     used.push({ from: browserBandStart, to: lineage!.handedOverAtSec! });
   }
 
-  const reserved = exported.usedRangesTruncated
+  const knowsFailureModes = typeof exported.usedRangesIncomplete === 'boolean';
+  const truncatedFloor = Number.isFinite(exported.usedRangesFloorSec)
+    && exported.usedRangesFloorSec > 0
+    ? Math.floor(exported.usedRangesFloorSec)
+    : 0;
+  // Unusable only when the seconds could be anywhere. A worker too old to say
+  // which failure it hit is assumed to have hit the fatal one.
+  const unusable = knowsFailureModes
+    ? !!exported.usedRangesIncomplete
+    : !!exported.usedRangesTruncated;
+  // Never below the window limit: a higher floor narrows the search, which is
+  // the point, but a lower one would widen it into seconds Last.fm rejects.
+  // The lineage carries its own floor from earlier cycles, and it binds here
+  // too — the browser's history is as capable of being incomplete as the
+  // worker's, and for the same reason.
+  const searchFloor = Math.max(
+    nowSec - RETAG_WINDOW_LIMIT_SECONDS,
+    knowsFailureModes ? truncatedFloor : 0,
+    (lineage && Number.isFinite(lineage.reTagKnownFromSec as any)
+      ? Number(lineage.reTagKnownFromSec) : 0),
+  );
+
+  const reserved = unusable
     ? null
     : findFreeRange(
       used,
       nowSec - PRESENT_MARGIN_SECONDS,
-      nowSec - RETAG_WINDOW_LIMIT_SECONDS,
+      searchFloor,
       RETAG_BACKFILL_SECONDS,
     );
 

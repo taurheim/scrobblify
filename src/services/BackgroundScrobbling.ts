@@ -222,6 +222,22 @@ export interface HandoffLineage {
    * landing on an earlier one.
    */
   reTagUsedRanges?: { from: number; to: number }[];
+  /**
+   * The second below which `reTagUsedRanges` is *not* known to be complete.
+   *
+   * The ranges are consumed by a gap search, and a gap search is the one use
+   * that a missing entry actively breaks: an omitted range turns an occupied
+   * stretch into an apparently free one, and allocating there loses plays
+   * silently. Two things legitimately drop entries — the cap below, and a
+   * worker export that had more ranges than it could send — and both drop the
+   * *lowest* ones, so what is lost is always describable as "everything under
+   * this second".
+   *
+   * Recording it keeps truncation survivable instead of fatal: the region
+   * above the floor is still completely described, so the search simply starts
+   * there rather than being abandoned. Zero means no knowledge is missing.
+   */
+  reTagKnownFromSec?: number;
 }
 
 /**
@@ -246,20 +262,49 @@ const MAX_LINEAGE_RANGES = 128;
  */
 const RETAG_WINDOW_LIMIT_SECONDS = 13 * 86400;
 
-function sanitizeRanges(raw: unknown): { from: number; to: number }[] {
-  if (!Array.isArray(raw)) { return []; }
+/**
+ * Applies the retention rules, reporting what the cap cost.
+ *
+ * `droppedBelowSec` is the lowest second still described when the cap had to
+ * discard something, and 0 when nothing correctness-bearing was lost. Ageing a
+ * range out past Last.fm's window is not a loss and never sets it: nothing can
+ * be scrobbled into those seconds any more, so their absence cannot mislead a
+ * gap search.
+ */
+function capRanges(raw: unknown): {
+  ranges: { from: number; to: number }[]; droppedBelowSec: number;
+} {
+  if (!Array.isArray(raw)) { return { ranges: [], droppedBelowSec: 0 }; }
   const cutoff = Math.floor(Date.now() / 1000) - RETAG_WINDOW_LIMIT_SECONDS;
-  const kept = raw
+  const valid = raw
     .filter((r): r is { from: number; to: number } => !!r
       && Number.isFinite((r as any).from) && Number.isFinite((r as any).to)
       && (r as any).from > 0 && (r as any).to >= (r as any).from
       && (r as any).to > cutoff)
     .map((r) => ({ from: Math.floor(r.from), to: Math.floor(r.to) }))
     // Highest first, so the cap drops the oldest rather than the newest.
-    .sort((a, b) => b.to - a.to)
-    .slice(0, MAX_LINEAGE_RANGES);
+    .sort((a, b) => b.to - a.to);
+  const kept = valid.slice(0, MAX_LINEAGE_RANGES);
   // Stored ascending, which is how every consumer expects to read them.
-  return kept.sort((a, b) => a.from - b.from);
+  kept.sort((a, b) => a.from - b.from);
+  return {
+    ranges: kept,
+    droppedBelowSec: valid.length > kept.length && kept.length > 0 ? kept[0].from : 0,
+  };
+}
+
+function sanitizeRanges(raw: unknown): { from: number; to: number }[] {
+  return capRanges(raw).ranges;
+}
+
+/**
+ * Combines two incompleteness floors. Higher wins: it is the more pessimistic
+ * claim, and the one that keeps a gap search inside describable ground.
+ */
+export function combineKnownFrom(a: unknown, b: unknown): number {
+  const left = Number.isFinite(a) && Number(a) > 0 ? Math.floor(Number(a)) : 0;
+  const right = Number.isFinite(b) && Number(b) > 0 ? Math.floor(Number(b)) : 0;
+  return Math.max(left, right);
 }
 
 /**
@@ -271,13 +316,18 @@ function sanitizeRanges(raw: unknown): { from: number; to: number }[] {
 export function mergeReTagRange(
   existing: { from: number; to: number }[] | undefined,
   range: { from: number; to: number } | null,
-): { from: number; to: number }[] {
+  existingKnownFromSec: unknown = 0,
+): { ranges: { from: number; to: number }[]; knownFromSec: number } {
   const all = sanitizeRanges(existing);
   if (range && Number.isFinite(range.from) && Number.isFinite(range.to)
     && range.from > 0 && range.to >= range.from) {
     all.push({ from: Math.floor(range.from), to: Math.floor(range.to) });
   }
-  return sanitizeRanges(all);
+  const capped = capRanges(all);
+  return {
+    ranges: capped.ranges,
+    knownFromSec: combineKnownFrom(existingKnownFromSec, capped.droppedBelowSec),
+  };
 }
 
 /**
@@ -290,19 +340,33 @@ export function mergeReTagRange(
  * Last.fm discards a repeat of (artist, track, timestamp) while reporting it
  * accepted, so the loss is invisible from both ends.
  *
- * `truncated` is carried through as a refusal rather than a partial merge:
- * an incomplete list would leave gaps that look free and are not.
+ * An incomplete list is merged rather than refused, which is the opposite of
+ * how the *reservation* treats one. The two uses are not symmetrical: a
+ * reservation reads the gaps between ranges and a missing range turns an
+ * occupied gap into an apparently free one, whereas the lineage is only ever a
+ * lower bound on what has been used. Every range here is real even when the
+ * set is partial, so keeping them can only widen what a later cycle avoids.
+ * Discarding the whole list because part of it was missing threw away true
+ * information and made the next allocation worse, not safer.
+ *
+ * The incompleteness itself is not discarded, though — it is what
+ * `knownFromSec` carries forward, so a later gap search knows where its
+ * knowledge stops instead of assuming the set is exhaustive.
  */
 export function mergeExportedRanges(
   existing: { from: number; to: number }[] | undefined,
   exported: unknown,
-  truncated: boolean,
-): { from: number; to: number }[] {
-  const base = sanitizeRanges(existing);
-  if (truncated) {
-    return base;
-  }
-  return sanitizeRanges([...base, ...sanitizeRanges(exported)]);
+  existingKnownFromSec: unknown = 0,
+  exportedFloorSec: unknown = 0,
+): { ranges: { from: number; to: number }[]; knownFromSec: number } {
+  const capped = capRanges([...sanitizeRanges(existing), ...sanitizeRanges(exported)]);
+  return {
+    ranges: capped.ranges,
+    knownFromSec: combineKnownFrom(
+      combineKnownFrom(existingKnownFromSec, exportedFloorSec),
+      capped.droppedBelowSec,
+    ),
+  };
 }
 
 export function setHandoffLineage(lineage: HandoffLineage): void {
@@ -321,12 +385,16 @@ export function getHandoffLineage(): HandoffLineage | null {
     const total = Number(parsed.originalTotalTracks);
     const succeeded = Number(parsed.originalSucceededCount);
     if (!Number.isFinite(total) || !Number.isFinite(succeeded)) { return null; }
+    // Re-capping on read can itself drop ranges, so the stored floor is raised
+    // by whatever that cost rather than trusted as-is.
+    const capped = capRanges(parsed.reTagUsedRanges);
     return {
       originalTotalTracks: total,
       originalSucceededCount: succeeded,
       reTagCursorSec: Number.isFinite(parsed.reTagCursorSec) ? parsed.reTagCursorSec : 0,
       handedOverAtSec: Number.isFinite(parsed.handedOverAtSec) ? parsed.handedOverAtSec : 0,
-      reTagUsedRanges: sanitizeRanges(parsed.reTagUsedRanges),
+      reTagUsedRanges: capped.ranges,
+      reTagKnownFromSec: combineKnownFrom(parsed.reTagKnownFromSec, capped.droppedBelowSec),
     };
   } catch {
     // Corrupt or unreadable. Cosmetic, so degrade rather than throw.
@@ -334,7 +402,10 @@ export function getHandoffLineage(): HandoffLineage | null {
   }
 }
 
-export function clearHandoffLineage(keepRanges?: { from: number; to: number }[]): void {
+export function clearHandoffLineage(
+  keepRanges?: { from: number; to: number }[],
+  keepKnownFromSec: unknown = 0,
+): void {
   try {
     /*
       The re-tag history outlives the lineage that carried it.
@@ -353,17 +424,22 @@ export function clearHandoffLineage(keepRanges?: { from: number; to: number }[])
       keeping the key goes too.
     */
     const existing = getHandoffLineage();
-    const ranges = keepRanges
-      ? sanitizeRanges(keepRanges)
-      : sanitizeRanges(existing ? existing.reTagUsedRanges : []);
-    if (ranges.length === 0) {
+    const capped = keepRanges
+      ? capRanges(keepRanges)
+      : capRanges(existing ? existing.reTagUsedRanges : []);
+    const knownFrom = combineKnownFrom(
+      keepRanges ? keepKnownFromSec : (existing && existing.reTagKnownFromSec),
+      capped.droppedBelowSec,
+    );
+    if (capped.ranges.length === 0) {
       window.localStorage.removeItem(LINEAGE_STORAGE_KEY);
       return;
     }
     window.localStorage.setItem(LINEAGE_STORAGE_KEY, JSON.stringify({
       originalTotalTracks: 0,
       originalSucceededCount: 0,
-      reTagUsedRanges: ranges,
+      reTagUsedRanges: capped.ranges,
+      reTagKnownFromSec: knownFrom,
     }));
   } catch {
     // Nothing to do.
