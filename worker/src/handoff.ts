@@ -61,6 +61,7 @@ export interface HandoffRow {
   job_id: string | null;
   exchange_attempts: number;
   failure_reason: string | null;
+  import_id: string | null;
   created_at: number;
   updated_at: number;
   expires_at: number;
@@ -72,6 +73,13 @@ export interface PreflightRequest {
   trackCount: number;
   chunkCount: number;
   declaredBytes: number;
+  /**
+   * Stable identity of the browser-side queue. Optional because a cached
+   * bundle built before this existed will keep omitting it, and refusing those
+   * clients outright would break the feature for exactly the users least able
+   * to notice why.
+   */
+  importId?: string | null;
 }
 
 export type PreflightResult =
@@ -124,6 +132,7 @@ export async function preflight(
       chunkCount: req.chunkCount,
       declaredBytes: req.declaredBytes,
       algorithmVersion: ALGORITHM_VERSION,
+      importId: req.importId ?? null,
     },
     nowSec,
     HANDOFF_TTL_SECONDS,
@@ -251,9 +260,9 @@ export async function handleCallback(
                 session_key_ct, session_key_iv, algorithm_version, schema_version,
                 total_tracks, cursor, scrobbled_count, failed_count,
                 last_run_at, next_eligible_at, consecutive_failures,
-                daily_window_count, probing, created_at, updated_at,
+                daily_window_count, probing, import_id, created_at, updated_at,
                 credential_expires_at
-              ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?, 1, ?, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?)`,
+              ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?, 1, ?, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
       params: [
         jobId,
         handoff.username,
@@ -262,6 +271,10 @@ export async function handleCallback(
         encrypted.iv,
         handoff.algorithm_version,
         handoff.track_count,
+        // Copied, not referenced. The handoff row is reaped and its columns go
+        // stale, but the question "was this queue handed over" has to stay
+        // answerable for as long as the job's own record does.
+        handoff.import_id ?? null,
         nowSec,
         nowSec,
         nowSec + CREDENTIAL_TTL_SECONDS,

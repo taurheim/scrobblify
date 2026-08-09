@@ -119,6 +119,11 @@ export interface JobRow {
   export_claim: string | null;
   /** State to restore when an `exporting` claim lapses or completes. */
   export_prev_state: string | null;
+  /**
+   * The browser-side queue this job was created from. NULL for jobs created
+   * before migration 004, and for clients that do not send one.
+   */
+  import_id: string | null;
   created_at: number;
   updated_at: number;
   credential_expires_at: number;
@@ -533,6 +538,13 @@ export async function reserveSlot(
     chunkCount: number;
     declaredBytes: number;
     algorithmVersion: number;
+    /**
+     * Identifies the browser-side queue this handoff was built from. Absent
+     * from clients built before it existed, and from every row created before
+     * migration 004 — see the note there on why "unknown" is a real answer
+     * rather than a defect.
+     */
+    importId?: string | null;
   },
   nowSec: number,
   ttlSeconds: number,
@@ -560,8 +572,8 @@ export async function reserveSlot(
       `INSERT INTO handoffs (
          id, state, username, live_username, payload_digest, track_count,
          chunk_count, declared_bytes, algorithm_version, exchange_attempts,
-         created_at, updated_at, expires_at
-       ) VALUES (?, 'issued', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+         import_id, created_at, updated_at, expires_at
+       ) VALUES (?, 'issued', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
       [
         handoff.id,
         handoff.username,
@@ -571,6 +583,7 @@ export async function reserveSlot(
         handoff.chunkCount,
         handoff.declaredBytes,
         handoff.algorithmVersion,
+        handoff.importId ?? null,
         nowSec,
         nowSec,
         nowSec + ttlSeconds,

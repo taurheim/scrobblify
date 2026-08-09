@@ -36,6 +36,16 @@ export const MIN_TRACKS_FOR_BACKGROUND = 2700;
 const SIGNIN_TTL_SECONDS = 900;
 
 /**
+ * Shortest import id `/scrobblify/import/:id` will answer about.
+ *
+ * The route is public because the id itself is the capability, which only
+ * holds while the id is unguessable. The client mints 128 bits; this floor
+ * exists so a client that gets that wrong — or a hand-typed probe — is refused
+ * rather than turning a capability lookup into an enumeration endpoint.
+ */
+const MIN_IMPORT_ID_LENGTH = 16;
+
+/**
  * How long a take-back holds a job in `exporting` before it reverts to
  * `paused`. Long enough for a client to read a large export and cancel;
  * short enough that an abandoned take-back does not park a job for hours.
@@ -241,6 +251,13 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         trackCount: Number(body.trackCount),
         chunkCount: Number(body.chunkCount),
         declaredBytes: Number(body.declaredBytes),
+        // Validated rather than trusted: it is echoed back by a public route,
+        // and the same character class the route's path pattern accepts is the
+        // only thing that can round-trip through it.
+        importId: typeof body.importId === 'string'
+          && /^[\w-]{16,128}$/.test(body.importId)
+          ? body.importId
+          : null,
       },
       env.signingKey,
       env.callbackUrl,
@@ -430,6 +447,88 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       [name, name],
     );
     return json(env, { ok: true, live: live !== null });
+  }
+
+  /*
+    ---- "has this exact queue been handed over?", without a session ----
+
+    `/job/live` answers a question about a *user*, and that is not quite the
+    question the client has to answer. `live:false` means nothing is sending
+    right now; it does not mean a saved local queue is safe. A worker can
+    scrobble 20,000 tracks and then complete, or hit `needs_reauth`, and a
+    browser that still holds the same import then sees "not live" and replays
+    all 20,000. Last.fm discards a repeat of (artist, track, timestamp)
+    silently while reporting it accepted, so nobody finds out.
+
+    `importId` is minted by the browser when the user makes a selection and
+    travels with the handoff onto the job (migration 004), so this stays
+    answerable from any device, after the session is gone, and after the job
+    has finished.
+
+    Public, like `/job/live`, but for a different reason. That route is public
+    because losing the session is one of the cases it exists to catch; this one
+    is public because the id *is* the credential. It is high-entropy and held
+    only by a browser that already has the queue, so requiring a session would
+    gate the answer on something strictly weaker than what the caller already
+    demonstrated by knowing the id.
+
+    Which is also why the minimum length below is a real check and not
+    politeness: a short or empty id would turn a capability into an
+    enumeration.
+
+    `cursor` is the contiguous terminal prefix — the only figure the client can
+    safely skip past. `scrobbledCount` is for display and is deliberately not
+    the same number: a batch can contain accepted and permanently failed
+    entries at once, so progress is not a prefix.
+  */
+  const importMatch = path.match(/^\/scrobblify\/import\/([\w-]+)$/);
+  if (importMatch && request.method === 'GET') {
+    const importId = importMatch[1];
+    if (importId.length < MIN_IMPORT_ID_LENGTH) {
+      return json(env, { ok: false, reason: 'bad_request' }, 400);
+    }
+    /*
+      One statement, for the same reason `/job/live` is one: ownership migrates
+      from the handoff row to the job row, and two reads can straddle that.
+
+      Handoffs that already produced a job are excluded — the job row carries
+      the same id and better numbers, and counting both would let the older,
+      emptier handoff row win the ordering.
+
+      Ordering prefers a live row, then the most recent. Re-handing a queue
+      back and forth creates one row per attempt, and it is the current one
+      that decides whether the browser may send.
+    */
+    const row = await env.sql.first<{
+      state: string; is_live: number; cursor: number;
+      scrobbled_count: number; total_tracks: number; created_at: number;
+    }>(
+      `SELECT state AS state,
+              CASE WHEN live_username IS NULL THEN 0 ELSE 1 END AS is_live,
+              cursor AS cursor, scrobbled_count AS scrobbled_count,
+              total_tracks AS total_tracks, created_at AS created_at
+         FROM jobs WHERE import_id = ?
+       UNION ALL
+       SELECT state,
+              CASE WHEN live_username IS NULL THEN 0 ELSE 1 END,
+              0, 0, track_count, created_at
+         FROM handoffs WHERE import_id = ? AND job_id IS NULL
+       ORDER BY is_live DESC, created_at DESC
+       LIMIT 1`,
+      [importId, importId],
+    );
+    if (!row) {
+      return json(env, { ok: true, known: false, live: false });
+    }
+    return json(env, {
+      ok: true,
+      known: true,
+      live: row.is_live === 1,
+      state: row.state,
+      cursor: Number(row.cursor),
+      scrobbledCount: Number(row.scrobbled_count),
+      totalTracks: Number(row.total_tracks),
+    });
   }
 
   // Everything below needs a session.

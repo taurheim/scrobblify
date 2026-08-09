@@ -100,6 +100,7 @@ const req = (username: string, trackCount = 10_000) => ({
   trackCount,
   chunkCount: 2,
   declaredBytes: 5000,
+  importId: 'import-id-0123456789abcdef',
 });
 
 async function addChunks(
@@ -211,6 +212,14 @@ async function main() {
     )) === 'sk-for-Alice-tok');
   check('credential TTL recorded', job.credential_expires_at > NOW);
   check('algorithm version pinned', job.algorithm_version === 1);
+  /*
+    Copied onto the job rather than read back through the handoff. The handoff
+    row is reaped, but "was this queue handed over, and how far did it get" has
+    to stay answerable for as long as the job's own record survives — that is
+    the entire point of the identity.
+  */
+  check('the import id follows the queue onto the job',
+    job.import_id === 'import-id-0123456789abcdef', job.import_id);
 
   console.log('\n-- callback: replay --');
   const replay = await handleCallback(

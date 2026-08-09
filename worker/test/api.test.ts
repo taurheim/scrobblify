@@ -118,17 +118,20 @@ function tracksNdjson(count: number, reTagged = false): Uint8Array {
 
 async function seedJob(sql: Sql, blobs: BlobStore, username: string, opts: {
   total?: number; cursor?: number; live?: boolean; state?: string; reTagged?: boolean;
+  importId?: string; scrobbled?: number;
 } = {}): Promise<string> {
   const total = opts.total ?? 100;
   const id = randomId();
   const cred = await encryptCredential('sk', CRED, id);
   await sql.run(
     `INSERT INTO jobs (id, username, live_username, state, algorithm_version, total_tracks,
-        cursor, session_key_ct, session_key_iv, created_at, updated_at, credential_expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        cursor, scrobbled_count, import_id, session_key_ct, session_key_iv,
+        created_at, updated_at, credential_expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id, username, opts.live === false ? null : username, opts.state ?? 'active',
-      ALGORITHM_VERSION, total, opts.cursor ?? 0, cred.ciphertext, cred.iv,
+      ALGORITHM_VERSION, total, opts.cursor ?? 0, opts.scrobbled ?? 0,
+      opts.importId ?? null, cred.ciphertext, cred.iv,
       NOW, NOW, NOW + 60 * 86400,
     ],
   );
@@ -245,6 +248,76 @@ async function main() {
         .live === true);
   }
 
+  console.log('\n-- the unauthenticated import lookup --');
+  {
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const IMPORT = 'import-id-0123456789abcdef';
+
+    const unknown = await handleRequest(env, req(`/scrobblify/import/${IMPORT}`));
+    const unknownBody: any = await unknown.json();
+    check('answers without a session', unknown.status === 200, unknown.status);
+    check('an unhanded queue is not known', unknownBody.known === false, unknownBody);
+    check('and is reported idle', unknownBody.live === false, unknownBody);
+
+    check('a short id is refused rather than answered',
+      (await handleRequest(env, req('/scrobblify/import/short'))).status === 400);
+
+    const jobId = await seedJob(sql, blobs, 'listener', {
+      importId: IMPORT, total: 5000, cursor: 1200, scrobbled: 1190,
+    });
+    const live: any = await (await handleRequest(env, req(`/scrobblify/import/${IMPORT}`))).json();
+    check('a handed-over queue is known', live.known === true, live);
+    check('and reported live while it can send', live.live === true, live);
+    check('reports the contiguous prefix, not the progress count',
+      live.cursor === 1200 && live.scrobbledCount === 1190, live);
+
+    /*
+      The case this endpoint exists for, and the one `/job/live` gets wrong.
+      A completed job clears live_username, so the user-scoped question says
+      "nothing is running" — which is true, and which a browser still holding
+      the queue would read as permission to send all 5,000 again.
+    */
+    await sql.run(
+      "UPDATE jobs SET state = 'completed', live_username = NULL, cursor = 5000 WHERE id = ?",
+      [jobId],
+    );
+    const userScoped: any = await (await handleRequest(
+      env, req('/scrobblify/job/live?username=listener'),
+    )).json();
+    check('the user-scoped question reports idle once the job completes',
+      userScoped.live === false, userScoped);
+    const done: any = await (await handleRequest(env, req(`/scrobblify/import/${IMPORT}`))).json();
+    check('but the queue is still known to have been handed over',
+      done.known === true, done);
+    check('with the finished cursor, so the browser can skip what was sent',
+      done.cursor === 5000 && done.state === 'completed', done);
+
+    // A second handover of the same queue: the current attempt decides.
+    await seedJob(sql, blobs, 'listener', { importId: IMPORT, total: 3800, cursor: 40 });
+    const again: any = await (await handleRequest(env, req(`/scrobblify/import/${IMPORT}`))).json();
+    check('a live re-handover wins over the finished one',
+      again.live === true && again.cursor === 40, again);
+
+    // A handoff that has not produced a job yet is still a handover.
+    await sql.run(
+      `INSERT INTO handoffs (id, state, username, live_username, payload_digest,
+          track_count, chunk_count, declared_bytes, algorithm_version, import_id,
+          created_at, updated_at, expires_at)
+       VALUES ('h-imp', 'issued', 'other', 'other', 'd', 5000, 1, 10, ?, ?, ?, ?, ?)`,
+      [ALGORITHM_VERSION, 'pending-import-0123456789', NOW, NOW, NOW + 3600],
+    );
+    const pending: any = await (await handleRequest(
+      env, req('/scrobblify/import/pending-import-0123456789'),
+    )).json();
+    check('an in-flight handoff with no job yet is known and live',
+      pending.known === true && pending.live === true, pending);
+
+    check('the id is the credential, so it says nothing about who owns it',
+      pending.username === undefined && pending.jobId === undefined, Object.keys(pending));
+  }
+
   console.log('\n-- preflight --');
   {
     const sql = freshSql();
@@ -289,6 +362,57 @@ async function main() {
       method: 'POST', body: 'not json',
     }));
     check('malformed JSON is a 400, not a 500', badBody.status === 400);
+  }
+
+  console.log('\n-- the import id survives preflight --');
+  {
+    const sql = freshSql();
+    const env = makeEnv(sql, new MemoryBlobs());
+    const send = (importId: unknown) => handleRequest(env, req('/scrobblify/handoff/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: randomId(),
+        payloadDigest: 'abc',
+        trackCount: 40000,
+        chunkCount: 40,
+        declaredBytes: 1000,
+        importId,
+      }),
+    }));
+
+    const ok: any = await (await send('import-id-0123456789abcdef')).json();
+    check('a well-formed id is stored on the handoff',
+      (await sql.first<any>('SELECT import_id FROM handoffs WHERE id = ?', [ok.handoffId]))
+        .import_id === 'import-id-0123456789abcdef');
+
+    // Nothing here may refuse the handoff: a cached bundle predating this
+    // field must still be able to hand over, and a client sending rubbish
+    // should degrade to "no identity" rather than lose the whole feature.
+    const none: any = await (await send(undefined)).json();
+    check('an absent id is accepted and left null',
+      none.ok === true
+      && (await sql.first<any>('SELECT import_id FROM handoffs WHERE id = ?', [none.handoffId]))
+        .import_id === null, none);
+
+    const short: any = await (await send('tooshort')).json();
+    check('an id too short to be a capability is dropped, not stored',
+      short.ok === true
+      && (await sql.first<any>('SELECT import_id FROM handoffs WHERE id = ?', [short.handoffId]))
+        .import_id === null, short);
+
+    // The route matches [\w-]+, so anything else could be stored and then be
+    // permanently unreadable through the endpoint that exists to read it.
+    const bad: any = await (await send('has/slash and spaces')).json();
+    check('an id the lookup route could not match is dropped',
+      bad.ok === true
+      && (await sql.first<any>('SELECT import_id FROM handoffs WHERE id = ?', [bad.handoffId]))
+        .import_id === null, bad);
+
+    const wrongType: any = await (await send(12345)).json();
+    check('a non-string id is dropped rather than coerced',
+      wrongType.ok === true
+      && (await sql.first<any>('SELECT import_id FROM handoffs WHERE id = ?', [wrongType.handoffId]))
+        .import_id === null, wrongType);
   }
 
   console.log('\n-- authentication --');
