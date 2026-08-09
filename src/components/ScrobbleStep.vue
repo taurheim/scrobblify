@@ -161,6 +161,20 @@ const NETWORK_ERROR_COOLDOWN_SECONDS = Math.ceil(NETWORK_ERROR_COOLDOWN_MS / MS_
 // window saturated by an earlier session has to drain before we can start.
 const PACING_COUNTDOWN_THRESHOLD_MS = 10 * MS_PER_SECOND;
 
+// How many consecutive tracks must need *no* wait before a pacing stretch is
+// considered over.
+//
+// A saturated rolling window frees exactly one slot at a time and the loop
+// consumes it immediately, so `msUntilBurstSafe()` alternates between a small
+// positive wait and zero on every single track. Ending the stretch on the first
+// zero therefore ended it once per track: telemetry showed a median
+// `paced_tracks` of 1 with waits of 4-40ms, i.e. two events per track rather
+// than one per stretch. At saturation two zero-wait tracks in a row are
+// impossible, so requiring a short streak keeps one continuous stretch, while
+// still exiting promptly when the window genuinely clears or the adaptive
+// burst limit is raised and frees a block of slots at once.
+const PACING_EXIT_CLEAR_TRACKS = 3;
+
 const MAX_CONSECUTIVE_FAILURES = 10;
 
 // Re-tagged plays (see Scrobble.reTagged) are stamped at send time, starting
@@ -225,6 +239,9 @@ export default Vue.extend({
       pacingStartedAtMs: 0,
       pacedTracks: 0,
       pacedWaitMs: 0,
+      // Consecutive tracks that needed no pacing wait. See
+      // PACING_EXIT_CLEAR_TRACKS — a single free slot does not end a stretch.
+      unpacedStreak: 0,
       // Mirrors of RateLimitTracker state. The tracker itself is deliberately
       // non-reactive (see created()), so these are refreshed explicitly.
       burstCount: 0,
@@ -383,6 +400,7 @@ export default Vue.extend({
      * to call unconditionally — it is a no-op when we were not pacing.
      */
     endPacing() {
+      this.unpacedStreak = 0;
       if (!this.pacing) {
         return;
       }
@@ -493,6 +511,7 @@ export default Vue.extend({
           // Reported once for the whole stretch, not once per track: the window
           // only ever frees one slot at a time, so this branch is taken for
           // every remaining track once the limit is reached.
+          this.unpacedStreak = 0;
           this.beginPacing(tracker, burstWaitMs);
           this.pacedTracks += 1;
           this.pacedWaitMs += burstWaitMs;
@@ -508,8 +527,14 @@ export default Vue.extend({
             await this.sleep(burstWaitMs);
           }
           this.syncRateLimitCounters();
-        } else {
-          this.endPacing();
+        } else if (this.pacing) {
+          // One free slot is not the end of a throttled stretch — it is the one
+          // slot this track is about to consume, after which the window is full
+          // again. Only a run of genuinely unimpeded tracks means we are clear.
+          this.unpacedStreak += 1;
+          if (this.unpacedStreak >= PACING_EXIT_CLEAR_TRACKS) {
+            this.endPacing();
+          }
         }
 
         // Daily ceiling: a rolling 24h window, so it frees up gradually rather

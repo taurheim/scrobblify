@@ -773,6 +773,114 @@ test.describe('Session Resume', () => {
     expect(finished).toBe(true);
   });
 
+  test('a throttled stretch is continuous, it does not restart on every freed slot', async ({ page }) => {
+    // Regression: the stretch ended the moment `msUntilBurstSafe()` returned 0.
+    // But a saturated window frees exactly one slot, which the very next track
+    // consumes — so the state flapped once per track, and what should have been
+    // a single pacing stretch became one begin/end pair per scrobble. Telemetry
+    // showed a median `paced_tracks` of 1 with waits of 4-40ms.
+    test.setTimeout(120000);
+    await interceptLastFm(page);
+    // Every reply takes the same time, so the reproduction does not hinge on
+    // browser overhead landing inside some window. The alternation comes from
+    // the seeded history instead (see below), which the app cannot outrun.
+    const REPLY_MS = 600;
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        await new Promise((resolve) => { setTimeout(resolve, REPLY_MS); });
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+
+    // A full window, seeded so that slots free in *pairs*: two sends share an
+    // expiry, then nothing for SLOT_PAIR_GAP_MS. That makes the alternation
+    // structural rather than a race — the first track of each pair always waits
+    // and the second always finds a slot already free, whatever the machine is
+    // doing. Real histories produce the same alternation through network jitter
+    // around the steady-state spacing, just less predictably.
+    //
+    // The pairs are spread to just under the full 10 minute window so the oldest
+    // is about to expire; bunching them tighter would leave the window blocked
+    // for minutes before the first slot appeared.
+    const SLOT_PAIR_GAP_MS = 2400;
+    const SETUP_LEAD_MS = 8000;
+    const anchor = Date.now() + SETUP_LEAD_MS;
+    const sendTimestamps = Array.from({ length: 500 }, (_, k) => {
+      const pair = Math.floor(k / 2);
+      // The +1 keeps the array strictly ascending without meaningfully
+      // separating the two halves of a pair.
+      return anchor - (249 - pair) * SLOT_PAIR_GAP_MS + (k % 2);
+    });
+    const tracks = Array.from({ length: 24 }, (_, n) => ({
+      track: `Track ${n + 1}`,
+      artist: `Artist ${n + 1}`,
+      album: '',
+      timestamp: Date.UTC(2024, 0, n + 1),
+    }));
+    await seedSavedState(page, buildState({
+      totalTracks: 24,
+      completedIndices: [],
+      tracks,
+      originalTotalTracks: 24,
+      originalSucceededCount: 0,
+      sendTimestamps,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=24 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    const notice = page.locator('text=Pacing to stay under');
+    await expect(notice).toBeVisible({ timeout: 20000 });
+
+    // Count how often the notice comes *back* after going away. Counting
+    // reappearances rather than disappearances deliberately ignores the last
+    // one, which is the stretch legitimately ending as the queue drains.
+    let everVisible = false;
+    let hiddenSinceVisible = false;
+    let reappearances = 0;
+    let finished = false;
+    for (let i = 0; i < 1200 && !finished; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await page.waitForTimeout(50);
+      // eslint-disable-next-line no-await-in-loop
+      const visible = await notice.isVisible();
+      if (visible) {
+        if (hiddenSinceVisible) {
+          reappearances += 1;
+          hiddenSinceVisible = false;
+        }
+        everVisible = true;
+      } else if (everVisible) {
+        hiddenSinceVisible = true;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      finished = await page.locator('text=Finished scrobbling').isVisible();
+    }
+
+    expect(finished).toBe(true);
+    // The window stays saturated for the whole run, so there is exactly one
+    // stretch and it should never have restarted.
+    expect(reappearances).toBe(0);
+  });
+
   test('a manual pause saves, offers a way back, and does not re-send the in-flight track', async ({ page }) => {
     // Regression: "Pause & Save" set `paused` but not `stopped`, so the paused
     // panel rendered a *disabled* "Wait Here" button and waited forever for an
