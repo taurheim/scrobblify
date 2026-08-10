@@ -199,8 +199,8 @@ export function adoptJournalledSecond(state: ScrobbleState): ScrobbleState {
   // fills a gap.
   if (state.pendingReTagTimestampSec) { return state; }
   if (!state.importId) { return state; }
-  const journal = api.inFlightSecond();
-  if (!journal || journal.importId !== state.importId) { return state; }
+  const journal = api.inFlightSecond(state.importId);
+  if (!journal) { return state; }
   let head: Scrobble | undefined;
   try {
     const all = StateManager.deserializeScrobbles(state.tracks);

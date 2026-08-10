@@ -497,18 +497,47 @@ export interface InFlightSecond {
   importId: string;
   trackKey: string;
   sec: number;
+  /** When the record was written, used only to age abandoned ones out. */
+  at: number;
 }
 
 /**
- * The stable name a journalled second is bound to.
+ * A handful of records, not one.
  *
- * Shared rather than duplicated: the send loop writes these keys and the
- * handoff reads them, and a key derived two slightly different ways is a key
- * that never matches — which fails silently, as a missing pin rather than an
- * error.
+ * A single slot means the next queue to send overwrites the record an earlier
+ * one's crash recovery depends on — and that earlier queue is exactly the one
+ * that cannot be asked, because it is not running. Its play stays at Last.fm
+ * under a second nothing remembers, and its resume invents another.
+ *
+ * Capped because this is unbounded otherwise, and aged out because a record
+ * older than Last.fm's collision window can no longer deduplicate anything:
+ * repeating that second would be stored as a new play rather than discarded.
  */
-export function journalTrackKey(artist: string, track: string, timestampMs: number): string {
-  return `${artist}\u0000${track}\u0000${timestampMs}`;
+const IN_FLIGHT_MAX_RECORDS = 4;
+const IN_FLIGHT_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+
+function readJournal(): InFlightSecond[] {
+  try {
+    const raw = window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY);
+    if (!raw) { return []; }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) { return []; }
+    const cutoff = Date.now() - IN_FLIGHT_TTL_MS;
+    return parsed.filter((r) => (
+      r
+      && typeof r.importId === 'string' && r.importId
+      && typeof r.trackKey === 'string' && r.trackKey
+      && Number.isFinite(Number(r.sec)) && Number(r.sec) > 0
+      && Number.isFinite(Number(r.at)) && Number(r.at) > cutoff
+    )).map((r) => ({
+      importId: r.importId as string,
+      trackKey: r.trackKey as string,
+      sec: Number(r.sec),
+      at: Number(r.at),
+    }));
+  } catch {
+    return [];
+  }
 }
 
 export function recordInFlightSecond(importId: string, trackKey: string, sec: number): boolean {
@@ -523,51 +552,74 @@ export function recordInFlightSecond(importId: string, trackKey: string, sec: nu
   */
   if (!importId || !trackKey || !Number.isFinite(sec) || sec <= 0) { return false; }
   try {
-    const record = JSON.stringify({ importId, trackKey, sec });
-    window.localStorage.setItem(IN_FLIGHT_STORAGE_KEY, record);
+    // Only this queue's own previous record is displaced: a queue has one send
+    // in flight at a time, so its earlier second is either resolved or has
+    // been superseded by this one.
+    const kept = readJournal().filter((r) => r.importId !== importId);
+    const record: InFlightSecond = {
+      importId, trackKey, sec, at: Date.now(),
+    };
+    const next = [record, ...kept].slice(0, IN_FLIGHT_MAX_RECORDS);
+    const encoded = JSON.stringify(next);
+    window.localStorage.setItem(IN_FLIGHT_STORAGE_KEY, encoded);
     // Read back, because the caller is about to decide whether it is safe to
     // send on the strength of this. A quota failure that throws is caught
     // below; one that silently stores nothing is not, and private-mode
     // storage has historically done both.
-    return window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY) === record;
+    return window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY) === encoded;
   } catch {
     return false;
   }
 }
 
-export function inFlightSecond(): InFlightSecond | null {
-  try {
-    const raw = window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY);
-    if (!raw) { return null; }
-    const parsed = JSON.parse(raw);
-    const sec = Number(parsed.sec);
-    if (!Number.isFinite(sec) || sec <= 0) { return null; }
-    if (typeof parsed.trackKey !== 'string' || !parsed.trackKey) { return null; }
-    if (typeof parsed.importId !== 'string' || !parsed.importId) { return null; }
-    return { importId: parsed.importId, trackKey: parsed.trackKey, sec };
-  } catch {
-    return null;
-  }
+/**
+ * The record this queue left behind, if any.
+ *
+ * Takes the identity rather than returning "whatever is there", because a
+ * record belonging to another queue names a different play, and adopting it
+ * would put this queue's next track under a second that queue may still be
+ * waiting on.
+ */
+export function inFlightSecond(importId: string): InFlightSecond | null {
+  if (!importId) { return null; }
+  return readJournal().find((r) => r.importId === importId) || null;
 }
 
 /**
  * Forgets the record, but only when it is the caller's own.
  *
- * The key is origin-global while the thing it describes belongs to one queue,
- * so an unconditional clear lets any part of the app delete a second another
- * queue's send is riding on — after which a crash mid-send can no longer be
- * recovered from, and the retry invents a duplicate. The send lock keeps two
- * *senders* apart, but selecting a new import happens outside it.
+ * The store is origin-global while each record belongs to one queue, so an
+ * unconditional clear lets any part of the app delete a second another queue's
+ * send is riding on — after which a crash mid-send can no longer be recovered
+ * from, and the retry invents a duplicate. The send lock keeps two *senders*
+ * apart, but selecting a new import happens outside it.
  */
 export function clearInFlightSecond(importId: string, trackKey: string): void {
-  const existing = inFlightSecond();
-  if (!existing) { return; }
-  if (existing.importId !== importId || existing.trackKey !== trackKey) { return; }
+  if (!importId || !trackKey) { return; }
   try {
-    window.localStorage.removeItem(IN_FLIGHT_STORAGE_KEY);
+    const existing = readJournal();
+    const kept = existing.filter((r) => r.importId !== importId || r.trackKey !== trackKey);
+    if (kept.length === existing.length) { return; }
+    if (kept.length === 0) {
+      window.localStorage.removeItem(IN_FLIGHT_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify(kept));
   } catch {
     // Nothing to do.
   }
+}
+
+/**
+ * The stable name a journalled second is bound to.
+ *
+ * Shared rather than duplicated: the send loop writes these keys and the
+ * handoff reads them, and a key derived two slightly different ways is a key
+ * that never matches — which fails silently, as a missing pin rather than an
+ * error.
+ */
+export function journalTrackKey(artist: string, track: string, timestampMs: number): string {
+  return `${artist}\u0000${track}\u0000${timestampMs}`;
 }
 
 export function clearHandoffLineage(

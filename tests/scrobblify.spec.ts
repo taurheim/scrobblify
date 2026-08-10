@@ -860,9 +860,69 @@ test.describe('Session Resume', () => {
       cannot have been handed over, so a fresh name takes nothing away.
     */
     expect(journals.length).toBeGreaterThan(0);
-    const record = JSON.parse(journals[0] as string);
+    const record = JSON.parse(journals[0] as string)[0];
     expect(record.importId).toBeTruthy();
     expect(record.importId.length).toBeGreaterThanOrEqual(16);
+  });
+
+  test('an identity that could not be written to disk is not sent under', async ({ page }) => {
+    const sent: number[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        sent.push(Number(params.get('timestamp[0]') || '0'));
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    const reTagged = [1, 2, 3, 4, 5].map((n) => ({
+      track: `Track ${n}`,
+      artist: `Artist ${n}`,
+      album: `Album ${n}`,
+      timestamp: Date.UTC(2024, 0, n),
+      reTagged: true,
+    }));
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState({ tracks: reTagged }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    // Broken only after the state has been read back, so the queue itself
+    // still resumes and only the write fails.
+    await page.evaluate(() => {
+      // eslint-disable-next-line func-names
+      IDBObjectStore.prototype.put = function () { throw new Error('disk full'); };
+    });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    /*
+      Minting an identity in memory is not minting one. Every journalled second
+      is bound to it, so if the disk never learns the name, the reloaded queue
+      cannot claim any of the records written under it: a crash mid-send leaves
+      a play at Last.fm whose second is recorded against an import that, as far
+      as the disk is concerned, never existed. The resume picks a fresh second
+      and duplicates it.
+
+      `autoSave` swallows a failed write — nothing is normally waiting on one —
+      so this has to go through the awaitable channel and refuse on failure.
+    */
+    await expect(page.locator('text=risk duplicating them')).toBeVisible({ timeout: 15000 });
+    expect(sent).toHaveLength(0);
   });
 
   test('a resumed session reports overall progress, not just the remaining chunk', async ({ page }) => {
@@ -1669,7 +1729,7 @@ test.describe('Re-tagged old plays', () => {
     */
     const raw = journalDuringFirstSend[0];
     expect(raw).toBeTruthy();
-    const journal = JSON.parse(raw as string);
+    const [journal] = JSON.parse(raw as string);
     expect(journal.sec).toBe(timestamps[0]);
     expect(journal.importId).toBeTruthy();
     expect(journal.trackKey).toBeTruthy();
@@ -1714,39 +1774,64 @@ test.describe('Re-tagged old plays', () => {
     */
     expect(timestamps).toHaveLength(0);
     await expect(page.locator('.overall-progress')).toContainText('0 of 5');
-  });
-
-  test('a journal belonging to another queue is not erased by this one', async ({ page }) => {
-    const foreign = JSON.stringify({
-      importId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      trackKey: 'Some Artist\u0000Some Track\u00001700000000000',
-      sec: 1700000000,
-    });
-
-    await runReTaggedImport(page, async (attempt) => {
-      // Planted on the last send, so nothing after it allocates a second and
-      // overwrites the record before the clear under test runs.
-      if (attempt === 5) {
-        await page.evaluate(
-          (record) => window.localStorage.setItem('scrobblify.background.inflightSecond', record),
-          foreign,
-        );
-      }
-      return { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } };
-    });
 
     /*
-      One origin-global key describes one queue's in-flight send, so a clear
-      that does not check whose record it is deletes whatever is there. The
-      sender lock keeps two send loops apart, but choosing a new import happens
-      outside it — and the record it would delete is the only evidence of a
-      second some other queue may already have a play sitting under. Losing it
-      turns a recoverable crash into a duplicate.
+      And nothing was left on the queue pretending to be a second in flight.
+      The component and store copies are written before the journal is
+      attempted, so saving with them still set would put a pin on the disk that
+      no request is riding on — where the resume reads it as *inherited*,
+      refuses to re-time it on principle, and reports a play as permanently
+      failed that was never even sent.
+    */
+    const savedPin = await page.evaluate(async () => new Promise<number>((resolve) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onsuccess = () => {
+        const db = request.result;
+        const read = db.transaction('scrobbleState', 'readonly')
+          .objectStore('scrobbleState').get('current');
+        read.onsuccess = () => {
+          db.close();
+          resolve((read.result && read.result.pendingReTagTimestampSec) || 0);
+        };
+        read.onerror = () => { db.close(); resolve(-1); };
+      };
+      request.onerror = () => resolve(-1);
+    }));
+    expect(savedPin).toBe(0);
+  });
+
+  test('a journal belonging to another queue is neither erased nor overwritten', async ({ page }) => {
+    const foreignId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const foreignKey = 'Some Artist\u0000Some Track\u00001700000000000';
+
+    // Planted before anything runs: an earlier import that crashed between
+    // choosing a second and hearing whether Last.fm stored the play.
+    await page.addInitScript(([id, key]) => {
+      window.localStorage.setItem('scrobblify.background.inflightSecond', JSON.stringify([
+        {
+          importId: id, trackKey: key, sec: 1700000000, at: Date.now(),
+        },
+      ]));
+    }, [foreignId, foreignKey]);
+
+    await runReTaggedImport(page, { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } });
+
+    /*
+      Each record belongs to one queue, and the queue it belongs to is the only
+      one that can resolve it — which is precisely the queue that is not
+      running. Clearing or overwriting it leaves that import's play sitting at
+      Last.fm under a second nothing remembers, and its resume invents another.
+
+      So this import's five sends must neither displace the record nor delete
+      it on their way past.
     */
     const afterRun = await page.evaluate(
       () => window.localStorage.getItem('scrobblify.background.inflightSecond'),
     );
-    expect(afterRun).toBe(foreign);
+    const records = JSON.parse(afterRun as string);
+    expect(records).toEqual([
+      expect.objectContaining({ importId: foreignId, trackKey: foreignKey, sec: 1700000000 }),
+    ]);
   });
 
   test('a rejection that is not about the timestamp is not retried', async ({ page }) => {

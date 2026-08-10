@@ -802,8 +802,20 @@ export default Vue.extend({
       const minted = StateManager.newImportId();
       if (!minted) { return false; }
       this.$store.commit('setImportId', minted);
+      /*
+        `autoSave` is the wrong door here: it swallows a failed write, because
+        nothing is normally waiting on one. Something is waiting on this one —
+        an identity that exists only in memory is not an identity a crash can
+        be recovered against, and journalling against it would produce records
+        the reloaded queue can never claim.
+
+        `persistProgressIfAhead` is also wrong: it can decline a write that is
+        merely not ahead, and a decline is not a confirmation.
+      */
+      const persist = this.persistProgress;
+      if (!persist) { return false; }
       try {
-        await this.autoSave();
+        await persist(this.progressSnapshot());
       } catch {
         return false;
       }
@@ -857,6 +869,25 @@ export default Vue.extend({
       const savedPendingSec = (this.$store.state.pendingReTagSec as number) || 0;
       const headTrack = tracks[this.scrobbledTracks];
       /*
+        A queue that will need substitute seconds needs a durable identity
+        first, because that is what every journalled second is bound to. Done
+        before the journal is even read: an id-less queue cannot match a record
+        and cannot write one.
+
+        Only when the remainder actually contains a re-tagged play — an import
+        of recent listens never touches any of this, and should not be stopped
+        by storage it does not use.
+      */
+      const needsReTagSeconds = tracks.slice(this.scrobbledTracks).some((t) => t.reTagged);
+      if (needsReTagSeconds && !await this.ensureImportIdentity()) {
+        this.endPacing();
+        this.stopped = true;
+        this.paused = true;
+        this.pauseReason = 'Scrobblify could not save the information it needs to send your older plays safely, so it has stopped rather than risk duplicating them. Your progress is saved. This usually means the browser is blocking storage for this site.';
+        this.trackStopped('retag_identity_unavailable');
+        return;
+      }
+      /*
         The journal is consulted only when the queue has nothing to say.
 
         It records a second in the gap between choosing one and hearing an
@@ -866,12 +897,10 @@ export default Vue.extend({
         wrong track is a fresh collision rather than the deduplication it
         exists to produce.
       */
-      const journalled = background.inFlightSecond();
+      const journalled = background.inFlightSecond((this.$store.state.importId as string) || '');
       const journalledSec = (
         journalled
         && headTrack
-        && journalled.importId
-        && journalled.importId === ((this.$store.state.importId as string) || '')
         && journalled.trackKey === this.reTagTrackKey(headTrack)
       ) ? journalled.sec : 0;
       const inheritedSec = savedPendingSec || journalledSec;
@@ -922,23 +951,9 @@ export default Vue.extend({
       }
 
       /*
-        A queue that will need substitute seconds needs an identity first,
-        because that is what a journalled second is bound to. Done once per
-        entry into the loop rather than per track, and only when there is
-        actually a re-tagged play in the remainder — an import of recent
-        listens never touches any of this.
+        `i` is incremented conditionally at the end so a rate-limited track can
+        be retried.
       */
-      const needsReTagSeconds = tracks.slice(this.scrobbledTracks).some((t) => t.reTagged);
-      if (needsReTagSeconds && !await this.ensureImportIdentity()) {
-        this.endPacing();
-        this.stopped = true;
-        this.paused = true;
-        this.pauseReason = 'Scrobblify could not save the information it needs to send your older plays safely, so it has stopped rather than risk duplicating them. Your progress is saved. This usually means the browser is blocking storage for this site.';
-        this.trackStopped('retag_identity_unavailable');
-        return;
-      }
-
-      // `i` is incremented conditionally at the end so a rate-limited track can be retried.
       for (let i = this.scrobbledTracks; i < tracks.length;) {
         // A handoff outranks everything. Checked separately from `paused`
         // because `pauseWithCountdown` clears that flag when its timer expires,
@@ -1177,6 +1192,16 @@ export default Vue.extend({
             this.endPacing();
             this.stopped = true;
             this.paused = true;
+            /*
+              Forgotten before the save, because no request ever left carrying
+              it. `setPendingSecond` writes the component and store copies
+              first, and saving with those still set would put a second on the
+              disk that nothing is riding on — where the resume reads it as
+              *inherited*, refuses to re-time it, and reports a play as
+              permanently failed that was never even attempted.
+            */
+            pendingReTagTimestampSec = undefined;
+            this.clearPendingSecond(track);
             this.pauseReason = 'Scrobblify could not save the information it needs to send your older plays safely, so it has stopped rather than risk duplicating them. Your progress is saved. This usually means the browser is blocking storage for this site.';
             // eslint-disable-next-line no-await-in-loop
             await this.autoSave();
