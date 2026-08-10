@@ -120,6 +120,22 @@ async function main() {
   check('preserves fields', tracks[0].artist === 'Artist 0' && tracks[0].track === 'Track 0');
   check('keeps the original timestamp as metadata',
     tracks[0].originalTimestampSec === 1_700_000_000);
+  /*
+    A chunk uploaded before the flag existed must still parse, and must not be
+    read as re-tagged — the export falls back to the zero-timestamp inference
+    for those, which is exactly right for a client too old to pin a second.
+  */
+  check('an omitted re-tag flag reads as false, not undefined',
+    tracks[0].reTagged === false);
+  const flagged = parseChunk(new TextEncoder().encode(JSON.stringify({
+    artist: 'a', track: 't', originalTimestampSec: 1_700_000_500, reTagged: true,
+  })), 1);
+  check('an explicit re-tag flag survives alongside a pinned second',
+    flagged[0].reTagged === true && flagged[0].originalTimestampSec === 1_700_000_500);
+  const lying = parseChunk(new TextEncoder().encode(JSON.stringify({
+    artist: 'a', track: 't', originalTimestampSec: 1, reTagged: 'yes',
+  })), 1);
+  check('only a boolean true counts', lying[0].reTagged === false);
 
   const shortCases: [string, () => void][] = [
     ['a short chunk is rejected outright', () => parseChunk(ndjson(99), 100)],

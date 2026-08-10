@@ -58,6 +58,18 @@ export interface UploadTrack {
   track: string;
   album?: string;
   originalTimestampSec: number;
+  /**
+   * Whether this play's date was invented by the client rather than listened
+   * at, sent explicitly instead of being inferred from a zero timestamp.
+   *
+   * The worker used to derive it — zero meant "stamp this at send time" — and
+   * that held right up until the client needed to pin a *specific* second on a
+   * re-tagged track it may already have sent. A pinned second is non-zero, so
+   * the inference would export that track as a genuine listen; the browser
+   * would then faithfully preserve a date that eventually ages out, and
+   * Last.fm would reject the play outright.
+   */
+  reTagged?: boolean;
 }
 
 export type HandoffOutcome =
@@ -1577,6 +1589,7 @@ function encodeChunk(tracks: UploadTrack[]): Uint8Array {
     track: t.track,
     album: t.album ?? '',
     originalTimestampSec: t.originalTimestampSec,
+    reTagged: t.reTagged === true,
   })).join('\n'));
 }
 

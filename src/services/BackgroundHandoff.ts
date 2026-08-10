@@ -46,6 +46,18 @@ const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
 const RETAG_WINDOW_LIMIT_SECONDS = WINDOW_SECONDS;
 
 /**
+ * How long a second stays capable of colliding.
+ *
+ * The full 14 days, not the conservative 13 used for ordering. The two bounds
+ * answer different questions: 13 asks "is this timestamp still worth
+ * preserving", where a margin costs nothing, while this one asks "could a play
+ * already be sitting at this second", where the margin is the bug. Between day
+ * 13 and day 14 Last.fm will still accept — and therefore may already hold —
+ * the tuple, so dropping the pin there is what mints a phantom play.
+ */
+const COLLISION_WINDOW_SECONDS = 14 * 86400;
+
+/**
  * Headroom left below the present. Matches the worker's own margin, so a
  * reservation cannot start so close to now that a slow send lands in the
  * future — which Last.fm rejects as ignore code 4.
@@ -76,6 +88,9 @@ export function toUploadTrack(scrobble: Scrobble): UploadTrack {
     originalTimestampSec: Number.isFinite(originalTimestampSec) && originalTimestampSec > 0
       ? originalTimestampSec
       : 0,
+    // Stated rather than left to be inferred from the zero above, because a
+    // pinned retry second breaks that inference. See `UploadTrack.reTagged`.
+    reTagged: !!scrobble.reTagged,
   };
 }
 
@@ -144,7 +159,7 @@ export function uploadListFromState(state: ScrobbleState, nowSec: number): Uploa
     && uploads.length > 0
     && remaining[0].reTagged
     && pending < nowSec
-    && pending >= nowSec - WINDOW_SECONDS) {
+    && pending >= nowSec - COLLISION_WINDOW_SECONDS) {
     uploads[0] = { ...uploads[0], originalTimestampSec: pending };
   }
   return orderForDeadline(uploads, nowSec);
@@ -153,6 +168,14 @@ export function uploadListFromState(state: ScrobbleState, nowSec: number): Uploa
 export interface BeginResult {
   ok: boolean;
   reason?: string;
+  /**
+   * The identity the queue on disk now carries, when this call minted one.
+   *
+   * Returned so the caller can mirror it into the store: `buildState` reads
+   * the store, so a later save from a tab that never learned about the mint
+   * would write the queue back without it and undo the guarantee.
+   */
+  importId?: string;
 }
 
 /**
@@ -233,18 +256,29 @@ export async function beginHandoff(
 
   // Persisted *first*. If the tab dies between here and the upload, the queue
   // is still on disk and the user resumes locally as they always could.
+  /*
+    An identity is minted here when the queue has none.
+
+    Selection is where one is normally minted, but a queue restored from a
+    progress file written before identities existed arrives without one — and
+    it is exactly as capable of being handed over as any other. Handing it over
+    id-less leaves nothing that can later answer "was this import given away",
+    so a stale copy of it reads silence as permission and replays every track
+    the worker sent. Minting before the upload is what makes the answer exist.
+  */
+  const importId = frozenState.importId || StateManager.newImportId();
   try {
-    await stateManager.saveState({ ...frozenState, handoffOrderEpoch: orderEpoch });
+    await stateManager.saveState({ ...frozenState, handoffOrderEpoch: orderEpoch, importId });
   } catch (e) {
     trackError('background.persistBeforeHandoff', e);
     api.releaseQueueOwner(attempt);
     return { ok: false, reason: 'save_failed' };
   }
 
-  const pre = await api.preflight(username, tracks, capacity.chunkTracks, frozenState.importId);
+  const pre = await api.preflight(username, tracks, capacity.chunkTracks, importId);
   if (!pre) {
     api.releaseQueueOwner(attempt);
-    return { ok: false, reason: 'preflight_failed' };
+    return { ok: false, reason: 'preflight_failed', importId };
   }
 
   // The freeze now names the handoff it is holding for, so a tab that finds a
@@ -257,7 +291,7 @@ export async function beginHandoff(
   });
 
   window.location.href = pre.authoriseUrl;
-  return { ok: true };
+  return { ok: true, importId };
 }
 
 export interface CompleteResult {
@@ -589,6 +623,24 @@ export function stateFromExport(
       The later of the two deadlines wins.
     */
     ...(reTagBlockedUntilSec > 0 ? { reTagBlockedUntilSec } : {}),
+    /*
+      A returned queue gets a *fresh* identity, deliberately.
+
+      The export carries no id, and reusing the old one would be worse than
+      dropping it: the server still remembers that id as handed over, so the
+      reconciled queue — the only copy that is now allowed to send — would
+      answer its own authority check with "known" and block itself forever.
+
+      Rotating gets both halves right. Stale copies on other devices keep the
+      old, server-known id and stay blocked, which is exactly what take-back
+      must not undo; this copy carries an id the server has never seen and is
+      free to run. An empty string (no `crypto`) degrades to the legacy
+      behaviour rather than pinning the wrong identity.
+    */
+    ...(() => {
+      const rotated = StateManager.newImportId();
+      return rotated ? { importId: rotated } : {};
+    })(),
     burstCount: 0,
     dailyCount: 0,
     dailyCountDate: new Date().toISOString().slice(0, 10),

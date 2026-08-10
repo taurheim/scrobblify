@@ -1147,6 +1147,12 @@ export default Vue.extend({
       });
 
       const result = await beginHandoff(this.stateManager, state, username, entryPoint);
+      if (result.importId) {
+        // The handoff may have minted one for a queue that had none. The store
+        // is what `buildState` reads, so without this a later save would write
+        // the queue back id-less and undo it.
+        this.$store.commit('setImportId', result.importId);
+      }
       if (!result.ok) {
         this.backgroundBusy = false;
         this.showBackgroundOffer = false;
@@ -1409,6 +1415,13 @@ export default Vue.extend({
         // Saved before the job is cancelled. Cancelling first and then failing
         // to save would destroy the only copy of the queue.
         await this.stateManager.saveState(restored);
+        /*
+          The returned queue carries a *rotated* identity (see
+          `stateFromExport`). The store still holds the one the server knows,
+          and `saveStateIfAhead` throws on a mismatch, so leaving it there
+          would make the next persist look like a cross-import collision.
+        */
+        this.$store.commit('setImportId', restored.importId || '');
 
         /*
           From here until the cancel is confirmed, both sides may believe they

@@ -50,6 +50,19 @@ export interface JobTrack {
    * window and any timestamp fixed at creation is rejected from ~day 15.
    */
   originalTimestampSec: number;
+  /**
+   * Whether the client invented this play's date rather than reading it from
+   * the listening history.
+   *
+   * Used to be inferred from a zero timestamp, which held until the client
+   * needed to pin a *particular* second on a re-tagged track it may already
+   * have sent — a pinned second is non-zero, so the inference would hand that
+   * track back on an export as a genuine listen, and the browser would
+   * preserve a date that eventually ages out of Last.fm's window and is
+   * rejected. Optional, because chunks uploaded before this existed carry no
+   * such field and must still be readable.
+   */
+  reTagged?: boolean;
 }
 
 export interface ChunkRow {
@@ -161,7 +174,15 @@ export function parseChunk(bytes: Uint8Array, expectedCount: number): JobTrack[]
     if (!Number.isFinite(ts)) {
       throw new ChunkValidationError(`entry ${i} has no usable timestamp`);
     }
-    return { artist, track, album, originalTimestampSec: Math.floor(ts) };
+    return {
+      artist,
+      track,
+      album,
+      originalTimestampSec: Math.floor(ts),
+      // Only an explicit `true` counts. An older client omits it entirely, and
+      // the export falls back to the zero-timestamp inference for those.
+      reTagged: parsed.reTagged === true,
+    };
   });
 }
 

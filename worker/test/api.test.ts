@@ -102,7 +102,7 @@ function req(path: string, init: RequestInit & { token?: string } = {}): Request
   return new Request(`https://api.savas.ca${path}`, { ...init, headers });
 }
 
-function tracksNdjson(count: number, reTagged = false): Uint8Array {
+function tracksNdjson(count: number, reTagged = false, pinFirstSec = 0): Uint8Array {
   const lines: string[] = [];
   for (let i = 0; i < count; i += 1) {
     lines.push(JSON.stringify({
@@ -110,7 +110,12 @@ function tracksNdjson(count: number, reTagged = false): Uint8Array {
       track: `Track ${i}`,
       album: 'Album',
       // 0 is how the client asks for send-time assignment; see toUploadTrack.
-      originalTimestampSec: reTagged ? 0 : 1_700_000_000 + i,
+      originalTimestampSec: reTagged
+        ? (i === 0 ? pinFirstSec : 0)
+        : 1_700_000_000 + i,
+      // Stated explicitly by any client new enough to pin a second, because a
+      // pin makes the zero-timestamp inference wrong for that one track.
+      ...(reTagged ? { reTagged: true } : {}),
     }));
   }
   return new TextEncoder().encode(lines.join('\n'));
@@ -118,7 +123,7 @@ function tracksNdjson(count: number, reTagged = false): Uint8Array {
 
 async function seedJob(sql: Sql, blobs: BlobStore, username: string, opts: {
   total?: number; cursor?: number; live?: boolean; state?: string; reTagged?: boolean;
-  importId?: string; scrobbled?: number;
+  importId?: string; scrobbled?: number; pinFirstSec?: number;
 } = {}): Promise<string> {
   const total = opts.total ?? 100;
   const id = randomId();
@@ -135,7 +140,7 @@ async function seedJob(sql: Sql, blobs: BlobStore, username: string, opts: {
       NOW, NOW, NOW + 60 * 86400,
     ],
   );
-  const raw = tracksNdjson(total, opts.reTagged);
+  const raw = tracksNdjson(total, opts.reTagged, opts.pinFirstSec ?? 0);
   const gz = await gzip(raw);
   const buf = gz.buffer.slice(gz.byteOffset, gz.byteOffset + gz.byteLength) as ArrayBuffer;
   await uploadChunk(sql, blobs, {
@@ -712,6 +717,39 @@ async function main() {
       body.state.tracks.every((t: any) => t.reTagged === true), body.state.tracks[0]);
     check('and never with a 1970 timestamp',
       body.state.tracks.every((t: any) => t.timestamp > 1e12), body.state.tracks[0]);
+  }
+
+  console.log('\n-- a pinned second survives the export as a re-tagged track --');
+  {
+    /*
+      The head of a handed-over queue may carry a *pinned* second: the client
+      sent that exact (artist, track, second) and never learned whether it
+      landed, so it hands the second over rather than letting the worker mint
+      a new one and create a phantom play.
+
+      A pin is non-zero, so the old `originalTimestampSec === 0` inference
+      called that track a genuine listen. The export then said `reTagged:
+      false`, the browser preserved the date verbatim, and Last.fm rejected it
+      once the second aged past fourteen days — a play lost outright. The
+      explicit flag is what stops that.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const pin = 1_700_000_500;
+    const id = await seedJob(sql, blobs, 'listener', {
+      total: 10, cursor: 0, reTagged: true, state: 'paused', pinFirstSec: pin,
+    });
+    const token = await issueSession('listener', SIGNING, NOW);
+    const body: any = await (await handleRequest(env,
+      req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
+
+    check('the pinned track is still flagged re-tagged despite its real second',
+      body.state.tracks[0].reTagged === true, body.state.tracks[0]);
+    check('and the pinned second itself comes back, not a placeholder',
+      body.state.tracks[0].timestamp === pin * 1000, body.state.tracks[0]);
+    check('every other re-tagged track is still flagged',
+      body.state.tracks.slice(1).every((t: any) => t.reTagged === true));
   }
 
   console.log('\n-- the export claims quiescence rather than observing it --');

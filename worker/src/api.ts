@@ -954,7 +954,18 @@ async function exportJob(
         // fail identically; they are reported separately instead.
         return;
       }
-      const reTagged = t.originalTimestampSec === 0;
+      /*
+        Stated by the client when it knows, inferred only for chunks uploaded
+        before the flag existed.
+
+        The inference alone is wrong for exactly one track: a re-tagged play
+        the browser may already have sent, whose second it pinned so the
+        worker would repeat the identical tuple rather than mint a second,
+        phantom play. That pin is non-zero, so a zero test calls it a genuine
+        listen — and the browser would then preserve a date that ages out and
+        is rejected outright.
+      */
+      const reTagged = t.reTagged === true || t.originalTimestampSec === 0;
       tracks.push({
         artist: t.artist,
         track: t.track,
@@ -966,8 +977,15 @@ async function exportJob(
           (`reTagged: false` suppresses its own inference) and Last.fm would
           reject wholesale as too old. The placeholder is cosmetic; the flag is
           what makes the client re-stamp against its own clock.
+
+          A pinned second is the exception worth keeping: it is a real second
+          this browser may already have used, and handing it back lets the
+          resumed queue repeat the identical tuple instead of inventing a new
+          one. Cosmetic for every other re-tagged track.
         */
-        timestamp: reTagged ? nowSec * 1000 : t.originalTimestampSec * 1000,
+        timestamp: t.originalTimestampSec > 0
+          ? t.originalTimestampSec * 1000
+          : nowSec * 1000,
         reTagged,
       });
     });
