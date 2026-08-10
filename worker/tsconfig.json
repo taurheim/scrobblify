@@ -14,6 +14,6 @@
     "types": ["node", "@cloudflare/workers-types"]
   },
   "include": ["src/**/*.ts", "test/**/*.ts", "../src/shared/**/*.ts"],
-  "//": "spike.ts is throwaway benchmark code kept only as evidence for the concurrency cap; it is not part of the worker.",
-  "exclude": ["node_modules", ".test-build", "src/spike.ts"]
+  "//": "spike.ts is throwaway benchmark code kept only as evidence for the concurrency cap; it is not part of the worker. client-*.test.ts and its stubs are checked by tsconfig.client.json instead, which supplies the @/ alias and DOM lib they need.",
+  "exclude": ["node_modules", ".test-build", "src/spike.ts", "test/client-*.test.ts", "test/stubs"]
 }

@@ -4,7 +4,7 @@
   "description": "Background scrobbling worker for scrobblify",
   "private": true,
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
     "test": "npm run typecheck && node scripts/run-tests.mjs",
     "dev": "wrangler dev --local"
   },

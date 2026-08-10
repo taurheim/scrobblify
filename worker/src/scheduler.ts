@@ -799,6 +799,55 @@ async function runJob(
 
   await reconcile(env, lease, sessionKey, nowSec);
 
+  /*
+    Nothing may be sent while a batch's fate is still unknown.
+
+    `reconcile` deliberately leaves an inconclusive batch in `sending` rather
+    than reading a failed lookup as "nothing was stored". But the cursor has
+    not advanced, so falling through to the send loop rebuilds that same slice
+    and `assignTimestamps` gives every re-tagged track in it a *different*
+    synthetic second. If the original request did land, that is up to fifty
+    duplicated plays — the exact outcome reconciliation exists to prevent, and
+    reconciliation's own comment about running "before anything is sent" is
+    only true if this gate exists.
+
+    A pinned entry would survive that, because it repeats its second exactly.
+    The other forty-nine would not.
+  */
+  const unresolved = await env.sql.first<{ n: number; oldest: number }>(
+    `SELECT COUNT(*) AS n, MIN(sent_at) AS oldest FROM batches
+      WHERE job_id = ? AND state = 'sending'`,
+    [lease.job.id],
+  );
+  if (unresolved && unresolved.n > 0) {
+    const graceEndsAt = (unresolved.oldest ?? nowSec) + RECONCILE_GRACE_SECONDS;
+    if (graceEndsAt > nowSec) {
+      /*
+        Not a failure — just too early to ask. A scrobble accepted moments
+        before the tick died is not queryable yet, so waiting out the grace
+        period is the normal path after a crash and must not spend one of the
+        job's ten attempts before it has even been tried once.
+      */
+      await fencedJobUpdate(
+        env.sql,
+        lease,
+        `locked_until = 0, last_run_at = ?, next_eligible_at = ?, state_reason = ?,
+         updated_at = ?`,
+        [nowSec, graceEndsAt + 1, 'Waiting to reconcile a batch left in flight', nowSec],
+      );
+      return empty;
+    }
+    // Past the grace period and still unknown: the lookup itself is failing.
+    // Back off and, after enough attempts, ask a human — rather than guessing.
+    await failJobAttempt(
+      env.sql,
+      lease,
+      'A batch is still in flight and could not be reconciled; not sending more',
+      nowSec,
+    );
+    return empty;
+  }
+
   let batchesSent = 0;
   let scrobbled = 0;
   let failed = 0;

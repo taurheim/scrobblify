@@ -310,10 +310,6 @@ function capRanges(raw: unknown): {
   };
 }
 
-function sanitizeRanges(raw: unknown): { from: number; to: number }[] {
-  return capRanges(raw).ranges;
-}
-
 /**
  * Combines two incompleteness floors. Higher wins: it is the more pessimistic
  * claim, and the one that keeps a gap search inside describable ground.
@@ -515,10 +511,22 @@ export interface InFlightSecond {
  * has gone stale. A clock that jumps forward — a correction, a resumed laptop,
  * a timezone-confused device — would otherwise hide a record written minutes
  * ago, after which the next allocation overwrites it for good and the play it
- * described is duplicated. Eviction is by insertion order instead, and the
- * cap is set well above the one queue a browser can actually hold on disk.
+ * described is duplicated. Eviction is by insertion order instead, which needs
+ * no clock at all; `at` is kept for diagnosis and is deliberately never read
+ * as an ordering key.
+ *
+ * The cap is set far above anything reachable rather than merely above the one
+ * queue a browser can hold on disk. Failing closed when it fills was
+ * considered and rejected: records for abandoned imports are never cleaned up,
+ * so a browser that had accumulated that many would have re-tagged scrobbling
+ * permanently broken, which is worse than the eviction it prevents. But an
+ * eviction still forgets a play, and each one forgets another — the damage is
+ * bounded per record, not overall. A record is a few dozen bytes against a
+ * multi-megabyte quota, so the honest response is to make eviction
+ * unreachable in practice rather than to ration it: this many *concurrently
+ * unresolved* imports in one browser does not happen.
  */
-const IN_FLIGHT_MAX_RECORDS = 8;
+const IN_FLIGHT_MAX_RECORDS = 64;
 
 function readJournal(): InFlightSecond[] {
   try {

@@ -13,6 +13,20 @@ export interface SerializedScrobble {
   reTagged?: boolean;
 }
 
+/**
+ * A track written off permanently by whoever owned the queue at the time.
+ *
+ * Deliberately self-contained rather than an index: the track it names is no
+ * longer in `tracks`, so there is nothing for an index to point at.
+ */
+export interface FailedTrackDetail {
+  artist: string;
+  track: string;
+  album?: string;
+  /** What Last.fm (or the worker) said. Shown to the user verbatim. */
+  reason: string;
+}
+
 export interface ScrobbleState {
   userName: string;
   totalTracks: number;
@@ -54,6 +68,21 @@ export interface ScrobbleState {
    * outcome. Carrying it here is what makes that resumable rather than lossy.
    */
   pendingReTagTimestampSec?: number;
+  /**
+   * Tracks a *previous* owner of this queue wrote off permanently, kept so the
+   * user can still be told which ones and why.
+   *
+   * The background worker reports its failures by name, but the queue it hands
+   * back has those tracks removed — they are neither remaining nor completed,
+   * so no index into `tracks` can describe them. Without this the user is told
+   * only "3 rejected by Last.fm" before take-back and nothing at all
+   * afterwards, which is the one thing they cannot recover from on their own:
+   * a track they cannot name is a track they cannot re-add.
+   *
+   * Carried through saves untouched. Absent in files written before it
+   * existed, and in any queue that has never been handed over.
+   */
+  failedDetails?: FailedTrackDetail[];
   /**
    * Start of a re-tag range reserved for this browser, when one is needed.
    *

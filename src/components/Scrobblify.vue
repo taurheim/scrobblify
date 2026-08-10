@@ -1807,6 +1807,12 @@ export default Vue.extend({
       // likewise has to be carried forward, since `remaining.length` shrinks on
       // every resume and would otherwise make completion look better each time.
       this.$store.commit('setResumedScrobbleCount', state.originalSucceededCount ?? completedSet.size);
+      /*
+        Failures a previous owner recorded are restored before the step mounts,
+        because that is the only chance to show them: the tracks they name are
+        not in the queue and nothing else remembers them.
+      */
+      this.$store.commit('setCarriedFailures', state.failedDetails || []);
       this.$store.commit('setOriginalTotalTracks', state.originalTotalTracks || state.totalTracks);
       this.hasResumableState = false;
       // Skip to scrobble step (step 4)
@@ -1880,6 +1886,7 @@ export default Vue.extend({
         // Not critical — continue anyway
       }
       this.$store.commit('setResumedScrobbleCount', 0);
+      this.$store.commit('setCarriedFailures', []);
       this.hasRemainingTracks = false;
       this.currentStep = 5;
     },
@@ -1901,6 +1908,15 @@ export default Vue.extend({
         originalSucceededCount: info.originalSucceededCount,
         sendTimestamps: info.sendTimestamps || [],
         lastReTagTimestampSec: info.lastReTagTimestampSec || 0,
+        /*
+          Carried untouched. These name tracks that are no longer in the queue,
+          so nothing here can reconstruct them — dropping them on the first
+          save after a take-back would lose the only record of what the worker
+          wrote off.
+        */
+        ...((this.$store.state.carriedFailures as any[]).length > 0
+          ? { failedDetails: this.$store.state.carriedFailures as any[] }
+          : {}),
         /*
           Carried through every save so a reserved range survives pause/resume
           cycles. Losing it would silently return the allocator to the shared

@@ -18,7 +18,7 @@
  * loss, because the browser is the only place these tracks exist.
  */
 import Scrobble from '@/models/Scrobble';
-import StateManager, { ScrobbleState } from '@/services/StateManager';
+import StateManager, { ScrobbleState, FailedTrackDetail } from '@/services/StateManager';
 import { trackEvent, trackError } from '@/services/Analytics';
 import * as api from '@/services/BackgroundScrobbling';
 import type { UploadTrack, HandoffOutcome } from '@/services/BackgroundScrobbling';
@@ -526,6 +526,27 @@ export function stateFromExport(
   }));
 
   /*
+    The worker's named failures come back with the queue, not in it.
+
+    Export removes failed tracks from `state.tracks` — they are neither
+    remaining nor completed — and reports them separately. Dropping them here
+    is how the user ends up knowing only that "3 tracks were rejected" and
+    never which three, with no way to re-add them. A refused pin makes that
+    worse: that report may name a play Last.fm actually stored, and the user
+    can only judge it if they know what it was.
+  */
+  const failedDetails: FailedTrackDetail[] = Array.isArray(exported.failures)
+    ? exported.failures
+      .filter((f: any) => f && (f.artist || f.track))
+      .map((f: any) => ({
+        artist: String(f.artist ?? ''),
+        track: String(f.track ?? ''),
+        album: String(f.album ?? ''),
+        reason: String(f.reason || 'Rejected by Last.fm'),
+      }))
+    : [];
+
+  /*
     A pinned retry survives the take-back, if the worker still had one.
 
     It cannot be recovered from the timestamp alone — the cosmetic placeholder
@@ -724,6 +745,7 @@ export function stateFromExport(
     totalTracks: serialized.length,
     completedIndices: [],
     failedIndices: [],
+    ...(failedDetails.length > 0 ? { failedDetails } : {}),
     tracks: serialized,
     originalTotalTracks: Math.max(
       fallbackOriginalTotal,

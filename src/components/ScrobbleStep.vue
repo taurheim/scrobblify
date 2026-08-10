@@ -112,14 +112,14 @@
     </div>
 
     <!-- Failed tracks section -->
-    <v-expansion-panels v-if="failedTracks.length > 0" class="mt-4">
+    <v-expansion-panels v-if="reportedFailures.length > 0" class="mt-4">
       <v-expansion-panel>
         <v-expansion-panel-header>
-          {{ failedTracks.length }} failed track(s)
+          {{ reportedFailures.length }} failed track(s)
         </v-expansion-panel-header>
         <v-expansion-panel-content>
-          <div v-for="(item, i) in failedTracks" :key="i" class="mb-1">
-            <strong>{{ item.track.toString() }}</strong> — {{ item.error }}
+          <div v-for="(item, i) in reportedFailures" :key="i" class="mb-1">
+            <strong>{{ item.name }}</strong> — {{ item.error }}
           </div>
         </v-expansion-panel-content>
       </v-expansion-panel>
@@ -430,6 +430,29 @@ export default Vue.extend({
     },
     isResumed(): boolean {
       return this.previouslyScrobbled > 0;
+    },
+    /**
+     * Every failure this import has accumulated, not just this session's.
+     *
+     * Display only — the counters and analytics stay on `failedTracks`, which
+     * measures what *this* browser did. The carried half names tracks the
+     * background worker wrote off; they are not in the queue and no index
+     * describes them, so if this list does not show them nothing does.
+     */
+    reportedFailures(): Array<{ name: string; error: string }> {
+      const carried = (this.$store.state.carriedFailures as Array<{
+        artist: string; track: string; reason: string;
+      }>) || [];
+      return [
+        ...carried.map((f) => ({
+          name: f.artist ? `${f.track} - ${f.artist}` : f.track,
+          error: f.reason,
+        })),
+        ...this.failedTracks.map((f) => ({
+          name: f.track.toString(),
+          error: f.error,
+        })),
+      ];
     },
     /**
      * Size of the whole import. `tracksToScrobble.length` shrinks every time a

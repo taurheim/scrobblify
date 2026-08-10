@@ -5,6 +5,14 @@
  * built, and so a TypeScript-only construct that esbuild cannot handle fails
  * here rather than at deploy time. `node:*` stays external because the worker
  * bundle must never contain Node built-ins, but the tests may use them.
+ *
+ * The `@` alias and the posthog stub exist so this runner can also execute
+ * tests against the *client* modules in `../src`. The Vue app has no unit
+ * runner of its own — its only automated coverage is Playwright, which drives
+ * a dev server with no background API configured and therefore cannot reach
+ * the handoff code at all. Bundling those modules here is the only way that
+ * logic can be tested. Analytics is stubbed because importing `posthog-js`
+ * under Node touches browser globals that do not exist.
  */
 import { readdirSync, rmSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -33,6 +41,8 @@ for (const test of tests) {
     '--platform=node',
     '--format=cjs',
     '--external:node:*',
+    `--alias:@=${join(root, '..', 'src')}`,
+    `--alias:posthog-js=${join(root, 'test', 'stubs', 'posthog.ts')}`,
     `--outfile=${out}`,
   ], { stdio: ['ignore', 'ignore', 'inherit'], shell: process.platform === 'win32' });
 

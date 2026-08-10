@@ -581,7 +581,55 @@ async function main() {
     check('an inconclusive lookup leaves the batch in flight', batch.state === 'sending',
       batch.state);
     check('it is not read as "nothing was stored"', batch.accepted_count === null);
-    check('the job keeps working rather than stalling', h.fake.sent.length > before);
+    /*
+      And nothing else is sent while it is unknown.
+
+      The cursor has not advanced, so the next batch would be the same fifty
+      tracks — with fresh synthetic seconds, because assignTimestamps allocates
+      anew. If the unresolved request did land, that is fifty duplicated plays.
+      An earlier version of this test asserted the opposite ("the job keeps
+      working rather than stalling"), which is precisely the bug: working
+      through an unknown is guessing.
+    */
+    check('nothing further is sent while its fate is unknown',
+      h.fake.sent.length === before, h.fake.sent.length - before);
+    const job = await h.job();
+    check('the cursor stays put', job.cursor === 0, job.cursor);
+    check('the failure is counted', job.consecutive_failures > 0, job.consecutive_failures);
+    check('and it backs off rather than retrying immediately',
+      job.next_eligible_at > NOW + 7200, job.next_eligible_at);
+    check('the job is not parked yet', job.state === 'active', job.state);
+  }
+
+  console.log('\n-- a batch inside the reconciliation grace period is simply waited out --');
+  {
+    /*
+      A scrobble accepted moments before the tick died is not queryable yet, so
+      reconcile does not even look. Waiting is the normal path after a crash
+      and must not spend one of the job's ten attempts, or a few crashes would
+      park a perfectly healthy job for a human.
+    */
+    const h = await harness({
+      total: 120,
+      script: [{ kind: 'throw', message: 'Network request failed' }],
+    });
+    await runTick(h.env, NOW);
+    const before = h.fake.sent.length;
+    const seeded = (await h.job()).consecutive_failures;
+    // Late enough that the job is eligible again after the seeding network
+    // error's own backoff, but still inside the 120s reconciliation grace.
+    const later = NOW + 70;
+    await runTick(h.env, later);
+    check('nothing is sent on top of the in-flight batch',
+      h.fake.sent.length === before, h.fake.sent.length - before);
+    check('and no lookup was even attempted', h.fake.recentCalls === 0, h.fake.recentCalls);
+    const job = await h.job();
+    check('waiting is not counted as a failure',
+      job.consecutive_failures === seeded, [job.consecutive_failures, seeded]);
+    check('it waits for the grace period to elapse',
+      job.next_eligible_at > NOW + RECONCILE_GRACE_SECONDS, job.next_eligible_at - NOW);
+    const batch = await h.sql.first<any>('SELECT * FROM batches WHERE job_id = ?', [h.jobId]);
+    check('the batch is still in flight', batch.state === 'sending', batch.state);
   }
 
   console.log('\n-- corrected names still reconcile --');

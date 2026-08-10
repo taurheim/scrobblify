@@ -19,6 +19,18 @@ export default new Vuex.Store({
     // so this is the only way the scrobble step can tell a resume from a fresh
     // start (without it, `scrobble_resumed` could never fire).
     resumedScrobbleCount: 0,
+    /*
+      Tracks a previous owner of this queue wrote off permanently, carried so
+      the scrobble step can still name them.
+
+      The background worker removes its failures from the queue it hands back,
+      so nothing in `selectedScrobbles` describes them. Without this the user
+      is told a count before take-back and nothing afterwards — and a track
+      they cannot name is a track they cannot re-add.
+    */
+    carriedFailures: [] as Array<{
+      artist: string; track: string; album?: string; reason: string;
+    }>,
     // Size of the user's original selection. Unlike `selectedScrobbles.length`
     // this does NOT shrink on resume, so it is the only stable denominator for
     // "how much of my import is done" — both in the UI and in analytics.
@@ -89,6 +101,9 @@ export default new Vuex.Store({
     },
     setResumedScrobbleCount(state: any, count: number) {
       state.resumedScrobbleCount = count;
+    },
+    setCarriedFailures(state: any, failures: any[]) {
+      Vue.set(state, 'carriedFailures', Array.isArray(failures) ? failures : []);
     },
     setOriginalTotalTracks(state: any, count: number) {
       state.originalTotalTracks = count;
