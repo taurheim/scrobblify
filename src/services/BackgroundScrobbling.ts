@@ -414,6 +414,50 @@ export function getHandoffLineage(): HandoffLineage | null {
   }
 }
 
+/**
+ * Records the browser's own re-tag high-water mark somewhere that outlives the
+ * import.
+ *
+ * The cursor used to live only in the Vuex store and the saved state, and both
+ * of those end with the import: a completed run clears IndexedDB, and a reload
+ * starts the store at zero. The next import then begins allocating from the
+ * top of the six-hour window again — straight back over the seconds the
+ * previous one just used. If the two selections share a track, Last.fm
+ * discards the repeat while reporting it accepted, and the play is gone with
+ * no error anywhere.
+ *
+ * The seconds it describes belong to the *account's* timeline, not to any one
+ * import, so this is the right lifetime for it. It is bounded in time rather
+ * than by import: once the cursor falls out of Last.fm's window it constrains
+ * nothing, because nothing can be scrobbled there any more.
+ *
+ * Monotonic, and never lowered — a lower value would re-open seconds already
+ * spent.
+ */
+export function recordReTagCursor(sec: number): void {
+  if (!Number.isFinite(sec) || sec <= 0) { return; }
+  try {
+    const existing = getHandoffLineage();
+    if (existing && (existing.reTagCursorSec || 0) >= sec) { return; }
+    setHandoffLineage({
+      originalTotalTracks: (existing && existing.originalTotalTracks) || 0,
+      originalSucceededCount: (existing && existing.originalSucceededCount) || 0,
+      handedOverAtSec: (existing && existing.handedOverAtSec) || 0,
+      reTagUsedRanges: (existing && existing.reTagUsedRanges) || [],
+      reTagKnownFromSec: (existing && existing.reTagKnownFromSec) || 0,
+      reTagCursorSec: sec,
+    });
+  } catch {
+    // Best effort. A lost cursor costs a possible collision, not a crash.
+  }
+}
+
+/** The persisted high-water mark, or 0 when this browser has none. */
+export function persistedReTagCursorSec(): number {
+  const lineage = getHandoffLineage();
+  return (lineage && lineage.reTagCursorSec) || 0;
+}
+
 export function clearHandoffLineage(
   keepRanges?: { from: number; to: number }[],
   keepKnownFromSec: unknown = 0,
@@ -448,7 +492,11 @@ export function clearHandoffLineage(
       keepRanges ? keepKnownFromSec : (existing && existing.reTagKnownFromSec),
       capped.droppedBelowSec,
     );
-    if (capped.ranges.length === 0 && knownFrom === 0) {
+    // The cursor is not part of the lineage's cosmetic half and survives it
+    // being cleared: it names seconds already written to the account's
+    // timeline, which no take-back undoes.
+    const cursor = (existing && existing.reTagCursorSec) || 0;
+    if (capped.ranges.length === 0 && knownFrom === 0 && cursor === 0) {
       window.localStorage.removeItem(LINEAGE_STORAGE_KEY);
       return;
     }
@@ -457,6 +505,7 @@ export function clearHandoffLineage(
       originalSucceededCount: 0,
       reTagUsedRanges: capped.ranges,
       reTagKnownFromSec: knownFrom,
+      reTagCursorSec: cursor,
     }));
   } catch {
     // Nothing to do.
@@ -1326,6 +1375,70 @@ export async function liveJobForUsername(username: string): Promise<boolean | nu
 }
 
 /**
+ * What the server knows about one specific queue.
+ *
+ * `known` is the field that matters: it says this exact selection was handed
+ * over at some point, by some device, whether or not anything is running now.
+ */
+export interface ImportStatus {
+  known: boolean;
+  live: boolean;
+  state?: string;
+  /** Contiguous terminal prefix the worker reached. Safe to skip; nothing else is. */
+  cursor: number;
+  scrobbledCount: number;
+  totalTracks: number;
+}
+
+/**
+ * Asks whether this queue has ever been handed to the background service.
+ *
+ * `liveJobForUsername` answers a question about the *user*, and a `false` from
+ * it is weaker than it looks. A job that has completed — or stalled on
+ * re-auth — clears `live_username`, so a browser still holding the same import
+ * reads "nothing is running" as permission and replays everything the worker
+ * already sent. Last.fm discards a repeat of (artist, track, timestamp)
+ * silently while reporting it accepted, so those plays are simply lost.
+ *
+ * The import id is the credential here, which is why this needs no session:
+ * only a browser that already holds the queue knows it.
+ *
+ * Returns null on any failure, and null is *not* permission — callers must
+ * treat it the same way they treat an unresolved ownership check.
+ */
+export async function importStatus(importId: string): Promise<ImportStatus | null> {
+  if (!isBackgroundConfigured() || !importId) {
+    return null;
+  }
+  try {
+    const res = await getWithTimeout(
+      `/scrobblify/import/${encodeURIComponent(importId)}`,
+      false,
+    );
+    if (!res || !res.ok) {
+      return null;
+    }
+    const body = await res.json();
+    // Only an explicit boolean counts, for the same reason as `live` above: a
+    // malformed body must not read as "never handed over", which is the answer
+    // that unblocks scrobbling.
+    if (typeof body.known !== 'boolean') {
+      return null;
+    }
+    return {
+      known: body.known,
+      live: body.live === true,
+      state: typeof body.state === 'string' ? body.state : undefined,
+      cursor: Number(body.cursor) || 0,
+      scrobbledCount: Number(body.scrobbledCount) || 0,
+      totalTracks: Number(body.totalTracks) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Whether background mode can be offered at all.
  *
  * Returns null rather than throwing on any failure, so the caller's only
@@ -1495,6 +1608,7 @@ export async function preflight(
   username: string,
   tracks: UploadTrack[],
   chunkTracks: number,
+  importId = '',
 ): Promise<{ handoffId: string; authoriseUrl: string } | null> {
   if (!isBackgroundConfigured()) {
     return null;
@@ -1511,6 +1625,11 @@ export async function preflight(
         trackCount: tracks.length,
         chunkCount: Math.ceil(tracks.length / chunkTracks),
         declaredBytes: payload.byteLength,
+        // What lets any device later ask whether *this queue* was handed over,
+        // rather than only whether this user has something running now. The
+        // worker drops it if it is missing or malformed rather than refusing
+        // the handoff, so an older client still works.
+        ...(importId ? { importId } : {}),
       }),
     });
     const body = await res.json();

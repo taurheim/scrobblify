@@ -255,6 +255,11 @@ export default Vue.extend({
        * holding back rather than silently refusing to work.
        */
       authorityUnknown: false,
+      /**
+       * Progress reported by the server for a queue it was handed, used only
+       * to make the block message concrete. Null when unknown.
+       */
+      handedOverProgress: null as { scrobbled: number; total: number } | null,
       /** Pending automatic retry of the ownership check, and its backoff. */
       authorityRetryTimer: null as number | null,
       authorityRetryCount: 0,
@@ -574,14 +579,24 @@ export default Vue.extend({
         gets asked about.
       */
       let username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
-      if (!username) {
-        try {
-          const saved = await this.stateManager.loadState();
-          username = (saved && saved.userName) || '';
-        } catch (e) {
-          // Unreadable state. There is nothing to resume either, so the
-          // question is moot.
+      let savedImportId = (this.$store.state.importId as string) || '';
+      try {
+        const saved = await this.stateManager.loadState();
+        if (saved) {
+          if (!username) {
+            username = saved.userName || '';
+          }
+          /*
+            The *saved* identity wins over the one in memory. A tab sitting on
+            a finished step still holds whatever it last selected, while the
+            record on disk is the queue that would actually be resumed — and
+            resuming is the action being gated.
+          */
+          savedImportId = saved.importId || savedImportId;
         }
+      } catch (e) {
+        // Unreadable state. There is nothing to resume either, so the
+        // question is moot.
       }
       if (!username) {
         this.authorityPending = false;
@@ -593,6 +608,7 @@ export default Vue.extend({
       // record it clears is the one this answer was about, since another tab
       // can establish a freeze while the request is in flight.
       const observed = background.queueOwner();
+      this.handedOverProgress = null;
       const live = await background.liveJobForUsername(username);
       this.authorityPending = false;
 
@@ -627,6 +643,30 @@ export default Vue.extend({
       }
 
       if (live === false) {
+        /*
+          Not yet permission.
+
+          `live` answers a question about the *user*: is anything sending for
+          them right now. A job that has finished — or that has stopped needing
+          re-authorisation — reports nothing live, and both of those clear the
+          server's own marker. Meanwhile this browser still holds the queue it
+          handed over, so "nothing is running" reads as "resume away", and it
+          re-sends thousands of tracks the worker already sent. Last.fm accepts
+          a repeat of the same track and second and discards it, so the user
+          watches a long, successful-looking run that adds nothing.
+
+          The queue's own identity is the only thing that distinguishes the two
+          cases, because it is the only claim that outlives the job.
+        */
+        const handedOver = await this.queueWasHandedOver(savedImportId);
+        if (handedOver === null) {
+          this.markAuthorityUnknown();
+          return;
+        }
+        if (handedOver === true) {
+          await this.blockForHandedOverQueue();
+          return;
+        }
         this.authorityUnknown = false;
         /*
           Only a `server` record may be released on this answer. A `freezing`
@@ -660,12 +700,81 @@ export default Vue.extend({
         The user is told why, and given a retry, rather than left looking at an
         app that silently refuses to work.
       */
+      this.markAuthorityUnknown();
+      trackEvent('background_authority_check', { result: 'unknown' });
+    },
+
+    /**
+     * Whether this exact queue has ever been given to the background service.
+     *
+     * `true` blocks, `false` releases, `null` means the question could not be
+     * answered and nothing may be concluded from it.
+     *
+     * An absent id is `false` rather than `null`, and that is a real decision.
+     * States written before identity existed have none, and neither do imports
+     * that never went near the feature — which is almost all of them. Treating
+     * "no id" as unknown would withhold scrobbling from every user who has
+     * never used background mode, to protect against a handover that by
+     * definition cannot have happened: a handover mints the id, so a queue
+     * without one was never uploaded. The residual risk is a queue exported
+     * from an older build and handed over by a *newer* one, which cannot
+     * happen either, since the newer build mints an id before it uploads.
+     */
+    async queueWasHandedOver(importId: string): Promise<boolean | null> {
+      if (!importId) {
+        return false;
+      }
+      const status = await background.importStatus(importId);
+      if (!status) {
+        return null;
+      }
+      /*
+        `known` is the whole answer, and `live` is deliberately ignored here.
+        The dangerous case is precisely a handover that is *no longer* live:
+        the tracks were sent, the marker is gone, and only this record
+        remembers it happened.
+      */
+      if (!status.known) {
+        return false;
+      }
+      this.handedOverProgress = status.totalTracks
+        ? { scrobbled: status.scrobbledCount, total: status.totalTracks }
+        : null;
+      return true;
+    },
+
+    /**
+     * Blocks because this queue belongs to a job, running or finished.
+     *
+     * Take-back exists for exactly this and is the only safe way out: it
+     * reconciles against what the server actually sent, whereas the browser's
+     * own copy of the queue predates the handover and knows nothing about it.
+     */
+    async blockForHandedOverQueue(): Promise<void> {
+      this.authorityUnknown = false;
+      this.ownershipBlocked = true;
+      this.hasResumableState = false;
+      background.setQueueOwner({ owner: 'server', id: '' });
+      await this.refreshBackgroundJob();
+      if (!this.backgroundJob) {
+        this.showReauth = true;
+        const p = this.handedOverProgress;
+        const detail = p ? ` It has scrobbled ${p.scrobbled} of ${p.total} tracks.` : '';
+        this.backgroundNotice = `This import was handed over to the background service, so scrobbling it from this browser is switched off — the tracks it already sent would be sent again and silently discarded.${detail} Sign in to check on it or bring it back here.`;
+      }
+      trackEvent('background_authority_check', { result: 'handed_over', signed_in: String(!!this.backgroundJob) });
+    },
+
+    /**
+     * The question could not be answered, so nothing is released.
+     */
+    markAuthorityUnknown(): void {
+      this.authorityPending = false;
       this.authorityUnknown = true;
       this.hasResumableState = false;
       // Self-clearing: a blip must not leave the app permanently unable to
       // scrobble just because nobody pressed the retry button.
       this.scheduleAuthorityRetry();
-      trackEvent('background_authority_check', { result: 'unknown' });
     },
 
     /**
@@ -1504,6 +1613,15 @@ export default Vue.extend({
         them.
       */
       this.$store.commit('setPendingReTagSec', state.pendingReTagTimestampSec || 0);
+      /*
+        Carried, never re-minted. A fresh id here would describe the same
+        tracks under a name the server has never seen, so a queue that *was*
+        handed over would come back looking untouched — which is precisely the
+        answer that lets a browser replay everything the worker already sent.
+        Files written before identity existed have none, and that is left empty
+        rather than filled in: "unknown" is a weaker claim than a wrong one.
+      */
+      this.$store.commit('setImportId', state.importId || '');
 
       // Restore remaining (not yet completed) tracks to store
       const allScrobbles = StateManager.deserializeScrobbles(state.tracks);
@@ -1637,6 +1755,15 @@ export default Vue.extend({
         */
         ...(info.pendingReTagTimestampSec
           ? { pendingReTagTimestampSec: info.pendingReTagTimestampSec }
+          : {}),
+        /*
+          The queue's identity, when it has one. Written unconditionally-ish
+          rather than only for background users: it is what lets a *later*
+          session ask whether this selection was ever handed over, and by then
+          the local marker that would have said so may well be gone.
+        */
+        ...((this.$store.state.importId as string)
+          ? { importId: this.$store.state.importId as string }
           : {}),
         burstCount: info.burstCount,
         dailyCount: info.dailyCount,

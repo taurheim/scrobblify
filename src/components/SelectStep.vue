@@ -156,6 +156,7 @@ import Vue from 'vue';
 import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
 import { trackEvent } from '@/services/Analytics';
+import StateManager from '@/services/StateManager';
 
 const workerCode = `
   let count = 0;
@@ -538,6 +539,16 @@ export default Vue.extend({
         which is a collision rather than the deduplication it exists for.
       */
       this.$store.commit('setPendingReTagSec', 0);
+      /*
+        A fresh identity for a fresh queue.
+
+        This one *is* per-import, unlike the lineage above. It exists so a
+        later question about this exact selection — "was it ever handed to the
+        background service?" — has an answer that survives the job finishing,
+        and so two tabs holding different selections can tell that their
+        progress counts are not comparable.
+      */
+      this.$store.commit('setImportId', StateManager.newImportId());
       trackEvent('tracks_selected', {
         selected_count: selected.length,
         total_count: this.totalTrackCount,

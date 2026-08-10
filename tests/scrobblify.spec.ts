@@ -853,6 +853,140 @@ test.describe('Session Resume', () => {
     // would be allocated a fresh timestamp and become a phantom scrobble.
     expect(scrobbled).toEqual(tracks.slice(2).map((t) => t.track));
   });
+
+  // Reads whatever `StateManager` last wrote, so these assert the real save
+  // path rather than a hand-built fixture.
+  async function readSavedState(page: Page): Promise<Record<string, any> | null> {
+    return page.evaluate(async () => new Promise<any>((resolve, reject) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction('scrobbleState', 'readonly');
+        const get = tx.objectStore('scrobbleState').get('current');
+        get.onsuccess = () => { db.close(); resolve(get.result ?? null); };
+        get.onerror = () => { db.close(); reject(get.error); };
+      };
+      request.onerror = () => reject(request.error);
+    }));
+  }
+
+  test('a resumed import keeps the identity it was saved with', async ({ page }) => {
+    /*
+      The queue's id is what lets the server be asked whether *this* import was
+      ever handed to the background service. Minting a fresh one on resume
+      would make a queue that had been handed over look untouched, and the
+      browser would then re-send every track the worker already sent — which
+      Last.fm accepts and silently discards, so it fails invisibly.
+    */
+    test.setTimeout(90000);
+    const importId = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+    const scrobbled: string[] = [];
+    const tracks = Array.from({ length: 12 }, (_, n) => ({
+      track: `Track ${n + 1}`,
+      artist: `Artist ${n + 1}`,
+      album: `Album ${n + 1}`,
+      timestamp: Date.UTC(2024, 0, n + 1),
+    }));
+
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+        await new Promise((resolve) => { setTimeout(resolve, 700); });
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState({
+      totalTracks: 12,
+      completedIndices: [0, 1],
+      tracks,
+      originalTotalTracks: 12,
+      originalSucceededCount: 2,
+      importId,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    // Read the save the pause takes, rather than the fixture: a completed run
+    // clears the record entirely, so the pause is the only moment the written
+    // state can be observed.
+    await expect.poll(() => scrobbled.length, { timeout: 20000 }).toBeGreaterThanOrEqual(2);
+    await page.getByRole('button', { name: 'Pause & Save' }).click();
+    await expect(page.getByRole('button', { name: 'Resume Now' })).toBeVisible({ timeout: 10000 });
+
+    const saved = await readSavedState(page);
+    expect(saved).not.toBeNull();
+    expect(saved!.importId).toBe(importId);
+  });
+
+  test('a fresh selection mints an identity the server will accept', async ({ page }) => {
+    // The worker requires `[\w-]{16,128}`, and rejects anything shorter as an
+    // enumerable id — the route that answers questions about a queue is public
+    // precisely because knowing the id is the proof of ownership.
+    test.setTimeout(90000);
+    const scrobbled: string[] = [];
+
+    // Registered *after* the navigation helper installs the shared Last.fm
+    // mock: Playwright gives the most recently added handler first refusal, so
+    // routing before it would leave the mock answering `track.scrobble` and
+    // nothing would ever reach this counter.
+    await goToUploadStep(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+        await new Promise((resolve) => { setTimeout(resolve, 2000); });
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.locator('input[type="file"][accept=".zip"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
+    await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect.poll(() => scrobbled.length, { timeout: 20000 }).toBeGreaterThanOrEqual(1);
+    await page.getByRole('button', { name: 'Pause & Save' }).click();
+    await expect(page.locator('text=Your progress has been saved automatically'))
+      .toBeVisible({ timeout: 10000 });
+
+    const saved = await readSavedState(page);
+    expect(saved).not.toBeNull();
+    expect(String(saved!.importId)).toMatch(/^[\w-]{16,128}$/);
+  });
 });
 
 test.describe('Rate limit handling', () => {

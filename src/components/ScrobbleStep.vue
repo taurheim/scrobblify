@@ -325,6 +325,17 @@ export default Vue.extend({
       // "not stopped" while it holds, so a freeze refuses rather than
       // uploading a queue whose latest sends never reached disk.
       persistFailed: false,
+      /*
+        Progress exists in memory that no confirmed write has captured.
+
+        `persistFailed` records that one attempt failed; this records that the
+        *queue on disk is behind*, which is the condition that actually
+        matters and which outlives any single attempt. Without it a second
+        handoff attempt finds the loop already stopped, answers "yes, safe",
+        and lets the freezing tab upload the stale queue it read back — every
+        track sent since the last good save going out a second time.
+      */
+      progressDirty: false,
       // Pending re-attempt of the send lock, while another tab holds it.
       sendLockRetryTimer: null as number | null,
       // Set when `scrobble()` refused because ownership was unresolved. The
@@ -725,6 +736,11 @@ export default Vue.extend({
       let reTagCursorSec = Math.max(
         this.reTagCursorSec,
         (this.$store.state.reTagCursorSec as number) || 0,
+        // Survives the import that produced it. Both of the sources above end
+        // with the import — a completed run clears the saved state and a
+        // reload starts the store at zero — so without this a second import
+        // walks back over the seconds the first one used.
+        background.persistedReTagCursorSec(),
       );
       /*
         Held across retries of the current track; cleared only once the track
@@ -929,8 +945,39 @@ export default Vue.extend({
           const latestSec = withinReservation
             ? Math.min(nowSec, (reserved as { ceilingSec: number }).ceilingSec)
             : nowSec;
-          reTagCursorSec = Math.min(latestSec, Math.max(reTagCursorSec + 1, earliestSec));
+          const candidateSec = Math.max(reTagCursorSec + 1, earliestSec);
+          if (candidateSec > latestSec) {
+            /*
+              There is no second left above the cursor and below the ceiling.
+
+              The old clamp resolved this with `Math.min(latestSec, …)`, which
+              hands back `latestSec` — a second at or below the cursor, and so
+              one this browser has already used. Every remaining re-tagged
+              track would then be pinned to it, and Last.fm would keep exactly
+              one of them.
+
+              It is a real situation now that the cursor outlives its import: a
+              new selection started moments after the last one finished has a
+              cursor sitting on the present, and so does a browser whose clock
+              has moved backwards. Both resolve themselves by waiting, so the
+              tracks are held rather than spent — the block carries the exact
+              second the wait ends, and lifts itself when the clock reaches it.
+            */
+            this.$store.commit('setReTagBlocked', candidateSec);
+            this.endPacing();
+            this.stopped = true;
+            this.paused = true;
+            this.pauseReason = 'Scrobblify has run out of substitute times for your older plays for the moment. They are still saved — resume in a little while and they will go through.';
+            await this.autoSave();
+            this.trackStopped('retag_no_second', { track_index: i });
+            return;
+          }
+          reTagCursorSec = candidateSec;
           this.reTagCursorSec = reTagCursorSec;
+          // Banked outside the import before it is used, for the same reason
+          // the pending second is recorded before the send: a second that
+          // might have been spent has to be durable from that moment on.
+          background.recordReTagCursor(reTagCursorSec);
           pendingReTagTimestampSec = reTagCursorSec;
           // Recorded *before* the send, not after. The dangerous case is a
           // request that reaches Last.fm and loses its response, so the second
@@ -939,6 +986,13 @@ export default Vue.extend({
         }
 
         try {
+          /*
+            Set *before* the send, not after it. The moment a request leaves,
+            the queue on disk is potentially behind — a response that never
+            arrives still leaves a track that may have been scrobbled, and that
+            is precisely the state a freeze must not mistake for captured.
+          */
+          this.progressDirty = true;
           const result = await api.scrobblePlay(track, pendingReTagTimestampSec);
           // The request succeeded but Last.fm may still have thrown the play
           // away. Counting that as success is what made the completion numbers
@@ -1231,13 +1285,24 @@ export default Vue.extend({
     },
 
     async haltForHandoff(): Promise<boolean> {
-      this.persistFailed = false;
       if (!this.scrobbling || !this.loopActive) {
         // Nothing is sending, so there is nothing to stop. Still flagged, so
         // the paused view explains itself and "Resume Now" stays disabled.
         this.handoffHalted = true;
+        /*
+          An idle loop is not the same as a captured one. If an earlier halt
+          stopped the loop but could not write, the sends it made are still
+          only in memory — and answering "safe" here is what lets the caller
+          upload the older queue sitting on disk. So the write is retried, and
+          its result *is* the answer.
+        */
+        if (this.progressDirty) {
+          return this.persistForHalt();
+        }
+        this.persistFailed = false;
         return true;
       }
+      this.persistFailed = false;
       this.handoffHalted = true;
       this.paused = true;
       this.manuallyPaused = true;
@@ -1261,7 +1326,7 @@ export default Vue.extend({
         worker to send a second time — so an unconfirmed save is answered the
         same way an unstopped loop is.
       */
-      return !this.loopActive && !this.persistFailed;
+      return !this.loopActive && !this.persistFailed && !this.progressDirty;
     },
 
     /**
@@ -1286,6 +1351,9 @@ export default Vue.extend({
       if (this.persistProgress) {
         try {
           await this.persistProgress(snapshot);
+          // A confirmed write is the only thing that clears this. The emit
+          // path below cannot confirm anything, so it does not.
+          this.progressDirty = false;
         } catch {
           // The parent reports it. Swallowed here so a failed save cannot
           // leave the loop holding its lock.
@@ -1332,6 +1400,7 @@ export default Vue.extend({
           // eslint-disable-next-line no-await-in-loop
           await persist(snapshot);
           this.persistFailed = false;
+          this.progressDirty = false;
           return true;
         } catch {
           // eslint-disable-next-line no-await-in-loop

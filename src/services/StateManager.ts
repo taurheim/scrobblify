@@ -107,6 +107,28 @@ export interface ScrobbleState {
    */
   handoffOrderEpoch?: number;
   /**
+   * Stable identity for this queue, minted at selection.
+   *
+   * Two distinct jobs depend on it:
+   *
+   * 1. Asking the worker whether *this* import was ever handed over. The
+   *    per-user liveness check cannot answer that — a job that completed, or
+   *    that stalled needing re-auth, reports nothing live while its tracks are
+   *    still sitting in this browser's queue. Resuming then replays them, and
+   *    Last.fm discards a repeat of `(artist, track, timestamp)` while
+   *    reporting it accepted, so the plays are lost with no error anywhere.
+   *
+   * 2. Making `saveStateIfAhead`'s comparison meaningful. Progress counts from
+   *    two different imports are not comparable, so without identity a tab
+   *    holding an old selection can look "ahead" of the current one and
+   *    overwrite it.
+   *
+   * Optional: absent from every file written before this existed. Absence
+   * degrades to the previous behaviour rather than to a refusal, which is the
+   * same posture taken when the server cannot be reached.
+   */
+  importId?: string;
+  /**
    * Legacy count-based rate-limit fields. Kept so progress files written by
    * older versions still import, and so files written by this version remain
    * readable by them. RateLimitTracker.seedFromLegacyCounts() converts these
@@ -123,6 +145,30 @@ const STORE_NAME = 'scrobbleState';
 const STATE_KEY = 'current';
 
 export default class StateManager {
+  /**
+   * Mints a queue identity.
+   *
+   * 128 bits, hex, so it satisfies the worker's `[\w-]{16,128}` shape and is
+   * far too large to guess. That matters because the id *is* the credential
+   * for `GET /scrobblify/import/:id` — that route is deliberately public,
+   * since a browser that has lost its worker session is one of the cases it
+   * exists to answer, and gating it on a session would demand something
+   * strictly weaker than knowing the id already proves.
+   *
+   * `crypto.getRandomValues` is required rather than preferred; falling back
+   * to `Math.random` would quietly turn a capability into an enumerable one.
+   * Every consumer already treats an absent id as "cannot prove anything".
+   */
+  static newImportId(): string {
+    const c = typeof crypto !== 'undefined' ? crypto : undefined;
+    if (!c || typeof c.getRandomValues !== 'function') {
+      return '';
+    }
+    const bytes = new Uint8Array(16);
+    c.getRandomValues(bytes);
+    return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
   static serializeScrobbles(scrobbles: Scrobble[]): SerializedScrobble[] {
     return scrobbles.map((s) => ({
       track: s.track,
@@ -203,6 +249,20 @@ export default class StateManager {
    * the import, so it is monotonic by construction and is the right ordering
    * key. Ties fall back to the shorter remaining queue.
    *
+   * That comparison is only meaningful *within one import*. Two tabs holding
+   * different selections have unrelated counts, so the one with the bigger
+   * number wins regardless of which record the user is actually working on —
+   * a stale tab can silently replace a live import with its own queue. When
+   * both records carry an identity and the identities differ, this therefore
+   * throws rather than returning false: "a write I correctly dropped because
+   * better progress is already on disk" and "a write I could not place at all"
+   * must not look the same to the halt path, which uses a successful persist
+   * as its evidence that the queue on disk is safe to hand over.
+   *
+   * A missing identity on either side means the question cannot be asked —
+   * states written before this existed have none — and falls back to the
+   * count comparison, the same degradation used everywhere else here.
+   *
    * Read and write share one `readwrite` transaction, which IndexedDB runs to
    * completion against the store before starting another — so this is a real
    * compare-and-set rather than a racy read-then-write.
@@ -216,18 +276,51 @@ export default class StateManager {
       const store = tx.objectStore(STORE_NAME);
       const req = store.get(STATE_KEY);
       let wrote = false;
+      let mismatch = false;
       req.onsuccess = () => {
         const existing = req.result as ScrobbleState | undefined;
+        if (existing && existing.importId && state.importId
+          && existing.importId !== state.importId) {
+          mismatch = true;
+          return;
+        }
         const ahead = !existing
           || (state.originalSucceededCount || 0) > (existing.originalSucceededCount || 0)
           || ((state.originalSucceededCount || 0) === (existing.originalSucceededCount || 0)
             && state.tracks.length <= existing.tracks.length);
-        if (ahead) {
+        /*
+          Equal progress is not equal knowledge.
+
+          Two tabs on the same import can hold identical counts and identical
+          queues while only one of them has a send in flight, and only that one
+          carries the second it was sent under. The counts make the other tab
+          look equally far along, so it qualifies as "ahead" and overwrites —
+          taking the pinned second with it. The retry then mints a fresh one,
+          and Last.fm stores that as a second, phantom play of a track the user
+          heard once.
+
+          Losing that field is therefore a step backwards even when nothing
+          else is, so a write that would drop it is refused. A write that
+          *changes* it is fine: that tab is the one doing the sending.
+        */
+        const dropsPendingSecond = !!existing
+          && !!existing.pendingReTagTimestampSec
+          && !state.pendingReTagTimestampSec
+          && (state.originalSucceededCount || 0) === (existing.originalSucceededCount || 0)
+          && state.tracks.length === existing.tracks.length;
+        if (ahead && !dropsPendingSecond) {
           store.put(state, STATE_KEY);
           wrote = true;
         }
       };
-      tx.oncomplete = () => { db.close(); resolve(wrote); };
+      tx.oncomplete = () => {
+        db.close();
+        if (mismatch) {
+          reject(new Error('saved state belongs to a different import'));
+          return;
+        }
+        resolve(wrote);
+      };
       tx.onerror = () => { db.close(); reject(tx.error); };
     });
   }

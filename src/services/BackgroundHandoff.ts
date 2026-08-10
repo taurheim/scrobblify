@@ -120,7 +120,34 @@ export function uploadListFromState(state: ScrobbleState, nowSec: number): Uploa
   const completed = new Set(state.completedIndices);
   const failed = new Set(state.failedIndices);
   const remaining = all.filter((_, i) => !completed.has(i) && !failed.has(i));
-  return orderForDeadline(remaining.map(toUploadTrack), nowSec);
+  const uploads = remaining.map(toUploadTrack);
+  /*
+    The head track may already be at Last.fm.
+
+    A re-tagged send whose response was lost leaves the browser holding the
+    exact second it used, and the whole point of keeping that second is that
+    the retry must repeat the identical `(artist, track, timestamp)` tuple —
+    Last.fm discards an identical repeat, but stores a *different* second as a
+    second play the user never listened to.
+
+    Handing the queue to the worker is a retry by another name, and the worker
+    would otherwise be told to invent its own second for that track, since
+    re-tagged tracks upload with `originalTimestampSec: 0`. Pinning it here is
+    what carries the idempotency across the handover.
+
+    Only while the second is still inside the window: an expired one would be
+    rejected outright, and a visible rejection of one track is worse than
+    letting the worker place it afresh when the original can no longer collide.
+  */
+  const pending = state.pendingReTagTimestampSec || 0;
+  if (pending > 0
+    && uploads.length > 0
+    && remaining[0].reTagged
+    && pending < nowSec
+    && pending >= nowSec - WINDOW_SECONDS) {
+    uploads[0] = { ...uploads[0], originalTimestampSec: pending };
+  }
+  return orderForDeadline(uploads, nowSec);
 }
 
 export interface BeginResult {
@@ -214,7 +241,7 @@ export async function beginHandoff(
     return { ok: false, reason: 'save_failed' };
   }
 
-  const pre = await api.preflight(username, tracks, capacity.chunkTracks);
+  const pre = await api.preflight(username, tracks, capacity.chunkTracks, frozenState.importId);
   if (!pre) {
     api.releaseQueueOwner(attempt);
     return { ok: false, reason: 'preflight_failed' };

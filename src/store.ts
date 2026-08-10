@@ -65,6 +65,20 @@ export default new Vuex.Store({
       travels with the saved state.
     */
     pendingReTagSec: 0,
+    /*
+      Stable identity for *this queue of tracks*, minted when the user selects
+      them and carried through every save, export and handoff.
+
+      Two questions need it and neither can be answered without it. The first
+      is whether the background service was ever given this import: asking
+      "does this user have something running?" is a different question, and a
+      job that finished — or stalled on re-auth — answers no while its tracks
+      remain in this browser's queue, so the browser replays them and Last.fm
+      discards every one of them silently. The second is whether two tabs are
+      looking at the same import at all, which is what makes a
+      furthest-progress comparison between their saves meaningful.
+    */
+    importId: '',
   },
   mutations: {
     setValidScrobbles(state: any, tracks: SpotifyListen[]) {
@@ -91,6 +105,9 @@ export default new Vuex.Store({
     },
     setPendingReTagSec(state: any, seconds: number) {
       state.pendingReTagSec = seconds;
+    },
+    setImportId(state: any, id: string) {
+      state.importId = id;
     },
     trackScrobbled(state: any) {
       state.tracksScrobbled += 1;
