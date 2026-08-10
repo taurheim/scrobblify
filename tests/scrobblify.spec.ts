@@ -727,6 +727,84 @@ test.describe('Session Resume', () => {
     expect(sent[2]).not.toBe(sent[1]);
   });
 
+  test('a second that has already been spent is not handed to the next track', async ({ page }) => {
+    const sent: number[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        sent.push(Number(params.get('timestamp[0]') || '0'));
+        // The second send is refused for the day, which stops the run and
+        // saves. That is the shortest route to a *second* entry into the send
+        // loop, which is the only place the leak was observable.
+        const body = sent.length === 2
+          ? {
+            scrobbles: {
+              '@attr': { accepted: 0, ignored: 1 },
+              scrobble: { ignoredMessage: { code: '5', '#text': 'Daily scrobble limit exceeded' } },
+            },
+          }
+          : { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } };
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify(body),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    const pinSec = Math.floor(Date.now() / 1000) - 13 * 24 * 60 * 60;
+    const reTagged = [1, 2, 3, 4, 5].map((n) => ({
+      track: `Track ${n}`,
+      artist: `Artist ${n}`,
+      album: `Album ${n}`,
+      timestamp: Date.UTC(2024, 0, n),
+      reTagged: true,
+    }));
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState({
+      tracks: reTagged,
+      pendingReTagTimestampSec: pinSec,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator('text=daily scrobble limit')).toBeVisible({ timeout: 30000 });
+    await expect.poll(() => sent.length, { timeout: 10000 }).toBe(2);
+
+    await page.locator('button:has-text("Try Again Now")').click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+
+    /*
+      Track 4 was stored under the restored pin and is done with. The store
+      kept that second anyway — and the store is what the next entry into the
+      loop reads back, so the second a play was already stored under was
+      handed to whichever track was at the head on resume.
+
+      Last.fm keys a scrobble on (user, artist, track, timestamp), so a
+      repeated second is only harmless while the two tracks differ. These
+      histories are mostly repeats of the same songs, which is the entire
+      reason substitute seconds are allocated one at a time in the first place.
+    */
+    expect(sent.length).toBeGreaterThan(2);
+    expect(sent).toContain(pinSec);
+    expect(sent.filter((s) => s === pinSec)).toHaveLength(1);
+    expect(new Set(sent).size).toBe(sent.length);
+  });
+
   test('a resumed session reports overall progress, not just the remaining chunk', async ({ page }) => {
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
@@ -1344,7 +1422,7 @@ test.describe('Re-tagged old plays', () => {
   // was asked to store.
   async function runReTaggedImport(
     page: Page,
-    scrobbleResponse: object | ((attempt: number) => object | 'abort'),
+    scrobbleResponse: object | ((attempt: number) => Promise<object | 'abort'> | object | 'abort'),
     // Text that marks the end of the run. Not every run ends by finishing:
     // rejections the loop reads as a systemic problem stop it deliberately.
     endsWith = 'Finished scrobbling',
@@ -1363,7 +1441,7 @@ test.describe('Re-tagged old plays', () => {
         timestamps.push(Number(raw));
         scrobbleAttempts++;
         const outcome = typeof scrobbleResponse === 'function'
-          ? scrobbleResponse(scrobbleAttempts)
+          ? await scrobbleResponse(scrobbleAttempts)
           : scrobbleResponse;
         if (outcome === 'abort') {
           await route.abort('connectionfailed');
@@ -1463,6 +1541,85 @@ test.describe('Re-tagged old plays', () => {
     expect(timestamps).toHaveLength(2);
     expect(timestamps[1]).not.toBe(timestamps[0]);
     await expect(page.locator('.overall-progress')).toContainText('0 of 5');
+  });
+
+  test('a second Last.fm refused for the day is not carried across the pause', async ({ page }) => {
+    const ok = { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } };
+    const dailyLimit = {
+      scrobbles: {
+        '@attr': { accepted: 0, ignored: 1 },
+        scrobble: { ignoredMessage: { code: '5', '#text': 'Daily scrobble limit exceeded' } },
+      },
+    };
+
+    const timestamps = await runReTaggedImport(
+      page,
+      (attempt) => (attempt === 2 ? dailyLimit : ok),
+      'daily scrobble limit',
+    );
+    expect(timestamps).toHaveLength(2);
+
+    // Through the disk, which is the route that matters: the pause can last a
+    // day, and the tab is not expected to survive it.
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+
+    /*
+      The refused second used to be saved along with the queue, so the resume
+      re-sent the track under it. That is right for a send whose outcome nobody
+      saw — an identical re-send is deduplicated where a fresh second would be
+      a phantom play — but Last.fm answering "ignored" is not silence. It says
+      outright that nothing was stored.
+
+      Keeping it is then actively harmful: the pause runs to the next day, by
+      which point the second may have aged out of the window Last.fm accepts,
+      and a second read back off the disk cannot be told apart from one that
+      may already hold a play. The track would be given up on rather than
+      re-timed. So a second known to be unspent is simply forgotten.
+    */
+    expect(timestamps.length).toBeGreaterThan(2);
+    expect(new Set(timestamps).size).toBe(timestamps.length);
+  });
+
+  test('the second a send is riding on is durable before the request leaves', async ({ page }) => {
+    const journalDuringFirstSend: (string | null)[] = [];
+
+    const timestamps = await runReTaggedImport(page, async (attempt) => {
+      if (attempt === 1) {
+        // Read while the request is still in flight — this is the whole
+        // interval the journal exists to cover.
+        journalDuringFirstSend.push(await page.evaluate(
+          () => window.localStorage.getItem('scrobblify.background.inflightSecond'),
+        ));
+      }
+      return { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } };
+    });
+
+    /*
+      The saved queue carries the pending second too, but it only reaches the
+      disk on the next save — and the dangerous interval is shorter than that.
+      A tab closed between choosing a second and hearing an answer leaves a
+      play that Last.fm may well have stored; a reload that knows nothing
+      about that second picks a different one, and the re-send lands beside
+      the first instead of being deduplicated away.
+    */
+    const raw = journalDuringFirstSend[0];
+    expect(raw).toBeTruthy();
+    const journal = JSON.parse(raw as string);
+    expect(journal.sec).toBe(timestamps[0]);
+    expect(journal.importId).toBeTruthy();
+    expect(journal.trackKey).toBeTruthy();
+
+    // And it is forgotten once every track is done with, so no later queue can
+    // inherit a second that has already been spent.
+    const afterRun = await page.evaluate(
+      () => window.localStorage.getItem('scrobblify.background.inflightSecond'),
+    );
+    expect(afterRun).toBeNull();
   });
 
   test('a rejection that is not about the timestamp is not retried', async ({ page }) => {

@@ -26,6 +26,7 @@ const HANDOFF_STORAGE_KEY = 'scrobblify.background.handoff';
  */
 const UNRESOLVED_STORAGE_KEY = 'scrobblify.background.unresolved';
 const LINEAGE_STORAGE_KEY = 'scrobblify.background.lineage';
+const IN_FLIGHT_STORAGE_KEY = 'scrobblify.background.inflightSecond';
 const SERVER_OWNS_STORAGE_KEY = 'scrobblify.background.serverOwns';
 const OWNERSHIP_CHANNEL = 'scrobblify.ownership';
 
@@ -468,6 +469,73 @@ export function recordReTagCursor(sec: number): void {
 export function persistedReTagCursorSec(): number {
   const lineage = getHandoffLineage();
   return (lineage && lineage.reTagCursorSec) || 0;
+}
+
+/**
+ * The second a send is *currently* riding on, written before the request
+ * leaves and cleared once its track is done with.
+ *
+ * The saved queue already carries `pendingReTagTimestampSec`, but it only
+ * reaches the disk on the next save — and the interval this exists for is
+ * shorter than that. Between choosing a second and hearing an answer the tab
+ * can be closed, and Last.fm may have stored the play regardless. A reload
+ * that knows nothing about that second allocates a different one, and the
+ * re-send lands beside the first as a phantom duplicate instead of being
+ * deduplicated away.
+ *
+ * Separate from the queue because it has to be written *synchronously*, in the
+ * moment between the choice and the request. It is deliberately not part of
+ * `HandoffLineage`: that record is rewritten wholesale by several callers with
+ * their own rules about what survives, and this must not inherit any of them.
+ *
+ * Bound to a track rather than a queue position. Positions are relative to
+ * whatever remainder was last saved, so the same index names a different track
+ * after a reload, and a second applied to the wrong track is a fresh collision
+ * rather than the deduplication it exists to produce.
+ */
+export interface InFlightSecond {
+  importId: string;
+  trackKey: string;
+  sec: number;
+}
+
+export function recordInFlightSecond(importId: string, trackKey: string, sec: number): void {
+  if (!Number.isFinite(sec) || sec <= 0 || !trackKey) { return; }
+  try {
+    window.localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify({
+      importId: importId || '',
+      trackKey,
+      sec,
+    }));
+  } catch {
+    // Best effort: a lost journal costs a possible duplicate, not a crash.
+  }
+}
+
+export function inFlightSecond(): InFlightSecond | null {
+  try {
+    const raw = window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY);
+    if (!raw) { return null; }
+    const parsed = JSON.parse(raw);
+    const sec = Number(parsed.sec);
+    if (!Number.isFinite(sec) || sec <= 0) { return null; }
+    if (typeof parsed.trackKey !== 'string' || !parsed.trackKey) { return null; }
+    return {
+      importId: typeof parsed.importId === 'string' ? parsed.importId : '',
+      trackKey: parsed.trackKey,
+      sec,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function clearInFlightSecond(): void {
+  try {
+    window.localStorage.removeItem(IN_FLIGHT_STORAGE_KEY);
+  } catch {
+    // Nothing to do.
+  }
 }
 
 export function clearHandoffLineage(

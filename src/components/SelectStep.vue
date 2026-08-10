@@ -157,6 +157,7 @@ import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
 import { trackEvent } from '@/services/Analytics';
 import StateManager from '@/services/StateManager';
+import * as background from '@/services/BackgroundScrobbling';
 
 const workerCode = `
   let count = 0;
@@ -539,6 +540,11 @@ export default Vue.extend({
         which is a collision rather than the deduplication it exists for.
       */
       this.$store.commit('setPendingReTagSec', 0);
+      // Including the copy that outlives the tab. The identity check on the
+      // way back in would refuse it anyway — a fresh queue mints a fresh id —
+      // but leaving a spent second lying around to be matched by accident is
+      // not worth the argument.
+      background.clearInFlightSecond();
       /*
         A fresh identity for a fresh queue.
 

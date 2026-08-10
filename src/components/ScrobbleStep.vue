@@ -724,6 +724,53 @@ export default Vue.extend({
       }, SEND_LOCK_RETRY_MS);
     },
 
+    /**
+     * A stable name for a track, used to bind a journalled second to the play
+     * it was chosen for.
+     *
+     * Queue positions are not stable: they are relative to whatever remainder
+     * was last saved, so the same index names a different track after a
+     * reload. The parsed listen date is included because a history legitimately
+     * contains the same song many times, and only one of those repeats is the
+     * one a second was chosen for.
+     */
+    reTagTrackKey(track: Scrobble): string {
+      return `${track.artist}\u0000${track.track}\u0000${track.timestamp.getTime()}`;
+    },
+
+    /**
+     * Records the second a send is about to ride on, in all three places that
+     * outlive some part of this loop.
+     *
+     * The journal is written last and synchronously, because it is the only
+     * one of the three that is durable at the instant the request leaves.
+     */
+    setPendingSecond(track: Scrobble, sec: number) {
+      this.pendingReTagSec = sec;
+      this.$store.commit('setPendingReTagSec', sec);
+      background.recordInFlightSecond(
+        (this.$store.state.importId as string) || '',
+        this.reTagTrackKey(track),
+        sec,
+      );
+    },
+
+    /**
+     * Forgets the pending second everywhere.
+     *
+     * Every one of these must be cleared together. The component copy is what
+     * reaches the saved queue, the store copy is what a resumed loop reads
+     * back, and the journal is what survives the tab. Leaving any of them
+     * behind hands a used second to whichever track arrives at the head next,
+     * and Last.fm answers a repeated (artist, track, timestamp) by discarding
+     * it while reporting success.
+     */
+    clearPendingSecond() {
+      this.pendingReTagSec = 0;
+      this.$store.commit('setPendingReTagSec', 0);
+      background.clearInFlightSecond();
+    },
+
     async runScrobbleLoop(tracker: RateLimitTracker) {
       this.completed = false;
       this.paused = false;
@@ -770,10 +817,51 @@ export default Vue.extend({
       */
       const savedPendingSec = (this.$store.state.pendingReTagSec as number) || 0;
       const headTrack = tracks[this.scrobbledTracks];
+      /*
+        The journal is consulted only when the queue has nothing to say.
+
+        It records a second in the gap between choosing one and hearing an
+        answer, which is exactly the interval the queue on disk cannot cover.
+        A record that names a different import, or a different track, is
+        another send's business and is left alone — applying a second to the
+        wrong track is a fresh collision rather than the deduplication it
+        exists to produce.
+      */
+      const journalled = background.inFlightSecond();
+      const journalledSec = (
+        journalled
+        && headTrack
+        && journalled.importId === ((this.$store.state.importId as string) || '')
+        && journalled.trackKey === this.reTagTrackKey(headTrack)
+      ) ? journalled.sec : 0;
+      const inheritedSec = savedPendingSec || journalledSec;
       let pendingReTagTimestampSec: number | undefined = (
-        savedPendingSec > 0 && headTrack && headTrack.reTagged
-      ) ? savedPendingSec : undefined;
-      this.pendingReTagSec = pendingReTagTimestampSec || 0;
+        inheritedSec > 0 && headTrack && headTrack.reTagged
+      ) ? inheritedSec : undefined;
+      if (pendingReTagTimestampSec) {
+        // Re-asserted through the same door the allocator uses, so a second
+        // that arrived by only one of the three routes is held by all of them
+        // from here on.
+        this.setPendingSecond(headTrack, pendingReTagTimestampSec);
+      } else {
+        this.pendingReTagSec = 0;
+      }
+      /*
+        Whether the second currently pending is known never to have been
+        stored by Last.fm.
+
+        Only two things establish that: this loop minted it and has not yet
+        heard back about a request carrying it, or Last.fm answered a request
+        carrying it with an explicit refusal. Everything else — a second read
+        back off the disk, a second that rode a request whose response never
+        arrived — leaves a play possibly sitting under it, and replacing such a
+        second is how a duplicate gets made.
+
+        Declared outside the loop body because it has to survive a retry: a
+        rate limit is a definite rejection from Last.fm, so the second the
+        rejected request carried is still known-unspent on the way round.
+      */
+      let pendingSecondUnspent = false;
       /*
         The one queue position whose second has already been re-allocated once.
         Held outside the loop body because a retry re-enters it, so a flag
@@ -781,8 +869,8 @@ export default Vue.extend({
         keeps refusing spin forever.
       */
       let reTagRetryIndex = -1;
-      if (savedPendingSec > 0 && !pendingReTagTimestampSec) {
-        this.$store.commit('setPendingReTagSec', 0);
+      if (inheritedSec > 0 && !pendingReTagTimestampSec) {
+        this.clearPendingSecond();
       }
 
       if (this.scrobbledTracks === 0 && this.previouslyScrobbled === 0) {
@@ -909,17 +997,6 @@ export default Vue.extend({
         this.currentTrackName = track.toString();
 
         let retrySameTrack = false;
-        /*
-          Whether the second about to be sent was chosen by this loop, here and
-          now, or inherited from a send whose outcome nobody ever saw — the
-          worker's export, or a send this browser started and was closed during.
-
-          Last.fm refuses the two identically and they must be answered
-          differently: a second we just minted stored nothing, so replacing it
-          is free, while an inherited one may already have a play sitting under
-          it, and replacing that is how a duplicate gets made.
-        */
-        let mintedThisAttempt = false;
         let recoveredFromRateLimit = false;
         let elapsedSinceFirstRateLimitMs = 0;
         let recoveredRateLimitPauseCount = 0;
@@ -1024,11 +1101,12 @@ export default Vue.extend({
           // might have been spent has to be durable from that moment on.
           background.recordReTagCursor(reTagCursorSec);
           pendingReTagTimestampSec = reTagCursorSec;
-          // Recorded *before* the send, not after. The dangerous case is a
-          // request that reaches Last.fm and loses its response, so the second
-          // has to be durable from the moment it could have been used.
-          this.pendingReTagSec = reTagCursorSec;
-          mintedThisAttempt = true;
+          // Recorded *before* the send, not after, and durably. The dangerous
+          // case is a request that reaches Last.fm and loses its response, so
+          // the second has to outlive this tab from the moment it could have
+          // been used — not merely from the next time the queue is saved.
+          this.setPendingSecond(track, reTagCursorSec);
+          pendingSecondUnspent = true;
         }
 
         try {
@@ -1057,6 +1135,25 @@ export default Vue.extend({
               // Not this track's fault and not permanent, so it must stay in
               // the queue *unprocessed*. Recording it as failed here would
               // count it once now and again when the resume re-sends it.
+              /*
+                The second goes back in the pot, but only if this loop chose it
+                and Last.fm has now said outright that it stored nothing.
+
+                Carrying it over the pause would be worse than useless: the
+                resume can be days later, by which time the second may have
+                aged past what Last.fm accepts — and a second read back off the
+                disk is indistinguishable from one that may already hold a
+                play, so the track would be given up on rather than re-timed.
+                A second known to be unspent is simply forgotten; the resume
+                picks a fresh one that is certain to be in window.
+
+                Only when it is *known* unspent. An inherited pin refused here
+                says nothing about the send it came from, and that send may
+                have stored the play.
+              */
+              if (pendingSecondUnspent) {
+                this.clearPendingSecond();
+              }
               this.pauseReason = 'Last.fm says you have hit your daily scrobble limit. Your progress is saved — come back tomorrow and resume.';
               this.stopped = true;
               this.paused = true;
@@ -1069,12 +1166,13 @@ export default Vue.extend({
             const badSecond = result.ignoredCode === IGNORE_CODE_TIMESTAMP_TOO_OLD
               || result.ignoredCode === IGNORE_CODE_TIMESTAMP_TOO_NEW;
             const chosenSecond = pendingReTagTimestampSec !== undefined;
-            if (badSecond && chosenSecond && !mintedThisAttempt) {
+            if (badSecond && chosenSecond && !pendingSecondUnspent) {
               /*
-                An inherited second, refused.
+                A second that may already be holding a play, refused.
 
-                This loop did not choose it: it came back in a worker export,
-                or from a send this browser started and never saw the end of.
+                This loop did not choose it, or chose it and then lost track of
+                what happened to it: it came back in a worker export, or off
+                the disk, or rode a request whose response never arrived.
                 Either way a play may already be sitting under it — that is the
                 entire reason the second is carried around instead of being
                 re-picked.
@@ -1101,22 +1199,22 @@ export default Vue.extend({
               }));
             } else if (badSecond && chosenSecond && reTagRetryIndex !== i) {
               /*
-                A second *we* chose, here, was refused — so nothing was stored
-                under it and there is nothing left to deduplicate against.
-                Dropping it and allocating another is free of the usual hazard,
-                and it is what stops a track being consumed for a mistake of
-                ours rather than a problem of its own.
+                A second known to be unspent was refused — so nothing was
+                stored under it and there is nothing left to deduplicate
+                against. Dropping it and allocating another is free of the
+                usual hazard, and it is what stops a track being consumed for a
+                mistake of ours rather than a problem of its own.
 
-                Scoped to a second this loop assigned. A track still carrying
-                its own real listen date that Last.fm calls too old is a
-                genuine rejection: re-tagging it here would quietly move a play
-                the user chose to keep, and that decision is theirs to make on
-                the upload screen.
+                Scoped to a second whose whole history this loop watched. A
+                track still carrying its own real listen date that Last.fm
+                calls too old is a genuine rejection: re-tagging it here would
+                quietly move a play the user chose to keep, and that decision
+                is theirs to make on the upload screen.
               */
               reTagRetryIndex = i;
               pendingReTagTimestampSec = undefined;
-              this.pendingReTagSec = 0;
-              this.$store.commit('setPendingReTagSec', 0);
+              pendingSecondUnspent = false;
+              this.clearPendingSecond();
               retrySameTrack = true;
               trackEvent('scrobble_retag_second_refused', this.progressProps({
                 track_index: i,
@@ -1140,8 +1238,8 @@ export default Vue.extend({
                 on the branch above. Bounded to one, and never a duplicate.
               */
               pendingReTagTimestampSec = undefined;
-              this.pendingReTagSec = 0;
-              this.$store.commit('setPendingReTagSec', 0);
+              pendingSecondUnspent = false;
+              this.clearPendingSecond();
               this.endPacing();
               this.stopped = true;
               this.paused = true;
@@ -1181,6 +1279,12 @@ export default Vue.extend({
             // processed — advance past this one before saving so the resume
             // doesn't re-send and re-count it.
             this.scrobbledTracks += 1;
+            // And the second it was sent under goes with it. Left behind, it
+            // would be saved alongside a queue whose head is now a *different*
+            // track, and the resume would hand a spent second to that track.
+            pendingReTagTimestampSec = undefined;
+            pendingSecondUnspent = false;
+            this.clearPendingSecond();
             // eslint-disable-next-line no-await-in-loop
             await this.autoSave();
             this.trackStopped('repeated_rejections', {
@@ -1228,6 +1332,17 @@ export default Vue.extend({
               }));
               this.stopped = true;
               this.paused = true;
+              /*
+                Same reasoning as the daily limit: error 29 is Last.fm turning
+                the request away, so a second this loop chose and has watched
+                ever since stored nothing. Carrying it across a pause that can
+                last hours only gives it time to age out of the window, after
+                which it can no longer be told apart from a second that may
+                hold a play, and the track is given up on instead of re-timed.
+              */
+              if (pendingSecondUnspent) {
+                this.clearPendingSecond();
+              }
               // eslint-disable-next-line no-await-in-loop
               await this.autoSave();
               this.trackStopped('rate_limit_exhausted', {
@@ -1259,6 +1374,14 @@ export default Vue.extend({
             trackEvent('scrobble_paused', this.progressProps({ reason: 'network_error' }));
             trackEvent('scrobble_network_error', this.progressProps({ track_index: i }));
             await this.pauseWithCountdown(NETWORK_ERROR_COOLDOWN_MS);
+            /*
+              The outcome of this request is genuinely unknown — it may have
+              reached Last.fm and had only its answer lost. So the second it
+              carried stops being known-unspent, and from here on it is treated
+              as one that may already hold a play: re-sent identically, and
+              reported rather than replaced if Last.fm later refuses it.
+            */
+            pendingSecondUnspent = false;
             retrySameTrack = true;
           } else {
             this.$store.commit('trackFailed');
@@ -1290,8 +1413,22 @@ export default Vue.extend({
 
         if (!retrySameTrack) {
           this.scrobbledTracks += 1;
+          /*
+            The track is done with, so its second must be forgotten in every
+            place that outlives this iteration — including the store, which a
+            resumed loop reads back, and the journal, which outlives the tab.
+
+            Clearing only the component copy left the other two holding a
+            second that had already been spent. The next entry into the loop
+            found it there, saw a re-tagged track at the head, and concluded it
+            was that track's pending second. If the two tracks were repeats of
+            the same song — which is the ordinary case in the histories this
+            feature exists for — Last.fm discarded the second one while
+            reporting it accepted, and the play was gone with no error.
+          */
           pendingReTagTimestampSec = undefined;
-          this.pendingReTagSec = 0;
+          pendingSecondUnspent = false;
+          this.clearPendingSecond();
           if (recoveredFromRateLimit) {
             trackEvent('scrobble_rate_limit_recovered', this.progressProps({
               burst_count: this.burstCount,
