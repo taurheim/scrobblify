@@ -311,6 +311,22 @@ async function reconcile(
       // eslint-disable-next-line no-await-in-loop
       seen = await fetchWindow(env, lease.job.username, window, sessionKey);
     } catch (e) {
+      /*
+        A revoked key is not an inconclusive lookup, and must not be retried
+        as one.
+
+        Every other failure here is transient: the batch stays in `sending`,
+        nothing is sent on top of it, and the next tick asks again. A dead
+        credential never answers, so that loop has no exit — the job would
+        back off to `needs_attention` (the wrong state, since the user needs
+        the reconnect flow, not a maintainer) and take-back would be refused
+        forever by the drain, which cannot abandon a batch while a decryptable
+        credential is still present. Raising it lets the caller park the job
+        for re-auth, after which the same window can actually be queried.
+      */
+      if (isInvalidSessionKeyError(e)) {
+        throw e;
+      }
       // An inconclusive lookup must not be read as "nothing was stored".
       // Leaving the batch in `sending` costs another reconciliation next tick;
       // treating it as lost costs the user 50 duplicate scrobbles.
@@ -797,7 +813,28 @@ async function runJob(
     return empty;
   }
 
-  await reconcile(env, lease, sessionKey, nowSec);
+  try {
+    await reconcile(env, lease, sessionKey, nowSec);
+  } catch (error) {
+    if (!isInvalidSessionKeyError(error)) {
+      throw error;
+    }
+    /*
+      The same parking `sendBatch` does for a revoked key, reached one step
+      earlier. The credential is deleted and the slot released so the user is
+      offered the reconnect flow; the unresolved batch stays in `sending` and
+      is reconciled with the new key once they return.
+    */
+    await fencedJobUpdate(
+      env.sql,
+      lease,
+      `state = 'needs_reauth', state_reason = ?, session_key_ct = NULL, session_key_iv = NULL,
+       live_username = NULL, locked_until = 0, updated_at = ?`,
+      ['Last.fm session key was revoked', nowSec],
+    );
+    await audit(env.sql, lease.job.id, lease.generation, 'reauth_during_reconcile', null, nowSec);
+    return empty;
+  }
 
   /*
     Nothing may be sent while a batch's fate is still unknown.
@@ -820,7 +857,14 @@ async function runJob(
     [lease.job.id],
   );
   if (unresolved && unresolved.n > 0) {
-    const graceEndsAt = (unresolved.oldest ?? nowSec) + RECONCILE_GRACE_SECONDS;
+    /*
+      A missing `sent_at` is treated as long past, never as fresh. Such a row
+      is invisible to reconciliation's `sent_at <= ?` predicate, so calling it
+      recent would renew the grace deadline every tick and wait on it forever
+      without ever counting a failure. Falling through to the failure path
+      instead reaches a human.
+    */
+    const graceEndsAt = (unresolved.oldest || 0) + RECONCILE_GRACE_SECONDS;
     if (graceEndsAt > nowSec) {
       /*
         Not a failure — just too early to ask. A scrobble accepted moments
@@ -1223,7 +1267,7 @@ async function drainPausedJobs(
 
   for (const job of drainable) {
     // eslint-disable-next-line no-await-in-loop
-    await drainOneJob(env, job.id, nowSec, report);
+    await drainOneJob(env, job.id, nowSec, report, false);
   }
 }
 
@@ -1262,7 +1306,7 @@ export async function drainJobOnDemand(
     // slow must not be reconciled out from under itself.
     return;
   }
-  await drainOneJob(env, jobId, nowSec, report);
+  await drainOneJob(env, jobId, nowSec, report, true);
 }
 
 async function drainOneJob(
@@ -1270,6 +1314,17 @@ async function drainOneJob(
   jobId: string,
   nowSec: number,
   report: TickReport,
+  /*
+    Whether the user has actually asked for their tracks back.
+
+    Abandoning an unresolved batch re-queues tracks whose fate is unknown, so
+    it can duplicate up to a batch's worth of plays. That is the right trade
+    only when the alternative is worse — a take-back that can never complete.
+    The background sweep has no such alternative: a `needs_reauth` job is
+    waiting for the user to *reconnect and continue*, and abandoning under it
+    hands those tracks straight back to the send loop.
+  */
+  userRequested: boolean,
 ): Promise<void> {
   const lease = await acquireJobForDrain(
     env.sql, jobId, Math.floor(Date.now() / 1000), LEASE_SECONDS,
@@ -1284,13 +1339,16 @@ async function drainOneJob(
       // Last.fm. Abandoning them is what lets the export proceed; their
       // tracks stay after the cursor and are handed back, which risks a
       // duplicate but never a loss — the safe direction for a job the user
-      // has already asked to stop.
-      await env.sql.run(
-        `UPDATE batches SET state = 'abandoned', settled_at = ?
-          WHERE job_id = ? AND state = 'sending'`,
-        [nowSec, lease.job.id],
-      );
-      await audit(env.sql, lease.job.id, lease.generation, 'drain_abandoned_no_credential', null, nowSec);
+      // has already asked to stop. Only for a job they have: see
+      // `userRequested`.
+      if (userRequested) {
+        await env.sql.run(
+          `UPDATE batches SET state = 'abandoned', settled_at = ?
+            WHERE job_id = ? AND state = 'sending'`,
+          [nowSec, lease.job.id],
+        );
+        await audit(env.sql, lease.job.id, lease.generation, 'drain_abandoned_no_credential', null, nowSec);
+      }
     } else {
       const sessionKey = await decryptCredential(
         { ciphertext: lease.job.session_key_ct, iv: lease.job.session_key_iv },
@@ -1298,7 +1356,34 @@ async function drainOneJob(
         lease.job.id,
       );
       if (sessionKey) {
-        await reconcile(env, lease, sessionKey, nowSec);
+        try {
+          await reconcile(env, lease, sessionKey, nowSec);
+        } catch (error) {
+          if (!isInvalidSessionKeyError(error)) {
+            throw error;
+          }
+          /*
+            A credential that is present but revoked answers nothing, ever, so
+            waiting for it blocks the export forever — the user asked to stop
+            and would have no way to get their tracks back.
+
+            Treated exactly like the no-credential case above, and gated the
+            same way: the batch is abandoned only when the user has actually
+            asked for their tracks back, because its tracks then stay after the
+            cursor and are handed back, which risks a duplicate but never a
+            loss. Under the background sweep there is nothing to unblock, so
+            the batch is left for the key the user is expected to reconnect
+            with.
+          */
+          if (userRequested) {
+            await env.sql.run(
+              `UPDATE batches SET state = 'abandoned', settled_at = ?
+                WHERE job_id = ? AND state = 'sending'`,
+              [nowSec, lease.job.id],
+            );
+            await audit(env.sql, lease.job.id, lease.generation, 'drain_abandoned_revoked_credential', null, nowSec);
+          }
+        }
       }
     }
   } catch (error) {

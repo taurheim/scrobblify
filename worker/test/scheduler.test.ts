@@ -21,6 +21,7 @@ import {
   MAX_RECORDED_FAILURES_PER_JOB,
   RECONCILE_GRACE_SECONDS,
   matchOutcomes,
+  drainJobOnDemand,
 } from '../src/scheduler';
 import { BatchScrobbleResult, ScrobbleEntry } from '../../src/shared/lastfm/protocol';
 
@@ -92,6 +93,9 @@ class FakeLastFm {
 
   public recentThrows = false;
 
+  /** Set to make the recent-tracks lookup fail the way a revoked key does. */
+  public recentThrowsRevoked = false;
+
   public recentCalls = 0;
 
   constructor(public script: Script[] = []) {}
@@ -124,6 +128,9 @@ class FakeLastFm {
 
   async getRecentTracks() {
     this.recentCalls += 1;
+    if (this.recentThrowsRevoked) {
+      throw new Error('Last.fm API error 9 (HTTP 403)');
+    }
     if (this.recentThrows) {
       throw new Error('Last.fm API error 8 (HTTP 200)');
     }
@@ -1052,6 +1059,118 @@ async function main() {
     check('the stale batch was settled', stillSending!.n === 0, stillSending!.n);
     check('and the job stayed parked where it was',
       (await h.job()).state === 'needs_attention');
+  }
+
+  console.log('\n-- a revoked credential during reconciliation parks for re-auth --');
+  {
+    /*
+      A revoked key is not an inconclusive lookup. Every other reconciliation
+      failure is transient — the batch stays in `sending`, nothing is sent on
+      top of it, the next tick asks again — but a dead credential never
+      answers, so that loop has no exit. Left as an ordinary failure the job
+      would back off to `needs_attention`, which asks a maintainer to act when
+      the person who can actually fix it is the user, and the reconnect flow
+      would never be offered.
+    */
+    const h = await harness({
+      total: 120,
+      script: [{ kind: 'throw', message: 'Network request failed' }],
+    });
+    await runTick(h.env, NOW);
+    h.fake.recentThrowsRevoked = true;
+    const before = h.fake.sent.length;
+    await runTick(h.env, NOW + 7200);
+    const job = await h.job();
+    check('the job asks the user to reconnect', job.state === 'needs_reauth', job.state);
+    check('the dead credential is deleted', job.session_key_ct === null, job.session_key_ct);
+    check('and the slot is released', job.live_username === null, job.live_username);
+    check('nothing was sent under an unresolved batch',
+      h.fake.sent.length === before, h.fake.sent.length - before);
+    const batch = await h.sql.first<any>(
+      "SELECT * FROM batches WHERE job_id = ? AND state = 'sending'", [h.jobId],
+    );
+    /*
+      Kept in flight deliberately. The user is coming back with a new key, and
+      the same window can be queried properly then — abandoning here would
+      throw away a resolvable answer for no reason. The sweep that runs in this
+      same tick must not undo that; see the drain tests below.
+    */
+    check('the unresolved batch is kept for the new key', !!batch, batch);
+    const parked = await h.sql.first<any>(
+      "SELECT COUNT(*) AS n FROM audit WHERE job_id = ? AND event = 'reauth_during_reconcile'",
+      [h.jobId],
+    );
+    check('and it is recorded', parked!.n === 1, parked!.n);
+  }
+
+  console.log('\n-- a take-back is not blocked by a revoked credential --');
+  {
+    /*
+      The counterpart, and the reason the parking above cannot simply wait.
+      Export returns 409 while any batch is `sending`, and the drain only
+      abandoned batches when the credential was *absent* — so a
+      present-but-revoked one refused take-back forever, leaving cancel (which
+      destroys the queue) as the user's only way out.
+
+      Abandoning risks a duplicate and never a loss, which is the safe
+      direction for a job the user has already asked to stop. That is the same
+      trade the no-credential branch has always made — and it is why this runs
+      through `drainJobOnDemand`, the take-back path, rather than the sweep.
+    */
+    const h = await harness({
+      total: 120,
+      script: [{ kind: 'throw', message: 'Network request failed' }],
+    });
+    await runTick(h.env, NOW);
+    h.fake.recentThrowsRevoked = true;
+    await h.sql.run(
+      "UPDATE jobs SET state = 'paused', locked_until = 0 WHERE id = ?",
+      [h.jobId],
+    );
+    await drainJobOnDemand(h.env, h.jobId, NOW + 7200);
+    const stillSending = await h.sql.first<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM batches WHERE job_id = ? AND state = 'sending'",
+      [h.jobId],
+    );
+    check('the batch no longer blocks the export', stillSending!.n === 0, stillSending!.n);
+    check('and the job stayed paused where the user left it',
+      (await h.job()).state === 'paused');
+    const abandoned = await h.sql.first<any>(
+      `SELECT COUNT(*) AS n FROM audit
+        WHERE job_id = ? AND event = 'drain_abandoned_revoked_credential'`,
+      [h.jobId],
+    );
+    check('and it is recorded', abandoned!.n === 1, abandoned!.n);
+  }
+
+  console.log('\n-- the sweep does not abandon a batch nobody asked to stop --');
+  {
+    /*
+      Abandoning re-queues tracks whose fate is unknown, so it can duplicate a
+      whole batch of plays. A `needs_reauth` job is not stopped — it is waiting
+      for the user to reconnect and carry on — and the sweep drains it on the
+      very tick that parks it. Left ungated, the fix above would hand fifty
+      unresolved tracks straight back to the send loop.
+    */
+    const h = await harness({
+      total: 120,
+      script: [{ kind: 'throw', message: 'Network request failed' }],
+    });
+    await runTick(h.env, NOW);
+    h.fake.recentThrowsRevoked = true;
+    await runTick(h.env, NOW + 7200);
+    const job = await h.job();
+    check('the job is parked for re-auth', job.state === 'needs_reauth', job.state);
+    const stillSending = await h.sql.first<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM batches WHERE job_id = ? AND state = 'sending'",
+      [h.jobId],
+    );
+    /*
+      Kept in flight deliberately. The user is coming back with a new key, and
+      the same window can be queried properly then — abandoning here would
+      throw away a resolvable answer and risk duplicating the batch.
+    */
+    check('the unresolved batch is kept for the new key', stillSending!.n === 1, stillSending!.n);
   }
 
   console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);

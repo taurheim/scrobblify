@@ -121,6 +121,9 @@
           <div v-for="(item, i) in reportedFailures" :key="i" class="mb-1">
             <strong>{{ item.name }}</strong> — {{ item.error }}
           </div>
+          <div v-if="carriedFailuresDropped > 0" class="mt-2">
+            …and {{ carriedFailuresDropped }} more that couldn't be listed here.
+          </div>
         </v-expansion-panel-content>
       </v-expansion-panel>
     </v-expansion-panels>
@@ -453,6 +456,13 @@ export default Vue.extend({
           error: f.error,
         })),
       ];
+    },
+    /**
+     * How many carried failures could not be kept, so an incomplete list can
+     * say so rather than reading as exhaustive.
+     */
+    carriedFailuresDropped(): number {
+      return this.$store.state.carriedFailuresDropped || 0;
     },
     /**
      * Size of the whole import. `tracksToScrobble.length` shrinks every time a

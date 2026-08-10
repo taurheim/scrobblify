@@ -10,6 +10,7 @@
  * dangerous — see `HandoffOutcome`.
  */
 import { trackError, trackEvent } from '@/services/Analytics';
+import type { FailedTrackDetail } from '@/services/StateManager';
 
 /**
  * Absent in local development, in which case background mode simply is not
@@ -210,7 +211,9 @@ export function clearOwnershipUnresolved(): void {
  * falls back to the remaining count.
  *
  * The one exception is `reTagUsedRanges`, which is correctness-bearing — see
- * its own note.
+ * its own note. `carriedFailures` is a second exception of a different kind:
+ * losing it does not risk a wrong scrobble, but it is the only record that a
+ * given play was written off, and nothing else can reconstruct it.
  */
 export interface HandoffLineage {
   originalTotalTracks: number;
@@ -251,7 +254,37 @@ export interface HandoffLineage {
    * there rather than being abandoned. Zero means no knowledge is missing.
    */
   reTagKnownFromSec?: number;
+  /**
+   * Tracks earlier owners of this queue wrote off permanently.
+   *
+   * Kept here rather than in the saved state because the saved state does not
+   * survive a handoff — `beginHandoff` clears it once the worker owns the
+   * queue, so a second handover would otherwise reduce this list to whatever
+   * the *latest* job happened to reject and silently drop everything reported
+   * by the ones before it. The lineage is the only thing that spans the whole
+   * chain of owners, which is exactly the lifetime this list needs.
+   */
+  carriedFailures?: FailedTrackDetail[];
+  /**
+   * How many failures were dropped to stay inside the cap below.
+   *
+   * A count is a poor substitute for a name, but it is far better than
+   * silently shortening the list: the user can at least tell that what they
+   * are reading is incomplete.
+   */
+  carriedFailuresDropped?: number;
 }
+
+/**
+ * How many named failures the lineage keeps.
+ *
+ * Generous, because each record is a few dozen bytes and the alternative to
+ * keeping one is the user never learning that a play was lost. Unlike the
+ * ranges above, the *oldest* are the ones worth keeping — they are the ones
+ * the user has had least opportunity to see — so the cap trims the newest
+ * only after the list is already implausibly long.
+ */
+const MAX_LINEAGE_FAILURES = 500;
 
 /**
  * How many re-tag ranges the lineage keeps.
@@ -390,6 +423,60 @@ export function mergeExportedRanges(
   };
 }
 
+/**
+ * Keeps only entries that actually name a track.
+ *
+ * An entry with neither an artist nor a title tells the user nothing, and
+ * showing it would imply a play was lost that this list cannot describe.
+ */
+function validFailures(raw: unknown): FailedTrackDetail[] {
+  if (!Array.isArray(raw)) { return []; }
+  return raw
+    .filter((f: any) => f && (typeof f.artist === 'string' || typeof f.track === 'string')
+      && (f.artist || f.track))
+    .map((f: any) => ({
+      artist: String(f.artist || ''),
+      track: String(f.track || ''),
+      album: String(f.album || ''),
+      reason: String(f.reason || 'Rejected by Last.fm'),
+    }));
+}
+
+/**
+ * Combines the failures already known to this lineage with a newly returned
+ * set, newest last, de-duplicated.
+ *
+ * Exported because the take-back path and the resume path both have to do it
+ * and must agree: a queue can pass through the server more than once, and each
+ * pass reports only what *that* job rejected.
+ */
+export function mergeCarriedFailures(
+  existing: FailedTrackDetail[] | undefined,
+  incoming: FailedTrackDetail[] | undefined,
+  priorDropped = 0,
+): { failures: FailedTrackDetail[]; dropped: number } {
+  const all = [...validFailures(existing), ...validFailures(incoming)];
+  const seen = new Set<string>();
+  const unique: FailedTrackDetail[] = [];
+  for (const f of all) {
+    /*
+      The same job's failures come back on every export, and a user may take
+      back more than once, so an identical record arriving twice is ordinary
+      rather than suspicious. Keyed on what the user reads, since that is what
+      a repeat would duplicate on screen.
+    */
+    const key = `${f.artist}\u0000${f.track}\u0000${f.reason}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(f);
+    }
+  }
+  const kept = unique.slice(0, MAX_LINEAGE_FAILURES);
+  const dropped = (Number.isFinite(priorDropped) && priorDropped > 0 ? Math.floor(priorDropped) : 0)
+    + (unique.length - kept.length);
+  return { failures: kept, dropped };
+}
+
 export function setHandoffLineage(lineage: HandoffLineage): void {
   try {
     window.localStorage.setItem(LINEAGE_STORAGE_KEY, JSON.stringify(lineage));
@@ -416,10 +503,80 @@ export function getHandoffLineage(): HandoffLineage | null {
       handedOverAtSec: Number.isFinite(parsed.handedOverAtSec) ? parsed.handedOverAtSec : 0,
       reTagUsedRanges: capped.ranges,
       reTagKnownFromSec: combineKnownFrom(parsed.reTagKnownFromSec, capped.droppedBelowSec),
+      carriedFailures: validFailures(parsed.carriedFailures),
+      carriedFailuresDropped: Number.isFinite(parsed.carriedFailuresDropped)
+        && Number(parsed.carriedFailuresDropped) > 0
+        ? Math.floor(Number(parsed.carriedFailuresDropped))
+        : 0,
     };
   } catch {
     // Corrupt or unreadable. Cosmetic, so degrade rather than throw.
     return null;
+  }
+}
+
+/**
+ * Folds a newly returned set of named failures into the lineage.
+ *
+ * Called on the take-back path, which is the only moment the browser learns
+ * what a job wrote off — and the last moment before that job is cancelled and
+ * its record of them destroyed. Returns the merged list so the caller can put
+ * the same set into the queue it is about to save.
+ */
+export function recordCarriedFailures(
+  incoming: FailedTrackDetail[] | undefined,
+): { failures: FailedTrackDetail[]; dropped: number } {
+  const existing = getHandoffLineage();
+  const merged = mergeCarriedFailures(
+    existing ? existing.carriedFailures : [],
+    incoming,
+    existing ? existing.carriedFailuresDropped : 0,
+  );
+  if (merged.failures.length === 0 && merged.dropped === 0) {
+    return merged;
+  }
+  try {
+    const raw = window.localStorage.getItem(LINEAGE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    window.localStorage.setItem(LINEAGE_STORAGE_KEY, JSON.stringify({
+      // Defaulted rather than assumed: a lineage may not exist yet, and
+      // `getHandoffLineage` refuses to read one whose totals are not numbers.
+      originalTotalTracks: 0,
+      originalSucceededCount: 0,
+      ...(parsed && typeof parsed === 'object' ? parsed : {}),
+      carriedFailures: merged.failures,
+      carriedFailuresDropped: merged.dropped,
+    }));
+  } catch {
+    /*
+      Not fail-closed, deliberately. This list only ever *describes* plays that
+      have already been written off; losing it costs the user a name, where
+      refusing to continue would cost them the rest of their import.
+    */
+    trackError('background.recordCarriedFailures', new Error('lineage write failed'));
+  }
+  return merged;
+}
+
+/**
+ * Drops the named failures a previous import left in the lineage.
+ *
+ * Unlike the rest of the lineage — which describes seconds on the account's
+ * timeline and outlives any one import — this list is about a particular
+ * selection's tracks, so a new selection is the point at which it stops being
+ * true.
+ */
+export function clearCarriedFailures(): void {
+  try {
+    const raw = window.localStorage.getItem(LINEAGE_STORAGE_KEY);
+    if (!raw) { return; }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') { return; }
+    delete parsed.carriedFailures;
+    delete parsed.carriedFailuresDropped;
+    window.localStorage.setItem(LINEAGE_STORAGE_KEY, JSON.stringify(parsed));
+  } catch {
+    // Cosmetic; a stale name shown against a new import is not a lost play.
   }
 }
 
@@ -670,7 +827,17 @@ export function clearHandoffLineage(
     // being cleared: it names seconds already written to the account's
     // timeline, which no take-back undoes.
     const cursor = (existing && existing.reTagCursorSec) || 0;
-    if (capped.ranges.length === 0 && knownFrom === 0 && cursor === 0) {
+    /*
+      Named failures survive too, and for a stronger reason than the cursor:
+      they describe plays that were written off, the queue that could have
+      re-listed them has been handed back and rebuilt, and no other copy
+      exists anywhere. Clearing the lineage happens on exactly the path where
+      that matters — the queue returning to the browser.
+    */
+    const failures = validFailures(existing && existing.carriedFailures);
+    const failuresDropped = (existing && existing.carriedFailuresDropped) || 0;
+    if (capped.ranges.length === 0 && knownFrom === 0 && cursor === 0
+      && failures.length === 0 && failuresDropped === 0) {
       window.localStorage.removeItem(LINEAGE_STORAGE_KEY);
       return;
     }
@@ -680,6 +847,8 @@ export function clearHandoffLineage(
       reTagUsedRanges: capped.ranges,
       reTagKnownFromSec: knownFrom,
       reTagCursorSec: cursor,
+      ...(failures.length > 0 ? { carriedFailures: failures } : {}),
+      ...(failuresDropped > 0 ? { carriedFailuresDropped: failuresDropped } : {}),
     }));
   } catch {
     // Nothing to do.

@@ -338,7 +338,34 @@ export default class StateManager {
           && (state.originalSucceededCount || 0) === (existing.originalSucceededCount || 0)
           && state.tracks.length === existing.tracks.length;
         if (ahead && !dropsPendingSecond) {
-          store.put(state, STATE_KEY);
+          /*
+            Named failures are carried forward rather than being allowed to
+            decide the write.
+
+            They describe tracks that are no longer in the queue, so no index
+            reconstructs them and only the tab that performed the take-back
+            has ever seen the list. A sibling that is genuinely further along
+            legitimately wins this comparison while knowing nothing about
+            them, and would erase the only record of what a background job
+            rejected.
+
+            Preserved rather than refused, deliberately: refusing would fail a
+            persist the halt path reads as "the queue on disk is not safe to
+            hand over", trading a lost *list* for a blocked handover. Within
+            one import this list only ever grows — a fresh selection mints a
+            new identity, which is rejected above — so keeping the longer side
+            cannot resurrect anything a user cleared.
+          */
+          const existingFailures = existing && Array.isArray(existing.failedDetails)
+            ? existing.failedDetails
+            : [];
+          const incomingFailures = Array.isArray(state.failedDetails)
+            ? state.failedDetails
+            : [];
+          const toWrite = existingFailures.length > incomingFailures.length
+            ? { ...state, failedDetails: existingFailures }
+            : state;
+          store.put(toWrite, STATE_KEY);
           wrote = true;
         }
       };

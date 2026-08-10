@@ -157,6 +157,7 @@ import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
 import { trackEvent } from '@/services/Analytics';
 import StateManager from '@/services/StateManager';
+import * as background from '@/services/BackgroundScrobbling';
 
 const workerCode = `
   let count = 0;
@@ -514,6 +515,16 @@ export default Vue.extend({
       // import that all later resume progress is measured against.
       this.$store.commit('setOriginalTotalTracks', scrobbles.length);
       this.$store.commit('setResumedScrobbleCount', 0);
+      /*
+        Named failures *are* reset, unlike the re-tag lineage below. They
+        describe tracks the user chose in a previous import; carrying them into
+        a new run's results would report failures this run never had, and the
+        selection just made is the user's own statement about what they want
+        scrobbled now.
+      */
+      this.$store.commit('setCarriedFailures', []);
+      this.$store.commit('setCarriedFailuresDropped', 0);
+      background.clearCarriedFailures();
       /*
         The re-tag lineage is deliberately **not** reset here.
 

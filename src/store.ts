@@ -31,6 +31,13 @@ export default new Vuex.Store({
     carriedFailures: [] as Array<{
       artist: string; track: string; album?: string; reason: string;
     }>,
+    /*
+      How many named failures could not be kept. Shown alongside the list so an
+      incomplete list is visibly incomplete: a user reading five names when
+      twelve tracks were rejected would otherwise re-add five and believe they
+      were done.
+    */
+    carriedFailuresDropped: 0,
     // Size of the user's original selection. Unlike `selectedScrobbles.length`
     // this does NOT shrink on resume, so it is the only stable denominator for
     // "how much of my import is done" — both in the UI and in analytics.
@@ -104,6 +111,11 @@ export default new Vuex.Store({
     },
     setCarriedFailures(state: any, failures: any[]) {
       Vue.set(state, 'carriedFailures', Array.isArray(failures) ? failures : []);
+    },
+    setCarriedFailuresDropped(state: any, dropped: number) {
+      state.carriedFailuresDropped = Number.isFinite(dropped) && dropped > 0
+        ? Math.floor(dropped)
+        : 0;
     },
     setOriginalTotalTracks(state: any, count: number) {
       state.originalTotalTracks = count;

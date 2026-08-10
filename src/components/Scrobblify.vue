@@ -1563,6 +1563,21 @@ export default Vue.extend({
             ? Math.floor(Date.now() / 1000)
             : exported.usedRangesFloorSec,
         );
+        /*
+          The names of the tracks this job wrote off are folded in on the same
+          principle, and for a stronger reason: cancelling the job destroys the
+          server's only record of them, and the queue being restored no longer
+          contains those tracks at all. A user who cannot name a rejected track
+          cannot re-add it. Merged rather than replaced, because a queue can
+          pass through the server more than once and each export reports only
+          what *that* job rejected.
+        */
+        const carriedFailures = background.recordCarriedFailures(restored.failedDetails);
+        if (carriedFailures.failures.length > 0) {
+          restored.failedDetails = carriedFailures.failures;
+        } else {
+          delete restored.failedDetails;
+        }
         // Saved before the job is cancelled. Cancelling first and then failing
         // to save would destroy the only copy of the queue.
         await this.stateManager.saveState(restored);
@@ -1580,6 +1595,13 @@ export default Vue.extend({
           turns the next autosave into a hard error.
         */
         this.$store.commit('setPendingReTagSec', restored.pendingReTagTimestampSec || 0);
+        /*
+          Committed here as well as on restore, so the tab that performed the
+          take-back shows the names without needing a reload — the very tab
+          whose user just asked what happened to their import.
+        */
+        this.$store.commit('setCarriedFailures', carriedFailures.failures);
+        this.$store.commit('setCarriedFailuresDropped', carriedFailures.dropped);
 
         /*
           From here until the cancel is confirmed, both sides may believe they
@@ -1810,9 +1832,19 @@ export default Vue.extend({
       /*
         Failures a previous owner recorded are restored before the step mounts,
         because that is the only chance to show them: the tracks they name are
-        not in the queue and nothing else remembers them.
+        not in the queue and nothing else remembers them. Merged with the
+        lineage, which is the only structure that spans the whole chain of
+        owners — `beginHandoff` clears the saved state, so a queue that has been
+        handed over twice carries only the most recent job's list on disk.
       */
-      this.$store.commit('setCarriedFailures', state.failedDetails || []);
+      const lineageFailures = background.getHandoffLineage();
+      const restoredFailures = background.mergeCarriedFailures(
+        lineageFailures ? lineageFailures.carriedFailures : [],
+        state.failedDetails,
+        lineageFailures ? lineageFailures.carriedFailuresDropped : 0,
+      );
+      this.$store.commit('setCarriedFailures', restoredFailures.failures);
+      this.$store.commit('setCarriedFailuresDropped', restoredFailures.dropped);
       this.$store.commit('setOriginalTotalTracks', state.originalTotalTracks || state.totalTracks);
       this.hasResumableState = false;
       // Skip to scrobble step (step 4)
@@ -1886,7 +1918,13 @@ export default Vue.extend({
         // Not critical — continue anyway
       }
       this.$store.commit('setResumedScrobbleCount', 0);
-      this.$store.commit('setCarriedFailures', []);
+      /*
+        `carriedFailures` is deliberately *not* cleared here. Completion is
+        exactly when the user reviews what happened, and these name tracks the
+        worker wrote off that exist nowhere else — clearing them here made the
+        list vanish at the only moment it was wanted. A genuinely new import
+        clears it instead (`SelectStep`).
+      */
       this.hasRemainingTracks = false;
       this.currentStep = 5;
     },
