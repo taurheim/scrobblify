@@ -239,6 +239,18 @@ export default Vue.extend({
        */
       ownershipBlocked: false,
       /**
+       * Whether this tab has ever been told that a queue of its own left it.
+       *
+       * Set when a handover is observed and never cleared, because the thing
+       * it records cannot be undone: from that moment on, the tracks sitting
+       * in this tab's memory may already have been sent by the worker, and
+       * only the queue on disk can say otherwise. A tab that has never seen a
+       * handover is holding nothing anyone else could have sent, which is what
+       * makes the ordinary first run — where nothing has been written to disk
+       * yet, because progress is only written on a pause — safe to release.
+       */
+      sawServerOwnership: false,
+      /**
        * True until the server has answered whether anything is running for
        * this user, and again whenever that answer could not be obtained.
        *
@@ -343,6 +355,7 @@ export default Vue.extend({
       const step = this.$refs.scrobbleStep as any;
       if (next) {
         this.hasResumableState = false;
+        this.sawServerOwnership = true;
         if (step && step.haltForHandoff) {
           // Deliberately not awaited: this is an event handler, and the halt
           // resolves only once the in-flight batch finishes.
@@ -383,6 +396,9 @@ export default Vue.extend({
     */
     this.releaseFreezeResponder = background.respondToFreezeRequests(async () => {
       const step = this.$refs.scrobbleStep as any;
+      // A sibling is preparing to hand this queue over, so from here on this
+      // tab's copy may be superseded whether or not the attempt succeeds.
+      this.sawServerOwnership = true;
       if (step && step.haltForHandoff) {
         /*
           The boolean is load-bearing. `haltForHandoff` returns false when the
@@ -639,6 +655,7 @@ export default Vue.extend({
         this.authorityUnknown = false;
         this.ownershipBlocked = true;
         this.hasResumableState = false;
+        this.sawServerOwnership = true;
         // With a valid session this renders the real status card, with pause,
         // resume and take-back. Without one there is nothing to show but the
         // block itself, so offer the sign-in that turns it into a status card.
@@ -673,6 +690,7 @@ export default Vue.extend({
           return;
         }
         if (handedOver === true) {
+          this.sawServerOwnership = true;
           await this.blockForHandedOverQueue();
           return;
         }
@@ -763,6 +781,7 @@ export default Vue.extend({
       this.authorityUnknown = false;
       this.ownershipBlocked = true;
       this.hasResumableState = false;
+      this.sawServerOwnership = true;
       background.setQueueOwner({ owner: 'server', id: '' });
       await this.refreshBackgroundJob();
       if (!this.backgroundJob) {
@@ -787,21 +806,25 @@ export default Vue.extend({
      * The identity on disk is therefore the arbiter. It matches for the tab
      * that owns the current queue and differs for every stale sibling, and a
      * sibling that stays halted loses nothing: reloading restores the real
-     * queue from disk.
+     * queue from disk. The one tab excused from producing that proof is the
+     * one that has never seen a handover, which is holding a queue no worker
+     * has ever been given.
      */
     async revalidateAfterRelease(): Promise<void> {
       const step = this.$refs.scrobbleStep as any;
       const inMemoryId = (this.$store.state.importId as string) || '';
       let savedQueue = false;
+      let diskReadable = true;
       let diskId = '';
       try {
         const saved = await this.stateManager.loadState();
         savedQueue = !!saved;
         diskId = saved ? (saved.importId || '') : '';
       } catch (e) {
-        // Unreadable. Released below, which is no worse than the unconditional
-        // release this replaced — and a queue that cannot be read cannot be
-        // resumed from disk either, so there is nothing to prefer over it.
+        // Unreadable, which is not the same as absent. The disk is the only
+        // witness that could clear this tab, so losing it means the question
+        // is unanswered — and an unanswered question does not release.
+        diskReadable = false;
       }
 
       /*
@@ -809,19 +832,30 @@ export default Vue.extend({
         them release.
 
         It was never halted, so it is holding nothing that could be stale.
-        Or there is no queue on disk at all — which is the ordinary case
-        during a first run, since progress is only written on a pause, and
-        reading it as a mismatch would stop a scrobble that had not even
-        started. Or the queue on disk is the one this tab is holding.
+        Or the queue on disk is readable and is the one this tab is holding.
+        Or this tab has never seen a handover at all — no ownership broadcast,
+        no freeze request, no handoff attempt of its own — in which case
+        nothing it holds can have been sent by anyone else, and an empty disk
+        is simply the ordinary first run, where progress has not been written
+        because it is only written on a pause.
 
-        Note that an *empty* in-memory id does not pass the last test against a
-        non-empty disk id: a queue restored from a progress file written before
-        identities existed has none, and a handoff mints one onto disk, so
-        "empty against non-empty" is precisely the stale case rather than an
-        exemption from it.
+        That last clause is deliberately narrow. It used to read "no queue on
+        disk", which released the *worst* case rather than the most innocent
+        one: a successful handover clears the disk, so every sibling tab still
+        holding the pre-handover queue found an empty disk and was let go to
+        replay tracks the worker had already sent.
+
+        Note also that an *empty* in-memory id does not pass the identity test
+        against a non-empty disk id: a queue restored from a progress file
+        written before identities existed has none, and a handoff mints one
+        onto disk, so "empty against non-empty" is precisely the stale case
+        rather than an exemption from it.
       */
       const holdsQueue = !!(step && step.handoffHalted);
-      if (!holdsQueue || !savedQueue || diskId === inMemoryId) {
+      const diskConfirmsThisTab = diskReadable && savedQueue && diskId === inMemoryId;
+      const neverHandedAnythingOver = !this.sawServerOwnership && diskReadable && !savedQueue
+        && !inMemoryId;
+      if (!holdsQueue || diskConfirmsThisTab || neverHandedAnythingOver) {
         if (step && step.releaseHandoffHalt) {
           step.releaseHandoffHalt();
         }
@@ -842,7 +876,11 @@ export default Vue.extend({
       this.hasResumableState = false;
       this.ownershipBlocked = true;
       this.backgroundNotice = 'This tab is holding an out-of-date copy of your import — the queue on disk has moved on. Reload this page to pick up where it actually got to; resuming here would send tracks that have already been scrobbled.';
-      trackEvent('background_stale_tab_blocked', { had_disk_id: String(!!diskId) });
+      trackEvent('background_stale_tab_blocked', {
+        had_disk_id: String(!!diskId),
+        disk_readable: String(diskReadable),
+        saved_queue: String(savedQueue),
+      });
     },
 
     /**
@@ -1227,6 +1265,9 @@ export default Vue.extend({
       });
 
       const result = await beginHandoff(this.stateManager, state, username, entryPoint);
+      // The attempt reached the point of uploading a queue, so this tab's copy
+      // is suspect from here on whether or not the handover completed.
+      this.sawServerOwnership = true;
       if (result.importId) {
         // The handoff may have minted one for a queue that had none. The store
         // is what `buildState` reads, so without this a later save would write

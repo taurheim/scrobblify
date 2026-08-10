@@ -227,6 +227,20 @@ const RETAG_WINDOW_LIMIT_SECONDS = 13 * 86400;
 // Retrying is pointless until tomorrow.
 const IGNORE_CODE_DAILY_LIMIT = 5;
 
+/*
+  Last.fm ignoredMessage codes 3 and 4: the second we chose was outside the
+  window it accepts.
+
+  Unlike every other rejection these are answers about *our* arithmetic rather
+  than about the track, and they are the one rejection that can be trusted to
+  mean nothing was stored — so the second is safe to abandon and the track is
+  safe to re-send with another one. That is what lets a pinned retry travel
+  home from the worker without being re-judged against the browser's clock: if
+  it has genuinely expired, this is where it is caught and replaced.
+*/
+const IGNORE_CODE_TIMESTAMP_TOO_OLD = 3;
+const IGNORE_CODE_TIMESTAMP_TOO_NEW = 4;
+
 function formatDuration(ms: number): string {
   const totalMinutes = Math.round(ms / MS_PER_MINUTE);
   if (totalMinutes < 1) {
@@ -760,6 +774,13 @@ export default Vue.extend({
         savedPendingSec > 0 && headTrack && headTrack.reTagged
       ) ? savedPendingSec : undefined;
       this.pendingReTagSec = pendingReTagTimestampSec || 0;
+      /*
+        The one queue position whose second has already been re-allocated once.
+        Held outside the loop body because a retry re-enters it, so a flag
+        declared per iteration would reset itself and let a track that Last.fm
+        keeps refusing spin forever.
+      */
+      let reTagRetryIndex = -1;
       if (savedPendingSec > 0 && !pendingReTagTimestampSec) {
         this.$store.commit('setPendingReTagSec', 0);
       }
@@ -1020,10 +1041,38 @@ export default Vue.extend({
               return;
             }
 
-            const reason = LastFm.describeIgnoreCode(result.ignoredCode, result.ignoredMessage);
-            this.$store.commit('trackFailed');
-            this.failedTracks.push({ track, error: reason });
-            consecutiveFailures++;
+            const badSecond = result.ignoredCode === IGNORE_CODE_TIMESTAMP_TOO_OLD
+              || result.ignoredCode === IGNORE_CODE_TIMESTAMP_TOO_NEW;
+            if (badSecond && pendingReTagTimestampSec !== undefined
+              && reTagRetryIndex !== i) {
+              /*
+                A second *we* chose was refused, so nothing was stored under it
+                and there is nothing left to deduplicate against. Dropping it
+                and allocating another is therefore free of the usual hazard,
+                and it is the only way a track sent with an expired pin gets a
+                second chance instead of being consumed as a failure.
+
+                Scoped to a second this browser or the worker assigned. A track
+                still carrying its own real listen date that Last.fm calls too
+                old is a genuine rejection: re-tagging it here would quietly
+                move a play the user chose to keep, and the re-tag decision is
+                the user's to make on the upload screen.
+              */
+              reTagRetryIndex = i;
+              pendingReTagTimestampSec = undefined;
+              this.pendingReTagSec = 0;
+              this.$store.commit('setPendingReTagSec', 0);
+              retrySameTrack = true;
+              trackEvent('scrobble_retag_second_refused', this.progressProps({
+                track_index: i,
+                ignored_code: result.ignoredCode,
+              }));
+            } else {
+              const reason = LastFm.describeIgnoreCode(result.ignoredCode, result.ignoredMessage);
+              this.$store.commit('trackFailed');
+              this.failedTracks.push({ track, error: reason });
+              consecutiveFailures++;
+            }
           } else {
             this.$store.commit('trackScrobbled');
             this.succeededTracks += 1;

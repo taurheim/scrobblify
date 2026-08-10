@@ -46,26 +46,18 @@ const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
 const RETAG_WINDOW_LIMIT_SECONDS = WINDOW_SECONDS;
 
 /**
- * How long a second stays capable of colliding.
+ * How long a second stays capable of colliding — 14 days, the full Last.fm
+ * window — is deliberately *not* a question this file answers.
  *
- * The full 14 days, not the conservative 13 used for ordering. The two bounds
- * answer different questions: 13 asks "is this timestamp still worth
- * preserving", where a margin costs nothing, while this one asks "could a play
- * already be sitting at this second", where the margin is the bug. Between day
- * 13 and day 14 Last.fm will still accept — and therefore may already hold —
- * the tuple, so dropping the pin there is what mints a phantom play.
- *
- * Deliberately *not* applied when handing a pin to the worker. Whether a pin
- * is still live is a question about the present, and the browser's clock is
- * the one clock in the system nobody can trust — a machine whose time has
- * slipped backwards would discard a second that is still collidable, and one
- * running fast would discard it early. The worker re-asks the same question
- * against its own clock at send time (`isPinUsable`), so the pin travels
- * unconditionally and is judged where the judging is reliable. That also makes
- * `uploadListFromState` free of the clock entirely, which the digest depends
- * on.
+ * Whether a pin is still live is a question about the present, and the
+ * browser's clock is the one clock in the system nobody can trust: a machine
+ * whose time has slipped would discard a second that is still collidable and
+ * invent a fresh one for a track the worker may already have sent. The worker
+ * re-asks it against its own clock at send time (`isPinUsable`), so a pin
+ * travels unconditionally in both directions and is judged where the judging
+ * is reliable. That also leaves `uploadListFromState` free of the clock
+ * entirely, which the pre-redirect digest depends on.
  */
-const COLLISION_WINDOW_SECONDS = 14 * 86400;
 
 /**
  * Headroom left below the present. Matches the worker's own margin, so a
@@ -494,21 +486,48 @@ export function stateFromExport(
     Moved to the head because that is where the pin is addressed. Both the
     browser's own allocator and the handoff apply a pending second to the
     track at the front of the queue, and applying it to any other track would
-    turn a deduplication into a fresh collision. There is at most one — only
-    the head track is ever pinned — so `find` is exact, not a heuristic.
+    turn a deduplication into a fresh collision.
   */
-  const pinnedIdx = tracks.findIndex((t: any) => t && t.pendingRetry === true
-    && Number.isFinite(t.timestamp) && t.timestamp > 0);
+  const pinnedIdxs: number[] = [];
+  tracks.forEach((t: any, idx: number) => {
+    if (t && t.pendingRetry === true && Number.isFinite(t.timestamp) && t.timestamp > 0) {
+      pinnedIdxs.push(idx);
+    }
+  });
   let pendingReTagTimestampSec = 0;
-  if (pinnedIdx >= 0) {
+  /*
+    Exactly one, or none at all.
+
+    Only the head track is ever pinned and it must be resolved before another
+    second is allocated, so a second marker means the invariant this reads has
+    already broken somewhere upstream. Guessing which of them the pin belongs
+    to would apply a deduplicating second to the wrong track — turning the one
+    thing that prevents a duplicate into the thing that causes one — so the
+    ambiguous case keeps none and lets the allocator issue fresh seconds.
+  */
+  if (pinnedIdxs.length > 1) {
+    trackEvent('background_export_multiple_pins', { count: pinnedIdxs.length });
+  } else if (pinnedIdxs.length === 1) {
+    const pinnedIdx = pinnedIdxs[0];
     const pinSec = Math.floor(tracks[pinnedIdx].timestamp / 1000);
     /*
-      Dropped once it can no longer collide. Past the window Last.fm rejects
-      the repeat outright, so insisting on it turns a possible phantom into a
-      certain, visible failure — the one trade where a fresh second is the
-      better answer.
+      Kept whatever the clock here says.
+
+      The obvious guard — drop it once it is too old to collide — has to ask
+      "how old is it" of the one clock in the system that nobody can trust. A
+      browser running fast discards a second that is still live and invents a
+      different one for a track the worker may already have sent, which is a
+      phantom play on a public profile; a browser running slow keeps one that
+      has expired. Only the second of those is recoverable, and it now is:
+      Last.fm answers an expired second with ignore code 3, and the send loop
+      responds by clearing the pin and re-sending that same track with a fresh
+      second rather than consuming it.
+
+      So the trade settles the other way round from how it looks. Preserving
+      unconditionally risks a visible, retried rejection; judging it against
+      the local clock risks a silent duplicate.
     */
-    if (pinSec > 0 && pinSec >= nowSec - COLLISION_WINDOW_SECONDS && pinSec < nowSec) {
+    if (pinSec > 0) {
       pendingReTagTimestampSec = pinSec;
       const [head] = serialized.splice(pinnedIdx, 1);
       serialized.unshift(head);

@@ -1364,8 +1364,45 @@ test.describe('Re-tagged old plays', () => {
     });
 
     expect(timestamps.length).toBeGreaterThan(0);
+    /*
+      Code 3 says the *second we chose* was refused, which is a statement about
+      our own arithmetic rather than about the track — and the one rejection
+      that can be trusted to mean nothing was stored. So each track is sent a
+      second time under a replacement second before it is given up on, which is
+      what lets a pinned retry come home from the worker without the browser
+      having to judge its age against a clock nobody can trust.
+
+      Exactly one replacement per track: a second refusal is a real failure.
+    */
+    expect(timestamps.length % 2).toBe(0);
+    const trackCount = timestamps.length / 2;
+    for (let i = 0; i < timestamps.length; i += 2) {
+      expect(timestamps[i + 1]).not.toBe(timestamps[i]);
+    }
+
     // The scrobble step is still mounted but hidden once the stepper advances,
     // so assert on text content rather than visibility.
+    await expect(page.locator('.v-expansion-panel-header')).toContainText(`${trackCount} failed track(s)`);
+    await expect(page.locator('.overall-progress')).toContainText(`0 of ${trackCount}`);
+  });
+
+  test('a rejection that is not about the timestamp is not retried', async ({ page }) => {
+    const timestamps = await runReTaggedImport(page, {
+      scrobbles: {
+        '@attr': { accepted: 0, ignored: 1 },
+        scrobble: { ignoredMessage: { code: '1', '#text': 'Artist ignored' } },
+      },
+    });
+
+    /*
+      The counterpart to the test above, and the reason that one is not simply
+      "retry anything Last.fm ignores". An ignored artist says nothing about
+      the second, so re-sending under a different one buys nothing and spends
+      another request — and every retry is a request this app has to pay for
+      out of a rate limit measured in hours.
+    */
+    expect(timestamps.length).toBeGreaterThan(0);
+    expect(new Set(timestamps).size).toBe(timestamps.length);
     await expect(page.locator('.v-expansion-panel-header')).toContainText(`${timestamps.length} failed track(s)`);
     await expect(page.locator('.overall-progress')).toContainText(`0 of ${timestamps.length}`);
   });
