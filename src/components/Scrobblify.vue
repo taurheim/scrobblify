@@ -1647,15 +1647,18 @@ export default Vue.extend({
         background.clearPendingHandoff();
         background.clearHandoffLineage(carriedLineage.ranges, carriedLineage.knownFromSec);
         /*
-          Said out loud when it applies. These tracks were sent but never
-          confirmed, so they come back in the queue and will be sent again —
-          the right way round, because a duplicate can be deleted and a missing
-          play cannot be recovered, but not something to do to somebody
-          without telling them.
+          Said out loud when it applies, and it now rarely does. A track that
+          was sent without a confirmed reply comes back pinned to the exact
+          second it rode on, so re-sending it is a no-op if it landed. This
+          counts only the ones whose second has aged past what Last.fm will
+          still accept: those cannot be repeated, so they go out under a new
+          time and may show up twice. Still the right way round — a duplicate
+          can be deleted and a missing play cannot be recovered — but not
+          something to do to somebody without telling them.
         */
         const uncertain = Number(exported.uncertainCount) || 0;
         this.backgroundNotice = uncertain > 0
-          ? `Your remaining tracks are back in this browser. Choose "Resume" to carry on here. Note that ${uncertain.toLocaleString()} track(s) were sent without a confirmed reply, so they are included again — if they did arrive, Last.fm may end up with a second copy of them.`
+          ? `Your remaining tracks are back in this browser. Choose "Resume" to carry on here. Note that ${uncertain.toLocaleString()} track(s) were sent without a confirmed reply too long ago to repeat exactly, so they go out again under a new time — if they did arrive, Last.fm may end up with a second copy of them.`
           : 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
         trackEvent('background_job_reclaimed', { job_id: jobId, uncertain });
       } catch (e) {

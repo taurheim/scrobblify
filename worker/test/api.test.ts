@@ -1130,6 +1130,119 @@ async function main() {
     check('and is given no credential', job.session_key_ct === null, job.session_key_ct);
   }
 
+  console.log('\n-- a re-attached credential gets a fresh lifetime too --');
+  {
+    /*
+      The commonest way into `needs_reauth` is the 60-day deadline passing. A
+      fresh key under the *expired* deadline is re-parked by the very next
+      tick, so the user reconnects, resumes, is parked again, and no track is
+      ever sent — a loop with no exit but cancelling. The key really is new,
+      so its clock really does start again.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs, {
+      getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'listener' }),
+    });
+    const jobId = await seedJob(sql, blobs, 'listener', { state: 'needs_reauth', live: false });
+    await sql.run(
+      `UPDATE jobs SET session_key_ct = NULL, session_key_iv = NULL,
+         credential_expires_at = ? WHERE id = ?`,
+      [NOW - 3600, jobId],
+    );
+    const state = await signHandoffState(
+      {
+        h: '', exp: NOW + 600, k: 'signin', u: 'listener', n: 'nonce-that-is-long-enough',
+      },
+      SIGNING,
+    );
+    await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    );
+    const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [jobId]);
+    check('the expired deadline is not inherited',
+      job.credential_expires_at > NOW, job.credential_expires_at);
+    check('and the next tick would not re-park it',
+      job.state === 'paused' && job.credential_expires_at > NOW, job);
+  }
+
+  console.log('\n-- an unconfirmed send comes back pinned to the second it rode on --');
+  {
+    /*
+      A batch row is written before the POST, so an abandoned batch may already
+      be on the account. Handing those tracks back as ordinary re-tags lets the
+      browser mint *new* seconds for them, and Last.fm deduplicates on the whole
+      (artist, track, timestamp) tuple — a new second is a new play. Repeating
+      the identical second makes the re-send a no-op if it landed and a normal
+      scrobble if it did not.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const id = await seedJob(sql, blobs, 'listener', {
+      total: 10, cursor: 0, state: 'paused', reTagged: true,
+    });
+    const forSend = [0, 1, 2].map((i) => ({
+      artist: `Artist ${i}`, track: `Track ${i}`, index: i, originalTimestampSec: 0,
+    }));
+    const lost = assignTimestamps(forSend, NOW, 0);
+    await sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, created_at)
+       VALUES (?, ?, 0, 0, 3, 'abandoned', ?, ?)`,
+      [randomId(), id, JSON.stringify(lost.assigned), NOW],
+    );
+    const token = await issueSession('listener', SIGNING, NOW);
+    const body: any = await (await handleRequest(env,
+      req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
+    const bySec = new Map(lost.assigned.map((a: any) => [a.index, a.timestampSec]));
+    const head = body.state.tracks.slice(0, 3);
+    check('each unconfirmed track carries the exact second it was sent with',
+      head.every((t: any, i: number) => t.timestamp === (bySec.get(i) as number) * 1000),
+      head.map((t: any) => t.timestamp));
+    check('and is not offered for re-tagging, which is what would mint a new one',
+      head.every((t: any) => t.reTagged === false), head);
+    check('a track behind them is still an ordinary re-tag',
+      body.state.tracks[3].reTagged === true, body.state.tracks[3]);
+    check('so nothing needs to be confessed to the user',
+      body.uncertainCount === 0, body.uncertainCount);
+  }
+
+  console.log('\n-- unless its second is too old for Last.fm to still take --');
+  {
+    /*
+      Once the second ages out, a repeat cannot be stored at all — pinning a
+      play that never landed to it would be the one unrecoverable outcome. Those
+      fall back to a fresh second, which may duplicate, and the user is told how
+      many. The age is judged against the worker's clock, which is the only one
+      here that can be trusted to say how old anything is.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const id = await seedJob(sql, blobs, 'listener', {
+      total: 10, cursor: 0, state: 'paused', reTagged: true,
+    });
+    const forSend = [0, 1].map((i) => ({
+      artist: `Artist ${i}`, track: `Track ${i}`, index: i, originalTimestampSec: 0,
+    }));
+    const stale = assignTimestamps(forSend, NOW - 20 * 86400, 0);
+    await sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, created_at)
+       VALUES (?, ?, 0, 0, 2, 'abandoned', ?, ?)`,
+      [randomId(), id, JSON.stringify(stale.assigned), NOW - 20 * 86400],
+    );
+    const token = await issueSession('listener', SIGNING, NOW);
+    const body: any = await (await handleRequest(env,
+      req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
+    check('an unrepeatable second is not pinned',
+      body.state.tracks.slice(0, 2).every((t: any) => t.reTagged === true),
+      body.state.tracks.slice(0, 2));
+    check('and the user is told how many may show up twice',
+      body.uncertainCount === 2, body.uncertainCount);
+  }
+
   console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);
   process.exit(failures === 0 ? 0 : 1);
 }

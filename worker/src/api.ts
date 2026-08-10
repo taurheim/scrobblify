@@ -19,9 +19,11 @@ import {
   reapExpiredHandoffs,
   HandoffRow,
   MAX_TRACKS_PER_JOB,
+  CREDENTIAL_TTL_SECONDS,
 } from './handoff';
 import { issueSession, authenticate } from './session';
 import { drainJobOnDemand } from './scheduler';
+import { WINDOW_SECONDS } from './timestamps';
 import {
   normalizeUsername, randomId, signHandoffState, verifyHandoffState, encryptCredential,
 } from './crypto';
@@ -217,14 +219,29 @@ async function reattachCredential(
       between the read and here — to `cancelled`, or to `exporting` for a
       take-back that is reading the queue out — and attaching a live credential
       to either would resurrect a job the user has finished with.
+
+      The lifetime is renewed, not inherited. The commonest way into
+      `needs_reauth` is the 60-day deadline passing, and a fresh key under an
+      expired deadline is re-parked by the very next tick — the user reconnects,
+      resumes, and is parked again before a single track is sent, forever. The
+      key really is new, so the clock really does start again.
     */
     const updated = await env.sql.run(
       `UPDATE jobs
           SET session_key_ct = ?, session_key_iv = ?, live_username = ?,
               state = 'paused', state_reason = NULL, consecutive_failures = 0,
+              credential_expires_at = ?,
               next_eligible_at = ?, locked_until = 0, updated_at = ?
         WHERE id = ? AND state = 'needs_reauth'`,
-      [credential.ciphertext, credential.iv, username, nowSec, nowSec, job.id],
+      [
+        credential.ciphertext,
+        credential.iv,
+        username,
+        nowSec + CREDENTIAL_TTL_SECONDS,
+        nowSec,
+        nowSec,
+        job.id,
+      ],
     );
     if (updated.changes > 0) {
       await env.sql.run(
@@ -1012,6 +1029,63 @@ async function exportJob(
   );
   const failedIndex = new Set<number>(failures.map((f) => f.track_index));
 
+  /*
+    Tracks whose fate nobody knows, and the exact second each of them rode on.
+
+    A batch row is written *before* the POST, so an abandoned batch is exactly
+    the case where the request may have reached Last.fm and the answer was
+    lost. Those entries are still after the cursor, so they are handed back and
+    will be sent again.
+
+    Sending them again under a *fresh* second is what turns "may already be
+    stored" into "is now stored twice", because Last.fm deduplicates on the
+    whole (artist, track, timestamp) tuple and a new second is a new tuple.
+    Repeating the identical second instead makes the re-send a no-op when the
+    original landed and a normal scrobble when it did not — the outcome is
+    correct either way, and the user is never asked to choose.
+
+    Only while the second is still inside the acceptance window. Once it ages
+    out, a repeat can no longer be stored at all, so pinning a lost play to it
+    would be the one genuinely unrecoverable outcome; those fall back to a
+    fresh second and are counted as uncertain instead. This is a judgement the
+    *client* explicitly refuses to make against its own clock, and rightly —
+    but the decision here is made against the worker's, which is the only one
+    in the system that can be trusted to say how old something is.
+  */
+  const abandoned = await env.sql.all<{ assigned_timestamps: string }>(
+    "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'abandoned'",
+    [claimedJob.id],
+  );
+  const repeatableSeconds = new Map<number, number>();
+  let uncertainCount = 0;
+  abandoned.forEach((row) => {
+    try {
+      const parsed = JSON.parse(row.assigned_timestamps);
+      if (!Array.isArray(parsed)) { return; }
+      parsed.forEach((v) => {
+        // Only entries still ahead of the cursor come back in the queue; one
+        // behind it was resolved and counted, and is not in `tracks` at all.
+        const idx = v && Number(v.index);
+        const sec = v && Number(v.timestampSec);
+        if (!Number.isFinite(idx) || idx < claimedJob.cursor) { return; }
+        if (failedIndex.has(idx)) { return; }
+        if (Number.isFinite(sec) && sec > 0 && nowSec - sec <= WINDOW_SECONDS) {
+          // Two batches can name one index when a retry was itself abandoned.
+          // The later second is the one the account is likelier to hold, and
+          // the one with window left to repeat.
+          const prior = repeatableSeconds.get(idx);
+          if (prior === undefined || sec > prior) { repeatableSeconds.set(idx, sec); }
+          return;
+        }
+        uncertainCount += 1;
+      });
+    } catch {
+      // Unreadable rows are not counted. Overstating the number would push a
+      // user into re-checking a history that is fine, and there is no index
+      // here to pin with either.
+    }
+  });
+
   const chunks = await env.sql.all<any>(
     'SELECT * FROM chunks WHERE job_id = ? AND end_index > ? ORDER BY chunk_index',
     [claimedJob.id, claimedJob.cursor],
@@ -1064,6 +1138,24 @@ async function exportJob(
         may already hold is exactly the phantom the pin exists to prevent.
       */
       const pendingRetry = t.reTagged === true && t.originalTimestampSec > 0;
+      /*
+        A second this job already spent on a send whose answer never came
+        back. Handed out as an ordinary listen date rather than as a re-tag,
+        which is precisely what makes the browser repeat it verbatim instead
+        of minting a new one — see the abandoned-batch scan above. It is
+        already in `usedRanges`, so no *other* track can be allocated onto it.
+      */
+      const repeatSec = repeatableSeconds.get(absolute);
+      if (repeatSec !== undefined) {
+        tracks.push({
+          artist: t.artist,
+          track: t.track,
+          album: t.album ?? '',
+          timestamp: repeatSec * 1000,
+          reTagged: false,
+        });
+        return;
+      }
       tracks.push({
         artist: t.artist,
         track: t.track,
@@ -1142,39 +1234,6 @@ async function exportJob(
   });
   const usedRanges = collapseToRanges(usedSeconds, MAX_EXPORTED_RANGES);
 
-  /*
-    Tracks whose fate nobody knows, counted so the user can be told.
-
-    A batch row is written before the POST, so an abandoned batch is exactly
-    the case where the request may have reached Last.fm and the answer was
-    lost. Those tracks are still after the cursor, so they are handed back and
-    will be sent again — which is the right way round (a duplicate is
-    recoverable, a lost play is not) but is not something to do to somebody
-    silently.
-  */
-  const unresolved = await env.sql.all<{ assigned_timestamps: string }>(
-    "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'abandoned'",
-    [claimedJob.id],
-  );
-  let uncertainCount = 0;
-  unresolved.forEach((row) => {
-    try {
-      const parsed = JSON.parse(row.assigned_timestamps);
-      if (!Array.isArray(parsed)) { return; }
-      parsed.forEach((v) => {
-        // Only entries still ahead of the cursor come back in the queue; one
-        // behind it was resolved and counted, and is not in `tracks` at all.
-        const idx = v && Number(v.index);
-        if (Number.isFinite(idx) && idx >= claimedJob.cursor) {
-          uncertainCount += 1;
-        }
-      });
-    } catch {
-      // Unreadable rows are not counted. Overstating the number would push a
-      // user into re-checking a history that is fine.
-    }
-  });
-
   return json(env, {
     ok: true,
     exportedAt: nowSec,
@@ -1209,9 +1268,11 @@ async function exportJob(
     usedRangesIncomplete: usedIncomplete,
     scrobbledByServer: claimedJob.scrobbled_count,
     /*
-      How many of the returned tracks may already be on the account. Zero for
-      every ordinary take-back; non-zero only when a batch was abandoned
-      without ever being reconciled, which needs a dead credential.
+      How many of the returned tracks may end up on the account *twice*. Not
+      the same as "may already be on the account": an abandoned batch whose
+      seconds are still repeatable comes back pinned to them, so re-sending is
+      a no-op if the original landed and costs nothing if it did not. Only the
+      entries too old to repeat are counted here.
     */
     uncertainCount,
     state: {
