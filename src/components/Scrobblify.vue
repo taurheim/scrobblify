@@ -332,8 +332,7 @@ export default Vue.extend({
     }
 
     try {
-      const saved = await this.stateManager.hasSavedState();
-      this.hasResumableState = saved && !unresolved && !owner;
+      await this.exposeSavedStateUnlessStale('mounted', !!unresolved || !!owner);
     } catch (e) {
       // IndexedDB not available — not critical, just skip resume
     }
@@ -731,11 +730,14 @@ export default Vue.extend({
           background.releaseQueueOwnerIfSame(observed);
           this.ownershipBlocked = false;
         }
-        try {
-          this.hasResumableState = await this.stateManager.hasSavedState();
-        } catch (e) {
-          // Nothing to restore the button for.
-        }
+        /*
+          The disk copy carries the identity minted by `stateFromExport`, which
+          was never uploaded, so the server answers "not known, not live" —
+          a definite "nothing is running" rather than no answer at all. That is
+          true and still not enough: a queue nothing is running is exactly what
+          a photograph looks like once the job it was taken from has finished.
+        */
+        await this.exposeSavedStateUnlessStale('authority_idle');
         trackEvent('background_authority_check', { result: 'idle' });
         return;
       }
@@ -904,11 +906,12 @@ export default Vue.extend({
         if (step && step.releaseHandoffHalt) {
           step.releaseHandoffHalt();
         }
-        try {
-          this.hasResumableState = await this.stateManager.hasSavedState();
-        } catch (e) {
-          this.hasResumableState = false;
-        }
+        /*
+          This tab's copy is current, which says nothing about whether the
+          queue behind it is real: a sibling's refused cancel condemns the disk
+          for every tab, not just the one that took the photograph.
+        */
+        await this.exposeSavedStateUnlessStale('release_revalidated');
         return;
       }
 
@@ -1737,8 +1740,21 @@ export default Vue.extend({
      * The record is matched against the identity actually on disk, because a
      * discard that failed leaves it lying around and the next import to be
      * saved here is not the one it was written about.
+     *
+     * Every path that can turn Resume back on goes through here, and that is
+     * the point. The marker left by an unfinished handover masks some of them
+     * some of the time, but it answers a different question and is cleared on
+     * its own schedule — the first release path to resolve ownership clears it
+     * and leaves the next reload reading the photograph unguarded. A guard
+     * that depends on the order two records happen to be cleared in is not a
+     * guard.
+     *
+     * `withheldForOwnership` is for callers that have their own reason to keep
+     * Resume off. They still come through here, because the queue on disk may
+     * need discarding whether or not this particular caller would have offered
+     * it.
      */
-    async exposeSavedStateUnlessStale(reason: string) {
+    async exposeSavedStateUnlessStale(reason: string, withheldForOwnership = false) {
       const stale = background.staleSnapshotRecord();
       if (stale) {
         let saved: ScrobbleState | null = null;
@@ -1779,13 +1795,15 @@ export default Vue.extend({
           condemn whatever is written here next.
         */
         background.clearStaleSnapshot();
-        this.hasResumableState = !!saved;
+        this.hasResumableState = !!saved && !withheldForOwnership;
         return;
       }
       try {
-        this.hasResumableState = await this.stateManager.hasSavedState();
+        this.hasResumableState = await this.stateManager.hasSavedState()
+          && !withheldForOwnership;
       } catch (e) {
-        // Nothing to restore the button for.
+        // Unreadable disk is not a queue to offer.
+        this.hasResumableState = false;
       }
     },
 
