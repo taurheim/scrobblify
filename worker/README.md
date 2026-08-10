@@ -37,6 +37,7 @@ npx wrangler r2 bucket create scrobblify
 npx wrangler d1 execute scrobblify --remote --file schema/001_init.sql
 npx wrangler d1 execute scrobblify --remote --file schema/002_synthetic_floor.sql
 npx wrangler d1 execute scrobblify --remote --file schema/003_export_claim.sql
+npx wrangler d1 execute scrobblify --remote --file schema/004_import_id.sql
 
 # 4. Secrets (see below).
 # 5. Deploy, then point api.savas.ca at the worker via a Cloudflare route.
@@ -103,6 +104,7 @@ Copy-Item .dev.vars.example .dev.vars
 npx wrangler d1 execute scrobblify --local --file schema/001_init.sql
 npx wrangler d1 execute scrobblify --local --file schema/002_synthetic_floor.sql
 npx wrangler d1 execute scrobblify --local --file schema/003_export_claim.sql
+npx wrangler d1 execute scrobblify --local --file schema/004_import_id.sql
 npx wrangler dev --local
 ```
 
