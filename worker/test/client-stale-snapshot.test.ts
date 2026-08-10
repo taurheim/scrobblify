@@ -20,7 +20,8 @@ import { storage } from './stubs/dom';
 import {
   setStaleSnapshot,
   staleSnapshotRecord,
-  clearStaleSnapshot,
+  clearStaleSnapshotIf,
+  sameStaleSnapshot,
   savedQueueIsStale,
 } from '@/services/BackgroundScrobbling';
 
@@ -93,10 +94,46 @@ function main() {
   {
     storage.clear();
     setStaleSnapshot('job-1', 'import-abc');
-    clearStaleSnapshot();
+    const seen = staleSnapshotRecord();
+    clearStaleSnapshotIf((current) => sameStaleSnapshot(current, seen));
     check('the record is gone', staleSnapshotRecord() === null);
     check('and the queue is no longer condemned',
       !savedQueueIsStale(staleSnapshotRecord(), 'import-abc'));
+  }
+
+  console.log('\n-- but not one a sibling wrote in the meantime --');
+  {
+    storage.clear();
+    /*
+      Every caller reads the record, does asynchronous work, and only then
+      retracts it. A second tab condemning its own photograph in that gap
+      replaces the record; retracting blindly would clear a condemnation
+      nobody made and offer that tab's live photograph back.
+    */
+    setStaleSnapshot('job-1', 'import-abc');
+    const seen = staleSnapshotRecord();
+    setStaleSnapshot('job-2', 'import-xyz');
+    clearStaleSnapshotIf((current) => sameStaleSnapshot(current, seen));
+    const after = staleSnapshotRecord();
+    check('the sibling record survives', !!after && after.importId === 'import-xyz', after);
+    check('and still condemns its own queue',
+      savedQueueIsStale(staleSnapshotRecord(), 'import-xyz'));
+  }
+
+  console.log('\n-- the same job under a new identity is a different record --');
+  {
+    storage.clear();
+    /*
+      A take-back can be retried, and each attempt saves a queue under a
+      freshly rotated identity. The record from the first attempt does not
+      describe the second attempt's copy.
+    */
+    setStaleSnapshot('job-1', 'import-abc');
+    const seen = staleSnapshotRecord();
+    setStaleSnapshot('job-1', 'import-def');
+    clearStaleSnapshotIf((current) => sameStaleSnapshot(current, seen));
+    const after = staleSnapshotRecord();
+    check('the newer record survives', !!after && after.importId === 'import-def', after);
   }
 
   console.log('\n-- a record that cannot be read is not a record --');

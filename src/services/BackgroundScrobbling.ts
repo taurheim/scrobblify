@@ -292,12 +292,43 @@ export function savedQueueIsStale(
   return record.importId === savedImportId;
 }
 
-export function clearStaleSnapshot(): void {
+/**
+ * Clears the record only if it is still the one the caller decided about.
+ *
+ * There is deliberately no unconditional version. The queue this record names
+ * is deleted under a compare-and-set, and the record has to be retracted the
+ * same way for the pair to mean anything. Every caller reads the record, does
+ * asynchronous work, and then clears it; in that gap another tab can condemn
+ * its *own* photograph and write a different record over this one. A blind
+ * `removeItem` then retracts a condemnation nobody made, and the queue it was
+ * protecting is offered back.
+ *
+ * localStorage is synchronous, so read-compare-remove needs no transaction:
+ * nothing else on this thread can run in between.
+ *
+ * An unreadable record is left alone. It condemns nothing either way — every
+ * decision goes through `staleSnapshotRecord`, which reports it as absent —
+ * and removing what cannot be identified is the mistake this exists to stop.
+ */
+export function clearStaleSnapshotIf(
+  matches: (record: StaleSnapshotRecord) => boolean,
+): void {
   try {
+    const current = staleSnapshotRecord();
+    if (!current || !matches(current)) return;
     window.localStorage.removeItem(STALE_SNAPSHOT_STORAGE_KEY);
   } catch {
     // Nothing to do.
   }
+}
+
+/** Whether two records describe the same condemned queue. */
+export function sameStaleSnapshot(
+  a: StaleSnapshotRecord | null,
+  b: StaleSnapshotRecord | null,
+): boolean {
+  if (!a || !b) return false;
+  return a.jobId === b.jobId && a.importId === b.importId;
 }
 
 /**

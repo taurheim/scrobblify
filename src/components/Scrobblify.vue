@@ -1675,7 +1675,9 @@ export default Vue.extend({
             await this.stateManager.clearStateIfMatching(
               (saved) => !!saved && (saved.importId || '') === (restored.importId || ''),
             );
-            background.clearStaleSnapshot();
+            background.clearStaleSnapshotIf(
+              (current) => current.importId === (restored.importId || ''),
+            );
           } catch (clearError) {
             trackError('background.clearStaleSnapshot', clearError);
           }
@@ -1693,8 +1695,15 @@ export default Vue.extend({
         /*
           A confirmed cancel makes this copy the real one, so any record left
           by an earlier refused attempt no longer describes it.
+
+          Only a record about *this* queue, though. A sibling that condemned
+          its own photograph while this take-back was in flight is protecting a
+          queue this branch knows nothing about.
         */
-        background.clearStaleSnapshot();
+        background.clearStaleSnapshotIf(
+          (current) => current.importId === (restored.importId || '')
+            || current.jobId === jobId,
+        );
         // The cancel is confirmed, so the record naming this job is ours to
         // clear — but a freeze another tab is holding for a *different*
         // handover is not.
@@ -1794,8 +1803,14 @@ export default Vue.extend({
           The photograph is gone — discarded just now, discarded earlier, or
           replaced by a later import. Either way the record describes nothing,
           and leaving it would condemn whatever is written here next.
+
+          Retracted only if it is still the record this call decided about: a
+          sibling can condemn its own photograph in the gap above, and clearing
+          that would offer *its* queue back.
         */
-        background.clearStaleSnapshot();
+        background.clearStaleSnapshotIf(
+          (current) => background.sameStaleSnapshot(current, stale),
+        );
         if (result.removed) {
           this.hasResumableState = false;
           trackEvent('background_stale_snapshot_discarded', { reason });
