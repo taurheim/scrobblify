@@ -1056,7 +1056,7 @@ async function exportJob(
     "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'abandoned'",
     [claimedJob.id],
   );
-  const repeatableSeconds = new Map<number, number>();
+  const repeatableSeconds = new Map<number, { sec: number; artist: string; track: string }>();
   let uncertainCount = 0;
   abandoned.forEach((row) => {
     try {
@@ -1074,7 +1074,13 @@ async function exportJob(
           // The later second is the one the account is likelier to hold, and
           // the one with window left to repeat.
           const prior = repeatableSeconds.get(idx);
-          if (prior === undefined || sec > prior) { repeatableSeconds.set(idx, sec); }
+          if (prior === undefined || sec > prior.sec) {
+            repeatableSeconds.set(idx, {
+              sec,
+              artist: String(v.artist ?? ''),
+              track: String(v.track ?? ''),
+            });
+          }
           return;
         }
         uncertainCount += 1;
@@ -1147,14 +1153,29 @@ async function exportJob(
       */
       const repeatSec = repeatableSeconds.get(absolute);
       if (repeatSec !== undefined) {
-        tracks.push({
-          artist: t.artist,
-          track: t.track,
-          album: t.album ?? '',
-          timestamp: repeatSec * 1000,
-          reTagged: false,
-        });
-        return;
+        /*
+          Checked against the name, not trusted on the index alone.
+
+          `AssignedTrack.index` is *batch-relative* when it is minted and is
+          rebased onto the blob before the row is written — so this map is
+          keyed correctly only for as long as that rebase stays in place. A
+          regression there would silently pin every second to the wrong track,
+          which is worse than the duplicate this exists to prevent: it would
+          write plays the user never had. The batch row carries the names it
+          sent, so the alignment is checkable, and a mismatch falls back to the
+          old behaviour of a fresh second and an honest count.
+        */
+        if (repeatSec.artist === t.artist && repeatSec.track === t.track) {
+          tracks.push({
+            artist: t.artist,
+            track: t.track,
+            album: t.album ?? '',
+            timestamp: repeatSec.sec * 1000,
+            reTagged: false,
+          });
+          return;
+        }
+        uncertainCount += 1;
       }
       tracks.push({
         artist: t.artist,

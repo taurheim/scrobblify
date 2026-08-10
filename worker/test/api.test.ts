@@ -1180,32 +1180,84 @@ async function main() {
     const blobs = new MemoryBlobs();
     const env = makeEnv(sql, blobs);
     const id = await seedJob(sql, blobs, 'listener', {
-      total: 10, cursor: 0, state: 'paused', reTagged: true,
+      total: 10, cursor: 4, state: 'paused', reTagged: true,
     });
+    /*
+      Seeded at a non-zero offset and rebased the way `runJob` rebases.
+      `assignTimestamps` mints *batch-relative* indices and the scheduler maps
+      them onto the blob before the row is written; a fixture that starts at
+      zero cannot tell the two apart, and would pass just as happily against a
+      version that pinned every second to the wrong track.
+    */
+    const startIndex = 4;
     const forSend = [0, 1, 2].map((i) => ({
-      artist: `Artist ${i}`, track: `Track ${i}`, index: i, originalTimestampSec: 0,
+      artist: `Artist ${startIndex + i}`,
+      track: `Track ${startIndex + i}`,
+      index: i,
+      originalTimestampSec: 0,
     }));
-    const lost = assignTimestamps(forSend, NOW, 0);
+    const minted = assignTimestamps(forSend, NOW, 0);
+    const lostAssigned = minted.assigned.map((a: any) => ({
+      ...a, index: startIndex + a.index,
+    }));
     await sql.run(
       `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
           assigned_timestamps, created_at)
-       VALUES (?, ?, 0, 0, 3, 'abandoned', ?, ?)`,
-      [randomId(), id, JSON.stringify(lost.assigned), NOW],
+       VALUES (?, ?, 0, ?, 3, 'abandoned', ?, ?)`,
+      [randomId(), id, startIndex, JSON.stringify(lostAssigned), NOW],
     );
     const token = await issueSession('listener', SIGNING, NOW);
     const body: any = await (await handleRequest(env,
       req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
-    const bySec = new Map(lost.assigned.map((a: any) => [a.index, a.timestampSec]));
+    const bySec = new Map(lostAssigned.map((a: any) => [a.index, a.timestampSec]));
     const head = body.state.tracks.slice(0, 3);
     check('each unconfirmed track carries the exact second it was sent with',
-      head.every((t: any, i: number) => t.timestamp === (bySec.get(i) as number) * 1000),
+      head.every((t: any, i: number) => t.timestamp === (bySec.get(startIndex + i) as number) * 1000),
       head.map((t: any) => t.timestamp));
+    check('and they are the tracks the batch actually named',
+      head.every((t: any, i: number) => t.artist === `Artist ${startIndex + i}`),
+      head.map((t: any) => t.artist));
     check('and is not offered for re-tagging, which is what would mint a new one',
       head.every((t: any) => t.reTagged === false), head);
     check('a track behind them is still an ordinary re-tag',
       body.state.tracks[3].reTagged === true, body.state.tracks[3]);
     check('so nothing needs to be confessed to the user',
       body.uncertainCount === 0, body.uncertainCount);
+  }
+
+  console.log('\n-- a second whose track does not match is not pinned to it --');
+  {
+    /*
+      The map is keyed by an index rebased from batch-relative to absolute
+      before it is stored. If that rebase ever regresses, every second lands on
+      the wrong track — plays the user never had, under times that look
+      deliberate, which is worse than the duplicate this exists to prevent. The
+      batch row carries the names it sent, so the alignment is checkable.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const id = await seedJob(sql, blobs, 'listener', {
+      total: 10, cursor: 0, state: 'paused', reTagged: true,
+    });
+    const forSend = [0, 1].map((i) => ({
+      artist: 'Someone Else', track: `Not Track ${i}`, index: i, originalTimestampSec: 0,
+    }));
+    const misaligned = assignTimestamps(forSend, NOW, 0);
+    await sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, created_at)
+       VALUES (?, ?, 0, 0, 2, 'abandoned', ?, ?)`,
+      [randomId(), id, JSON.stringify(misaligned.assigned), NOW],
+    );
+    const token = await issueSession('listener', SIGNING, NOW);
+    const body: any = await (await handleRequest(env,
+      req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
+    check('a second belonging to another track is refused',
+      body.state.tracks.slice(0, 2).every((t: any) => t.reTagged === true),
+      body.state.tracks.slice(0, 2));
+    check('and the fallback is confessed rather than hidden',
+      body.uncertainCount === 2, body.uncertainCount);
   }
 
   console.log('\n-- unless its second is too old for Last.fm to still take --');
