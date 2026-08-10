@@ -148,8 +148,9 @@ async function main() {
     });
     check('capped', calls === MAX_REPEAT_LOOKUPS, calls);
     check('the rest stay pinned', r.unresolved === 3, r);
-    check('the rest keep their timestamps',
-      e.state.tracks[MAX_REPEAT_LOOKUPS].reTagged === false, e.state.tracks[MAX_REPEAT_LOOKUPS]);
+    check('the rest keep their timestamps and lead the queue',
+      e.state.tracks.slice(0, 3).every((t: any) => t.reTagged === false),
+      e.state.tracks.slice(0, 3));
   }
 
   console.log('\n-- the budget stops the walk, and what it did not reach stays pinned --');
@@ -177,10 +178,43 @@ async function main() {
     }, 20);
     check('stopped after the first window', calls === 1, calls);
     check('the rest are unresolved, not concluded', r.unresolved === 3 && r.freed === 1, r);
-    check('and keep their pinned seconds',
-      e.state.tracks[3].reTagged === false
-        && e.state.tracks[3].timestamp === (BASE + 3 * 100_000) * 1000,
-      e.state.tracks[3]);
+    /*
+      And they are at the front. Nothing can decide their case, but a pinned
+      tuple is idempotent only while Last.fm still accepts the second, so the
+      queue should reach them first rather than in a fortnight.
+    */
+    check('and are moved to the head of the queue',
+      e.state.tracks.slice(0, 3).every((t: any, i: number) => t.reTagged === false
+        && t.timestamp === (BASE + (i + 1) * 100_000) * 1000),
+      e.state.tracks.slice(0, 3));
+    check('leaving the freed one behind them',
+      e.state.tracks[3].reTagged === true, e.state.tracks[3]);
+  }
+
+  console.log('\n-- an ambiguous pin leads the queue rather than trailing it --');
+  {
+    /*
+      Nothing can settle this entry, but a pinned tuple is idempotent only
+      while Last.fm still accepts the second. At the back of a large queue it
+      waits weeks and is then unsendable under any time; at the front it goes
+      out with the first batch, where a repeat costs nothing either way.
+    */
+    const tracks = [
+      track('A', 'Ordinary', BASE + 500),
+      track('B', 'Ambiguous', BASE),
+      track('C', 'AlsoOrdinary', BASE + 600),
+    ];
+    const e = payload(tracks, [{ i: 1, sec: BASE }]);
+    const r = await resolveExportedRepeats(e, windowOf([
+      { artist: 'Someone Else', track: 'Different', timestampSec: BASE },
+    ]));
+    check('unresolved', r.unresolved === 1, r);
+    check('the pin is now first', e.state.tracks[0].track === 'Ambiguous', e.state.tracks);
+    check('and the others keep their order',
+      e.state.tracks[1].track === 'Ordinary' && e.state.tracks[2].track === 'AlsoOrdinary',
+      e.state.tracks);
+    check('nothing was added or lost', e.state.tracks.length === 3
+      && e.state.totalTracks === 3, e.state.tracks.length);
   }
 
   console.log('\n-- a malformed or absent list does nothing --');

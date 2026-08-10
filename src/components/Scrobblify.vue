@@ -1034,11 +1034,7 @@ export default Vue.extend({
         // Only if the record we examined is still the one on record.
         background.releaseQueueOwnerIfSame(owner);
         this.ownershipBlocked = false;
-        try {
-          this.hasResumableState = await this.stateManager.hasSavedState();
-        } catch (e) {
-          // Nothing to restore the button for.
-        }
+        await this.exposeSavedStateUnlessStale('job_finished');
         trackEvent('background_ownership_released', { reason: 'job_finished' });
         return;
       }
@@ -1120,11 +1116,7 @@ export default Vue.extend({
         // it" answer, so leaving the gate closed would hide a queue we have
         // just proved is safe to resume.
         this.ownershipBlocked = false;
-        try {
-          this.hasResumableState = await this.stateManager.hasSavedState();
-        } catch (e) {
-          // Nothing to restore the button for.
-        }
+        await this.exposeSavedStateUnlessStale('client_owns');
         trackEvent('background_ownership_resolved', { outcome: 'client_owns' });
         return;
       }
@@ -1656,6 +1648,28 @@ export default Vue.extend({
         // request never arrived leaves the job alive, and showing "Resume"
         // then invites the user to scrobble everything a second time.
         if (!await background.jobAction(jobId, 'cancel', exportClaim)) {
+          /*
+            The queue that was just saved is a photograph, not a handover.
+
+            The server still holds the real one and is free to carry on
+            sending it — a refusal is exactly what happens when the export
+            claim lapsed, which is the case where it has had the most time to
+            do so. Marked durably, because "nobody owns this queue" resolves
+            itself the moment the job finishes, and both release paths would
+            then read this copy back and offer Resume.
+
+            Discarded here where it can be done cleanly; the record is what
+            catches it if the discard fails or the tab closes first.
+          */
+          background.setStaleSnapshot(jobId, restored.importId || '');
+          try {
+            await this.stateManager.clearState();
+            background.clearStaleSnapshot();
+          } catch (clearError) {
+            trackError('background.clearStaleSnapshot', clearError);
+          }
+          this.hasResumableState = false;
+          trackEvent('background_takeback_cancel_refused', { job_id: jobId });
           this.backgroundNotice = 'Your tracks were copied back, but the background import could not be stopped, so this browser will not resume them yet. Use "Take my progress back" again in a moment.';
           await this.refreshBackgroundJob();
           this.backgroundBusy = false;
@@ -1665,6 +1679,11 @@ export default Vue.extend({
         this.backgroundJob = null;
         this.hasResumableState = true;
         this.ownershipBlocked = false;
+        /*
+          A confirmed cancel makes this copy the real one, so any record left
+          by an earlier refused attempt no longer describes it.
+        */
+        background.clearStaleSnapshot();
         // The cancel is confirmed, so the record naming this job is ours to
         // clear — but a freeze another tab is holding for a *different*
         // handover is not.
@@ -1697,6 +1716,77 @@ export default Vue.extend({
         this.showError = true;
       }
       this.backgroundBusy = false;
+    },
+
+    /**
+     * Offers the saved queue back to the user — unless it is a photograph.
+     *
+     * Both release paths reach the same conclusion: nobody else owns this
+     * queue any more, so Resume can come back. That is sound for a queue this
+     * browser has been holding all along, and wrong for the one case where the
+     * saved copy was written from an export whose cancel was then refused.
+     * There the server kept the real queue and was free to carry on sending
+     * it, so restoring this copy scrobbles everything that happened since a
+     * second time.
+     *
+     * The snapshot is discarded rather than hidden. Keeping it would leave the
+     * same trap armed for the next release path to walk into, and there is
+     * nothing in it worth keeping: the server's copy is the real one, and a
+     * fresh take-back is a button press away.
+     *
+     * The record is matched against the identity actually on disk, because a
+     * discard that failed leaves it lying around and the next import to be
+     * saved here is not the one it was written about.
+     */
+    async exposeSavedStateUnlessStale(reason: string) {
+      const stale = background.staleSnapshotRecord();
+      if (stale) {
+        let saved: ScrobbleState | null = null;
+        try {
+          saved = await this.stateManager.loadState();
+        } catch (e) {
+          /*
+            The disk cannot be read, so the queue on it cannot be identified.
+            Withhold Resume for this page rather than guess: the record
+            survives the reload and the next attempt can try again.
+          */
+          trackError('background.staleSnapshotRead', e);
+          this.hasResumableState = false;
+          this.ownershipBlocked = true;
+          return;
+        }
+        if (background.savedQueueIsStale(stale, saved ? (saved.importId || '') : null)) {
+          try {
+            await this.stateManager.clearState();
+            background.clearStaleSnapshot();
+            this.hasResumableState = false;
+            trackEvent('background_stale_snapshot_discarded', { reason });
+          } catch (e) {
+            /*
+              Still on disk, and now nothing owns it. Resume stays withheld for
+              the life of this page and the record survives the reload, so the
+              next attempt tries again rather than offering the queue.
+            */
+            trackError('background.clearStaleSnapshot', e);
+            this.hasResumableState = false;
+            this.ownershipBlocked = true;
+          }
+          return;
+        }
+        /*
+          The photograph is gone — either discarded already, or replaced by a
+          later import. The record describes nothing now, and leaving it would
+          condemn whatever is written here next.
+        */
+        background.clearStaleSnapshot();
+        this.hasResumableState = !!saved;
+        return;
+      }
+      try {
+        this.hasResumableState = await this.stateManager.hasSavedState();
+      } catch (e) {
+        // Nothing to restore the button for.
+      }
     },
 
     /**

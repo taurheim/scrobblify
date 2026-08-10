@@ -565,6 +565,11 @@ export interface RepeatResolution {
  * truncation as "empty" would re-time a play that is already on the account.
  * So is a window never asked about, because the budget ran out.
  *
+ * Everything still pinned at the end is moved to the front of the queue. The
+ * question cannot be decided, but the tuple is idempotent while Last.fm will
+ * still accept it, so the one thing that can still go wrong is waiting — and
+ * waiting is the part that is under our control.
+ *
  * Mutates `exported` in place; the caller passes it straight to
  * `stateFromExport`.
  */
@@ -608,11 +613,13 @@ export async function resolveExportedRepeats(
   });
 
   const settledPositions = new Set<number>();
+  const stillPinned = new Set<number>();
   const deadline = Date.now() + budgetMs;
   for (let c = 0; c < clusters.length; c += 1) {
     const cluster = clusters[c];
     if (c >= MAX_REPEAT_LOOKUPS || Date.now() >= deadline) {
       result.unresolved += cluster.length;
+      cluster.forEach((e) => stillPinned.add(e.i));
       // eslint-disable-next-line no-continue
       continue;
     }
@@ -630,6 +637,7 @@ export async function resolveExportedRepeats(
     }
     if (!window || !window.complete) {
       result.unresolved += cluster.length;
+      cluster.forEach((e) => stillPinned.add(e.i));
       // eslint-disable-next-line no-continue
       continue;
     }
@@ -661,22 +669,46 @@ export async function resolveExportedRepeats(
         result.settled += 1;
       } else {
         result.unresolved += 1;
+        stillPinned.add(e.i);
       }
     });
   }
 
-  if (settledPositions.size > 0) {
+  if (settledPositions.size > 0 || stillPinned.size > 0) {
     /*
-      Removed from the queue and added to the server's count in one step. The
-      total the user sees is derived from the two together, so moving a track
-      across without crediting it would report the import as having shrunk.
+      Settled entries are removed from the queue and added to the server's
+      count in one step. The total the user sees is derived from the two
+      together, so moving a track across without crediting it would report the
+      import as having shrunk.
+
+      Whatever is still pinned goes to the *front*.
+
+      Those are the entries whose second could not be settled either way, and
+      the only thing that can still go wrong with one is time: the tuple is
+      idempotent while Last.fm will accept it, and unsendable afterwards.
+      Nothing here can decide the question, but the queue can stop making it
+      worse. At the back of a hundred-thousand-track queue a pin waits weeks;
+      at the front it goes out with the first batch, and a repeat that lands
+      inside the window is a no-op if the original arrived and a normal
+      scrobble if it did not — no conclusion required.
+
+      They are also `reTagged: false`, so they are not held back by a re-tag
+      block, which is the other thing that can stall the head of a queue.
 
       Written back into the envelope the caller already holds, because that is
       what goes on to `stateFromExport`: returning a copy would leave a stale
-      original one line away from being used by mistake.
+      original one line away from being used by mistake. Nothing indexes into
+      this array yet — `completedIndices` and `failedIndices` are empty and the
+      positions above have already been consumed — so reordering it is free.
     */
     /* eslint-disable no-param-reassign */
-    exported.state.tracks = tracks.filter((_: unknown, i: number) => !settledPositions.has(i));
+    const kept = tracks
+      .map((t: unknown, i: number) => ({ t, i }))
+      .filter((e: { t: unknown; i: number }) => !settledPositions.has(e.i));
+    exported.state.tracks = [
+      ...kept.filter((e: { t: unknown; i: number }) => stillPinned.has(e.i)),
+      ...kept.filter((e: { t: unknown; i: number }) => !stillPinned.has(e.i)),
+    ].map((e: { t: unknown; i: number }) => e.t);
     exported.state.totalTracks = exported.state.tracks.length;
     exported.scrobbledByServer = (Number(exported.scrobbledByServer) || 0) + settledPositions.size;
     /* eslint-enable no-param-reassign */

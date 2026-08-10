@@ -29,6 +29,7 @@ const UNRESOLVED_STORAGE_KEY = 'scrobblify.background.unresolved';
 const LINEAGE_STORAGE_KEY = 'scrobblify.background.lineage';
 const IN_FLIGHT_STORAGE_KEY = 'scrobblify.background.inflightSecond';
 const SERVER_OWNS_STORAGE_KEY = 'scrobblify.background.serverOwns';
+const STALE_SNAPSHOT_STORAGE_KEY = 'scrobblify.background.staleSnapshot';
 const OWNERSHIP_CHANNEL = 'scrobblify.ownership';
 
 export interface Capacity {
@@ -192,6 +193,108 @@ export function getOwnershipUnresolved(): OwnershipMarker | null {
 export function clearOwnershipUnresolved(): void {
   try {
     window.localStorage.removeItem(UNRESOLVED_STORAGE_KEY);
+  } catch {
+    // Nothing to do.
+  }
+}
+
+/**
+ * Records that the queue saved on this device is a snapshot that has been
+ * overtaken, and must never be resumed.
+ *
+ * Take-back saves the exported queue *before* it cancels the job, because
+ * cancelling first and then failing to save would destroy the only copy. When
+ * the cancel is then refused — which now happens whenever the export claim has
+ * lapsed — the server still holds the real queue and has been free to carry on
+ * scrobbling it. What is on disk here is a photograph of where the import used
+ * to be.
+ *
+ * Without this record, "unresolved ownership" is the only thing standing in the
+ * way, and that resolves itself the moment the job stops being live: both
+ * release paths then read the saved queue back and offer Resume. Everything the
+ * server sent after the snapshot would be scrobbled a second time.
+ *
+ * So the two conditions are recorded separately, because they are different
+ * questions. Ownership asks "does the server still own this queue"; this asks
+ * "is this copy of it still true". A job that has finished answers the first
+ * and says nothing about the second.
+ *
+ * Deliberately not cleared by resolving ownership. Only replacing the queue —
+ * a take-back that completes, or discarding it — can clear it.
+ *
+ * The record names the queue as well as the job, because it outlives both. A
+ * discard that fails leaves it on disk indefinitely, and by the time the next
+ * release path reads it the browser may be holding an entirely different
+ * import that nothing is wrong with. A record that cannot say *which* queue it
+ * condemns would take that one with it.
+ */
+export interface StaleSnapshotRecord {
+  jobId: string;
+  /** The rotated identity the exported queue was saved under. */
+  importId: string;
+}
+
+export function setStaleSnapshot(jobId: string, importId: string): void {
+  try {
+    window.localStorage.setItem(
+      STALE_SNAPSHOT_STORAGE_KEY,
+      JSON.stringify({ jobId, importId }),
+    );
+  } catch {
+    // Private browsing. The in-memory path still refuses for this page's life.
+  }
+}
+
+export function staleSnapshotRecord(): StaleSnapshotRecord | null {
+  try {
+    const raw = window.localStorage.getItem(STALE_SNAPSHOT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      jobId: typeof parsed.jobId === 'string' ? parsed.jobId : '',
+      importId: typeof parsed.importId === 'string' ? parsed.importId : '',
+    };
+  } catch {
+    /*
+      Unparseable is not absent. A record written by an older build, or
+      truncated by a quota failure mid-write, still says a photograph was
+      taken — and the queue it names is the one on disk, since nothing else
+      writes there. Reported as a record with no identity, which the
+      comparison below treats as matching only an equally unnamed queue.
+    */
+    return null;
+  }
+}
+
+/**
+ * Whether the queue on disk is the photograph the record condemns.
+ *
+ * `savedImportId` is the identity of the state currently on disk, or `null`
+ * when there is nothing there at all.
+ *
+ * Identity is what makes this decision safe in both directions. A matching id
+ * is proof this is the same copy the refused cancel left behind. A *different*
+ * id is proof it is not — the disk has been rewritten by a later import, and
+ * discarding that would destroy progress the server never had.
+ *
+ * Two unnamed queues compare equal, and that is the intended fail-safe
+ * direction: identities only come out empty when `crypto.getRandomValues` is
+ * unavailable, and in that browser a wrongly kept photograph duplicates plays
+ * on a public profile while a wrongly discarded queue costs a re-import.
+ */
+export function savedQueueIsStale(
+  record: StaleSnapshotRecord | null,
+  savedImportId: string | null,
+): boolean {
+  if (!record) return false;
+  if (savedImportId === null) return false;
+  return record.importId === savedImportId;
+}
+
+export function clearStaleSnapshot(): void {
+  try {
+    window.localStorage.removeItem(STALE_SNAPSHOT_STORAGE_KEY);
   } catch {
     // Nothing to do.
   }
