@@ -450,19 +450,39 @@ export interface RepeatableSecond {
 }
 
 /**
- * The seconds this job already spent on sends whose answers never came back.
+ * The seconds this job already spent on sends whose answer never came back.
  *
- * A batch row is written *before* the POST, so an abandoned batch is precisely
- * the case where the request may have reached Last.fm and the reply was lost.
- * Re-sending those tracks under a fresh second turns "may already be stored"
- * into "is now stored twice", because Last.fm deduplicates on the whole
- * (artist, track, timestamp) tuple. Repeating the identical second instead is
- * a no-op if the original landed and a normal scrobble if it did not.
+ * A batch row is written *before* the POST, so a spent second whose outcome is
+ * not terminal is precisely the case where the request may have reached
+ * Last.fm and the answer was lost. Re-sending those tracks under a fresh
+ * second turns "may already be stored" into "is now stored twice", because
+ * Last.fm deduplicates on the whole (artist, track, timestamp) tuple.
+ * Repeating the identical second instead is a no-op if the original landed and
+ * a normal scrobble if it did not.
+ *
+ * **This is deliberately not a question about the batch's state.** It was, and
+ * that was a bug: only `abandoned` batches were read, so an entry Last.fm
+ * never echoed sat in a `settled` batch and was re-sent under a new second.
+ * Reconciliation makes it worse — it writes `reconciled`, and its `unknown` is
+ * the name-rewrite case, which is exactly a play that may be stored under a
+ * name we cannot match. Neither state is ever revisited by `reconcile`, which
+ * selects only `sending`, so nothing downstream would have caught it.
+ *
+ * So every batch is read, and the entries that need repeating are picked out
+ * of it:
+ *
+ * - `abandoned` and `sending`: no answer exists for any entry, so all of them.
+ * - anything settled: only the entries recorded `unknown`.
+ *
+ * `capped` and `bad_timestamp` are pointedly excluded. Last.fm told us it did
+ * *not* store those, so there is nothing to deduplicate against, and pinning
+ * them to an ageing second only risks the repeat expiring — which is read as
+ * our assignment being wrong and parks the job for a human.
  *
  * Read by both senders — the scheduler, when a job resumes over its own
- * abandoned batch, and the export, when handing those tracks to the browser.
- * It has to hold on both sides, or the guarantee is only as strong as whichever
- * of them happens to send next.
+ * unresolved batch, and the export, when handing those tracks to the browser.
+ * It has to hold on both sides, or the guarantee is only as strong as
+ * whichever of them happens to send next.
  *
  * The names are carried so the caller can check the second against the track it
  * is about to land on. `AssignedTrack.index` is batch-relative when minted and
@@ -478,14 +498,14 @@ export interface RepeatableSecond {
  * browser handed the same second may not reach it for days. See the two
  * constants above.
  */
-export async function abandonedSeconds(
+export async function unresolvedSeconds(
   sql: Sql,
   jobId: string,
   nowSec: number,
   maxAgeSec: number,
 ): Promise<{ repeatable: Map<number, RepeatableSecond>; stale: Set<number> }> {
-  const rows = await sql.all<{ assigned_timestamps: string }>(
-    "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'abandoned'",
+  const rows = await sql.all<{ state: string; assigned_timestamps: string; outcomes: string | null }>(
+    'SELECT state, assigned_timestamps, outcomes FROM batches WHERE job_id = ?',
     [jobId],
   );
   const repeatable = new Map<number, RepeatableSecond>();
@@ -500,10 +520,42 @@ export async function abandonedSeconds(
       return;
     }
     if (!Array.isArray(parsed)) { return; }
+    /*
+      Which indices in this batch still have no answer.
+      `null` means "every entry", used where no response was ever parsed.
+    */
+    let unresolvedIdx: Set<number> | null = null;
+    if (row.state !== 'abandoned' && row.state !== 'sending') {
+      unresolvedIdx = new Set<number>();
+      let outcomes: any;
+      try {
+        outcomes = JSON.parse(row.outcomes || 'null');
+      } catch {
+        outcomes = null;
+      }
+      /*
+        A settled batch with no readable outcomes cannot be interrogated per
+        entry. It was written by the path that records them, so this is
+        corruption rather than a state — and the safe reading of "I know a
+        second was spent and cannot tell you what happened" is that every
+        entry may need repeating.
+      */
+      if (!Array.isArray(outcomes)) {
+        unresolvedIdx = null;
+      } else {
+        outcomes.forEach((o) => {
+          const idx = o && Number(o.i);
+          if (Number.isFinite(idx) && o.s === 'unknown') {
+            unresolvedIdx!.add(idx);
+          }
+        });
+      }
+    }
     parsed.forEach((v) => {
       const idx = v && Number(v.index);
       const sec = v && Number(v.timestampSec);
       if (!Number.isFinite(idx)) { return; }
+      if (unresolvedIdx !== null && !unresolvedIdx.has(idx)) { return; }
       if (!Number.isFinite(sec) || sec <= 0 || nowSec - sec > maxAgeSec) {
         stale.add(idx);
         return;
@@ -511,12 +563,12 @@ export async function abandonedSeconds(
       /*
         Keyed per index, and the earliest survives.
 
-        Two rows can name one index only if a retry was itself abandoned, which
-        the reuse this function exists for is meant to make impossible — so a
-        second row is a row written before that rule held. The earliest is the
-        one every later send was supposed to have inherited, and settling on it
-        converges the index back onto a single tuple instead of leaving two
-        candidates that no reader can choose between.
+        One index legitimately appears in more than one row now: the batch that
+        first spent a second on it and every retry that repeated that second.
+        They agree, so the choice rarely matters — but where they disagree, the
+        earliest is the one every later send was supposed to have inherited.
+        Settling on it converges the index back onto a single tuple instead of
+        leaving two candidates no reader can choose between.
       */
       const prior = repeatable.get(idx);
       if (prior === undefined || sec < prior.sec) {

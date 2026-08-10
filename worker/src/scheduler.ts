@@ -35,7 +35,7 @@ import {
   canRun,
   tripBreaker,
   haltGlobally,
-  abandonedSeconds,
+  unresolvedSeconds,
   REPEATABLE_WINDOW_SECONDS,
 } from './store';
 import { BlobStore, JobTrack, readChunkFor } from './chunks';
@@ -571,12 +571,14 @@ async function sendBatch(
     An index that a previous send already spent a second on keeps that second,
     forever.
 
-    A batch row is written before the POST, so a batch abandoned without an
-    answer may already be on the account. Those tracks stay after the cursor
-    and are sent again — by this loop, if the job resumes rather than being
-    taken back. Sending them under a *fresh* second is what turns "may already
-    be stored" into "is now stored twice", because Last.fm deduplicates on the
-    whole (artist, track, timestamp) tuple.
+    A batch row is written before the POST, so a track whose outcome is not
+    terminal may already be on the account — whether the whole batch was
+    abandoned without an answer, or Last.fm answered and simply did not echo
+    that entry. Those tracks stay after the cursor and are sent again — by this
+    loop, if the job resumes rather than being taken back. Sending them under a
+    *fresh* second is what turns "may already be stored" into "is now stored
+    twice", because Last.fm deduplicates on the whole (artist, track,
+    timestamp) tuple.
 
     Repeating the identical second instead makes the re-send a no-op when the
     original landed and a normal scrobble when it did not. This is the same
@@ -590,7 +592,7 @@ async function sendBatch(
     Reusing means an index only ever has one, so repeating it is always
     idempotent, however many times the answer is lost.
   */
-  const reused = (await abandonedSeconds(
+  const reused = (await unresolvedSeconds(
     env.sql, job.id, nowSec, REPEATABLE_WINDOW_SECONDS,
   )).repeatable;
   const assigned = rebased.map((a) => {

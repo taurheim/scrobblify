@@ -732,6 +732,110 @@ async function main() {
       new Set(sent.map((e: any) => e.timestampSec)).size === 50);
   }
 
+  console.log('\n-- an entry Last.fm never echoed repeats its second too --');
+  {
+    /*
+      The batch state is not the question. Last.fm can answer with a 200 and
+      simply not echo every entry it was sent; those come back `unknown`, the
+      cursor stops before them, and the batch is written `settled`. Reading
+      only `abandoned` batches meant that entry was re-sent under a *fresh*
+      second — and an unechoed entry is exactly the case where the play may
+      already be stored, since the request certainly arrived.
+
+      Worse for reconciliation, which writes `reconciled`: its `unknown` is the
+      name-rewrite case, a play that very likely *is* on the account under a
+      name we could not match. Neither state is ever revisited, because
+      `reconcile` selects only `sending`.
+    */
+    const h = await harness({ total: 50, originalDaysAgo: 4000 });
+    const spent = assignTimestamps(
+      Array.from({ length: 2 }, (_v, i) => ({
+        artist: `Artist ${i}`, track: `Track ${i}`, index: i, originalTimestampSec: 0,
+      })),
+      NOW - 3600,
+      0,
+    );
+    // Index 0 was accepted and the cursor moved over it; index 1 came back
+    // with no echo at all, so the cursor stopped and it will be sent again.
+    const outcomes = [
+      { i: 0, s: 'accepted', t: spent.assigned[0].timestampSec },
+      { i: 1, s: 'unknown', t: spent.assigned[1].timestampSec },
+    ];
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, outcomes, sent_at, settled_at, created_at)
+       VALUES (?, ?, 0, 0, 2, 'settled', ?, ?, ?, ?, ?)`,
+      [randomId(), h.jobId, JSON.stringify(spent.assigned), JSON.stringify(outcomes),
+        NOW - 3600, NOW - 3600, NOW - 3600],
+    );
+    await h.sql.run('UPDATE jobs SET cursor = 1, scrobbled_count = 1 WHERE id = ?', [h.jobId]);
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    check('the unechoed entry rides its original second again',
+      sent[0].timestampSec === spent.assigned[1].timestampSec,
+      { got: sent[0].timestampSec, want: spent.assigned[1].timestampSec });
+    check('and it is the track that second belongs to',
+      sent[0].track === 'Track 1', sent[0]);
+  }
+
+  console.log('\n-- but an entry Last.fm refused is re-timed, not pinned --');
+  {
+    /*
+      A daily-limit refusal is Last.fm saying it did *not* store the play.
+      There is nothing to deduplicate against, so pinning it to a second that
+      goes on ageing only risks the repeat expiring — which comes back as a
+      rejected timestamp, is read as our assignment being wrong, and parks the
+      job for a human. Only genuinely unanswered entries are worth pinning.
+    */
+    const h = await harness({ total: 50, originalDaysAgo: 4000 });
+    const spent = assignTimestamps(
+      [{ artist: 'Artist 0', track: 'Track 0', originalTimestampSec: 0 }],
+      NOW - 3600,
+      0,
+    );
+    const outcomes = [{ i: 0, s: 'capped', c: 29, t: spent.assigned[0].timestampSec }];
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, outcomes, sent_at, settled_at, created_at)
+       VALUES (?, ?, 0, 0, 1, 'settled', ?, ?, ?, ?, ?)`,
+      [randomId(), h.jobId, JSON.stringify(spent.assigned), JSON.stringify(outcomes),
+        NOW - 3600, NOW - 3600, NOW - 3600],
+    );
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    check('a refused entry takes a fresh second',
+      sent[0].timestampSec !== spent.assigned[0].timestampSec,
+      { got: sent[0].timestampSec, refused: spent.assigned[0].timestampSec });
+  }
+
+  console.log('\n-- a settled batch with unreadable outcomes repeats everything --');
+  {
+    /*
+      The row says a second was spent and cannot say what became of it. That
+      is corruption rather than a state, and the safe reading of "I do not
+      know" is the same one the whole mechanism is built on: repeat, because a
+      repeat is free when the play landed and necessary when it did not.
+    */
+    const h = await harness({ total: 50, originalDaysAgo: 4000 });
+    const spent = assignTimestamps(
+      [{ artist: 'Artist 0', track: 'Track 0', originalTimestampSec: 0 }],
+      NOW - 3600,
+      0,
+    );
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, outcomes, sent_at, settled_at, created_at)
+       VALUES (?, ?, 0, 0, 1, 'settled', ?, ?, ?, ?, ?)`,
+      [randomId(), h.jobId, JSON.stringify(spent.assigned), '{not json',
+        NOW - 3600, NOW - 3600, NOW - 3600],
+    );
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    check('the spent second is repeated rather than replaced',
+      sent[0].timestampSec === spent.assigned[0].timestampSec,
+      { got: sent[0].timestampSec, want: spent.assigned[0].timestampSec });
+  }
+
   console.log('\n-- but not a second that belongs to a different track --');
   {
     /*

@@ -8,7 +8,7 @@
  * job's write-once blob.
  */
 import {
-  Sql, JobRow, readControl, countCommittedSlots, abandonedSeconds,
+  Sql, JobRow, readControl, countCommittedSlots, unresolvedSeconds,
   REPEATABLE_HANDOFF_WINDOW_SECONDS,
 } from './store';
 import {
@@ -1082,7 +1082,7 @@ async function exportJob(
     to a browser that may not reach the track for a day or more, and a repeat
     that expires in its hands cannot be stored at all.
   */
-  const { repeatable: repeatableSeconds, stale } = await abandonedSeconds(
+  const { repeatable: repeatableSeconds, stale } = await unresolvedSeconds(
     env.sql, claimedJob.id, nowSec, REPEATABLE_HANDOFF_WINDOW_SECONDS,
   );
   /*
