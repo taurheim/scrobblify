@@ -478,11 +478,19 @@ test.describe('Scrobble Step', () => {
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
 
-    await expect(page.locator('body')).toContainText('Finished scrobbling', { timeout: 30000 });
+    /*
+      Polled on the captured request rather than gated on page text.
 
-    // Verify scrobble used POST with form body
-    expect(scrobbleMethod).toBe('POST');
+      "Finished scrobbling" lives in the stepper pane for step 5, which Vuetify
+      renders up front and merely hides — so `toContainText` against the body
+      matches its hidden copy and passes before a single request has left. That
+      made this test race the app it was checking: under a full-suite load it
+      read `scrobbleMethod` while the loop was still starting up and failed on
+      an empty string, which looks exactly like a routing bug and is not one.
+    */
+    await expect.poll(() => scrobbleMethod, { timeout: 30000 }).toBe('POST');
     expect(scrobbleContentType).toContain('application/x-www-form-urlencoded');
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
   });
 });
 
@@ -647,6 +655,76 @@ test.describe('Session Resume', () => {
     await page.waitForTimeout(4000);
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
     await expect(page.locator('.upload-step')).toBeHidden();
+  });
+
+  test('a second Last.fm refuses is only re-timed when this browser chose it', async ({ page }) => {
+    const sent: number[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        sent.push(Number(params.get('timestamp[0]') || '0'));
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            scrobbles: {
+              '@attr': { accepted: 0, ignored: 1 },
+              scrobble: { ignoredMessage: { code: '3', '#text': 'Timestamp too old' } },
+            },
+          }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    /*
+      A pinned second carried over from a send whose outcome nobody saw — the
+      shape a worker take-back produces. Track 4 is the head of the remaining
+      queue, so the pin belongs to it.
+    */
+    const pinSec = Math.floor(Date.now() / 1000) - 13 * 24 * 60 * 60;
+    const reTagged = [1, 2, 3, 4, 5].map((n) => ({
+      track: `Track ${n}`,
+      artist: `Artist ${n}`,
+      album: `Album ${n}`,
+      timestamp: Date.UTC(2024, 0, n),
+      reTagged: true,
+    }));
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState({
+      tracks: reTagged,
+      pendingReTagTimestampSec: pinSec,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    /*
+      Three sends, and no more. The pin goes out once and is *not* replaced:
+      Last.fm refusing it means the tuple can no longer be stored, not that it
+      never was, so a fresh second could put a duplicate on a public profile.
+      Track 5's second was chosen here and stored nothing, so it is replaced
+      once — and a second refusal stops the run rather than spending the queue
+      one track at a time on what is really a wrong clock.
+    */
+    await expect.poll(() => sent.length, { timeout: 30000 }).toBe(3);
+    await page.waitForTimeout(2000);
+    expect(sent.length).toBe(3);
+    expect(sent[0]).toBe(pinSec);
+    expect(sent.filter((s) => s === pinSec)).toHaveLength(1);
+    expect(sent[2]).not.toBe(sent[1]);
   });
 
   test('a resumed session reports overall progress, not just the remaining chunk', async ({ page }) => {
@@ -1267,6 +1345,9 @@ test.describe('Re-tagged old plays', () => {
   async function runReTaggedImport(
     page: Page,
     scrobbleResponse: object | ((attempt: number) => object | 'abort'),
+    // Text that marks the end of the run. Not every run ends by finishing:
+    // rejections the loop reads as a systemic problem stop it deliberately.
+    endsWith = 'Finished scrobbling',
   ) {
     const timestamps: number[] = [];
     let scrobbleAttempts = 0;
@@ -1331,7 +1412,7 @@ test.describe('Re-tagged old plays', () => {
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
-    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator(`text=${endsWith}`)).toBeVisible({ timeout: 30000 });
 
     return timestamps;
   }
@@ -1355,35 +1436,33 @@ test.describe('Re-tagged old plays', () => {
     }
   });
 
-  test('a scrobble Last.fm ignored is reported as failed, not scrobbled', async ({ page }) => {
-    const timestamps = await runReTaggedImport(page, {
-      scrobbles: {
-        '@attr': { accepted: 0, ignored: 1 },
-        scrobble: { ignoredMessage: { code: '3', '#text': 'Timestamp too old' } },
+  test('two refused seconds in a row stop the run instead of spending the queue', async ({ page }) => {
+    const timestamps = await runReTaggedImport(
+      page,
+      {
+        scrobbles: {
+          '@attr': { accepted: 0, ignored: 1 },
+          scrobble: { ignoredMessage: { code: '3', '#text': 'Timestamp too old' } },
+        },
       },
-    });
+      'Last.fm rejected the substitute times',
+    );
 
-    expect(timestamps.length).toBeGreaterThan(0);
     /*
       Code 3 says the *second we chose* was refused, which is a statement about
       our own arithmetic rather than about the track — and the one rejection
-      that can be trusted to mean nothing was stored. So each track is sent a
-      second time under a replacement second before it is given up on, which is
-      what lets a pinned retry come home from the worker without the browser
-      having to judge its age against a clock nobody can trust.
+      that can be trusted to mean nothing was stored. So the first track is
+      re-sent once under a replacement second.
 
-      Exactly one replacement per track: a second refusal is a real failure.
+      The second refusal is a different animal. The allocator only ever offers
+      seconds inside the window Last.fm accepts, so being refused twice means
+      this machine's clock and Last.fm's disagree — a condition every remaining
+      track shares. Carrying on would consume the whole queue as failures one
+      track at a time, so the run stops with all of it still there.
     */
-    expect(timestamps.length % 2).toBe(0);
-    const trackCount = timestamps.length / 2;
-    for (let i = 0; i < timestamps.length; i += 2) {
-      expect(timestamps[i + 1]).not.toBe(timestamps[i]);
-    }
-
-    // The scrobble step is still mounted but hidden once the stepper advances,
-    // so assert on text content rather than visibility.
-    await expect(page.locator('.v-expansion-panel-header')).toContainText(`${trackCount} failed track(s)`);
-    await expect(page.locator('.overall-progress')).toContainText(`0 of ${trackCount}`);
+    expect(timestamps).toHaveLength(2);
+    expect(timestamps[1]).not.toBe(timestamps[0]);
+    await expect(page.locator('.overall-progress')).toContainText('0 of 5');
   });
 
   test('a rejection that is not about the timestamp is not retried', async ({ page }) => {

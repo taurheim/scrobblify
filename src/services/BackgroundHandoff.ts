@@ -518,14 +518,15 @@ export function stateFromExport(
       browser running fast discards a second that is still live and invents a
       different one for a track the worker may already have sent, which is a
       phantom play on a public profile; a browser running slow keeps one that
-      has expired. Only the second of those is recoverable, and it now is:
-      Last.fm answers an expired second with ignore code 3, and the send loop
-      responds by clearing the pin and re-sending that same track with a fresh
-      second rather than consuming it.
+      has expired. Only the second of those is recoverable, and it is: the send
+      loop puts the pin out unchanged, and if Last.fm refuses it as too old the
+      track is reported as a failure rather than re-sent under a new second —
+      because a refusal says the tuple can no longer be stored, not that it
+      never was.
 
       So the trade settles the other way round from how it looks. Preserving
-      unconditionally risks a visible, retried rejection; judging it against
-      the local clock risks a silent duplicate.
+      unconditionally risks one visible, named failure; judging it against the
+      local clock risks a silent duplicate.
     */
     if (pinSec > 0) {
       pendingReTagTimestampSec = pinSec;

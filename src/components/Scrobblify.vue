@@ -310,6 +310,11 @@ export default Vue.extend({
     */
     const unresolved = background.getOwnershipUnresolved();
     const owner = background.queueOwner();
+    if (unresolved) {
+      // A handover this browser started and could not finish. Whether it took
+      // effect is exactly what is unknown, so it counts as one having happened.
+      this.sawServerOwnership = true;
+    }
 
     try {
       const saved = await this.stateManager.hasSavedState();
@@ -329,6 +334,11 @@ export default Vue.extend({
     */
     if (owner) {
       this.ownershipBlocked = true;
+      // Read from the durable record rather than from a broadcast this tab was
+      // never here to receive. Same meaning either way: a queue of ours has
+      // left, so nothing this tab later holds may be released without the disk
+      // agreeing it is current.
+      this.sawServerOwnership = true;
       await this.reconcileQueueOwner(owner);
     }
 

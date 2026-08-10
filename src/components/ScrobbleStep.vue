@@ -233,10 +233,10 @@ const IGNORE_CODE_DAILY_LIMIT = 5;
 
   Unlike every other rejection these are answers about *our* arithmetic rather
   than about the track, and they are the one rejection that can be trusted to
-  mean nothing was stored — so the second is safe to abandon and the track is
-  safe to re-send with another one. That is what lets a pinned retry travel
-  home from the worker without being re-judged against the browser's clock: if
-  it has genuinely expired, this is where it is caught and replaced.
+  mean nothing was stored *this time*. Whether something was stored under that
+  second earlier is a different question, and the answer decides what happens
+  next: a second this loop just minted can be replaced for free, while an
+  inherited one may already carry a play and must not be re-timed.
 */
 const IGNORE_CODE_TIMESTAMP_TOO_OLD = 3;
 const IGNORE_CODE_TIMESTAMP_TOO_NEW = 4;
@@ -909,6 +909,17 @@ export default Vue.extend({
         this.currentTrackName = track.toString();
 
         let retrySameTrack = false;
+        /*
+          Whether the second about to be sent was chosen by this loop, here and
+          now, or inherited from a send whose outcome nobody ever saw — the
+          worker's export, or a send this browser started and was closed during.
+
+          Last.fm refuses the two identically and they must be answered
+          differently: a second we just minted stored nothing, so replacing it
+          is free, while an inherited one may already have a play sitting under
+          it, and replacing that is how a duplicate gets made.
+        */
+        let mintedThisAttempt = false;
         let recoveredFromRateLimit = false;
         let elapsedSinceFirstRateLimitMs = 0;
         let recoveredRateLimitPauseCount = 0;
@@ -932,7 +943,20 @@ export default Vue.extend({
           seconds it protects are all in the past and slide out of Last.fm's
           window on their own.
         */
-        const blockedUntilSec = track.reTagged ? this.reTagBlockedUntilSec() : 0;
+        /*
+          The block guards *allocation*, not sending.
+
+          A track that already carries a pending second has nothing left to
+          allocate, and holding it back is the one thing that can turn a pin
+          into a duplicate: the second it is pinned to keeps ageing while it
+          waits, and once Last.fm will no longer accept it the play it may
+          already represent can only be re-sent under a different time. So a
+          pin always goes through, and the block is re-examined for whichever
+          track is behind it.
+        */
+        const blockedUntilSec = (track.reTagged && pendingReTagTimestampSec === undefined)
+          ? this.reTagBlockedUntilSec()
+          : 0;
         if (blockedUntilSec > 0) {
           this.endPacing();
           this.stopped = true;
@@ -1004,6 +1028,7 @@ export default Vue.extend({
           // request that reaches Last.fm and loses its response, so the second
           // has to be durable from the moment it could have been used.
           this.pendingReTagSec = reTagCursorSec;
+          mintedThisAttempt = true;
         }
 
         try {
@@ -1043,20 +1068,50 @@ export default Vue.extend({
 
             const badSecond = result.ignoredCode === IGNORE_CODE_TIMESTAMP_TOO_OLD
               || result.ignoredCode === IGNORE_CODE_TIMESTAMP_TOO_NEW;
-            if (badSecond && pendingReTagTimestampSec !== undefined
-              && reTagRetryIndex !== i) {
+            const chosenSecond = pendingReTagTimestampSec !== undefined;
+            if (badSecond && chosenSecond && !mintedThisAttempt) {
               /*
-                A second *we* chose was refused, so nothing was stored under it
-                and there is nothing left to deduplicate against. Dropping it
-                and allocating another is therefore free of the usual hazard,
-                and it is the only way a track sent with an expired pin gets a
-                second chance instead of being consumed as a failure.
+                An inherited second, refused.
 
-                Scoped to a second this browser or the worker assigned. A track
-                still carrying its own real listen date that Last.fm calls too
-                old is a genuine rejection: re-tagging it here would quietly
-                move a play the user chose to keep, and the re-tag decision is
-                the user's to make on the upload screen.
+                This loop did not choose it: it came back in a worker export,
+                or from a send this browser started and never saw the end of.
+                Either way a play may already be sitting under it — that is the
+                entire reason the second is carried around instead of being
+                re-picked.
+
+                Last.fm refusing it now says the tuple can no longer be
+                *stored*. It does not say it was never stored. Re-sending the
+                track under a fresh second would therefore be a coin flip
+                between recovering a lost play and adding a second copy of one
+                the user heard once, to a public profile, where they will
+                neither expect it nor easily find it.
+
+                So it is reported rather than re-timed. One named failure the
+                user can act on beats a silent duplicate they cannot.
+              */
+              this.$store.commit('trackFailed');
+              this.failedTracks.push({
+                track,
+                error: 'This play had already been sent once under a time Last.fm will no longer accept. Scrobblify did not send it again, because re-sending it under a different time could put a duplicate on your profile.',
+              });
+              consecutiveFailures++;
+              trackEvent('scrobble_pin_expired', this.progressProps({
+                track_index: i,
+                ignored_code: result.ignoredCode,
+              }));
+            } else if (badSecond && chosenSecond && reTagRetryIndex !== i) {
+              /*
+                A second *we* chose, here, was refused — so nothing was stored
+                under it and there is nothing left to deduplicate against.
+                Dropping it and allocating another is free of the usual hazard,
+                and it is what stops a track being consumed for a mistake of
+                ours rather than a problem of its own.
+
+                Scoped to a second this loop assigned. A track still carrying
+                its own real listen date that Last.fm calls too old is a
+                genuine rejection: re-tagging it here would quietly move a play
+                the user chose to keep, and that decision is theirs to make on
+                the upload screen.
               */
               reTagRetryIndex = i;
               pendingReTagTimestampSec = undefined;
@@ -1067,6 +1122,34 @@ export default Vue.extend({
                 track_index: i,
                 ignored_code: result.ignoredCode,
               }));
+            } else if (badSecond && chosenSecond) {
+              /*
+                Twice, on seconds this loop picked itself.
+
+                The allocator only ever offers seconds inside the window
+                Last.fm accepts, so a refusal means this machine's clock and
+                Last.fm's disagree — a condition every remaining track shares.
+                Consuming them one at a time would spend most of the queue
+                before the consecutive-failure guard noticed, so the run stops
+                with this track still in it and says what to check.
+
+                The pin is cleared because we know it was refused. If the
+                compare-and-set on the way out declines that write — it refuses
+                a save that drops a pending second when nothing else has moved
+                — the resume inherits the old one and spends this single track
+                on the branch above. Bounded to one, and never a duplicate.
+              */
+              pendingReTagTimestampSec = undefined;
+              this.pendingReTagSec = 0;
+              this.$store.commit('setPendingReTagSec', 0);
+              this.endPacing();
+              this.stopped = true;
+              this.paused = true;
+              this.pauseReason = 'Last.fm rejected the substitute times Scrobblify chose for your older plays. That usually means this device\'s clock is wrong. Your progress is saved — check the clock and resume.';
+              // eslint-disable-next-line no-await-in-loop
+              await this.autoSave();
+              this.trackStopped('retag_second_refused', { track_index: i });
+              return;
             } else {
               const reason = LastFm.describeIgnoreCode(result.ignoredCode, result.ignoredMessage);
               this.$store.commit('trackFailed');
