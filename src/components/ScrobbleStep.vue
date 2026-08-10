@@ -146,6 +146,7 @@ import { trackEvent, trackError } from '@/services/Analytics';
 import RateLimitTracker, { DAILY_LIMIT } from '@/services/RateLimitTracker';
 import { canCompress } from '@/services/BackgroundScrobbling';
 import * as background from '@/services/BackgroundScrobbling';
+import StateManager from '@/services/StateManager';
 
 /**
  * Below this, finishing in the browser takes about a day and the extra moving
@@ -735,7 +736,7 @@ export default Vue.extend({
      * one a second was chosen for.
      */
     reTagTrackKey(track: Scrobble): string {
-      return `${track.artist}\u0000${track.track}\u0000${track.timestamp.getTime()}`;
+      return background.journalTrackKey(track.artist, track.track, track.timestamp.getTime());
     },
 
     /**
@@ -744,11 +745,13 @@ export default Vue.extend({
      *
      * The journal is written last and synchronously, because it is the only
      * one of the three that is durable at the instant the request leaves.
+     * Returns whether that write can be relied on: the caller is about to
+     * decide whether it is safe to send at all.
      */
-    setPendingSecond(track: Scrobble, sec: number) {
+    setPendingSecond(track: Scrobble, sec: number): boolean {
       this.pendingReTagSec = sec;
       this.$store.commit('setPendingReTagSec', sec);
-      background.recordInFlightSecond(
+      return background.recordInFlightSecond(
         (this.$store.state.importId as string) || '',
         this.reTagTrackKey(track),
         sec,
@@ -764,11 +767,47 @@ export default Vue.extend({
      * behind hands a used second to whichever track arrives at the head next,
      * and Last.fm answers a repeated (artist, track, timestamp) by discarding
      * it while reporting success.
+     *
+     * The journal is cleared only when it is this queue's and this track's.
+     * It is one origin-global key describing one queue's send, so clearing it
+     * blind would let this loop delete a second some other queue is riding on.
      */
-    clearPendingSecond() {
+    clearPendingSecond(track?: Scrobble) {
       this.pendingReTagSec = 0;
       this.$store.commit('setPendingReTagSec', 0);
-      background.clearInFlightSecond();
+      if (track) {
+        background.clearInFlightSecond(
+          (this.$store.state.importId as string) || '',
+          this.reTagTrackKey(track),
+        );
+      }
+    },
+
+    /**
+     * Makes sure this queue has a durable identity before anything is
+     * journalled against it.
+     *
+     * Selection mints one, but a progress file written before identities
+     * existed comes back without one — and the journal refuses to store an
+     * empty id, because two id-less queues would match each other and could
+     * trade seconds. Minting here is safe for exactly the reason it is safe in
+     * `beginHandoff`: a queue that has no identity cannot have been handed
+     * over, so a fresh one takes nothing away.
+     *
+     * Persisted before it is used. An id that exists only in memory is not an
+     * identity a crash can be recovered against.
+     */
+    async ensureImportIdentity(): Promise<boolean> {
+      if ((this.$store.state.importId as string) || '') { return true; }
+      const minted = StateManager.newImportId();
+      if (!minted) { return false; }
+      this.$store.commit('setImportId', minted);
+      try {
+        await this.autoSave();
+      } catch {
+        return false;
+      }
+      return true;
     },
 
     async runScrobbleLoop(tracker: RateLimitTracker) {
@@ -831,6 +870,7 @@ export default Vue.extend({
       const journalledSec = (
         journalled
         && headTrack
+        && journalled.importId
         && journalled.importId === ((this.$store.state.importId as string) || '')
         && journalled.trackKey === this.reTagTrackKey(headTrack)
       ) ? journalled.sec : 0;
@@ -870,7 +910,7 @@ export default Vue.extend({
       */
       let reTagRetryIndex = -1;
       if (inheritedSec > 0 && !pendingReTagTimestampSec) {
-        this.clearPendingSecond();
+        this.clearPendingSecond(headTrack);
       }
 
       if (this.scrobbledTracks === 0 && this.previouslyScrobbled === 0) {
@@ -879,6 +919,23 @@ export default Vue.extend({
         trackEvent('scrobble_resumed', this.progressProps({
           already_scrobbled: this.scrobbledTracks,
         }));
+      }
+
+      /*
+        A queue that will need substitute seconds needs an identity first,
+        because that is what a journalled second is bound to. Done once per
+        entry into the loop rather than per track, and only when there is
+        actually a re-tagged play in the remainder — an import of recent
+        listens never touches any of this.
+      */
+      const needsReTagSeconds = tracks.slice(this.scrobbledTracks).some((t) => t.reTagged);
+      if (needsReTagSeconds && !await this.ensureImportIdentity()) {
+        this.endPacing();
+        this.stopped = true;
+        this.paused = true;
+        this.pauseReason = 'Scrobblify could not save the information it needs to send your older plays safely, so it has stopped rather than risk duplicating them. Your progress is saved. This usually means the browser is blocking storage for this site.';
+        this.trackStopped('retag_identity_unavailable');
+        return;
       }
 
       // `i` is incremented conditionally at the end so a rate-limited track can be retried.
@@ -1105,7 +1162,27 @@ export default Vue.extend({
           // case is a request that reaches Last.fm and loses its response, so
           // the second has to outlive this tab from the moment it could have
           // been used — not merely from the next time the queue is saved.
-          this.setPendingSecond(track, reTagCursorSec);
+          if (!this.setPendingSecond(track, reTagCursorSec)) {
+            /*
+              The journal is what makes this send recoverable, so a send it
+              could not record is one that must not happen.
+
+              Without it, a tab closed between here and the answer leaves a
+              play Last.fm may well have stored and no record of the second it
+              was stored under — and the resume, finding none, picks a
+              different one and puts a second copy on a public profile. The
+              queue is left whole and the run stops instead: a held play is
+              recoverable, a duplicated one is not.
+            */
+            this.endPacing();
+            this.stopped = true;
+            this.paused = true;
+            this.pauseReason = 'Scrobblify could not save the information it needs to send your older plays safely, so it has stopped rather than risk duplicating them. Your progress is saved. This usually means the browser is blocking storage for this site.';
+            // eslint-disable-next-line no-await-in-loop
+            await this.autoSave();
+            this.trackStopped('retag_journal_unavailable', { track_index: i });
+            return;
+          }
           pendingSecondUnspent = true;
         }
 
@@ -1152,7 +1229,7 @@ export default Vue.extend({
                 have stored the play.
               */
               if (pendingSecondUnspent) {
-                this.clearPendingSecond();
+                this.clearPendingSecond(track);
               }
               this.pauseReason = 'Last.fm says you have hit your daily scrobble limit. Your progress is saved — come back tomorrow and resume.';
               this.stopped = true;
@@ -1214,7 +1291,7 @@ export default Vue.extend({
               reTagRetryIndex = i;
               pendingReTagTimestampSec = undefined;
               pendingSecondUnspent = false;
-              this.clearPendingSecond();
+              this.clearPendingSecond(track);
               retrySameTrack = true;
               trackEvent('scrobble_retag_second_refused', this.progressProps({
                 track_index: i,
@@ -1239,7 +1316,7 @@ export default Vue.extend({
               */
               pendingReTagTimestampSec = undefined;
               pendingSecondUnspent = false;
-              this.clearPendingSecond();
+              this.clearPendingSecond(track);
               this.endPacing();
               this.stopped = true;
               this.paused = true;
@@ -1284,7 +1361,7 @@ export default Vue.extend({
             // track, and the resume would hand a spent second to that track.
             pendingReTagTimestampSec = undefined;
             pendingSecondUnspent = false;
-            this.clearPendingSecond();
+            this.clearPendingSecond(track);
             // eslint-disable-next-line no-await-in-loop
             await this.autoSave();
             this.trackStopped('repeated_rejections', {
@@ -1341,7 +1418,7 @@ export default Vue.extend({
                 hold a play, and the track is given up on instead of re-timed.
               */
               if (pendingSecondUnspent) {
-                this.clearPendingSecond();
+                this.clearPendingSecond(track);
               }
               // eslint-disable-next-line no-await-in-loop
               await this.autoSave();
@@ -1428,7 +1505,7 @@ export default Vue.extend({
           */
           pendingReTagTimestampSec = undefined;
           pendingSecondUnspent = false;
-          this.clearPendingSecond();
+          this.clearPendingSecond(track);
           if (recoveredFromRateLimit) {
             trackEvent('scrobble_rate_limit_recovered', this.progressProps({
               burst_count: this.burstCount,

@@ -499,16 +499,39 @@ export interface InFlightSecond {
   sec: number;
 }
 
-export function recordInFlightSecond(importId: string, trackKey: string, sec: number): void {
-  if (!Number.isFinite(sec) || sec <= 0 || !trackKey) { return; }
+/**
+ * The stable name a journalled second is bound to.
+ *
+ * Shared rather than duplicated: the send loop writes these keys and the
+ * handoff reads them, and a key derived two slightly different ways is a key
+ * that never matches — which fails silently, as a missing pin rather than an
+ * error.
+ */
+export function journalTrackKey(artist: string, track: string, timestampMs: number): string {
+  return `${artist}\u0000${track}\u0000${timestampMs}`;
+}
+
+export function recordInFlightSecond(importId: string, trackKey: string, sec: number): boolean {
+  /*
+    An empty identity is refused rather than stored.
+
+    Two id-less queues would both match `''`, and if their heads happened to
+    share a key one could adopt the other's second — which is not a lost
+    dedup but an invented collision. The caller is expected to have minted an
+    identity by now; refusing here is what makes that a requirement rather
+    than a hope.
+  */
+  if (!importId || !trackKey || !Number.isFinite(sec) || sec <= 0) { return false; }
   try {
-    window.localStorage.setItem(IN_FLIGHT_STORAGE_KEY, JSON.stringify({
-      importId: importId || '',
-      trackKey,
-      sec,
-    }));
+    const record = JSON.stringify({ importId, trackKey, sec });
+    window.localStorage.setItem(IN_FLIGHT_STORAGE_KEY, record);
+    // Read back, because the caller is about to decide whether it is safe to
+    // send on the strength of this. A quota failure that throws is caught
+    // below; one that silently stores nothing is not, and private-mode
+    // storage has historically done both.
+    return window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY) === record;
   } catch {
-    // Best effort: a lost journal costs a possible duplicate, not a crash.
+    return false;
   }
 }
 
@@ -520,17 +543,26 @@ export function inFlightSecond(): InFlightSecond | null {
     const sec = Number(parsed.sec);
     if (!Number.isFinite(sec) || sec <= 0) { return null; }
     if (typeof parsed.trackKey !== 'string' || !parsed.trackKey) { return null; }
-    return {
-      importId: typeof parsed.importId === 'string' ? parsed.importId : '',
-      trackKey: parsed.trackKey,
-      sec,
-    };
+    if (typeof parsed.importId !== 'string' || !parsed.importId) { return null; }
+    return { importId: parsed.importId, trackKey: parsed.trackKey, sec };
   } catch {
     return null;
   }
 }
 
-export function clearInFlightSecond(): void {
+/**
+ * Forgets the record, but only when it is the caller's own.
+ *
+ * The key is origin-global while the thing it describes belongs to one queue,
+ * so an unconditional clear lets any part of the app delete a second another
+ * queue's send is riding on — after which a crash mid-send can no longer be
+ * recovered from, and the retry invents a duplicate. The send lock keeps two
+ * *senders* apart, but selecting a new import happens outside it.
+ */
+export function clearInFlightSecond(importId: string, trackKey: string): void {
+  const existing = inFlightSecond();
+  if (!existing) { return; }
+  if (existing.importId !== importId || existing.trackKey !== trackKey) { return; }
   try {
     window.localStorage.removeItem(IN_FLIGHT_STORAGE_KEY);
   } catch {

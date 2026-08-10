@@ -157,7 +157,6 @@ import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
 import { trackEvent } from '@/services/Analytics';
 import StateManager from '@/services/StateManager';
-import * as background from '@/services/BackgroundScrobbling';
 
 const workerCode = `
   let count = 0;
@@ -538,13 +537,15 @@ export default Vue.extend({
         the head of the previous queue — and there is no such track here. Left
         set, it would be handed to whatever track happens to be first now,
         which is a collision rather than the deduplication it exists for.
+
+        Only this browser's *in-memory* copy, though. The durable journal is
+        origin-global and may be describing a send another queue is riding on
+        right now — selection happens outside the send lock — and deleting
+        that would leave a crash mid-send unrecoverable. It is keyed by import
+        identity, and this selection is about to mint a new one, so it can
+        never be adopted here by accident.
       */
       this.$store.commit('setPendingReTagSec', 0);
-      // Including the copy that outlives the tab. The identity check on the
-      // way back in would refuse it anyway — a fresh queue mints a fresh id —
-      // but leaving a spent second lying around to be matched by accident is
-      // not worth the argument.
-      background.clearInFlightSecond();
       /*
         A fresh identity for a fresh queue.
 

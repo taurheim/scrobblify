@@ -176,6 +176,48 @@ export function uploadListFromState(state: ScrobbleState, nowSec: number): Uploa
   return orderForDeadline(uploads, nowSec);
 }
 
+/**
+ * Fills in a pending second the send loop journalled but never got to save.
+ *
+ * The journal exists because the queue on disk lags the send: a tab closed
+ * between choosing a second and hearing an answer leaves a play Last.fm may
+ * have stored, recorded nowhere but there. Resuming locally adopts it at the
+ * top of the send loop — but a handover does not go through the send loop. It
+ * takes the saved state directly, so without this the worker is told to invent
+ * its own second for a track that may already be sitting under one, and the
+ * two land side by side on a public profile.
+ *
+ * Applied before `uploadListFromState` *and* saved, because the upload bytes
+ * are re-derived after the redirect from the reloaded state and both
+ * derivations have to produce the digest the server committed to.
+ *
+ * Adopted only when the identity and the head track both match: the key is
+ * origin-global, so a record left by a different queue names a different play.
+ */
+export function adoptJournalledSecond(state: ScrobbleState): ScrobbleState {
+  // A second already on the queue is authoritative; the journal only ever
+  // fills a gap.
+  if (state.pendingReTagTimestampSec) { return state; }
+  if (!state.importId) { return state; }
+  const journal = api.inFlightSecond();
+  if (!journal || journal.importId !== state.importId) { return state; }
+  let head: Scrobble | undefined;
+  try {
+    const all = StateManager.deserializeScrobbles(state.tracks);
+    const completed = new Set(state.completedIndices);
+    const failed = new Set(state.failedIndices);
+    head = all.filter((_, i) => !completed.has(i) && !failed.has(i)).shift();
+  } catch (e) {
+    trackError('background.adoptJournalledSecond', e);
+    return state;
+  }
+  if (!head || !head.reTagged) { return state; }
+  const key = api.journalTrackKey(head.artist, head.track, head.timestamp.getTime());
+  if (key !== journal.trackKey) { return state; }
+  trackEvent('background_handoff_adopted_pin');
+  return { ...state, pendingReTagTimestampSec: journal.sec };
+}
+
 export interface BeginResult {
   ok: boolean;
   reason?: string;
@@ -249,6 +291,27 @@ export async function beginHandoff(
     return { ok: false, reason: 'reload_failed' };
   }
 
+  /*
+    An identity is minted here when the queue has none.
+
+    Selection is where one is normally minted, but a queue restored from a
+    progress file written before identities existed arrives without one — and
+    it is exactly as capable of being handed over as any other. Handing it over
+    id-less leaves nothing that can later answer "was this import given away",
+    so a stale copy of it reads silence as permission and replays every track
+    the worker sent. Minting before the upload is what makes the answer exist.
+  */
+  const importId = frozenState.importId || StateManager.newImportId();
+  /*
+    Done before the tracks are derived, not after.
+
+    A second the send loop journalled but never saved has to be inside both the
+    uploaded list and the state that is written to disk — the list is
+    re-derived post-redirect from that state, and the two derivations must
+    produce identical bytes for the digest to describe what the server got.
+  */
+  frozenState = adoptJournalledSecond({ ...frozenState, importId });
+
   // Pinned so the post-redirect derivation reproduces this exact ordering.
   // Without it the sort key would be re-evaluated minutes later against a
   // moved clock, and a track sitting on the window boundary could change
@@ -267,17 +330,6 @@ export async function beginHandoff(
 
   // Persisted *first*. If the tab dies between here and the upload, the queue
   // is still on disk and the user resumes locally as they always could.
-  /*
-    An identity is minted here when the queue has none.
-
-    Selection is where one is normally minted, but a queue restored from a
-    progress file written before identities existed arrives without one — and
-    it is exactly as capable of being handed over as any other. Handing it over
-    id-less leaves nothing that can later answer "was this import given away",
-    so a stale copy of it reads silence as permission and replays every track
-    the worker sent. Minting before the upload is what makes the answer exist.
-  */
-  const importId = frozenState.importId || StateManager.newImportId();
   try {
     await stateManager.saveState({ ...frozenState, handoffOrderEpoch: orderEpoch, importId });
   } catch (e) {

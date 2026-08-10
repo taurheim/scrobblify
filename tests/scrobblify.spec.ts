@@ -805,6 +805,66 @@ test.describe('Session Resume', () => {
     expect(new Set(sent).size).toBe(sent.length);
   });
 
+  test('a queue saved before identities existed is given one before it sends', async ({ page }) => {
+    const journals: (string | null)[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        // Read while the request is in flight: the record is cleared the
+        // moment its track is done with.
+        journals.push(await page.evaluate(
+          () => window.localStorage.getItem('scrobblify.background.inflightSecond'),
+        ));
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    const reTagged = [1, 2, 3, 4, 5].map((n) => ({
+      track: `Track ${n}`,
+      artist: `Artist ${n}`,
+      album: `Album ${n}`,
+      timestamp: Date.UTC(2024, 0, n),
+      reTagged: true,
+    }));
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    // No `importId`: exactly what a progress file written before queue
+    // identities existed looks like on disk.
+    await seedSavedState(page, buildState({ tracks: reTagged }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+
+    /*
+      The journal binds a second to the queue that chose it, and an empty
+      identity matches every other empty one — so two id-less queues whose
+      heads happened to share a track could trade seconds, which is not a
+      missed deduplication but an invented collision. Minting one here is safe
+      for the same reason it is safe at handover: a queue with no identity
+      cannot have been handed over, so a fresh name takes nothing away.
+    */
+    expect(journals.length).toBeGreaterThan(0);
+    const record = JSON.parse(journals[0] as string);
+    expect(record.importId).toBeTruthy();
+    expect(record.importId.length).toBeGreaterThanOrEqual(16);
+  });
+
   test('a resumed session reports overall progress, not just the remaining chunk', async ({ page }) => {
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
@@ -1620,6 +1680,73 @@ test.describe('Re-tagged old plays', () => {
       () => window.localStorage.getItem('scrobblify.background.inflightSecond'),
     );
     expect(afterRun).toBeNull();
+  });
+
+  test('a second it cannot record is a second it will not send under', async ({ page }) => {
+    /*
+      Storage that accepts a write and keeps nothing is the failure this
+      guards, not storage that throws — private-mode quota has historically
+      done both, and the silent one is the one a `try` never sees.
+    */
+    await page.addInitScript(() => {
+      const original = window.localStorage.setItem.bind(window.localStorage);
+      window.localStorage.setItem = (key: string, value: string) => {
+        if (key === 'scrobblify.background.inflightSecond') { return; }
+        original(key, value);
+      };
+    });
+
+    const timestamps = await runReTaggedImport(
+      page,
+      { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } },
+      'risk duplicating them',
+    );
+
+    /*
+      The journal is what makes a re-tagged send recoverable, so a send it
+      could not record is one that must not happen.
+
+      Without it, a tab closed between choosing a second and hearing an answer
+      leaves a play Last.fm may well have stored and no record of the second it
+      was stored under; the resume finds none, picks a different one, and puts
+      a second copy on a public profile. Stopping holds the queue instead —
+      held plays are recoverable, duplicated ones are not.
+    */
+    expect(timestamps).toHaveLength(0);
+    await expect(page.locator('.overall-progress')).toContainText('0 of 5');
+  });
+
+  test('a journal belonging to another queue is not erased by this one', async ({ page }) => {
+    const foreign = JSON.stringify({
+      importId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      trackKey: 'Some Artist\u0000Some Track\u00001700000000000',
+      sec: 1700000000,
+    });
+
+    await runReTaggedImport(page, async (attempt) => {
+      // Planted on the last send, so nothing after it allocates a second and
+      // overwrites the record before the clear under test runs.
+      if (attempt === 5) {
+        await page.evaluate(
+          (record) => window.localStorage.setItem('scrobblify.background.inflightSecond', record),
+          foreign,
+        );
+      }
+      return { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } };
+    });
+
+    /*
+      One origin-global key describes one queue's in-flight send, so a clear
+      that does not check whose record it is deletes whatever is there. The
+      sender lock keeps two send loops apart, but choosing a new import happens
+      outside it — and the record it would delete is the only evidence of a
+      second some other queue may already have a play sitting under. Losing it
+      turns a recoverable crash into a duplicate.
+    */
+    const afterRun = await page.evaluate(
+      () => window.localStorage.getItem('scrobblify.background.inflightSecond'),
+    );
+    expect(afterRun).toBe(foreign);
   });
 
   test('a rejection that is not about the timestamp is not retried', async ({ page }) => {
