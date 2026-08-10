@@ -477,9 +477,40 @@ export function mergeCarriedFailures(
   return { failures: kept, dropped };
 }
 
+/**
+ * Writes the lineage, preserving the named failures the caller did not mention.
+ *
+ * Every other field here is one the caller recomputes in full, so a whole-record
+ * write is the right shape for them. The failure list is not: it is accumulated
+ * over the *whole chain of owners* and no caller that is updating a cursor or
+ * starting a handover has any business restating it. Both such callers omitted
+ * it and silently destroyed it, which is precisely the loss the list exists to
+ * prevent — so the omission is read as "leave it alone" rather than "clear it".
+ *
+ * Clearing is available, deliberately and only, through `clearCarriedFailures`.
+ */
 export function setHandoffLineage(lineage: HandoffLineage): void {
   try {
-    window.localStorage.setItem(LINEAGE_STORAGE_KEY, JSON.stringify(lineage));
+    // Read raw rather than through `getHandoffLineage`, which refuses a record
+    // whose totals are not numbers — a record this very function may be about
+    // to give valid totals to. The failure list must survive that repair.
+    const raw = window.localStorage.getItem(LINEAGE_STORAGE_KEY);
+    const existing = raw ? JSON.parse(raw) : null;
+    const stated = lineage.carriedFailures !== undefined;
+    const failures = stated
+      ? validFailures(lineage.carriedFailures)
+      : validFailures(existing && existing.carriedFailures);
+    const rawDropped = stated
+      ? lineage.carriedFailuresDropped
+      : (existing && existing.carriedFailuresDropped);
+    const dropped = Number.isFinite(rawDropped) && Number(rawDropped) > 0
+      ? Math.floor(Number(rawDropped))
+      : 0;
+    window.localStorage.setItem(LINEAGE_STORAGE_KEY, JSON.stringify({
+      ...lineage,
+      ...(failures.length > 0 ? { carriedFailures: failures } : {}),
+      ...(dropped > 0 ? { carriedFailuresDropped: dropped } : {}),
+    }));
   } catch {
     // Cosmetic only — the progress bar falls back to the remaining count.
   }

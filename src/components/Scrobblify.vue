@@ -39,6 +39,20 @@
           :loading="backgroundBusy"
           @click="resumeBackgroundJob"
         >Resume on the server</v-btn>
+        <!--
+          The only way a job parked for re-auth can ever send again: the
+          sign-in callback re-attaches the credential it proves. Without the
+          button the headline told the user to reconnect and gave them nothing
+          to reconnect with, leaving take-back (which abandons any batch still
+          in flight) as their only exit.
+        -->
+        <v-btn
+          v-else-if="backgroundJob.state === 'needs_reauth'"
+          color="primary"
+          class="mr-2"
+          :loading="reauthBusy"
+          @click="reauthenticate"
+        >Reconnect Last.fm</v-btn>
         <v-btn outlined class="mr-2" :loading="backgroundBusy" @click="takeBackProgress">
           Take my progress back
         </v-btn>
@@ -1632,8 +1646,18 @@ export default Vue.extend({
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         background.clearHandoffLineage(carriedLineage.ranges, carriedLineage.knownFromSec);
-        this.backgroundNotice = 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
-        trackEvent('background_job_reclaimed', { job_id: jobId });
+        /*
+          Said out loud when it applies. These tracks were sent but never
+          confirmed, so they come back in the queue and will be sent again —
+          the right way round, because a duplicate can be deleted and a missing
+          play cannot be recovered, but not something to do to somebody
+          without telling them.
+        */
+        const uncertain = Number(exported.uncertainCount) || 0;
+        this.backgroundNotice = uncertain > 0
+          ? `Your remaining tracks are back in this browser. Choose "Resume" to carry on here. Note that ${uncertain.toLocaleString()} track(s) were sent without a confirmed reply, so they are included again — if they did arrive, Last.fm may end up with a second copy of them.`
+          : 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
+        trackEvent('background_job_reclaimed', { job_id: jobId, uncertain });
       } catch (e) {
         trackError('background.takeBackProgress', e);
         // The job may have been left paused. Say so, and re-read its real

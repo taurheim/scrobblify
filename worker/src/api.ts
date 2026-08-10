@@ -23,7 +23,7 @@ import {
 import { issueSession, authenticate } from './session';
 import { drainJobOnDemand } from './scheduler';
 import {
-  normalizeUsername, randomId, signHandoffState, verifyHandoffState,
+  normalizeUsername, randomId, signHandoffState, verifyHandoffState, encryptCredential,
 } from './crypto';
 
 /** Remaining tracks below which background mode is not worth the trade-offs. */
@@ -164,6 +164,77 @@ function authoriseUrl(env: ApiEnv, state: string): string {
   const cb = `${env.callbackUrl}?state=${encodeURIComponent(state)}`;
   return `https://www.last.fm/api/auth/?api_key=${encodeURIComponent(env.lastfmApiKey)}`
     + `&cb=${encodeURIComponent(cb)}`;
+}
+
+/**
+ * Gives a job parked in `needs_reauth` a working write credential again.
+ *
+ * The only path in the system that can. `needs_reauth` is entered when the
+ * stored key is gone or has been revoked, and it clears `live_username`, so
+ * the job cannot send and is not resumable — the user's alternatives are a
+ * take-back (which abandons any batch still in flight, risking duplicates) or
+ * a cancel (which discards the queue). The status card has always told them to
+ * reconnect Last.fm; this is what makes that true.
+ *
+ * Best effort, and silent. Signing in must succeed even when the re-attach
+ * cannot: this is a bonus on a flow whose actual job is to prove identity, and
+ * failing the sign-in would strand the user worse than the parked job does.
+ *
+ * Restored to `paused` rather than `active` so continuing stays the user's
+ * explicit choice, and because `paused` is what the status card offers a
+ * Resume button for.
+ */
+async function reattachCredential(
+  env: ApiEnv,
+  username: string,
+  sessionKey: string,
+  nowSec: number,
+): Promise<void> {
+  try {
+    const job = await env.sql.first<JobRow>(
+      `SELECT * FROM jobs WHERE username = ? AND state = 'needs_reauth'
+        ORDER BY created_at DESC LIMIT 1`,
+      [username],
+    );
+    if (!job) { return; }
+    /*
+      `live_username` carries a unique index, so a job started since this one
+      was parked already owns the slot. Taking it would fail the write; racing
+      it would give one user two sending jobs over the same account. The parked
+      job stays parked and its tracks stay recoverable by take-back.
+    */
+    const slotHeld = await env.sql.first<{ n: number }>(
+      `SELECT 1 AS n FROM jobs WHERE live_username = ?
+        UNION ALL
+       SELECT 1 AS n FROM handoffs WHERE live_username = ?
+        LIMIT 1`,
+      [username, username],
+    );
+    if (slotHeld) { return; }
+    const credential = await encryptCredential(sessionKey, env.credentialSecret, job.id);
+    /*
+      Conditioned on the state it was read in. A tick may have moved this job
+      between the read and here — to `cancelled`, or to `exporting` for a
+      take-back that is reading the queue out — and attaching a live credential
+      to either would resurrect a job the user has finished with.
+    */
+    const updated = await env.sql.run(
+      `UPDATE jobs
+          SET session_key_ct = ?, session_key_iv = ?, live_username = ?,
+              state = 'paused', state_reason = NULL, consecutive_failures = 0,
+              next_eligible_at = ?, locked_until = 0, updated_at = ?
+        WHERE id = ? AND state = 'needs_reauth'`,
+      [credential.ciphertext, credential.iv, username, nowSec, nowSec, job.id],
+    );
+    if (updated.changes > 0) {
+      await env.sql.run(
+        'INSERT INTO audit (id, job_id, generation, event, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [randomId(), job.id, job.generation, 'credential_reattached', null, nowSec],
+      );
+    }
+  } catch {
+    // Never at the cost of the sign-in itself; see above.
+  }
 }
 
 async function liveJobFor(sql: Sql, username: string): Promise<JobRow | null> {
@@ -335,6 +406,23 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         return Response.redirect(target.toString(), 302);
       }
       const session = await issueSession(normalizeUsername(identity.username), env.signingKey, nowSec);
+      /*
+        A job parked for re-authentication gets its write credential back here.
+
+        This flow otherwise discards the session key on purpose, and that is
+        still the rule for every other case: proving who you are needs no
+        ability to write. But `needs_reauth` exists precisely because the
+        stored key is gone or revoked, and nothing else in the system can
+        supply a new one — so without this the UI's "reconnect Last.fm"
+        promised a recovery that did not exist. The job could then only be
+        taken back, which abandons any batch still in flight and risks
+        duplicating it, or cancelled, which discards the queue.
+
+        Narrow by construction: the username on the state has already been
+        checked against what `auth.getSession` returned, so the key can only
+        ever be attached to its own owner's job.
+      */
+      await reattachCredential(env, normalizeUsername(identity.username), identity.sessionKey, nowSec);
       target.searchParams.set('signin', 'ok');
       // The nonce is echoed back so the initiating browser can prove this
       // return is its own. It travels in the fragment with the token, so it
@@ -1054,6 +1142,39 @@ async function exportJob(
   });
   const usedRanges = collapseToRanges(usedSeconds, MAX_EXPORTED_RANGES);
 
+  /*
+    Tracks whose fate nobody knows, counted so the user can be told.
+
+    A batch row is written before the POST, so an abandoned batch is exactly
+    the case where the request may have reached Last.fm and the answer was
+    lost. Those tracks are still after the cursor, so they are handed back and
+    will be sent again — which is the right way round (a duplicate is
+    recoverable, a lost play is not) but is not something to do to somebody
+    silently.
+  */
+  const unresolved = await env.sql.all<{ assigned_timestamps: string }>(
+    "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'abandoned'",
+    [claimedJob.id],
+  );
+  let uncertainCount = 0;
+  unresolved.forEach((row) => {
+    try {
+      const parsed = JSON.parse(row.assigned_timestamps);
+      if (!Array.isArray(parsed)) { return; }
+      parsed.forEach((v) => {
+        // Only entries still ahead of the cursor come back in the queue; one
+        // behind it was resolved and counted, and is not in `tracks` at all.
+        const idx = v && Number(v.index);
+        if (Number.isFinite(idx) && idx >= claimedJob.cursor) {
+          uncertainCount += 1;
+        }
+      });
+    } catch {
+      // Unreadable rows are not counted. Overstating the number would push a
+      // user into re-checking a history that is fine.
+    }
+  });
+
   return json(env, {
     ok: true,
     exportedAt: nowSec,
@@ -1087,6 +1208,12 @@ async function exportJob(
     */
     usedRangesIncomplete: usedIncomplete,
     scrobbledByServer: claimedJob.scrobbled_count,
+    /*
+      How many of the returned tracks may already be on the account. Zero for
+      every ordinary take-back; non-zero only when a batch was abandoned
+      without ever being reconciled, which needs a dead credential.
+    */
+    uncertainCount,
     state: {
       totalTracks: tracks.length,
       completedIndices: [],

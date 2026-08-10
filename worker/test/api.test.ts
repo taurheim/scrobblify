@@ -8,7 +8,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { schemaSql } from './schema';
 import { Sql, SqlResult, JobRow } from '../src/store';
 import { BlobStore, gzip, uploadChunk, CHUNK_TRACKS } from '../src/chunks';
-import { encryptCredential, sha256Hex, randomId, signPayload } from '../src/crypto';
+import {
+  encryptCredential, sha256Hex, randomId, signPayload, signHandoffState,
+} from '../src/crypto';
 import { issueSession, SESSION_TTL_SECONDS } from '../src/session';
 import { ALGORITHM_VERSION } from '../src/handoff';
 import { handleRequest, ApiEnv, MIN_TRACKS_FOR_BACKGROUND, collapseToRanges } from '../src/api';
@@ -1052,6 +1054,80 @@ async function main() {
       }))).status === 404);
     const preflightCors = await handleRequest(env, req('/scrobblify/job', { method: 'OPTIONS' }));
     check('preflight OPTIONS is answered without a token', preflightCors.status === 204);
+  }
+
+  console.log('\n-- signing in gives a re-auth job its credential back --');
+  {
+    /*
+      `needs_reauth` clears `live_username` and the stored key, so the job
+      cannot send and is not resumable. Nothing else in the system can supply a
+      new key — the sign-in flow deliberately discarded the one it proves — so
+      the status card's "reconnect Last.fm" promised a recovery that did not
+      exist. The user's only exits were take-back, which abandons any batch
+      still in flight and risks duplicating it, or cancel, which discards the
+      queue.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs, {
+      getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'listener' }),
+    });
+    const jobId = await seedJob(sql, blobs, 'listener', { state: 'needs_reauth', live: false });
+    await sql.run(
+      'UPDATE jobs SET session_key_ct = NULL, session_key_iv = NULL WHERE id = ?', [jobId],
+    );
+    const state = await signHandoffState(
+      {
+        h: '', exp: NOW + 600, k: 'signin', u: 'listener', n: 'nonce-that-is-long-enough',
+      },
+      SIGNING,
+    );
+    const res = await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    );
+    check('the sign-in still succeeds', res.status === 302, res.status);
+    const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [jobId]);
+    check('the job can send again', job.state === 'paused', job.state);
+    check('it has a credential', !!job.session_key_ct, job.session_key_ct);
+    check('and it holds the account slot', job.live_username === 'listener', job.live_username);
+    const logged = await sql.first<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM audit WHERE job_id = ? AND event = 'credential_reattached'",
+      [jobId],
+    );
+    check('and it is recorded', logged!.n === 1, logged!.n);
+  }
+
+  console.log('\n-- but never over a job that already holds the slot --');
+  {
+    /*
+      `live_username` carries a unique index. A job started since this one was
+      parked already owns the account, and giving the parked one a live
+      credential too would mean two jobs sending the same user's history at
+      once — every track in the overlap duplicated.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs, {
+      getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'listener' }),
+    });
+    const parked = await seedJob(sql, blobs, 'listener', { state: 'needs_reauth', live: false });
+    await sql.run(
+      'UPDATE jobs SET session_key_ct = NULL, session_key_iv = NULL WHERE id = ?', [parked],
+    );
+    await seedJob(sql, blobs, 'listener', { live: true });
+    const state = await signHandoffState(
+      {
+        h: '', exp: NOW + 600, k: 'signin', u: 'listener', n: 'nonce-that-is-long-enough',
+      },
+      SIGNING,
+    );
+    const res = await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    );
+    check('the sign-in still succeeds', res.status === 302, res.status);
+    const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [parked]);
+    check('the parked job is left parked', job.state === 'needs_reauth', job.state);
+    check('and is given no credential', job.session_key_ct === null, job.session_key_ct);
   }
 
   console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);

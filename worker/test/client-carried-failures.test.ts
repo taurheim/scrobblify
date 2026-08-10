@@ -22,6 +22,7 @@ import {
   setHandoffLineage,
   clearHandoffLineage,
   clearCarriedFailures,
+  recordReTagCursor,
 } from '@/services/BackgroundScrobbling';
 
 let failures = 0;
@@ -199,6 +200,58 @@ function main() {
     check('the caller is not broken', !threw);
     check('and still gets the list for this session',
       !!merged && merged.failures.length === 1, merged);
+  }
+
+  console.log('\n-- whole-record writers do not erase the failures --');
+  {
+    storage.clear();
+    /*
+      `setHandoffLineage` takes a whole record, and both production callers —
+      the handover setup in `Scrobblify.vue` and `recordReTagCursor` below —
+      build that record from the fields *they* care about. Neither has any
+      business restating a list accumulated across every previous owner, and
+      both omitted it, which destroyed it on the next handover or the next
+      allocated second. The omission now means "leave it alone".
+    */
+    recordCarriedFailures([fail('Survives', 'A Handover')]);
+    setHandoffLineage({
+      originalTotalTracks: 900,
+      originalSucceededCount: 100,
+      reTagUsedRanges: [],
+      reTagKnownFromSec: 0,
+      reTagCursorSec: 0,
+    });
+    const afterHandover = getHandoffLineage();
+    check('a second handover keeps them',
+      !!afterHandover && (afterHandover.carriedFailures || []).length === 1, afterHandover);
+
+    recordReTagCursor(1700000500);
+    const afterCursor = getHandoffLineage();
+    check('advancing the re-tag cursor keeps them',
+      !!afterCursor && (afterCursor.carriedFailures || []).length === 1, afterCursor);
+    check('and the cursor still advanced',
+      !!afterCursor && afterCursor.reTagCursorSec === 1700000500, afterCursor);
+  }
+
+  console.log('\n-- an explicit list still replaces them --');
+  {
+    storage.clear();
+    // Omission means "leave alone"; saying so means what it says, or nothing
+    // could ever correct a list that had gone wrong.
+    recordCarriedFailures([fail('Old', 'Entry')]);
+    setHandoffLineage({
+      originalTotalTracks: 0,
+      originalSucceededCount: 0,
+      reTagUsedRanges: [],
+      reTagKnownFromSec: 0,
+      reTagCursorSec: 0,
+      carriedFailures: [fail('New', 'Entry')],
+    });
+    const lineage = getHandoffLineage();
+    check('the stated list wins',
+      !!lineage && (lineage.carriedFailures || []).length === 1
+      && (lineage.carriedFailures || [])[0].artist === 'New',
+      lineage);
   }
 
   if (failures > 0) {
