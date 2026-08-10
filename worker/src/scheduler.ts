@@ -36,6 +36,7 @@ import {
   tripBreaker,
   haltGlobally,
   abandonedSeconds,
+  REPEATABLE_WINDOW_SECONDS,
 } from './store';
 import { BlobStore, JobTrack, readChunkFor } from './chunks';
 import { LastFmClient } from './lastfm';
@@ -589,7 +590,9 @@ async function sendBatch(
     Reusing means an index only ever has one, so repeating it is always
     idempotent, however many times the answer is lost.
   */
-  const reused = (await abandonedSeconds(env.sql, job.id, nowSec)).repeatable;
+  const reused = (await abandonedSeconds(
+    env.sql, job.id, nowSec, REPEATABLE_WINDOW_SECONDS,
+  )).repeatable;
   const assigned = rebased.map((a) => {
     const prior = reused.get(a.index);
     if (prior === undefined || prior.artist !== a.artist || prior.track !== a.track) {

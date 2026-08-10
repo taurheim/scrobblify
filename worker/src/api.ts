@@ -7,7 +7,10 @@
  * only tracks that ever reach Last.fm are the ones already committed to a
  * job's write-once blob.
  */
-import { Sql, JobRow, readControl, countCommittedSlots, abandonedSeconds } from './store';
+import {
+  Sql, JobRow, readControl, countCommittedSlots, abandonedSeconds,
+  REPEATABLE_HANDOFF_WINDOW_SECONDS,
+} from './store';
 import {
   BlobStore, uploadChunk, deleteJobBlobs, readChunkFor, CHUNK_TRACKS,
 } from './chunks';
@@ -1051,11 +1054,13 @@ async function exportJob(
     correct either way, and the user is never asked to choose.
 
     The same rule is applied by `sendBatch` when a job resumes over its own
-    abandoned batch, from this same helper, because a guarantee that holds on
-    only one of the two senders is no guarantee at all.
+    abandoned batch, from this same helper — but under a longer window. That
+    sender puts the second out within moments of choosing it; this one hands it
+    to a browser that may not reach the track for a day or more, and a repeat
+    that expires in its hands cannot be stored at all.
   */
   const { repeatable: repeatableSeconds, stale } = await abandonedSeconds(
-    env.sql, claimedJob.id, nowSec,
+    env.sql, claimedJob.id, nowSec, REPEATABLE_HANDOFF_WINDOW_SECONDS,
   );
   /*
     Counted per index rather than per row, and only for indices that actually
@@ -1068,6 +1073,21 @@ async function exportJob(
   stale.forEach((idx) => {
     if (idx >= claimedJob.cursor && !failedIndex.has(idx)) { uncertainCount += 1; }
   });
+  /*
+    The repeated seconds, by position in the exported `tracks` array.
+
+    A pin is a bet that stays good only while Last.fm still accepts the
+    second, and handing it to a browser starts a clock the worker cannot see:
+    the queue may not reach that track for days. Naming the entries lets the
+    client settle each one against the user's actual history the moment it
+    takes the queue back — while it is online and the second is still inside
+    the window — rather than discovering at send time that the bet expired,
+    when neither repeating nor re-timing is safe.
+
+    Positions, not indices: `failedIndex` removes entries, so the exported
+    array is not aligned with the job's own numbering.
+  */
+  const repeats: { i: number; sec: number }[] = [];
 
   const chunks = await env.sql.all<any>(
     'SELECT * FROM chunks WHERE job_id = ? AND end_index > ? ORDER BY chunk_index',
@@ -1143,6 +1163,17 @@ async function exportJob(
           old behaviour of a fresh second and an honest count.
         */
         if (repeatSec.artist === t.artist && repeatSec.track === t.track) {
+          /*
+            Named in `repeats` as well as pinned, by position in this array.
+
+            The pin alone is enough to make a re-send harmless *today*, but it
+            keeps ageing in the browser's hands, and once Last.fm will no
+            longer accept it the play it may represent cannot be sent under any
+            second at all. Telling the client which entries these are lets it
+            settle the question once, while the user is present and online,
+            instead of carrying an expiring bet for the length of a queue.
+          */
+          repeats.push({ i: tracks.length, sec: repeatSec.sec });
           tracks.push({
             artist: t.artist,
             track: t.track,
@@ -1273,6 +1304,13 @@ async function exportJob(
       entries too old to repeat are counted here.
     */
     uncertainCount,
+    /*
+      The entries above that came back pinned to a second the worker already
+      spent on them, by position in `state.tracks`. Advisory: a client that
+      ignores this list still repeats the tuple verbatim and is still safe
+      today — it merely carries the bet until the second ages out.
+    */
+    repeats,
     state: {
       totalTracks: tracks.length,
       completedIndices: [],

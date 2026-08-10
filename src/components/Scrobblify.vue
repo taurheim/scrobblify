@@ -181,6 +181,7 @@ import BackgroundOffer from '@/components/BackgroundOffer.vue';
 import * as background from '@/services/BackgroundScrobbling';
 import {
   beginHandoff, completeHandoff, uploadListFromState, stateFromExport,
+  resolveExportedRepeats,
 } from '@/services/BackgroundHandoff';
 import { trackEvent, trackError, resetUser } from '@/services/Analytics';
 
@@ -1548,7 +1549,32 @@ export default Vue.extend({
         // still after the cursor, so it would be exported *and* sent. The
         // server rejects the export with 409 until that settles.
         const exported = await this.exportWhenQuiescent(jobId, exportClaim);
-        const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
+        const lfm = this.$store.state.lfmApi as LastFm;
+        const username = lfm.getUserName() || '';
+        /*
+          Settled before the state is built, while the user is here and online.
+
+          Tracks the worker sent without hearing back come home pinned to the
+          exact second they rode on, which makes a repeat harmless — but only
+          until that second ages out of Last.fm's window, and this queue may
+          take days to reach them. Asking Last.fm now turns most of those bets
+          into answers: confirmed plays leave the queue, provably-absent ones
+          are freed to take a fresh second. Anything ambiguous, and everything
+          if the lookups fail outright, is left exactly as an older client
+          would have had it.
+        */
+        const repeats = await resolveExportedRepeats(
+          exported,
+          (fromSec, toSec) => lfm.getPlaysInSecondsWindow(fromSec, toSec),
+        );
+        if (repeats.settled || repeats.freed || repeats.unresolved) {
+          trackEvent('background_repeats_resolved', {
+            job_id: jobId,
+            settled: repeats.settled,
+            freed: repeats.freed,
+            unresolved: repeats.unresolved,
+          });
+        }
         const restored = stateFromExport(
           exported,
           username,

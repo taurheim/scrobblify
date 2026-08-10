@@ -163,6 +163,70 @@ export default class LastFm {
   }
 
   /**
+   * Every completed scrobble in a second-range, paginated to completion.
+   *
+   * Distinct from `getPlaysInTimeRange`, which takes one page and is used
+   * where a miss only costs a redundant send. Callers of this one draw a
+   * conclusion from *absence* — "nothing is stored at this second, so our
+   * request never landed" — and a truncated page is indistinguishable from an
+   * empty window, so it must say when it could not see the whole thing.
+   *
+   * Last.fm caps `limit` at 200 whatever is asked for, and `from`/`to` are
+   * exclusive, so callers widen by a second on each side. Walks backwards
+   * using the oldest timestamp seen rather than `page`, which shifts under a
+   * concurrent scrobble.
+   */
+  public async getPlaysInSecondsWindow(
+    fromSec: number,
+    toSec: number,
+    maxPages = 5,
+  ): Promise<{ plays: { artist: string; track: string; timestampSec: number }[];
+    complete: boolean; }> {
+    if (this.userName === null) {
+      throw new Error('Couldn\'t find username');
+    }
+    const PAGE = 200;
+    const plays: { artist: string; track: string; timestampSec: number }[] = [];
+    let to = toSec;
+    for (let page = 0; page < maxPages; page += 1) {
+      const requestParams: {[key: string]: string} = {
+        method: 'user.getrecenttracks',
+        user: this.userName,
+        from: String(fromSec),
+        to: String(to),
+        limit: String(PAGE),
+      };
+      // eslint-disable-next-line no-await-in-loop
+      const response = await this.makeRequest('GET', requestParams);
+      let tracks = response && response.recenttracks && response.recenttracks.track;
+      if (tracks && !Array.isArray(tracks)) {
+        tracks = [tracks];
+      }
+      if (!Array.isArray(tracks)) {
+        return { plays, complete: true };
+      }
+      const rows = tracks
+        // A now-playing entry carries no date and is not a completed scrobble.
+        .filter((t: any) => t && t.date && t.date.uts)
+        .map((t: any) => ({
+          artist: (t.artist && (t.artist['#text'] || t.artist.name)) || '',
+          track: t.name || '',
+          timestampSec: Number(t.date.uts),
+        }));
+      plays.push(...rows);
+      if (tracks.length < PAGE) {
+        return { plays, complete: true };
+      }
+      const oldest = Math.min(...rows.map((r) => r.timestampSec));
+      if (!Number.isFinite(oldest) || oldest <= fromSec + 1) {
+        return { plays, complete: true };
+      }
+      to = oldest;
+    }
+    return { plays, complete: false };
+  }
+
+  /**
    * Fetch all scrobbles in a date range using paginated bulk requests.
    * Uses limit=1000 per page for maximum efficiency.
    * @param onProgress called with (fetchedSoFar, total) after each page

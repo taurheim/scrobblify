@@ -1223,6 +1223,19 @@ async function main() {
       body.state.tracks[3].reTagged === true, body.state.tracks[3]);
     check('so nothing needs to be confessed to the user',
       body.uncertainCount === 0, body.uncertainCount);
+    /*
+      Named by position so the client can settle them against Last.fm while
+      the user is still here. A pin only stays harmless while the second is
+      inside the acceptance window, and this queue may not reach these tracks
+      for days.
+    */
+    check('and each one is named in `repeats`',
+      Array.isArray(body.repeats) && body.repeats.length === 3,
+      body.repeats);
+    check('by position in the returned queue, with the second it holds',
+      body.repeats.every((r: any, i: number) => r.i === i
+        && r.sec === bySec.get(startIndex + i)),
+      body.repeats);
   }
 
   console.log('\n-- a second whose track does not match is not pinned to it --');
@@ -1293,6 +1306,8 @@ async function main() {
       body.state.tracks.slice(0, 2));
     check('and the user is told how many may show up twice',
       body.uncertainCount === 2, body.uncertainCount);
+    check('and nothing is offered for settling that has no second to settle',
+      Array.isArray(body.repeats) && body.repeats.length === 0, body.repeats);
   }
 
   console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);

@@ -420,21 +420,28 @@ export async function selectDueJobs(
 }
 
 /**
- * How long an already-spent second stays worth repeating.
+ * How long an already-spent second stays worth repeating when the sender is
+ * *this worker*, which puts it out within seconds of deciding.
  *
- * Last.fm accepts scrobbles up to 14 days old, and `COLLISION_WINDOW_SECONDS`
- * is that full span because "might this second still hold a play" must not be
- * answered optimistically. This is the *other* question — "can we still send
- * this second again" — and it needs the opposite bias, because the answer is
- * acted on by a browser that may sit rate-limited for a day before it gets
- * there. Two days of margin, so a repeat that looked sendable when it was
- * handed over still is when it lands.
- *
- * Erring short costs a possible duplicate, which the user can delete. Erring
- * long costs a play that was never stored and can no longer be sent under any
- * second, which nobody can recover.
+ * The full margin Last.fm's 14 days allows for a request that might sit in a
+ * retry queue, and no more — the same bound `WINDOW_SECONDS` draws for a
+ * freshly minted second, for the same reason. Anything tighter refuses to
+ * repeat a tuple Last.fm would still have deduplicated, and mints a new one
+ * instead: a visible second copy of a play that was already there.
  */
-export const REPEATABLE_WINDOW_SECONDS = 12 * 86400;
+export const REPEATABLE_WINDOW_SECONDS = 13 * 86400;
+
+/**
+ * The same question asked on behalf of a *browser*, which may not get to the
+ * track for a day or more after being handed it.
+ *
+ * A repeat that expires in the browser's hands cannot be stored under any
+ * second, and is recorded as a named failure — which is a lost play if the
+ * original send never landed. So this one carries a margin the immediate case
+ * does not need: erring short costs a possible duplicate the user can delete,
+ * erring long costs a play nobody can recover.
+ */
+export const REPEATABLE_HANDOFF_WINDOW_SECONDS = 12 * 86400;
 
 export interface RepeatableSecond {
   sec: number;
@@ -465,11 +472,17 @@ export interface RepeatableSecond {
  * `stale` names the indices whose second is past repeating. They are not
  * silently dropped: a caller that re-sends them under a new second is taking a
  * duplicate risk it has to be able to report.
+ *
+ * `maxAgeSec` is the caller's, not this function's, because the two senders are
+ * not asking the same question. This worker sends within seconds of deciding; a
+ * browser handed the same second may not reach it for days. See the two
+ * constants above.
  */
 export async function abandonedSeconds(
   sql: Sql,
   jobId: string,
   nowSec: number,
+  maxAgeSec: number,
 ): Promise<{ repeatable: Map<number, RepeatableSecond>; stale: Set<number> }> {
   const rows = await sql.all<{ assigned_timestamps: string }>(
     "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'abandoned'",
@@ -491,7 +504,7 @@ export async function abandonedSeconds(
       const idx = v && Number(v.index);
       const sec = v && Number(v.timestampSec);
       if (!Number.isFinite(idx)) { return; }
-      if (!Number.isFinite(sec) || sec <= 0 || nowSec - sec > REPEATABLE_WINDOW_SECONDS) {
+      if (!Number.isFinite(sec) || sec <= 0 || nowSec - sec > maxAgeSec) {
         stale.add(idx);
         return;
       }

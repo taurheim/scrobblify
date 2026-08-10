@@ -481,6 +481,182 @@ export async function completeHandoff(
 }
 
 /**
+ * Normalises a name for comparison against what Last.fm stored.
+ *
+ * Kept identical to the worker's `normalizeForMatch` on purpose — the two
+ * halves ask the same question of the same API, and a comparison that is loose
+ * on one side and strict on the other reaches opposite conclusions about the
+ * same play.
+ */
+function normalizeForMatch(value: string): string {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\u2018\u2019\u201a\u201b]/g, "'")
+    .replace(/[\u201c\u201d\u201e\u201f]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** How far apart two repeated seconds may be and still share one lookup. */
+const REPEAT_CLUSTER_GAP_SECONDS = 900;
+
+/** Windows queried before the rest are left as they are. */
+export const MAX_REPEAT_LOOKUPS = 12;
+
+export interface RepeatResolution {
+  /** Confirmed at Last.fm. Removed from the queue and counted as scrobbled. */
+  settled: number;
+  /** Provably absent. Freed to be re-timed like any other re-tagged track. */
+  freed: number;
+  /** Left pinned, exactly as an older client would have handled all of them. */
+  unresolved: number;
+}
+
+/**
+ * Settles the seconds the worker handed back pinned, against real history.
+ *
+ * A pinned second is a bet that a repeat is harmless: if the original send
+ * landed, Last.fm discards the identical (artist, track, timestamp) tuple, and
+ * if it did not, the repeat stores it. The bet is sound *while Last.fm still
+ * accepts the second* — and the browser may not reach that track for days,
+ * after which the play can be sent under no second at all and is reported as a
+ * permanent failure. Asking now, while the user is present and the second is
+ * still in window, replaces an expiring bet with an answer.
+ *
+ * Three outcomes, and only two of them are conclusions:
+ *
+ *  - **the exact tuple is there** — it landed. The track leaves the queue and
+ *    is counted among the server's successes.
+ *  - **that second is empty** — nothing was stored under it, so the send did
+ *    not land. Last.fm records at the submitted timestamp, so there is nowhere
+ *    else it could be. Freed to take a fresh second like any other re-tag.
+ *  - **some other play occupies it** — ambiguous, because Last.fm rewrites
+ *    names and the entry there may be this very play under a corrected title.
+ *    Left pinned. This is the pre-existing behaviour for every entry, so the
+ *    ambiguous case is never made worse than it already was.
+ *
+ * A window that could not be read completely is treated as ambiguous for all
+ * of its entries: a truncated page and an empty one look alike, and reading a
+ * truncation as "empty" would re-time a play that is already on the account.
+ *
+ * Mutates `exported` in place; the caller passes it straight to
+ * `stateFromExport`.
+ */
+export async function resolveExportedRepeats(
+  exported: any,
+  lookup: (fromSec: number, toSec: number) => Promise<{
+    plays: { artist: string; track: string; timestampSec: number }[];
+    complete: boolean;
+  }>,
+): Promise<RepeatResolution> {
+  const result: RepeatResolution = { settled: 0, freed: 0, unresolved: 0 };
+  const tracks = exported && exported.state && Array.isArray(exported.state.tracks)
+    ? exported.state.tracks
+    : null;
+  if (!tracks || !Array.isArray(exported.repeats) || exported.repeats.length === 0) {
+    return result;
+  }
+
+  const entries = exported.repeats
+    .filter((r: any) => r
+      && Number.isInteger(r.i) && r.i >= 0 && r.i < tracks.length
+      && Number.isFinite(r.sec) && r.sec > 0)
+    .map((r: any) => ({ i: r.i as number, sec: Math.floor(r.sec) as number }))
+    .sort((a: any, b: any) => a.sec - b.sec);
+  if (entries.length === 0) {
+    return result;
+  }
+
+  // One request per cluster of nearby seconds. The worker allocates
+  // descending and one per second, so a batch's worth of abandoned entries is
+  // a contiguous run and costs a single lookup.
+  const clusters: { i: number; sec: number }[][] = [];
+  entries.forEach((e: { i: number; sec: number }) => {
+    const last = clusters[clusters.length - 1];
+    if (last && e.sec - last[last.length - 1].sec <= REPEAT_CLUSTER_GAP_SECONDS) {
+      last.push(e);
+    } else {
+      clusters.push([e]);
+    }
+  });
+
+  const settledPositions = new Set<number>();
+  for (let c = 0; c < clusters.length; c += 1) {
+    const cluster = clusters[c];
+    if (c >= MAX_REPEAT_LOOKUPS) {
+      result.unresolved += cluster.length;
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+    const from = cluster[0].sec - 1;
+    const to = cluster[cluster.length - 1].sec + 1;
+    let window: {
+      plays: { artist: string; track: string; timestampSec: number }[];
+      complete: boolean;
+    } | null = null;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      window = await lookup(from, to);
+    } catch (e) {
+      window = null;
+    }
+    if (!window || !window.complete) {
+      result.unresolved += cluster.length;
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+    const bySecond = new Map<number, { artist: string; track: string }[]>();
+    window.plays.forEach((p) => {
+      const bucket = bySecond.get(p.timestampSec);
+      if (bucket) { bucket.push(p); } else { bySecond.set(p.timestampSec, [p]); }
+    });
+    cluster.forEach((e) => {
+      const t = tracks[e.i];
+      const bucket = bySecond.get(e.sec);
+      if (!bucket || bucket.length === 0) {
+        /*
+          Nothing at all under this second, so the send never reached Last.fm.
+          Handed back to the ordinary re-tag path: `reTagged` is what makes the
+          browser stamp it against its own clock, and the timestamp below is
+          then cosmetic, matching what the worker emits for every other
+          re-tagged track.
+        */
+        t.reTagged = true;
+        t.timestamp = Date.now();
+        result.freed += 1;
+        return;
+      }
+      const hit = bucket.some((p) => normalizeForMatch(p.artist) === normalizeForMatch(t.artist)
+        && normalizeForMatch(p.track) === normalizeForMatch(t.track));
+      if (hit) {
+        settledPositions.add(e.i);
+        result.settled += 1;
+      } else {
+        result.unresolved += 1;
+      }
+    });
+  }
+
+  if (settledPositions.size > 0) {
+    /*
+      Removed from the queue and added to the server's count in one step. The
+      total the user sees is derived from the two together, so moving a track
+      across without crediting it would report the import as having shrunk.
+
+      Written back into the envelope the caller already holds, because that is
+      what goes on to `stateFromExport`: returning a copy would leave a stale
+      original one line away from being used by mistake.
+    */
+    /* eslint-disable no-param-reassign */
+    exported.state.tracks = tracks.filter((_: unknown, i: number) => !settledPositions.has(i));
+    exported.state.totalTracks = exported.state.tracks.length;
+    exported.scrobbledByServer = (Number(exported.scrobbledByServer) || 0) + settledPositions.size;
+    /* eslint-enable no-param-reassign */
+  }
+  return result;
+}
+
+/**
  * Rebuilds a local `ScrobbleState` from a job export.
  *
  * The server deliberately returns only tracks and counts, not a `ScrobbleState`.

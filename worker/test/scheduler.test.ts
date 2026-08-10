@@ -8,7 +8,10 @@
  */
 import { DatabaseSync } from 'node:sqlite';
 import { schemaSql } from './schema';
-import { Sql, SqlResult, JobRow, readControl } from '../src/store';
+import {
+  Sql, SqlResult, JobRow, readControl,
+  REPEATABLE_WINDOW_SECONDS, REPEATABLE_HANDOFF_WINDOW_SECONDS,
+} from '../src/store';
 import { BlobStore, gzip, uploadChunk } from '../src/chunks';
 import { encryptCredential, sha256Hex, randomId } from '../src/crypto';
 import { ALGORITHM_VERSION } from '../src/handoff';
@@ -766,7 +769,7 @@ async function main() {
       the user can delete.
     */
     const h = await harness({ total: 50, originalDaysAgo: 4000 });
-    const longAgo = NOW - 13 * 86400;
+    const longAgo = NOW - 13 * 86400 - 3600;
     const spent = assignTimestamps(
       [{ artist: 'Artist 0', track: 'Track 0', originalTimestampSec: 0 }],
       longAgo,
@@ -785,6 +788,44 @@ async function main() {
       { got: sent[0].timestampSec, refused: spent.assigned[0].timestampSec });
     check('and the fresh one is actually sendable',
       NOW - sent[0].timestampSec < 13 * 86400, sent[0].timestampSec);
+  }
+
+  console.log('\n-- the immediate sender repeats what the handoff would not --');
+  {
+    /*
+      The two senders ask different questions of the same second.
+
+      `sendBatch` puts it out within moments of choosing it, so it should
+      repeat for as long as Last.fm will still store the tuple — refusing
+      earlier mints a *new* second and duplicates a play that may already be
+      there. The export hands it to a browser that may not reach the track for
+      a day or more, and a repeat that expires in its hands can be sent under
+      no second at all, so that side keeps a margin.
+
+      A second between the two cutoffs is where the difference shows.
+    */
+    const h = await harness({ total: 50, originalDaysAgo: 4000 });
+    const between = NOW - 12 * 86400 - 43200;
+    const spent = assignTimestamps(
+      [{ artist: 'Artist 0', track: 'Track 0', originalTimestampSec: 0 }],
+      between,
+      0,
+    );
+    check('the fixture sits between the two cutoffs',
+      NOW - spent.assigned[0].timestampSec > REPEATABLE_HANDOFF_WINDOW_SECONDS
+        && NOW - spent.assigned[0].timestampSec <= REPEATABLE_WINDOW_SECONDS,
+      { age: NOW - spent.assigned[0].timestampSec });
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, sent_at, created_at)
+       VALUES (?, ?, 0, 0, 1, 'abandoned', ?, ?, ?)`,
+      [randomId(), h.jobId, JSON.stringify(spent.assigned), between, between],
+    );
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    check('the resume repeats it verbatim',
+      sent[0].timestampSec === spent.assigned[0].timestampSec,
+      { got: sent[0].timestampSec, want: spent.assigned[0].timestampSec });
   }
 
   console.log('\n-- control switches --');
