@@ -966,6 +966,16 @@ async function exportJob(
         is rejected outright.
       */
       const reTagged = t.reTagged === true || t.originalTimestampSec === 0;
+      /*
+        A re-tagged track with a real second is not a listen date — it is a
+        pinned retry, a second some browser already spent on a send whose
+        answer it never saw. Said out loud in the export because after this
+        point nothing can reconstruct it: the placeholder below is also
+        non-zero, so a client looking only at the timestamp cannot tell a pin
+        from a cosmetic stamp, and inventing a fresh second for a play Last.fm
+        may already hold is exactly the phantom the pin exists to prevent.
+      */
+      const pendingRetry = t.reTagged === true && t.originalTimestampSec > 0;
       tracks.push({
         artist: t.artist,
         track: t.track,
@@ -987,6 +997,7 @@ async function exportJob(
           ? t.originalTimestampSec * 1000
           : nowSec * 1000,
         reTagged,
+        ...(pendingRetry ? { pendingRetry: true } : {}),
       });
     });
   }

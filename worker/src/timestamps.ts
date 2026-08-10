@@ -26,6 +26,20 @@
 export const WINDOW_SECONDS = 13 * 86400;
 
 /**
+ * How long a second stays capable of *colliding*, as opposed to being worth
+ * preserving.
+ *
+ * The full 14 days Last.fm accepts, with no safety margin, and the difference
+ * from `WINDOW_SECONDS` is deliberate: the two answer different questions. A
+ * margin costs nothing when deciding whether a listen date is still worth
+ * keeping — there is always a synthetic second to fall back on. It is the bug
+ * when deciding whether a play might already be sitting at a given second,
+ * because "probably expired" is not "cannot collide", and a second that
+ * Last.fm still accepts is a second it may still hold.
+ */
+export const COLLISION_WINDOW_SECONDS = 14 * 86400;
+
+/**
  * Synthetic timestamps are placed at least this far in the past. A scrobble
  * timestamped in the future earns ignore code 4, and clock skew between us and
  * Last.fm is not something we can measure.
@@ -47,6 +61,13 @@ export interface TrackForSend {
   track: string;
   album?: string;
   originalTimestampSec: number;
+  /**
+   * True when the client invented this play's date rather than reading it.
+   *
+   * Only meaningful here in combination with a non-zero timestamp, which is
+   * the signature of a *pinned retry*: see `isPinnedRetry`.
+   */
+  reTagged?: boolean;
 }
 
 export interface AssignedTrack {
@@ -90,6 +111,46 @@ export function isWithinWindow(originalTimestampSec: number, nowSec: number): bo
 }
 
 /**
+ * True when a track carries a second the browser may already have spent.
+ *
+ * A re-tagged play has no real listen date — the client sends 0 and asks for
+ * one at send time — so a re-tagged track arriving with a timestamp is not a
+ * listen date at all. It is the exact second a browser used on a send whose
+ * response it never saw, handed over so this worker can repeat the identical
+ * `(artist, track, second)` tuple. Last.fm discards an identical repeat but
+ * stores a different second as a play the user never listened to, so the pin
+ * is the difference between a no-op and a phantom.
+ */
+export function isPinnedRetry(t: TrackForSend): boolean {
+  return t.reTagged === true
+    && Number.isFinite(t.originalTimestampSec)
+    && t.originalTimestampSec > 0;
+}
+
+/**
+ * Whether a pinned second is still worth repeating.
+ *
+ * Judged against the *collision* window, not the preservation one. The extra
+ * day is the whole point: between day 13 and day 14 Last.fm still accepts the
+ * tuple, so it may still hold the original, and minting a fresh second there
+ * is precisely what creates the phantom the pin exists to prevent.
+ *
+ * Past 14 days the original can no longer collide — Last.fm would reject the
+ * repeat outright — so a fresh second is the better of two imperfect answers.
+ */
+export function isPinUsable(pinnedSec: number, nowSec: number): boolean {
+  if (!Number.isFinite(pinnedSec) || pinnedSec <= 0) {
+    return false;
+  }
+  // A future second earns ignore code 4 whoever sends it, so the browser's
+  // original cannot have landed either. Nothing to be idempotent about.
+  if (pinnedSec > nowSec - 1) {
+    return false;
+  }
+  return pinnedSec >= nowSec - COLLISION_WINDOW_SECONDS;
+}
+
+/**
  * Assigns a send-time timestamp to each track in a batch.
  *
  * `syntheticFloor` is the lowest synthetic second used by previous batches of
@@ -123,7 +184,18 @@ export function assignTimestamps(
   // dropped scrobble.
   const taken = new Set<number>();
   const preserved: (number | null)[] = tracks.map((t) => {
-    if (isWithinWindow(t.originalTimestampSec, nowSec)) {
+    /*
+      A pinned retry is reserved on the *collision* window rather than the
+      preservation one. It is not a listen date being kept for its own sake;
+      it is an idempotency guarantee, and it holds for as long as Last.fm
+      would still recognise the repeat — a day longer than dates we merely
+      prefer to keep.
+    */
+    const pinned = isPinnedRetry(t);
+    const keep = pinned
+      ? isPinUsable(t.originalTimestampSec, nowSec)
+      : isWithinWindow(t.originalTimestampSec, nowSec);
+    if (keep) {
       const ts = Math.floor(t.originalTimestampSec);
       if (!taken.has(ts)) {
         taken.add(ts);

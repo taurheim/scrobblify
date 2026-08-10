@@ -348,15 +348,24 @@ export default Vue.extend({
           // resolves only once the in-flight batch finishes.
           Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
         }
-      } else if (step && step.releaseHandoffHalt) {
+      } else {
         /*
-          Ownership was released, so whatever stopped this tab did not happen.
-          Without this the halt outlives it: a failed preflight in another tab
-          leaves every sibling `handoffHalted`, and "Resume" cannot restart
-          them because the flag is checked at the top of the send loop.
+          Ownership was released, so whatever stopped this tab is over — for
+          the tab that ended it. Not necessarily for this one.
+
+          A take-back ends ownership by cancelling the job, and the tracks it
+          rescued go to *disk*. Every sibling tab is still holding the queue it
+          had before the handover in memory, most of which the worker has since
+          scrobbled. Releasing the halt on the strength of the broadcast alone
+          lets any of them press Resume and replay all of it.
+
+          So the release is earned, not granted: `revalidateAfterRelease` asks
+          whether this tab's own queue is still the queue, and only then lets
+          the loop run again.
         */
-        step.releaseHandoffHalt();
-        this.hasResumableState = true;
+        Promise.resolve(this.revalidateAfterRelease()).catch(() => {
+          // Unanswerable. The halt stays, which is the safe direction.
+        });
       }
     });
 
@@ -763,6 +772,77 @@ export default Vue.extend({
         this.backgroundNotice = `This import was handed over to the background service, so scrobbling it from this browser is switched off — the tracks it already sent would be sent again and silently discarded.${detail} Sign in to check on it or bring it back here.`;
       }
       trackEvent('background_authority_check', { result: 'handed_over', signed_in: String(!!this.backgroundJob) });
+    },
+
+    /**
+     * Decides whether a broadcast release actually applies to *this* tab.
+     *
+     * Ownership is released by whichever tab resolved the handover, and the
+     * broadcast says only that the server no longer owns the queue. It does
+     * not say that this tab's copy of the queue is still current, and after a
+     * take-back it usually is not: the rescued queue was written to disk with
+     * a fresh identity, while this tab still holds the pre-handover tracks in
+     * memory under the old one — a queue the worker has already sent most of.
+     *
+     * The identity on disk is therefore the arbiter. It matches for the tab
+     * that owns the current queue and differs for every stale sibling, and a
+     * sibling that stays halted loses nothing: reloading restores the real
+     * queue from disk.
+     */
+    async revalidateAfterRelease(): Promise<void> {
+      const step = this.$refs.scrobbleStep as any;
+      const inMemoryId = (this.$store.state.importId as string) || '';
+      let savedQueue = false;
+      let diskId = '';
+      try {
+        const saved = await this.stateManager.loadState();
+        savedQueue = !!saved;
+        diskId = saved ? (saved.importId || '') : '';
+      } catch (e) {
+        // Unreadable. Released below, which is no worse than the unconditional
+        // release this replaced — and a queue that cannot be read cannot be
+        // resumed from disk either, so there is nothing to prefer over it.
+      }
+
+      /*
+        Three ways to be certain nothing has superseded this tab, and all of
+        them release.
+
+        It was never halted, so it is holding nothing that could be stale.
+        Or there is no queue on disk at all — which is the ordinary case
+        during a first run, since progress is only written on a pause, and
+        reading it as a mismatch would stop a scrobble that had not even
+        started. Or the queue on disk is the one this tab is holding.
+
+        Note that an *empty* in-memory id does not pass the last test against a
+        non-empty disk id: a queue restored from a progress file written before
+        identities existed has none, and a handoff mints one onto disk, so
+        "empty against non-empty" is precisely the stale case rather than an
+        exemption from it.
+      */
+      const holdsQueue = !!(step && step.handoffHalted);
+      if (!holdsQueue || !savedQueue || diskId === inMemoryId) {
+        if (step && step.releaseHandoffHalt) {
+          step.releaseHandoffHalt();
+        }
+        try {
+          this.hasResumableState = await this.stateManager.hasSavedState();
+        } catch (e) {
+          this.hasResumableState = false;
+        }
+        return;
+      }
+
+      /*
+        Stale. The halt stays and the queue this tab is holding is disowned in
+        the only way that cannot be got wrong — by making the user reload,
+        which reads the real queue back off disk. Resume is withheld for the
+        same reason: it would restart the in-memory copy.
+      */
+      this.hasResumableState = false;
+      this.ownershipBlocked = true;
+      this.backgroundNotice = 'This tab is holding an out-of-date copy of your import — the queue on disk has moved on. Reload this page to pick up where it actually got to; resuming here would send tracks that have already been scrobbled.';
+      trackEvent('background_stale_tab_blocked', { had_disk_id: String(!!diskId) });
     },
 
     /**
@@ -1422,6 +1502,13 @@ export default Vue.extend({
           would make the next persist look like a cross-import collision.
         */
         this.$store.commit('setImportId', restored.importId || '');
+        /*
+          The pin the worker handed back, mirrored for the same reason. The
+          store is what `buildState` reads, and `saveStateIfAhead` refuses a
+          write that would drop a pending second — so leaving a stale 0 here
+          turns the next autosave into a hard error.
+        */
+        this.$store.commit('setPendingReTagSec', restored.pendingReTagTimestampSec || 0);
 
         /*
           From here until the cancel is confirmed, both sides may believe they

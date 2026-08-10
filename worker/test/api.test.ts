@@ -750,6 +750,10 @@ async function main() {
       body.state.tracks[0].timestamp === pin * 1000, body.state.tracks[0]);
     check('every other re-tagged track is still flagged',
       body.state.tracks.slice(1).every((t: any) => t.reTagged === true));
+    check('the pin is called out explicitly, since a timestamp alone cannot say so',
+      body.state.tracks[0].pendingRetry === true, body.state.tracks[0]);
+    check('and no other track claims to be one',
+      body.state.tracks.slice(1).every((t: any) => t.pendingRetry === undefined));
   }
 
   console.log('\n-- the export claims quiescence rather than observing it --');

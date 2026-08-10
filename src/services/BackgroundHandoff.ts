@@ -54,6 +54,16 @@ const RETAG_WINDOW_LIMIT_SECONDS = WINDOW_SECONDS;
  * already be sitting at this second", where the margin is the bug. Between day
  * 13 and day 14 Last.fm will still accept — and therefore may already hold —
  * the tuple, so dropping the pin there is what mints a phantom play.
+ *
+ * Deliberately *not* applied when handing a pin to the worker. Whether a pin
+ * is still live is a question about the present, and the browser's clock is
+ * the one clock in the system nobody can trust — a machine whose time has
+ * slipped backwards would discard a second that is still collidable, and one
+ * running fast would discard it early. The worker re-asks the same question
+ * against its own clock at send time (`isPinUsable`), so the pin travels
+ * unconditionally and is judged where the judging is reliable. That also makes
+ * `uploadListFromState` free of the clock entirely, which the digest depends
+ * on.
  */
 const COLLISION_WINDOW_SECONDS = 14 * 86400;
 
@@ -155,12 +165,21 @@ export function uploadListFromState(state: ScrobbleState, nowSec: number): Uploa
     letting the worker place it afresh when the original can no longer collide.
   */
   const pending = state.pendingReTagTimestampSec || 0;
-  if (pending > 0
-    && uploads.length > 0
-    && remaining[0].reTagged
-    && pending < nowSec
-    && pending >= nowSec - COLLISION_WINDOW_SECONDS) {
+  const pinned = pending > 0 && uploads.length > 0 && remaining[0].reTagged;
+  if (pinned) {
     uploads[0] = { ...uploads[0], originalTimestampSec: pending };
+    /*
+      Sent first, ahead of the deadline order.
+
+      Every other track is ordered by when its own timestamp expires. This one
+      is ordered by when an *idempotency guarantee* expires, and that is a
+      different and much nearer deadline: the pin is only worth anything while
+      Last.fm would still recognise the repeat. `orderForDeadline` would read
+      a 13-day-old pin as out-of-window and bury it behind the entire queue,
+      which on a large job is days — long enough for the second to age out and
+      the retry to become a phantom instead of a no-op.
+    */
+    return [uploads[0], ...orderForDeadline(uploads.slice(1), nowSec)];
   }
   return orderForDeadline(uploads, nowSec);
 }
@@ -444,6 +463,10 @@ export function stateFromExport(
     return null;
   }
 
+  // Read once, up front. Several decisions below are relative to "now", and
+  // taking separate readings would let them disagree with each other.
+  const nowSec = Math.floor(Date.now() / 1000);
+
   const serialized = tracks.map((t: any) => ({
     track: String(t.track ?? ''),
     artist: String(t.artist ?? ''),
@@ -457,6 +480,40 @@ export function stateFromExport(
     */
     reTagged: !!t.reTagged,
   }));
+
+  /*
+    A pinned retry survives the take-back, if the worker still had one.
+
+    It cannot be recovered from the timestamp alone — the cosmetic placeholder
+    every other re-tagged track carries is non-zero too — so the export says
+    so outright, and this is the only place that reading is available. Losing
+    it here would hand the browser a track it may already have scrobbled, with
+    permission to invent a different second for it: a phantom play on a public
+    profile, which is the single worst thing this codebase can do.
+
+    Moved to the head because that is where the pin is addressed. Both the
+    browser's own allocator and the handoff apply a pending second to the
+    track at the front of the queue, and applying it to any other track would
+    turn a deduplication into a fresh collision. There is at most one — only
+    the head track is ever pinned — so `find` is exact, not a heuristic.
+  */
+  const pinnedIdx = tracks.findIndex((t: any) => t && t.pendingRetry === true
+    && Number.isFinite(t.timestamp) && t.timestamp > 0);
+  let pendingReTagTimestampSec = 0;
+  if (pinnedIdx >= 0) {
+    const pinSec = Math.floor(tracks[pinnedIdx].timestamp / 1000);
+    /*
+      Dropped once it can no longer collide. Past the window Last.fm rejects
+      the repeat outright, so insisting on it turns a possible phantom into a
+      certain, visible failure — the one trade where a fresh second is the
+      better answer.
+    */
+    if (pinSec > 0 && pinSec >= nowSec - COLLISION_WINDOW_SECONDS && pinSec < nowSec) {
+      pendingReTagTimestampSec = pinSec;
+      const [head] = serialized.splice(pinnedIdx, 1);
+      serialized.unshift(head);
+    }
+  }
 
   const scrobbledByServer = Number.isFinite(exported.scrobbledByServer)
     ? exported.scrobbledByServer
@@ -480,7 +537,6 @@ export function stateFromExport(
     where the `min(nowSec, …)` clamp pins every subsequent track to the same
     second and collides repeats deliberately.
   */
-  const nowSec = Math.floor(Date.now() / 1000);
   const lineage = api.getHandoffLineage();
   const priorTotal = lineage ? lineage.originalTotalTracks : 0;
   const priorSucceeded = lineage ? lineage.originalSucceededCount : 0;
@@ -605,6 +661,8 @@ export function stateFromExport(
     originalSucceededCount: priorSucceeded + scrobbledByServer,
     sendTimestamps: [],
     lastReTagTimestampSec: 0,
+    // Restored from the export's explicit marker; see the search above.
+    ...(pendingReTagTimestampSec > 0 ? { pendingReTagTimestampSec } : {}),
     ...(reserved
       ? { reTagFloorSec: reserved.from, reTagCeilingSec: reserved.to }
       : {}),

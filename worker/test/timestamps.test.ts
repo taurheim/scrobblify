@@ -8,9 +8,11 @@
 import {
   assignTimestamps,
   isWithinWindow,
+  isPinUsable,
   reconciliationWindow,
   normalizeForMatch,
   WINDOW_SECONDS,
+  COLLISION_WINDOW_SECONDS,
   PRESENT_MARGIN_SECONDS,
 } from '../src/timestamps';
 
@@ -86,6 +88,59 @@ function main() {
   check('the synthetic one moved out of the way', r3.assigned[0].timestampSec !== ceiling);
   check('both survive', new Set(r3.assigned.map((a) => a.timestampSec)).size === 2);
 
+  console.log('\n-- a pinned retry outlives the preservation window --');
+  /*
+    A re-tagged track with a real second is not a listen date. It is the exact
+    second a browser spent on a send whose response it never saw, handed over
+    so this worker can repeat the identical tuple — Last.fm discards a repeat
+    and stores a different second as a play that never happened.
+
+    The preservation window stops a day early on purpose, to leave room for a
+    batch that sits overnight. Applying that margin here is the bug: between
+    day 13 and day 14 Last.fm still accepts the tuple, so it may still hold the
+    original, and minting a fresh second is precisely the phantom.
+  */
+  check('a pin from 13.5 days ago is still usable',
+    isPinUsable(NOW - Math.floor(13.5 * 86400), NOW));
+  check('but is outside the preservation window',
+    !isWithinWindow(NOW - Math.floor(13.5 * 86400), NOW));
+  check('the far edge of the collision window is usable',
+    isPinUsable(NOW - COLLISION_WINDOW_SECONDS, NOW));
+  check('one second past it is not',
+    !isPinUsable(NOW - COLLISION_WINDOW_SECONDS - 1, NOW));
+  check('a future pin is not usable', !isPinUsable(NOW + 100, NOW));
+  check('zero is not a pin', !isPinUsable(0, NOW));
+
+  const pinSec = NOW - Math.floor(13.5 * 86400);
+  const withPin = [
+    {
+      artist: 'Pinned', track: 'Retry', originalTimestampSec: pinSec, reTagged: true,
+    },
+    { artist: 'Other', track: 'Old', originalTimestampSec: NOW - 500 * 86400 },
+  ];
+  const rPin = assignTimestamps(withPin, NOW, 0);
+  check('the pinned second is repeated exactly', rPin.assigned[0].timestampSec === pinSec,
+    rPin.assigned[0]);
+  check('and the other track still gets a synthetic one',
+    rPin.assigned[1].timestampSec !== NOW - 500 * 86400);
+  check('the two do not collide',
+    rPin.assigned[0].timestampSec !== rPin.assigned[1].timestampSec);
+
+  const stalePin = [{
+    artist: 'Pinned',
+    track: 'Retry',
+    originalTimestampSec: NOW - 20 * 86400,
+    reTagged: true,
+  }];
+  check('a pin Last.fm would reject is replaced rather than insisted on',
+    assignTimestamps(stalePin, NOW, 0).assigned[0].timestampSec !== NOW - 20 * 86400);
+
+  const reTaggedNoPin = [{
+    artist: 'A', track: 'B', originalTimestampSec: 0, reTagged: true,
+  }];
+  check('an ordinary re-tagged track is unaffected',
+    assignTimestamps(reTaggedNoPin, NOW, 0).assigned[0].timestampSec <= NOW - PRESENT_MARGIN_SECONDS);
+
   console.log('\n-- duplicate reals --');
   const dupReal = NOW - 5 * 86400;
   const r4 = assignTimestamps(tracks([dupReal, dupReal, dupReal]), NOW, 0);
@@ -112,13 +167,13 @@ function main() {
 
   console.log('\n-- the floor wraps rather than falling out of the window --');
   const staleFloor = NOW - WINDOW_SECONDS - 10_000;
-  const r5 = assignTimestamps(tracks(new Array(50).fill(shared)), NOW, staleFloor);
+  const rWrap = assignTimestamps(tracks(new Array(50).fill(shared)), NOW, staleFloor);
   check('a stale floor is not continued from',
-    r5.assigned.every((a) => a.timestampSec > staleFloor));
+    rWrap.assigned.every((a) => a.timestampSec > staleFloor));
   check('wrapped values are still in window',
-    r5.assigned.every((a) => a.timestampSec >= NOW - WINDOW_SECONDS));
+    rWrap.assigned.every((a) => a.timestampSec >= NOW - WINDOW_SECONDS));
   check('wrapped values are still in the past',
-    r5.assigned.every((a) => a.timestampSec <= NOW - PRESENT_MARGIN_SECONDS));
+    rWrap.assigned.every((a) => a.timestampSec <= NOW - PRESENT_MARGIN_SECONDS));
 
   const futureFloor = NOW + 10_000;
   const r6 = assignTimestamps(tracks(new Array(5).fill(shared)), NOW, futureFloor);

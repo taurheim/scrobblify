@@ -538,6 +538,9 @@ async function sendBatch(
       track: t.track,
       album: t.album,
       originalTimestampSec: t.originalTimestampSec,
+      // Carried so `assignTimestamps` can tell a pinned retry from a listen
+      // date and hold it for the full collision window.
+      reTagged: t.reTagged,
     })),
     nowSec,
     job.synthetic_floor ?? 0,
