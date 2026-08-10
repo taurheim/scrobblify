@@ -152,6 +152,37 @@ async function main() {
       e.state.tracks[MAX_REPEAT_LOOKUPS].reTagged === false, e.state.tracks[MAX_REPEAT_LOOKUPS]);
   }
 
+  console.log('\n-- the budget stops the walk, and what it did not reach stays pinned --');
+  {
+    /*
+      This runs while the export claim is held, and the claim is what makes the
+      snapshot true. Overrunning it means the queue can move on underneath the
+      answers being collected. A budget that expires leaves the remaining
+      entries exactly as an older client would have had them.
+    */
+    const tracks: any[] = [];
+    const repeats: { i: number; sec: number }[] = [];
+    for (let i = 0; i < 4; i += 1) {
+      tracks.push(track('A', `T${i}`, BASE + i * 100_000));
+      repeats.push({ i, sec: BASE + i * 100_000 });
+    }
+    const e = payload(tracks, repeats);
+    let calls = 0;
+    const r = await resolveExportedRepeats(e, async () => {
+      calls += 1;
+      // Spend the whole budget inside the first window.
+      const until = Date.now() + 30;
+      while (Date.now() < until) { /* burn */ }
+      return { plays: [], complete: true };
+    }, 20);
+    check('stopped after the first window', calls === 1, calls);
+    check('the rest are unresolved, not concluded', r.unresolved === 3 && r.freed === 1, r);
+    check('and keep their pinned seconds',
+      e.state.tracks[3].reTagged === false
+        && e.state.tracks[3].timestamp === (BASE + 3 * 100_000) * 1000,
+      e.state.tracks[3]);
+  }
+
   console.log('\n-- a malformed or absent list does nothing --');
   {
     const e = payload([track('A', 'One', BASE)], []);

@@ -798,6 +798,26 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       } catch {
         cancelBody = null;
       }
+      /*
+        And a cancel that presents one must still hold it.
+
+        The claim is what makes the exported snapshot true. It lapses after
+        `EXPORT_CLAIM_SECONDS`, and the sweep then reverts the row to `paused`
+        — at which point the job can be resumed and can send tracks the
+        snapshot still lists as remaining. A cancel accepted after that reports
+        success for a queue that has moved on, and the client goes on to send
+        its stale copy: every track the worker got through in the meantime is
+        scrobbled twice.
+
+        So an offered claim is checked as an assertion about *now*, not as a
+        password: the job must still be exporting under it. A caller whose
+        claim lapsed is refused and starts the take-back again, which costs one
+        round trip and re-reads the queue as it actually is.
+
+        A cancel with no claim at all keeps its own rule: it cannot be acting
+        on a stale snapshot, because it never took one, but it must still not
+        delete the blobs a live export is reading.
+      */
       const offeredClaim = cancelBody && typeof cancelBody.claim === 'string'
         ? cancelBody.claim
         : null;
@@ -811,14 +831,17 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
                 session_key_ct = NULL, session_key_iv = NULL, live_username = NULL,
                 locked_until = 0, completed_at = ?, purge_after = ?, updated_at = ?
           WHERE id = ? AND state NOT IN ('completed', 'failed', 'cancelled')
-            AND (state <> 'exporting' OR export_claim IS NULL OR export_claim = ?)`,
-        [nowSec, nowSec + 30 * 86400, nowSec, job.id, offeredClaim],
+            AND ((? IS NULL AND (state <> 'exporting' OR export_claim IS NULL))
+                 OR (state = 'exporting' AND export_claim = ?))`,
+        [nowSec, nowSec + 30 * 86400, nowSec, job.id, offeredClaim, offeredClaim],
       );
 
       if (cancelled.changes === 0) {
         /*
-          The write was refused. Only two things can refuse it: the job was
-          already terminal, or an export holds it under a different claim.
+          The write was refused. Three things can refuse it: the job was
+          already terminal, an export holds it under a different claim, or the
+          caller's own claim has lapsed and the row is no longer exporting
+          under it.
 
           Re-reading and asking "is it *still* exporting?" was wrong, because
           a claim can lapse and revert the row to `paused` in between — and

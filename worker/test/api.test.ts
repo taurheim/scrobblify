@@ -1036,6 +1036,43 @@ async function main() {
       blobs.data.size === blobsBefore, { before: blobsBefore, after: blobs.data.size });
   }
 
+  console.log('\n-- a cancel whose claim has lapsed is refused, not honoured --');
+  {
+    /*
+      The claim is what makes an exported snapshot true. It expires, and the
+      sweep then reverts the row to `paused` — at which point the job can be
+      resumed and can send tracks the snapshot still lists as remaining. A
+      cancel accepted after that reports success for a queue that has moved on,
+      and the client goes on to send its stale copy: everything the worker got
+      through in the meantime is scrobbled a second time.
+
+      The old condition only checked the claim while the row still said
+      `exporting`, so a lapse turned the guard off exactly when it was needed.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 0, state: 'paused' });
+    const token = await issueSession('listener', SIGNING, NOW);
+    const blobsBefore = blobs.data.size;
+
+    const stale = await handleRequest(env, req(`/scrobblify/job/${id}/cancel`,
+      { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }));
+    check('a claim the job does not hold cannot cancel it',
+      stale.status === 409, stale.status);
+    check('the job is still resumable',
+      (await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]))!.state === 'paused');
+    check('and its queue is intact for the retry',
+      blobs.data.size === blobsBefore, { before: blobsBefore, after: blobs.data.size });
+
+    // The same claim, once the job really is exporting under it, still works.
+    await sql.run("UPDATE jobs SET state = 'exporting', export_claim = ? WHERE id = ?",
+      [EXPORT_CLAIM, id]);
+    const good = await handleRequest(env, req(`/scrobblify/job/${id}/cancel`,
+      { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }));
+    check('the holder of a live claim can still cancel', good.status === 200, good.status);
+  }
+
   console.log('\n-- unknown routes --');
   {
     const sql = freshSql();

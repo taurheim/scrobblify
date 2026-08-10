@@ -500,8 +500,33 @@ function normalizeForMatch(value: string): string {
 /** How far apart two repeated seconds may be and still share one lookup. */
 const REPEAT_CLUSTER_GAP_SECONDS = 900;
 
-/** Windows queried before the rest are left as they are. */
-export const MAX_REPEAT_LOOKUPS = 12;
+/**
+ * Windows queried before the rest are left as they are.
+ *
+ * Generous enough that the cap is not what stops a realistic take-back: a
+ * batch of fifty preserved originals scattered across a listening history is
+ * fifty separate windows, and leaving the tail of that unasked would keep
+ * exactly the expiring pins this exists to settle. The real brake is the
+ * deadline below.
+ */
+export const MAX_REPEAT_LOOKUPS = 60;
+
+/**
+ * How long the whole reconciliation may take.
+ *
+ * This runs while the export claim is held, and that claim is what makes the
+ * snapshot true: if it lapses, the sweep reverts the job to resumable and the
+ * queue can move on underneath us. The cancel now refuses a lapsed claim, so
+ * overrunning costs a retry rather than a duplicate — but a take-back that has
+ * to be retried is a bad enough outcome to budget against. Well inside
+ * `EXPORT_CLAIM_SECONDS` (600), leaving room for the export itself and the
+ * cancel that follows.
+ *
+ * Checked between windows rather than enforced on one, because a single
+ * request has its own retry behaviour and cutting it short mid-flight would
+ * turn a slow answer into an unknown one.
+ */
+export const REPEAT_LOOKUP_BUDGET_MS = 90_000;
 
 export interface RepeatResolution {
   /** Confirmed at Last.fm. Removed from the queue and counted as scrobbled. */
@@ -538,6 +563,7 @@ export interface RepeatResolution {
  * A window that could not be read completely is treated as ambiguous for all
  * of its entries: a truncated page and an empty one look alike, and reading a
  * truncation as "empty" would re-time a play that is already on the account.
+ * So is a window never asked about, because the budget ran out.
  *
  * Mutates `exported` in place; the caller passes it straight to
  * `stateFromExport`.
@@ -548,6 +574,7 @@ export async function resolveExportedRepeats(
     plays: { artist: string; track: string; timestampSec: number }[];
     complete: boolean;
   }>,
+  budgetMs: number = REPEAT_LOOKUP_BUDGET_MS,
 ): Promise<RepeatResolution> {
   const result: RepeatResolution = { settled: 0, freed: 0, unresolved: 0 };
   const tracks = exported && exported.state && Array.isArray(exported.state.tracks)
@@ -581,9 +608,10 @@ export async function resolveExportedRepeats(
   });
 
   const settledPositions = new Set<number>();
+  const deadline = Date.now() + budgetMs;
   for (let c = 0; c < clusters.length; c += 1) {
     const cluster = clusters[c];
-    if (c >= MAX_REPEAT_LOOKUPS) {
+    if (c >= MAX_REPEAT_LOOKUPS || Date.now() >= deadline) {
       result.unresolved += cluster.length;
       // eslint-disable-next-line no-continue
       continue;
