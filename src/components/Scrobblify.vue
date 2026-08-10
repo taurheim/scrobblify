@@ -826,10 +826,12 @@ export default Vue.extend({
       let savedQueue = false;
       let diskReadable = true;
       let diskId = '';
+      let diskSucceeded = 0;
       try {
         const saved = await this.stateManager.loadState();
         savedQueue = !!saved;
         diskId = saved ? (saved.importId || '') : '';
+        diskSucceeded = saved ? (saved.originalSucceededCount || 0) : 0;
       } catch (e) {
         // Unreadable, which is not the same as absent. The disk is the only
         // witness that could clear this tab, so losing it means the question
@@ -862,7 +864,25 @@ export default Vue.extend({
         rather than an exemption from it.
       */
       const holdsQueue = !!(step && step.handoffHalted);
-      const diskConfirmsThisTab = diskReadable && savedQueue && diskId === inMemoryId;
+      /*
+        Matching identities prove lineage, not currency.
+
+        A sibling that was frozen holds the queue as it stood when it stopped,
+        while the tab that froze it went on to persist a further snapshot of
+        the *same* import. If that handover is then abandoned — a failed
+        preflight, a refused upload — everyone is released, and a sibling that
+        checked only the name would resume its own older copy and re-send every
+        track the other tab got through in between.
+
+        So the disk also has to be no further along than this tab. A sibling
+        that is behind stays halted, which costs it nothing: reloading restores
+        the furthest queue from disk, and that is the queue that should be
+        running.
+      */
+      const memorySucceeded = (step && typeof step.totalSucceeded === 'number')
+        ? step.totalSucceeded : 0;
+      const diskConfirmsThisTab = diskReadable && savedQueue && diskId === inMemoryId
+        && diskSucceeded <= memorySucceeded;
       const neverHandedAnythingOver = !this.sawServerOwnership && diskReadable && !savedQueue
         && !inMemoryId;
       if (!holdsQueue || diskConfirmsThisTab || neverHandedAnythingOver) {

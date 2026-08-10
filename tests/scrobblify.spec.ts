@@ -923,6 +923,93 @@ test.describe('Session Resume', () => {
     */
     await expect(page.locator('text=risk duplicating them')).toBeVisible({ timeout: 15000 });
     expect(sent).toHaveLength(0);
+
+    /*
+      And the name it could not write is not kept in memory to be trusted next
+      time. A retry that finds a non-empty identity accepts it without ever
+      attempting the write again, and every second journalled under it names an
+      import the disk has never heard of — so a crash mid-send leaves a play at
+      Last.fm that the reloaded queue cannot claim, and re-sends it under a
+      fresh second. A name only this tab knows is worse than no name at all,
+      because no name at least stops the run.
+    */
+    await page.getByRole('button', { name: /Try Again/ }).first().click();
+    await page.waitForTimeout(3000);
+    expect(sent).toHaveLength(0);
+  });
+
+  test('naming the queue does not erase the second it is already sending under', async ({ page }) => {
+    const pinSec = Math.floor(Date.now() / 1000) - 13 * 24 * 60 * 60;
+    const diskDuringFirstSend: number[] = [];
+    const readDiskPin = () => page.evaluate(async () => new Promise<number>((resolve) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onsuccess = () => {
+        const db = request.result;
+        const read = db.transaction('scrobbleState', 'readonly')
+          .objectStore('scrobbleState').get('current');
+        read.onsuccess = () => {
+          db.close();
+          resolve((read.result && read.result.pendingReTagTimestampSec) || 0);
+        };
+        read.onerror = () => { db.close(); resolve(-1); };
+      };
+      request.onerror = () => resolve(-1);
+    }));
+
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        if (diskDuringFirstSend.length === 0) {
+          diskDuringFirstSend.push(await readDiskPin());
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    const reTagged = [1, 2, 3, 4, 5].map((n) => ({
+      track: `Track ${n}`,
+      artist: `Artist ${n}`,
+      album: `Album ${n}`,
+      timestamp: Date.UTC(2024, 0, n),
+      reTagged: true,
+    }));
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    // No identity, but a second already in flight: a progress file written
+    // before identities existed, saved while a send was outstanding.
+    await seedSavedState(page, buildState({
+      tracks: reTagged,
+      pendingReTagTimestampSec: pinSec,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+
+    /*
+      Minting an identity persists the queue, and the snapshot it persists is
+      built from the component's own fields — which at that moment did not yet
+      carry the second the saved state arrived with. Naming the queue would
+      therefore quietly erase the durable record of a second a request may
+      already be riding on, leaving only the journal, which a later eviction or
+      a failed write can take away too.
+    */
+    expect(diskDuringFirstSend[0]).toBe(pinSec);
   });
 
   test('a resumed session reports overall progress, not just the remaining chunk', async ({ page }) => {
@@ -1803,13 +1890,19 @@ test.describe('Re-tagged old plays', () => {
   test('a journal belonging to another queue is neither erased nor overwritten', async ({ page }) => {
     const foreignId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
     const foreignKey = 'Some Artist\u0000Some Track\u00001700000000000';
-
-    // Planted before anything runs: an earlier import that crashed between
-    // choosing a second and hearing whether Last.fm stored the play.
+    // An earlier import that crashed between choosing a second and hearing
+    // whether Last.fm stored the play.
+    // Fifteen days old: past any window Last.fm would still deduplicate on,
+    // and therefore past the point where a timer would have been tempted to
+    // discard it. A clock that jumps forward is indistinguishable from time
+    // passing, so nothing here is allowed to expire on one.
     await page.addInitScript(([id, key]) => {
       window.localStorage.setItem('scrobblify.background.inflightSecond', JSON.stringify([
         {
-          importId: id, trackKey: key, sec: 1700000000, at: Date.now(),
+          importId: id,
+          trackKey: key,
+          sec: 1700000000,
+          at: Date.now() - 15 * 24 * 60 * 60 * 1000,
         },
       ]));
     }, [foreignId, foreignKey]);

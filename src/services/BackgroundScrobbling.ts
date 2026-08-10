@@ -497,7 +497,7 @@ export interface InFlightSecond {
   importId: string;
   trackKey: string;
   sec: number;
-  /** When the record was written, used only to age abandoned ones out. */
+  /** When the record was written. Used only to order eviction. */
   at: number;
 }
 
@@ -509,12 +509,16 @@ export interface InFlightSecond {
  * that cannot be asked, because it is not running. Its play stays at Last.fm
  * under a second nothing remembers, and its resume invents another.
  *
- * Capped because this is unbounded otherwise, and aged out because a record
- * older than Last.fm's collision window can no longer deduplicate anything:
- * repeating that second would be stored as a new play rather than discarded.
+ * Capped, because this is unbounded otherwise. Records are **not** expired on
+ * a timer: an unresolved record is evidence about a play that may be sitting
+ * at Last.fm, and this browser's clock is not entitled to decide that evidence
+ * has gone stale. A clock that jumps forward — a correction, a resumed laptop,
+ * a timezone-confused device — would otherwise hide a record written minutes
+ * ago, after which the next allocation overwrites it for good and the play it
+ * described is duplicated. Eviction is by insertion order instead, and the
+ * cap is set well above the one queue a browser can actually hold on disk.
  */
-const IN_FLIGHT_MAX_RECORDS = 4;
-const IN_FLIGHT_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const IN_FLIGHT_MAX_RECORDS = 8;
 
 function readJournal(): InFlightSecond[] {
   try {
@@ -522,18 +526,16 @@ function readJournal(): InFlightSecond[] {
     if (!raw) { return []; }
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) { return []; }
-    const cutoff = Date.now() - IN_FLIGHT_TTL_MS;
     return parsed.filter((r) => (
       r
       && typeof r.importId === 'string' && r.importId
       && typeof r.trackKey === 'string' && r.trackKey
       && Number.isFinite(Number(r.sec)) && Number(r.sec) > 0
-      && Number.isFinite(Number(r.at)) && Number(r.at) > cutoff
     )).map((r) => ({
       importId: r.importId as string,
       trackKey: r.trackKey as string,
       sec: Number(r.sec),
-      at: Number(r.at),
+      at: Number(r.at) || 0,
     }));
   } catch {
     return [];

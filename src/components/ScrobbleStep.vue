@@ -813,13 +813,26 @@ export default Vue.extend({
         merely not ahead, and a decline is not a confirmation.
       */
       const persist = this.persistProgress;
-      if (!persist) { return false; }
-      try {
-        await persist(this.progressSnapshot());
-      } catch {
-        return false;
+      let written = false;
+      if (persist) {
+        try {
+          await persist(this.progressSnapshot());
+          written = true;
+        } catch {
+          written = false;
+        }
       }
-      return true;
+      if (!written) {
+        /*
+          Rolled back, or the next attempt would find a non-empty id in memory
+          and accept it without ever retrying the write — and every second
+          journalled under it would name an import the disk has never heard of.
+          A name only this tab knows is worse than no name: no name at least
+          stops the run.
+        */
+        this.$store.commit('setImportId', '');
+      }
+      return written;
     },
 
     async runScrobbleLoop(tracker: RateLimitTracker) {
@@ -879,6 +892,16 @@ export default Vue.extend({
         by storage it does not use.
       */
       const needsReTagSeconds = tracks.slice(this.scrobbledTracks).some((t) => t.reTagged);
+      /*
+        Carried into the component field before anything persists, because the
+        identity write below snapshots that field and would otherwise write a
+        queue with no pending second at all — erasing the durable copy of a
+        second a request may already be riding on, purely as a side effect of
+        naming the queue. The adoption block just below decides whether the
+        second is actually still this track's; that decision is allowed to drop
+        it, this write is not.
+      */
+      this.pendingReTagSec = savedPendingSec;
       if (needsReTagSeconds && !await this.ensureImportIdentity()) {
         this.endPacing();
         this.stopped = true;
