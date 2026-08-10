@@ -79,6 +79,17 @@ export interface AssignedTrack {
   timestampSec: number;
   /** True when the track kept its real listen time. Reported to the user. */
   preservedOriginal: boolean;
+  /**
+   * True when this second is a browser's idempotency pin rather than a listen
+   * date, and was kept as-is.
+   *
+   * Carried into the outcome so a rejection can be treated as final. Codes 3
+   * and 4 are normally *our* assignment being wrong and are deliberately
+   * non-terminal — the job stalls and a human looks at it — but a pin is the
+   * only second that can ever be sent for this track, so there is nothing to
+   * reassign and stalling would park the job forever.
+   */
+  pinnedRetry?: boolean;
 }
 
 export interface AssignmentResult {
@@ -135,8 +146,9 @@ export function isPinnedRetry(t: TrackForSend): boolean {
  * tuple, so it may still hold the original, and minting a fresh second there
  * is precisely what creates the phantom the pin exists to prevent.
  *
- * Past 14 days the original can no longer collide — Last.fm would reject the
- * repeat outright — so a fresh second is the better of two imperfect answers.
+ * Past 14 days the repeat will be refused — but that is a statement about what
+ * can be *submitted* now, not about what was stored then. See
+ * `isPinReplaceable`, which is the question this worker actually acts on.
  */
 export function isPinUsable(pinnedSec: number, nowSec: number): boolean {
   if (!Number.isFinite(pinnedSec) || pinnedSec <= 0) {
@@ -151,6 +163,29 @@ export function isPinUsable(pinnedSec: number, nowSec: number): boolean {
 }
 
 /**
+ * Whether a pinned second may be swapped for one this worker chooses.
+ *
+ * Only when the pin cannot describe a stored play at all. A second in the
+ * future is refused by Last.fm whoever submits it, so the browser's original
+ * was refused too and there is nothing to repeat; a malformed one names
+ * nothing. Everything else — including a pin so old that repeating it will be
+ * rejected — **must not be replaced**.
+ *
+ * That last case is the one worth stating plainly, because the intuitive
+ * answer is wrong. "Too old to submit" is not "was never stored". If the
+ * browser's send did land, a fresh second puts a second copy of that play on
+ * the user's profile, and there is no way for them to tell which is which.
+ * Repeating the doomed pin instead costs at most one **reported** failure,
+ * which is the same trade the browser makes for an inherited pin.
+ */
+export function isPinReplaceable(pinnedSec: number, nowSec: number): boolean {
+  if (!Number.isFinite(pinnedSec) || pinnedSec <= 0) {
+    return true;
+  }
+  return pinnedSec > nowSec - 1;
+}
+
+/**
  * Assigns a send-time timestamp to each track in a batch.
  *
  * `syntheticFloor` is the lowest synthetic second used by previous batches of
@@ -159,7 +194,12 @@ export function isPinUsable(pinnedSec: number, nowSec: number): boolean {
  *
  * Guarantees the caller depends on:
  *  - every timestamp in the returned batch is unique
- *  - every timestamp is inside Last.fm's window and not in the future
+ *  - every timestamp is inside Last.fm's window and not in the future, with
+ *    one deliberate exception: a pinned retry keeps its second even when that
+ *    second is too old to be accepted, because replacing it is how a play that
+ *    was already stored gets duplicated. Such an entry is flagged
+ *    `pinnedRetry` so its rejection can be treated as final rather than as a
+ *    reason to stall the job
  *  - a preserved original is never overwritten by a synthetic value, and a
  *    synthetic value never collides with a preserved one in the same batch
  */
@@ -192,8 +232,19 @@ export function assignTimestamps(
       prefer to keep.
     */
     const pinned = isPinnedRetry(t);
+    /*
+      A pinned retry keeps its second unless that second cannot describe a
+      stored play at all.
+
+      Not judged on the collision window, which asks whether the repeat will
+      still be *accepted*. Being refused is the acceptable outcome here: the
+      alternative is a fresh second beside a play that may already exist, and
+      a duplicate on a public profile has no user-side recovery where a
+      reported failure does. `isPinUsable` still describes the accept/refuse
+      boundary and is used where that is genuinely the question.
+    */
     const keep = pinned
-      ? isPinUsable(t.originalTimestampSec, nowSec)
+      ? !isPinReplaceable(t.originalTimestampSec, nowSec)
       : isWithinWindow(t.originalTimestampSec, nowSec);
     if (keep) {
       const ts = Math.floor(t.originalTimestampSec);
@@ -213,6 +264,7 @@ export function assignTimestamps(
   for (let i = 0; i < tracks.length; i += 1) {
     const t = tracks[i];
     let ts = preserved[i];
+    const keptPin = preserved[i] !== null && isPinnedRetry(t);
     if (ts === null) {
       while (taken.has(next) || next > ceiling) {
         next -= 1;
@@ -230,6 +282,7 @@ export function assignTimestamps(
       index: i,
       timestampSec: ts,
       preservedOriginal: preserved[i] !== null,
+      pinnedRetry: keptPin,
     });
   }
 

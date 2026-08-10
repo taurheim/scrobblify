@@ -147,14 +147,18 @@ function freshSql(): Sql {
   return new NodeSql(db);
 }
 
-function trackLines(count: number, originalTimestampSec: number): Uint8Array {
+function trackLines(count: number, originalTimestampSec: number, pin?: {
+  index: number; sec: number;
+}): Uint8Array {
   const lines: string[] = [];
   for (let i = 0; i < count; i += 1) {
+    const pinned = pin !== undefined && pin.index === i;
     lines.push(JSON.stringify({
       artist: `Artist ${i}`,
       track: `Track ${i}`,
       album: 'An Album',
-      originalTimestampSec,
+      originalTimestampSec: pinned ? pin.sec : originalTimestampSec,
+      ...(pinned ? { reTagged: true } : {}),
     }));
   }
   return new TextEncoder().encode(lines.join('\n'));
@@ -173,6 +177,8 @@ async function harness(options: {
   script?: Script[];
   /** Days ago the listens happened. Large values force synthetic timestamps. */
   originalDaysAgo?: number;
+  /** A re-tagged track carrying an idempotency pin, at this blob index. */
+  pin?: { index: number; sec: number };
   job?: Partial<Record<string, unknown>>;
 } = {}): Promise<Harness> {
   const total = options.total ?? 120;
@@ -202,7 +208,7 @@ async function harness(options: {
     names.map((n) => columns[n]),
   );
 
-  const raw = trackLines(total, NOW - (options.originalDaysAgo ?? 400) * 86400);
+  const raw = trackLines(total, NOW - (options.originalDaysAgo ?? 400) * 86400, options.pin);
   const compressed = await gzip(raw);
   const buf = compressed.buffer.slice(
     compressed.byteOffset,
@@ -375,6 +381,61 @@ async function main() {
       "SELECT * FROM audit WHERE job_id = ? AND event = 'timestamp_rejected'", [h.jobId],
     );
     check('a timestamp rejection raises an audit entry', audits.length === 1, audits.length);
+  }
+
+  console.log('\n-- a refused pin is terminal, not a stall --');
+  {
+    /*
+      An inherited pin is the only second that track can ever be sent under:
+      any other risks landing beside a play the browser already stored. So the
+      worker sends the doomed second, Last.fm answers code 3, and that refusal
+      has to be final. Treating it as an ordinary bad assignment would re-send
+      the same second forever and park the job for a human who has no way to
+      change the answer.
+    */
+    const pinSec = NOW - 20 * 86400;
+    const h = await harness({
+      total: 1,
+      pin: { index: 0, sec: pinSec },
+      script: [{ kind: 'ignore', from: 0, code: 3, message: 'Timestamp too old' }],
+    });
+    await runTick(h.env, NOW);
+    check('the doomed pin was sent unchanged, not replaced with a fresh second',
+      h.fake.sent[0].entries[0].timestampSec === pinSec, h.fake.sent[0].entries[0]);
+    const job = await h.job();
+    check('the cursor advances past it', job.cursor === 1, job.cursor);
+    check('it is reported as a failure', job.failed_count === 1, job.failed_count);
+    check('the job is not parked for a human', job.state !== 'needs_attention', job.state);
+    check('it finishes instead', job.state === 'completed', job.state);
+    const rows = await h.sql.all<any>('SELECT * FROM failures WHERE job_id = ?', [h.jobId]);
+    check('the user is told which track it was', rows.length === 1 && rows[0].track === 'Track 0',
+      rows);
+    const audits = await h.sql.all<any>(
+      "SELECT * FROM audit WHERE job_id = ? AND event = 'pinned_retry_refused'", [h.jobId],
+    );
+    check('and the refusal is observable in the audit log', audits.length === 1, audits.length);
+    check('it is not filed as our own assignment being wrong',
+      (await h.sql.all<any>(
+        "SELECT * FROM audit WHERE job_id = ? AND event = 'timestamp_rejected'", [h.jobId],
+      )).length === 0);
+  }
+
+  console.log('\n-- the same rejection without a pin still stalls --');
+  {
+    /*
+      The counterpart. Codes 3 and 4 stay non-terminal for seconds this worker
+      chose, because those are reassignable and discarding the track would lose
+      a play nothing has ever sent.
+    */
+    const h = await harness({
+      total: 1,
+      script: [{ kind: 'ignore', from: 0, code: 3, message: 'Timestamp too old' }],
+    });
+    await runTick(h.env, NOW);
+    const job = await h.job();
+    check('the cursor does not advance', job.cursor === 0, job.cursor);
+    check('nothing is written off', job.failed_count === 0, job.failed_count);
+    check('a human is asked', job.state === 'needs_attention', job.state);
   }
 
   console.log('\n-- revoked credential --');

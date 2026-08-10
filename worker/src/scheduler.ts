@@ -616,7 +616,20 @@ async function sendBatch(
   // Step 3: record outcomes.
   const outcomes: EntryOutcome[] = result.outcomes.map((o, i) => {
     const c = classifyOutcome(o);
-    return { i: assigned[i].index, s: c.state, c: c.code, t: assigned[i].timestampSec };
+    /*
+      A rejected pin is final, where a rejected assignment of ours is not.
+
+      Codes 3 and 4 are normally evidence that this worker chose badly, so they
+      stall the job rather than discarding tracks. A pinned retry is the one
+      case where there is nothing to choose: that second is the only one that
+      can ever be sent for this track, because any other risks landing beside a
+      play the browser may already have stored. Leaving it non-terminal would
+      park the job forever on a track no future attempt can change.
+    */
+    const state: EntryState = (c.state === 'bad_timestamp' && assigned[i].pinnedRetry)
+      ? 'failed'
+      : c.state;
+    return { i: assigned[i].index, s: state, c: c.code, t: assigned[i].timestampSec };
   });
 
   const capped = outcomes.some((o) => o.s === 'capped');
@@ -657,6 +670,25 @@ async function sendBatch(
     await audit(env.sql, job.id, lease.generation, 'timestamp_rejected', {
       count: badTimestamps.length,
       sample: badTimestamps.slice(0, 3),
+    }, nowSec);
+  }
+  /*
+    Pinned refusals are deliberately absent from `badTimestamps` above, so they
+    neither stall the batch nor park the job. They are still worth seeing: each
+    one is a play whose fate is genuinely unknown, reported to the user as a
+    failure because the alternative was a possible duplicate.
+  */
+  const pinnedRefusals = result.outcomes
+    .map((o, i) => ({ c: classifyOutcome(o), i }))
+    .filter((x) => x.c.state === 'bad_timestamp' && assigned[x.i].pinnedRetry);
+  if (pinnedRefusals.length > 0) {
+    await audit(env.sql, job.id, lease.generation, 'pinned_retry_refused', {
+      count: pinnedRefusals.length,
+      sample: pinnedRefusals.slice(0, 3).map((x) => ({
+        index: assigned[x.i].index,
+        timestampSec: assigned[x.i].timestampSec,
+        code: x.c.code,
+      })),
     }, nowSec);
   }
   if (advance === 0 && badTimestamps.length > 0) {

@@ -9,6 +9,7 @@ import {
   assignTimestamps,
   isWithinWindow,
   isPinUsable,
+  isPinReplaceable,
   reconciliationWindow,
   normalizeForMatch,
   WINDOW_SECONDS,
@@ -126,14 +127,52 @@ function main() {
   check('the two do not collide',
     rPin.assigned[0].timestampSec !== rPin.assigned[1].timestampSec);
 
+  check('a kept pin is flagged as one', rPin.assigned[0].pinnedRetry === true, rPin.assigned[0]);
+  check('an ordinary preserved original is not', rPin.assigned[1].pinnedRetry !== true,
+    rPin.assigned[1]);
+
+  /*
+    "Too old to submit" is not "was never stored".
+
+    A pin names a second a browser already spent on a send whose answer it
+    never heard. Once it ages past the collision window Last.fm will refuse it
+    — but refusing to *store* it again is not evidence it was never stored the
+    first time, and the browser's own rule since round fifteen is that an
+    inherited pin is never re-timed. Minting a synthetic second here is a
+    coin flip between recovering one play and putting a second copy on a public
+    profile, and only one of those is unrecoverable. So the doomed pin is kept,
+    Last.fm refuses it, and the scheduler treats that refusal as terminal.
+  */
+  const stalePinSec = NOW - 20 * 86400;
   const stalePin = [{
     artist: 'Pinned',
     track: 'Retry',
-    originalTimestampSec: NOW - 20 * 86400,
+    originalTimestampSec: stalePinSec,
     reTagged: true,
   }];
-  check('a pin Last.fm would reject is replaced rather than insisted on',
-    assignTimestamps(stalePin, NOW, 0).assigned[0].timestampSec !== NOW - 20 * 86400);
+  const rStale = assignTimestamps(stalePin, NOW, 0);
+  check('a pin Last.fm will reject is still sent, not replaced with a duplicate',
+    rStale.assigned[0].timestampSec === stalePinSec, rStale.assigned[0]);
+  check('and it is flagged, so the rejection can be made terminal',
+    rStale.assigned[0].pinnedRetry === true, rStale.assigned[0]);
+
+  /*
+    A future pin is the one case where re-timing is safe: Last.fm answers
+    ignore code 4 for everyone, so the browser's original cannot have landed.
+  */
+  const futurePin = [{
+    artist: 'Pinned', track: 'Future', originalTimestampSec: NOW + 4000, reTagged: true,
+  }];
+  const rFuture = assignTimestamps(futurePin, NOW, 0);
+  check('a future pin is replaced with a sendable second',
+    rFuture.assigned[0].timestampSec <= NOW - PRESENT_MARGIN_SECONDS, rFuture.assigned[0]);
+  check('and is no longer flagged as a pin', rFuture.assigned[0].pinnedRetry !== true,
+    rFuture.assigned[0]);
+
+  check('a malformed pin is replaceable', isPinReplaceable(Number.NaN, NOW));
+  check('a future pin is replaceable', isPinReplaceable(NOW + 100, NOW));
+  check('an old pin is not replaceable', !isPinReplaceable(NOW - 20 * 86400, NOW));
+  check('a live pin is not replaceable', !isPinReplaceable(NOW - 86400, NOW));
 
   const reTaggedNoPin = [{
     artist: 'A', track: 'B', originalTimestampSec: 0, reTagged: true,
