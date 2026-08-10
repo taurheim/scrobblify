@@ -401,6 +401,70 @@ export default class StateManager {
     });
   }
 
+  /**
+   * Deletes the saved state only if it is still the one the caller decided
+   * about.
+   *
+   * `clearState` deletes whatever is there. That is right for a user pressing
+   * "start over", and wrong for anything that first *reads* the state, decides
+   * it should go, and then deletes it: the disk is shared with every other tab
+   * on this origin, and between the read and the delete a sibling can save a
+   * completely different import over it. The delete does not know that and
+   * takes the new queue with it — a queue that may exist nowhere else.
+   *
+   * So the read and the delete share one `readwrite` transaction, which
+   * IndexedDB runs to completion against the store before starting another.
+   * The same compare-and-set `saveStateIfAhead` relies on.
+   *
+   * `matches` is given the state as it exists at delete time, or `null` when
+   * there is none, and decides whether it is the one to remove. It must be
+   * synchronous: an `await` inside it would end the transaction.
+   *
+   * Returns what the disk holds afterwards, so a caller can tell "the queue I
+   * condemned is gone" from "something else is there now, leave it alone".
+   */
+  public async clearStateIfMatching(
+    matches: (saved: ScrobbleState | null) => boolean,
+  ): Promise<{ removed: boolean; remaining: ScrobbleState | null }> {
+    const db = await this.openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(STATE_KEY);
+      let removed = false;
+      let remaining: ScrobbleState | null = null;
+      let thrown: unknown = null;
+      req.onsuccess = () => {
+        const existing = (req.result as ScrobbleState | undefined) ?? null;
+        try {
+          if (matches(existing)) {
+            store.delete(STATE_KEY);
+            removed = true;
+            return;
+          }
+        } catch (e) {
+          /*
+            A predicate that throws has not decided anything, so nothing is
+            deleted and the caller is told rather than left reading a "no
+            match" that never happened.
+          */
+          thrown = e;
+          return;
+        }
+        remaining = existing;
+      };
+      tx.oncomplete = () => {
+        db.close();
+        if (thrown) {
+          reject(thrown);
+          return;
+        }
+        resolve({ removed, remaining });
+      };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    });
+  }
+
   public async hasSavedState(): Promise<boolean> {
     const db = await this.openDB();
     return new Promise((resolve, reject) => {

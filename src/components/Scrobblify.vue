@@ -1666,7 +1666,15 @@ export default Vue.extend({
           */
           background.setStaleSnapshot(jobId, restored.importId || '');
           try {
-            await this.stateManager.clearState();
+            /*
+              Conditional on the identity just written, for the same reason the
+              guard is: a sibling tab can save a different import between the
+              save above and this delete, and an unconditional delete would
+              take that one instead.
+            */
+            await this.stateManager.clearStateIfMatching(
+              (saved) => !!saved && (saved.importId || '') === (restored.importId || ''),
+            );
             background.clearStaleSnapshot();
           } catch (clearError) {
             trackError('background.clearStaleSnapshot', clearError);
@@ -1757,9 +1765,20 @@ export default Vue.extend({
     async exposeSavedStateUnlessStale(reason: string, withheldForOwnership = false) {
       const stale = background.staleSnapshotRecord();
       if (stale) {
-        let saved: ScrobbleState | null = null;
+        let result: { removed: boolean; remaining: ScrobbleState | null };
         try {
-          saved = await this.stateManager.loadState();
+          /*
+            Read and delete in one transaction. Deciding from a separate read
+            and then deleting unconditionally would let a sibling tab's save
+            land in between — and this guard now runs on `mounted`, which is
+            the one path two tabs are certain to run at the same time.
+          */
+          result = await this.stateManager.clearStateIfMatching(
+            (saved) => background.savedQueueIsStale(
+              stale,
+              saved ? (saved.importId || '') : null,
+            ),
+          );
         } catch (e) {
           /*
             The disk cannot be read, so the queue on it cannot be identified.
@@ -1771,31 +1790,18 @@ export default Vue.extend({
           this.ownershipBlocked = true;
           return;
         }
-        if (background.savedQueueIsStale(stale, saved ? (saved.importId || '') : null)) {
-          try {
-            await this.stateManager.clearState();
-            background.clearStaleSnapshot();
-            this.hasResumableState = false;
-            trackEvent('background_stale_snapshot_discarded', { reason });
-          } catch (e) {
-            /*
-              Still on disk, and now nothing owns it. Resume stays withheld for
-              the life of this page and the record survives the reload, so the
-              next attempt tries again rather than offering the queue.
-            */
-            trackError('background.clearStaleSnapshot', e);
-            this.hasResumableState = false;
-            this.ownershipBlocked = true;
-          }
-          return;
-        }
         /*
-          The photograph is gone — either discarded already, or replaced by a
-          later import. The record describes nothing now, and leaving it would
-          condemn whatever is written here next.
+          The photograph is gone — discarded just now, discarded earlier, or
+          replaced by a later import. Either way the record describes nothing,
+          and leaving it would condemn whatever is written here next.
         */
         background.clearStaleSnapshot();
-        this.hasResumableState = !!saved && !withheldForOwnership;
+        if (result.removed) {
+          this.hasResumableState = false;
+          trackEvent('background_stale_snapshot_discarded', { reason });
+          return;
+        }
+        this.hasResumableState = !!result.remaining && !withheldForOwnership;
         return;
       }
       try {
