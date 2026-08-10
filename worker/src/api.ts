@@ -7,7 +7,7 @@
  * only tracks that ever reach Last.fm are the ones already committed to a
  * job's write-once blob.
  */
-import { Sql, JobRow, readControl, countCommittedSlots } from './store';
+import { Sql, JobRow, readControl, countCommittedSlots, abandonedSeconds } from './store';
 import {
   BlobStore, uploadChunk, deleteJobBlobs, readChunkFor, CHUNK_TRACKS,
 } from './chunks';
@@ -23,7 +23,6 @@ import {
 } from './handoff';
 import { issueSession, authenticate } from './session';
 import { drainJobOnDemand } from './scheduler';
-import { WINDOW_SECONDS } from './timestamps';
 import {
   normalizeUsername, randomId, signHandoffState, verifyHandoffState, encryptCredential,
 } from './crypto';
@@ -220,6 +219,12 @@ async function reattachCredential(
       take-back that is reading the queue out — and attaching a live credential
       to either would resurrect a job the user has finished with.
 
+      Refused outright while a lease is held. A drain acquired for a take-back
+      is running against the snapshot it read, and its batch writes are not
+      fenced; clearing `locked_until` under it would let a job it is still
+      abandoning batches for be resumed by another tab. The user can press
+      Reconnect again a moment later, which is a far smaller problem.
+
       The lifetime is renewed, not inherited. The commonest way into
       `needs_reauth` is the 60-day deadline passing, and a fresh key under an
       expired deadline is re-parked by the very next tick — the user reconnects,
@@ -232,7 +237,7 @@ async function reattachCredential(
               state = 'paused', state_reason = NULL, consecutive_failures = 0,
               credential_expires_at = ?,
               next_eligible_at = ?, locked_until = 0, updated_at = ?
-        WHERE id = ? AND state = 'needs_reauth'`,
+        WHERE id = ? AND state = 'needs_reauth' AND locked_until <= ?`,
       [
         credential.ciphertext,
         credential.iv,
@@ -241,6 +246,7 @@ async function reattachCredential(
         nowSec,
         nowSec,
         job.id,
+        nowSec,
       ],
     );
     if (updated.changes > 0) {
@@ -1044,52 +1050,23 @@ async function exportJob(
     original landed and a normal scrobble when it did not — the outcome is
     correct either way, and the user is never asked to choose.
 
-    Only while the second is still inside the acceptance window. Once it ages
-    out, a repeat can no longer be stored at all, so pinning a lost play to it
-    would be the one genuinely unrecoverable outcome; those fall back to a
-    fresh second and are counted as uncertain instead. This is a judgement the
-    *client* explicitly refuses to make against its own clock, and rightly —
-    but the decision here is made against the worker's, which is the only one
-    in the system that can be trusted to say how old something is.
+    The same rule is applied by `sendBatch` when a job resumes over its own
+    abandoned batch, from this same helper, because a guarantee that holds on
+    only one of the two senders is no guarantee at all.
   */
-  const abandoned = await env.sql.all<{ assigned_timestamps: string }>(
-    "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'abandoned'",
-    [claimedJob.id],
+  const { repeatable: repeatableSeconds, stale } = await abandonedSeconds(
+    env.sql, claimedJob.id, nowSec,
   );
-  const repeatableSeconds = new Map<number, { sec: number; artist: string; track: string }>();
+  /*
+    Counted per index rather than per row, and only for indices that actually
+    come back in the queue. An index behind the cursor was resolved and is not
+    in `tracks`; one already recorded as a permanent failure is reported by
+    name instead. Neither can be duplicated by a resume, so neither belongs in
+    a warning about duplicates.
+  */
   let uncertainCount = 0;
-  abandoned.forEach((row) => {
-    try {
-      const parsed = JSON.parse(row.assigned_timestamps);
-      if (!Array.isArray(parsed)) { return; }
-      parsed.forEach((v) => {
-        // Only entries still ahead of the cursor come back in the queue; one
-        // behind it was resolved and counted, and is not in `tracks` at all.
-        const idx = v && Number(v.index);
-        const sec = v && Number(v.timestampSec);
-        if (!Number.isFinite(idx) || idx < claimedJob.cursor) { return; }
-        if (failedIndex.has(idx)) { return; }
-        if (Number.isFinite(sec) && sec > 0 && nowSec - sec <= WINDOW_SECONDS) {
-          // Two batches can name one index when a retry was itself abandoned.
-          // The later second is the one the account is likelier to hold, and
-          // the one with window left to repeat.
-          const prior = repeatableSeconds.get(idx);
-          if (prior === undefined || sec > prior.sec) {
-            repeatableSeconds.set(idx, {
-              sec,
-              artist: String(v.artist ?? ''),
-              track: String(v.track ?? ''),
-            });
-          }
-          return;
-        }
-        uncertainCount += 1;
-      });
-    } catch {
-      // Unreadable rows are not counted. Overstating the number would push a
-      // user into re-checking a history that is fine, and there is no index
-      // here to pin with either.
-    }
+  stale.forEach((idx) => {
+    if (idx >= claimedJob.cursor && !failedIndex.has(idx)) { uncertainCount += 1; }
   });
 
   const chunks = await env.sql.all<any>(

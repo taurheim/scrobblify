@@ -12,6 +12,7 @@ import { Sql, SqlResult, JobRow, readControl } from '../src/store';
 import { BlobStore, gzip, uploadChunk } from '../src/chunks';
 import { encryptCredential, sha256Hex, randomId } from '../src/crypto';
 import { ALGORITHM_VERSION } from '../src/handoff';
+import { assignTimestamps } from '../src/timestamps';
 import {
   runTick,
   SchedulerEnv,
@@ -688,6 +689,102 @@ async function main() {
     check('and is not retried', h.fake.sent.length === 0);
     check('and is audited',
       (await h.sql.all("SELECT 1 FROM audit WHERE event = 'credential_undecryptable'")).length === 1);
+  }
+
+  console.log('\n-- a resume over an abandoned batch repeats its seconds --');
+  {
+    /*
+      The export is not the only sender. A take-back abandons an unresolved
+      batch, and if the export never completes — response lost, tab closed —
+      the claim lapses and the job becomes resumable. The unresolved gate only
+      blocks batches in `sending`, so the scheduler walks straight over the
+      abandoned indices from the same cursor.
+
+      Minting fresh seconds for them is what duplicates every play the lost
+      request actually landed, because Last.fm deduplicates on the whole
+      (artist, track, timestamp) tuple. The seconds were written down before
+      the POST precisely so this case could repeat them.
+    */
+    const h = await harness({ total: 50, originalDaysAgo: 4000 });
+    const spent = assignTimestamps(
+      Array.from({ length: 50 }, (_v, i) => ({
+        artist: `Artist ${i}`, track: `Track ${i}`, index: i, originalTimestampSec: 0,
+      })),
+      NOW - 3600,
+      0,
+    );
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, sent_at, created_at)
+       VALUES (?, ?, 0, 0, 50, 'abandoned', ?, ?, ?)`,
+      [randomId(), h.jobId, JSON.stringify(spent.assigned), NOW - 3600, NOW - 3600],
+    );
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    const bySec = new Map(spent.assigned.map((a: any) => [a.index, a.timestampSec]));
+    check('every re-sent track carries the second it already rode on',
+      sent.every((e: any, i: number) => e.timestampSec === bySec.get(i)),
+      sent.slice(0, 3).map((e: any) => e.timestampSec));
+    check('so nothing that landed the first time can land twice',
+      new Set(sent.map((e: any) => e.timestampSec)).size === 50);
+  }
+
+  console.log('\n-- but not a second that belongs to a different track --');
+  {
+    /*
+      The reuse map is keyed on an index that is rebased from batch-relative to
+      absolute before it is stored. Were that rebase to regress, every second
+      would land on the wrong track — plays the user never had, under times
+      that look deliberate. The row carries the names it sent, so it is
+      checkable, and a mismatch simply takes a fresh second.
+    */
+    const h = await harness({ total: 50, originalDaysAgo: 4000 });
+    const spent = assignTimestamps(
+      [{ artist: 'Someone Else', track: 'Not This', originalTimestampSec: 0 }],
+      NOW - 3600,
+      0,
+    );
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, sent_at, created_at)
+       VALUES (?, ?, 0, 0, 1, 'abandoned', ?, ?, ?)`,
+      [randomId(), h.jobId, JSON.stringify(spent.assigned), NOW - 3600, NOW - 3600],
+    );
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    check('the mismatched second is not reused',
+      sent[0].timestampSec !== spent.assigned[0].timestampSec,
+      { got: sent[0].timestampSec, refused: spent.assigned[0].timestampSec });
+  }
+
+  console.log('\n-- a second too old to repeat is not repeated --');
+  {
+    /*
+      Past the window a repeat can no longer be stored at all, so pinning a
+      play that may never have landed to it would guarantee the one outcome
+      nobody can recover. Those take a fresh second, which risks a duplicate
+      the user can delete.
+    */
+    const h = await harness({ total: 50, originalDaysAgo: 4000 });
+    const longAgo = NOW - 13 * 86400;
+    const spent = assignTimestamps(
+      [{ artist: 'Artist 0', track: 'Track 0', originalTimestampSec: 0 }],
+      longAgo,
+      0,
+    );
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, sent_at, created_at)
+       VALUES (?, ?, 0, 0, 1, 'abandoned', ?, ?, ?)`,
+      [randomId(), h.jobId, JSON.stringify(spent.assigned), longAgo, longAgo],
+    );
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    check('an unrepeatable second is left behind',
+      sent[0].timestampSec !== spent.assigned[0].timestampSec,
+      { got: sent[0].timestampSec, refused: spent.assigned[0].timestampSec });
+    check('and the fresh one is actually sendable',
+      NOW - sent[0].timestampSec < 13 * 86400, sent[0].timestampSec);
   }
 
   console.log('\n-- control switches --');

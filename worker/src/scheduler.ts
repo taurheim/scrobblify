@@ -35,6 +35,7 @@ import {
   canRun,
   tripBreaker,
   haltGlobally,
+  abandonedSeconds,
 } from './store';
 import { BlobStore, JobTrack, readChunkFor } from './chunks';
 import { LastFmClient } from './lastfm';
@@ -564,7 +565,38 @@ async function sendBatch(
 
   // Rebase the in-batch indices onto the job's blob so outcomes survive
   // independently of where the batch started.
-  const assigned = assignment.assigned.map((a) => ({ ...a, index: startIndex + a.index }));
+  const rebased = assignment.assigned.map((a) => ({ ...a, index: startIndex + a.index }));
+  /*
+    An index that a previous send already spent a second on keeps that second,
+    forever.
+
+    A batch row is written before the POST, so a batch abandoned without an
+    answer may already be on the account. Those tracks stay after the cursor
+    and are sent again — by this loop, if the job resumes rather than being
+    taken back. Sending them under a *fresh* second is what turns "may already
+    be stored" into "is now stored twice", because Last.fm deduplicates on the
+    whole (artist, track, timestamp) tuple.
+
+    Repeating the identical second instead makes the re-send a no-op when the
+    original landed and a normal scrobble when it did not. This is the same
+    trick the export plays when handing tracks back to the browser, and it has
+    to hold on both sides or the guarantee is only as good as which of them
+    happens to send next.
+
+    It also makes the *second* abandonment harmless. If a retry could mint a
+    new second, an index could accumulate two candidate tuples and no reader
+    could tell which one the account holds — repeating either might duplicate.
+    Reusing means an index only ever has one, so repeating it is always
+    idempotent, however many times the answer is lost.
+  */
+  const reused = (await abandonedSeconds(env.sql, job.id, nowSec)).repeatable;
+  const assigned = rebased.map((a) => {
+    const prior = reused.get(a.index);
+    if (prior === undefined || prior.artist !== a.artist || prior.track !== a.track) {
+      return a;
+    }
+    return { ...a, timestampSec: prior.sec };
+  });
   const batchId = randomId();
 
   // Step 1: the mapping is durable *before* the send, and in the same

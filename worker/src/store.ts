@@ -419,6 +419,108 @@ export async function selectDueJobs(
   );
 }
 
+/**
+ * How long an already-spent second stays worth repeating.
+ *
+ * Last.fm accepts scrobbles up to 14 days old, and `COLLISION_WINDOW_SECONDS`
+ * is that full span because "might this second still hold a play" must not be
+ * answered optimistically. This is the *other* question — "can we still send
+ * this second again" — and it needs the opposite bias, because the answer is
+ * acted on by a browser that may sit rate-limited for a day before it gets
+ * there. Two days of margin, so a repeat that looked sendable when it was
+ * handed over still is when it lands.
+ *
+ * Erring short costs a possible duplicate, which the user can delete. Erring
+ * long costs a play that was never stored and can no longer be sent under any
+ * second, which nobody can recover.
+ */
+export const REPEATABLE_WINDOW_SECONDS = 12 * 86400;
+
+export interface RepeatableSecond {
+  sec: number;
+  artist: string;
+  track: string;
+}
+
+/**
+ * The seconds this job already spent on sends whose answers never came back.
+ *
+ * A batch row is written *before* the POST, so an abandoned batch is precisely
+ * the case where the request may have reached Last.fm and the reply was lost.
+ * Re-sending those tracks under a fresh second turns "may already be stored"
+ * into "is now stored twice", because Last.fm deduplicates on the whole
+ * (artist, track, timestamp) tuple. Repeating the identical second instead is
+ * a no-op if the original landed and a normal scrobble if it did not.
+ *
+ * Read by both senders — the scheduler, when a job resumes over its own
+ * abandoned batch, and the export, when handing those tracks to the browser.
+ * It has to hold on both sides, or the guarantee is only as strong as whichever
+ * of them happens to send next.
+ *
+ * The names are carried so the caller can check the second against the track it
+ * is about to land on. `AssignedTrack.index` is batch-relative when minted and
+ * rebased before it is stored; if that rebase ever regresses, every second here
+ * would point at the wrong track, which writes plays the user never had.
+ *
+ * `stale` names the indices whose second is past repeating. They are not
+ * silently dropped: a caller that re-sends them under a new second is taking a
+ * duplicate risk it has to be able to report.
+ */
+export async function abandonedSeconds(
+  sql: Sql,
+  jobId: string,
+  nowSec: number,
+): Promise<{ repeatable: Map<number, RepeatableSecond>; stale: Set<number> }> {
+  const rows = await sql.all<{ assigned_timestamps: string }>(
+    "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'abandoned'",
+    [jobId],
+  );
+  const repeatable = new Map<number, RepeatableSecond>();
+  const stale = new Set<number>();
+  rows.forEach((row) => {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(row.assigned_timestamps);
+    } catch {
+      // Unreadable. There is no index here to repeat *or* to warn about, so it
+      // can only be left alone; see the callers, which say so to the user.
+      return;
+    }
+    if (!Array.isArray(parsed)) { return; }
+    parsed.forEach((v) => {
+      const idx = v && Number(v.index);
+      const sec = v && Number(v.timestampSec);
+      if (!Number.isFinite(idx)) { return; }
+      if (!Number.isFinite(sec) || sec <= 0 || nowSec - sec > REPEATABLE_WINDOW_SECONDS) {
+        stale.add(idx);
+        return;
+      }
+      /*
+        Keyed per index, and the earliest survives.
+
+        Two rows can name one index only if a retry was itself abandoned, which
+        the reuse this function exists for is meant to make impossible — so a
+        second row is a row written before that rule held. The earliest is the
+        one every later send was supposed to have inherited, and settling on it
+        converges the index back onto a single tuple instead of leaving two
+        candidates that no reader can choose between.
+      */
+      const prior = repeatable.get(idx);
+      if (prior === undefined || sec < prior.sec) {
+        repeatable.set(idx, {
+          sec,
+          artist: String(v.artist ?? ''),
+          track: String(v.track ?? ''),
+        });
+      }
+    });
+  });
+  // An index with a repeatable second is not uncertain, whatever some older
+  // row says about it.
+  repeatable.forEach((_v, idx) => stale.delete(idx));
+  return { repeatable, stale };
+}
+
 export interface Control {
   paused: number;
   paused_reason: string | null;
