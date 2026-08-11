@@ -3,6 +3,9 @@ node_modules
 /dist
 test-results/
 
+# Derived dev-mock fixture: regenerated on demand by `npm run dev:mock:bg`.
+tests/fixtures/test-spotify-data-large.zip
+
 # local env files
 .env.local
 .env.*.local

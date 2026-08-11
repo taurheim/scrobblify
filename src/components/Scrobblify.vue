@@ -559,7 +559,20 @@ export default Vue.extend({
     jobEta(): string {
       const job = this.backgroundJob;
       if (!job || job.state !== 'active' || !job.estimatedCompletionSec) { return ''; }
-      const days = Math.ceil(job.estimatedCompletionSec / 86400);
+      /*
+        An absolute second, not a duration. The worker sends
+        `nowSec + ceil(daysLeft * 86400)` (worker/src/api.ts), and the
+        completed case sends `completed_at` — both epoch seconds. Dividing the
+        field by a day directly reported every active job as finishing in
+        about 20,677 days, which is simply the epoch expressed in days.
+
+        Recomputes on every poll because `backgroundJob` is replaced with a
+        fresh object each time; `Date.now()` on its own is not a reactive
+        dependency and could not drive this by itself.
+      */
+      const secondsLeft = job.estimatedCompletionSec - Math.floor(Date.now() / 1000);
+      if (secondsLeft <= 0) { return ''; }
+      const days = Math.ceil(secondsLeft / 86400);
       if (days <= 1) { return 'Should finish within a day.'; }
       return `Should finish in about ${days} days.`;
     },
