@@ -9,13 +9,13 @@
       <v-card-text class="pt-4">
         <p>
           You have <strong>{{ remaining.toLocaleString() }}</strong> tracks left.
-          Last.fm limits everyone to about 2,800 scrobbles a day, so finishing
-          this in your browser means coming back roughly
-          <strong>{{ daysRemaining }}</strong> more times.
+          Last.fm only accepts about 2,700 scrobbles a day from one account, so
+          finishing here means coming back over the next
+          <strong>{{ daysRemaining }}</strong>.
         </p>
         <p>
-          Instead, Scrobblify's server can finish it for you. Close the tab
-          whenever you like — it keeps going without you.
+          Scrobblify's server can do the rest instead. It carries on after you
+          close the tab.
         </p>
 
         <!--
@@ -29,44 +29,41 @@
           <ul class="pl-4 mb-0">
             <li class="mb-2">
               <strong>Listen dates will change.</strong>
-              Last.fm only accepts scrobbles from the past 14 days. This import
-              will take longer than that, so tracks played outside that window
-              are stamped with the time they're actually sent, not the time you
-              really played them. Tracks still inside the window keep their
-              real dates.
+              Last.fm rejects scrobbles older than 14 days, and this import
+              takes longer than that. Tracks played before the cutoff get the
+              date they were sent instead of the date you played them. Anything
+              inside the 14 days keeps its real date.
               <span v-if="allReTagged">
                 You already chose to move your old plays to today, so this
                 changes nothing you hadn't already accepted.
               </span>
             </li>
             <li class="mb-2">
-              <strong>The server stores a Last.fm key that can scrobble as you.</strong>
-              You'll be sent to Last.fm to approve it. It is encrypted, used
-              only for this import, and deleted the moment the import finishes,
-              is cancelled, or goes 60 days without being used. You can revoke
-              it yourself at any time from
+              <strong>The server keeps a key that can scrobble as you.</strong>
+              Last.fm asks you to approve it on the next screen. It is stored
+              encrypted and used only for this import. It gets deleted when the
+              import ends, when you cancel, or after 60 days unused. You can
+              also revoke it yourself in
               <a href="https://www.last.fm/settings/applications" target="_blank" rel="noopener">
                 your Last.fm settings</a>.
             </li>
             <li>
-              <strong>Your remaining track list is uploaded.</strong>
-              Artist, track, album and listen time — the same data you're about
-              to scrobble anyway. It's deleted when the import ends.
+              <strong>Your remaining tracks are uploaded.</strong>
+              Artist, track, album and listen time: the same data you were
+              about to send anyway. Deleted when the import ends.
             </li>
           </ul>
         </v-alert>
 
         <v-alert type="warning" text dense class="mt-3">
-          This is brand new and you'd be one of the first people using it. If
-          anything looks wrong — duplicates, missing tracks, dates that make no
-          sense — please email
-          <a :href="mailtoLink">niko@savas.ca</a> and I'll fix it. You can stop
-          the import and take your progress back at any time.
+          This feature is new and not well tested yet. If something looks wrong
+          (duplicates, missing tracks, odd dates), email
+          <a :href="mailtoLink">niko@savas.ca</a> and I'll look into it. You can
+          stop the import and take your progress back at any point.
         </v-alert>
 
         <p class="mt-3 mb-0 text-body-2 grey--text text--darken-1">
-          Prefer not to? Nothing changes — keep scrobbling in this tab exactly
-          as you were.
+          &ldquo;Not now&rdquo; leaves this tab scrobbling as before.
         </p>
       </v-card-text>
 
@@ -84,8 +81,13 @@
 <script lang="ts">
 import Vue from 'vue';
 
-/** Roughly Last.fm's per-user daily allowance, used only for the estimate. */
-const DAILY_LIMIT = 2800;
+/*
+  The rate the worker actually paces at, and the same constant `describeJob`
+  in worker/src/api.ts divides by. Last.fm's own ceiling is nearer 2,800, but
+  quoting that here made this dialog promise a date one day earlier than the
+  status card the user lands on immediately afterwards.
+*/
+const DAILY_LIMIT = 2700;
 
 export default Vue.extend({
   name: 'BackgroundOffer',

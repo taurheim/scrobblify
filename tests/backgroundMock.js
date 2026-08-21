@@ -33,6 +33,13 @@ const MIN_TRACKS = 2700;
 const MAX_TRACKS = 2700 * 60;
 const CHUNK_TRACKS = 1000;
 
+// The rate the *real* worker paces at, and the only thing the completion
+// estimate may be derived from. The simulation deliberately runs ~86,400x
+// faster than this so the progress bar visibly moves, but reusing that speed
+// for the ETA made a 28-day job report "Should finish within a day" — the
+// status card would contradict the offer dialog the user had just read.
+const WORKER_TRACKS_PER_DAY = 2700;
+
 const CORS = {
   // Safe as a wildcard: the session travels in an Authorization header, not a
   // cookie, so nothing here is a credentialed request.
@@ -125,7 +132,9 @@ function shimHtml(session, handoffId) {
  *
  * `rate` is the only knob that matters in practice. The real worker manages
  * about 2,700 scrobbles a day; at that speed nothing visibly moves, so this
- * defaults to a few dozen a second and the status card animates.
+ * defaults to a few dozen a second and the status card animates. It drives
+ * the progress bar only — the completion estimate uses the real rate, so the
+ * card's ETA still matches the one the offer dialog quoted.
  */
 function createMockWorker(options = {}) {
   const apiOrigin = options.apiOrigin || DEFAULT_API_ORIGIN;
@@ -183,7 +192,16 @@ function createMockWorker(options = {}) {
       failed: job.failed,
       remaining,
       waitingUntil: job.waitingUntil,
-      estimatedCompletionSec: nowSec + Math.ceil(remaining / world.rate),
+      // Anchored to the job's creation and its *original* size, not to
+      // `remaining`. The simulation drains the queue about 86,400x faster than
+      // the real worker, so anything derived from live progress collapses to
+      // "within a day" within seconds of the card appearing — contradicting
+      // the estimate the offer dialog quoted a moment earlier. Holding it
+      // steady is what a real 28-day job looks like over a demo session.
+      estimatedCompletionSec: job.state === 'completed'
+        ? Math.floor(job.completedAtMs / 1000)
+        : Math.floor(job.createdAtMs / 1000)
+          + Math.ceil((job.totalTracks / WORKER_TRACKS_PER_DAY) * 86400),
       createdAt: Math.floor(job.createdAtMs / 1000),
       completedAt: job.completedAtMs ? Math.floor(job.completedAtMs / 1000) : null,
       // Fourteen days out, so the status card never renders its expiry warning
