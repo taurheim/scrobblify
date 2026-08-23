@@ -16,7 +16,11 @@ export interface ScrobbleResult {
 }
 
 export default class LastFm {
-  private API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
+  // Overridable so `npm run dev:mock` can point the client at the dev server's
+  // mock middleware instead of the real API (see vue.config.js). VUE_APP_* is
+  // inlined by webpack at build time and is `undefined` in a production build,
+  // so the shipped bundle always talks to Last.fm itself.
+  private API_BASE_URL = process.env.VUE_APP_LASTFM_API_BASE || 'https://ws.audioscrobbler.com/2.0/';
 
   private API_RATE_BUFFER_MS = 250;
 

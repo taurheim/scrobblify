@@ -101,7 +101,19 @@ prevent. So each mock gets a transport-free core:
   Playwright spec would want it.
 
 Only `vue.config.js` — Node, build time — requires from `tests/`. Nothing in
-`src/` imports a mock.
+`src/` imports a mock. The path constants and the env they imply live in
+`tests/mockPaths.js`, shared by the middleware and `dev-mock.js` so the two
+cannot drift. Every value is relative; an absolute origin would bake in
+localhost and break when the server is opened from another device.
+
+### Middleware robustness
+
+Each mock middleware is wrapped in a `guard()` that turns a throw into a 500.
+They are async, so an uncaught throw surfaces as an unhandled rejection and
+takes the entire `vue-cli-service serve` process down — losing the mock, the
+compile and the watch because one request had a malformed body. The worker mock
+calls `JSON.parse` on request bodies, which is exactly the sort of thing a
+half-written `curl` gets wrong.
 
 ### `dev:mock`
 
@@ -132,13 +144,37 @@ var is set. Combined with the `||` fallbacks and the compile-time-false banner
 ## Verification
 
 1. `npm run lint:check` — 0 errors (baseline: 0 errors, 135 warnings).
-2. `npx playwright test` — pass count identical to the pre-change baseline,
-   demonstrating the real code path is unchanged.
+2. `npx playwright test` — pass count identical to the pre-change baseline of
+   56, demonstrating the real code path is unchanged.
 3. `npm run build` with a mock var set fails with the guard message; a clean
-   build succeeds and `dist/` contains no `mock/lastfm`.
-4. Manual: `npm run dev:mock`, open the printed URL in an ordinary browser, walk
-   authorize → upload → select → scrobble. The banner is present and DevTools
-   records zero requests to `ws.audioscrobbler.com`.
+   build succeeds and `dist/` contains no `mock/lastfm`, `mock-banner`,
+   `MOCK MODE`, `mock/worker` or `mock-auth`, while the real Last.fm API and
+   auth URLs are still present.
+4. End to end: a Playwright browser with **no** route interception anywhere,
+   pointed at the mock dev server, sees the banner, follows the authorize link
+   through the real auth code path to `testuser`, reaches the upload step, and
+   issues zero requests to `audioscrobbler.com` or `last.fm`.
+
+## Defects found while verifying
+
+Both were exposed by the change rather than introduced by it, and both are
+fixed here:
+
+- **A malformed request body killed the dev server.** The middlewares are
+  async, so a throw from `handle` became an unhandled rejection and took
+  `vue-cli-service serve` with it. Now wrapped in `guard()`.
+- **`createMockWorker` read `appOrigin` with `||`.** The middleware passes an
+  empty string to mean "relative", which `||` treats as unset — so the handoff
+  authorise URL came back as `http://localhost:8080/mock-auth`, pointing at the
+  port the Playwright suite runs on. Now an explicit `=== undefined` check.
+
+## Follow-up not taken
+
+A permanent regression test for "an unmocked browser is still mocked" would need
+a second Playwright project with its own `webServer` on the mock port and its own
+env. That is a real addition to CI time and config, and the bug it guards against
+is in dev tooling rather than shipped code, so it is left out deliberately. The
+end-to-end check above was run as a throwaway script.
 
 ## Out of scope
 

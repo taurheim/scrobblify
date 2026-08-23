@@ -3,37 +3,54 @@
 //   npm run dev:mock                 classic flow only
 //   npm run dev:mock -- --background also mocks the background worker
 //
-// Opens a real (headed) Chromium window pointed at the dev server, intercepts
-// every Last.fm API call with canned responses, and pre-seeds the logged-in
-// state — so you can click through the whole upload -> select -> scrobble flow
-// without a real Last.fm account. Reuses the exact mock the Playwright tests
-// use (tests/lastfmMock.js).
+// Starts a dev server whose Last.fm is served by the mock middleware in
+// vue.config.js, then prints a URL. Open it in whatever browser you like: the
+// mocking lives in the server, so every tab, window and device pointed at it is
+// covered, and the app shows a MOCK MODE banner so you can tell at a glance.
+//
+// This used to drive a headed Playwright window and install `page.route()` on a
+// single page. Exactly one tab was mocked. Opening the same dev server in your
+// ordinary browser reached the real Last.fm and scrobbled to whatever account
+// that profile was signed in to, with no indication that anything was different
+// — while this script's own banner said "nothing is really scrobbled".
 //
 // With --background it additionally:
 //
-//   * starts the dev server with VUE_APP_BACKGROUND_API set, which is what
-//     switches the background feature on at all — `isBackgroundConfigured()`
-//     is false without it, and every handoff screen stays hidden;
-//   * intercepts that origin with tests/backgroundMock.js, a fake worker, so
-//     no wrangler / D1 / R2 / deployment is involved;
-//   * generates and uploads a 3,000-track history, because the offer is gated
-//     on 2,700 remaining tracks and the committed fixture has five.
+//   * sets VUE_APP_BACKGROUND_API, which is what switches the background
+//     feature on at all — `isBackgroundConfigured()` is false without it, and
+//     every handoff screen stays hidden;
+//   * serves tests/backgroundMock.js, a fake worker, so no wrangler / D1 / R2
+//     or deployment is involved;
+//   * generates a 3,000-track history, because the offer is gated on 2,700
+//     remaining tracks and the committed fixture has five. Upload it by hand;
+//     the path is printed below.
 //
-// If a dev server is already running on port 8080 it is reused; otherwise this
-// script starts `vue-cli-service serve` for you and shuts it down on exit.
+// The server always starts fresh on its own port, never 8080, and never reuses
+// one it finds. Both halves of that matter:
+//
+//   * VUE_APP_* is inlined by webpack at compile time, so a server started
+//     without the mock env has already baked the real Last.fm URL into the
+//     bundle. Adopting it would mock nothing while announcing the opposite —
+//     the same bug in a new costume.
+//   * playwright.config.ts sets `reuseExistingServer` on 8080. A mock server
+//     left running there would be silently adopted by the next
+//     `npx playwright test`, whose specs intercept ws.audioscrobbler.com — a
+//     URL the mocked app no longer calls.
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { chromium } = require('@playwright/test');
-const { interceptLastFm, mockLastFmAuth } = require('./lastfmMock');
-const { interceptBackgroundWorker, MIN_TRACKS, DEFAULT_API_ORIGIN } = require('./backgroundMock');
+const { MIN_TRACKS } = require('./backgroundMock');
 const { generateLargeFixture } = require('./fixtures/generate-fixture');
+const { mockEnv } = require('./mockPaths');
 
-const PORT = 8080;
+const PORT = 8090;
 const BASE_URL = `http://localhost:${PORT}`;
-const START_PATH = '/#/scrobble';
+// Must be the publicPath (see vue.config.js): webpack only serves the app
+// there, and `/` is not reliable for a non-browser probe.
+const READY_URL = `${BASE_URL}/scrobblify/`;
+const APP_URL = `${BASE_URL}/scrobblify/#/scrobble`;
 
 const args = process.argv.slice(2);
 const BACKGROUND = args.includes('--background');
@@ -41,6 +58,20 @@ const TRACK_COUNT = Number(args[args.indexOf('--tracks') + 1]) || MIN_TRACKS + 3
 const LARGE_FIXTURE = path.join(__dirname, 'fixtures', 'test-spotify-data-large.zip');
 
 function isServerUp() {
+  return new Promise((resolve) => {
+    const req = http.get(READY_URL, (res) => {
+      res.resume();
+      resolve(true);
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(1500, () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+function isPortTaken() {
   return new Promise((resolve) => {
     const req = http.get(BASE_URL, (res) => {
       res.resume();
@@ -67,51 +98,44 @@ async function waitForServer(timeoutMs) {
   return false;
 }
 
+function banner() {
+  const line = '='.repeat(66);
+  console.log('');
+  console.log(line);
+  console.log('  Scrobblify is running with Last.fm MOCKED.');
+  console.log('');
+  console.log(`  Open:  ${APP_URL}`);
+  console.log('');
+  console.log('  Any browser works — the mock lives in the dev server, not in a');
+  console.log('  remote-controlled window. Look for the MOCK MODE banner; if it');
+  console.log('  is not there, you are not mocked.');
+  console.log('');
+  console.log('  "Click here to authorize" goes to the mock and signs you in as');
+  console.log('  "testuser". All Last.fm calls return canned data.');
+  if (BACKGROUND) {
+    console.log('');
+    console.log('  Background worker MOCKED (no wrangler needed).');
+    console.log(`  Upload this by hand:  ${LARGE_FIXTURE}`);
+    console.log('  Then select every track, press Scrobble, then "Pause & Save".');
+    console.log('  The handoff offer lives on the paused screen — that is by design.');
+    console.log('  The simulated job runs at ~40 tracks/sec so the status card moves.');
+  }
+  console.log('');
+  console.log('  Press Ctrl+C to stop.');
+  console.log(line);
+  console.log('');
+}
+
 async function main() {
-  let serverProc = null;
-
-  if (await isServerUp()) {
-    console.log(`✓ Reusing dev server already running at ${BASE_URL}`);
-    if (BACKGROUND) {
-      // VUE_APP_* is inlined by webpack at compile time, so a server started
-      // without it has already baked an empty API base into the bundle and no
-      // amount of mocking here can switch the feature on.
-      console.log('');
-      console.log('  !! That server was not started by this script, so it may not have');
-      console.log('     VUE_APP_BACKGROUND_API compiled in. If no background offer appears,');
-      console.log('     stop it and re-run this command so it can start its own.');
-      console.log('');
-    }
-  } else {
-    console.log(`Starting dev server (vue-cli-service serve) on port ${PORT}...`);
-    serverProc = spawn(
-      'npx',
-      ['vue-cli-service', 'serve', '--port', String(PORT)],
-      {
-        stdio: 'inherit',
-        shell: true,
-        env: BACKGROUND
-          ? { ...process.env, VUE_APP_BACKGROUND_API: DEFAULT_API_ORIGIN }
-          : process.env,
-      },
-    );
-    serverProc.on('exit', (code) => {
-      if (code && code !== 0) {
-        console.error(`Dev server exited with code ${code}`);
-        process.exit(code);
-      }
-    });
-
-    console.log('Waiting for dev server to become ready...');
-    const ready = await waitForServer(90000);
-    if (!ready) {
-      console.error('Dev server did not start within 90s.');
-      if (serverProc) {
-        serverProc.kill();
-      }
-      process.exit(1);
-    }
-    console.log('✓ Dev server is ready.');
+  if (await isPortTaken()) {
+    console.error(`Port ${PORT} is already in use.`);
+    console.error('');
+    console.error('This script will not adopt a server it did not start: the mock');
+    console.error('endpoints are compiled into the bundle, so a server started');
+    console.error('without them would talk to the real Last.fm.');
+    console.error('');
+    console.error('Stop whatever is on that port and try again.');
+    process.exit(1);
   }
 
   if (BACKGROUND && !fs.existsSync(LARGE_FIXTURE)) {
@@ -120,66 +144,46 @@ async function main() {
     console.log(`✓ ${r.path} (${r.bytes} bytes)`);
   }
 
-  const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-  const page = await context.newPage();
+  console.log(`Starting dev server (vue-cli-service serve) on port ${PORT}...`);
+  const serverProc = spawn(
+    'npx',
+    ['vue-cli-service', 'serve', '--port', String(PORT)],
+    {
+      stdio: 'inherit',
+      shell: true,
+      env: { ...process.env, ...mockEnv({ background: BACKGROUND }) },
+    },
+  );
 
-  // Install the shared Last.fm mock before any navigation.
-  await interceptLastFm(page);
-  if (BACKGROUND) {
-    await interceptBackgroundWorker(page, { appOrigin: BASE_URL });
-  }
-
-  // Establish the origin so localStorage is writable, seed auth, then reload so
-  // the app's init() picks up the "logged in" session from localStorage.
-  await page.goto(BASE_URL + START_PATH);
-  await mockLastFmAuth(page);
-  await page.reload();
-
-  if (BACKGROUND) {
-    // Drop the user straight on the select step. Parsing 3,000 entries by hand
-    // through the file picker every run is friction with no upside.
-    try {
-      await page.locator('.upload-step').waitFor({ timeout: 30000 });
-      await page.locator('input[type="file"][accept=".zip"]').setInputFiles(LARGE_FIXTURE);
-      console.log('✓ Uploaded the large fixture — pick a date range and continue.');
-    } catch (e) {
-      console.log(`(Could not auto-upload the fixture: ${e.message}. Upload ${LARGE_FIXTURE} by hand.)`);
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) {
+      return;
     }
-  }
-
-  console.log('');
-  console.log('==================================================================');
-  console.log('  Scrobblify is running with Last.fm MOCKED.');
-  console.log(`  URL:  ${BASE_URL}${START_PATH}`);
-  console.log('  You are auto-authenticated as "testuser" — no real account used.');
-  console.log('  All Last.fm calls return canned data; nothing is really scrobbled.');
-  if (BACKGROUND) {
-    console.log('');
-    console.log(`  Background worker MOCKED at ${DEFAULT_API_ORIGIN} (no wrangler needed).`);
-    console.log('  Select every track, press Scrobble, then press "Pause & Save".');
-    console.log('  The handoff offer lives on the paused screen — that is by design.');
-    console.log('  The Last.fm redirect is replaced by a same-origin shim page.');
-    console.log('  The simulated job runs at ~40 tracks/sec so the status card moves.');
-  }
-  console.log('  Close the browser window (or press Ctrl+C) to stop.');
-  console.log('==================================================================');
-  console.log('');
-
-  const shutdown = async () => {
-    try {
-      await browser.close();
-    } catch (e) { /* already closed */ }
-    if (serverProc) {
-      serverProc.kill();
-    }
+    shuttingDown = true;
+    serverProc.kill();
     process.exit(0);
   };
 
-  // Exit when the user closes the browser window.
-  browser.on('disconnected', shutdown);
+  serverProc.on('exit', (code) => {
+    if (!shuttingDown && code && code !== 0) {
+      console.error(`Dev server exited with code ${code}`);
+      process.exit(code);
+    }
+  });
+
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  console.log('Waiting for dev server to become ready...');
+  const ready = await waitForServer(180000);
+  if (!ready) {
+    console.error('Dev server did not start within 180s.');
+    serverProc.kill();
+    process.exit(1);
+  }
+
+  banner();
 }
 
 main().catch((err) => {

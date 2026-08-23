@@ -138,7 +138,11 @@ function shimHtml(session, handoffId) {
  */
 function createMockWorker(options = {}) {
   const apiOrigin = options.apiOrigin || DEFAULT_API_ORIGIN;
-  const appOrigin = options.appOrigin || DEFAULT_APP_ORIGIN;
+  // An explicit empty string is a *relative* origin, which is what the dev
+  // server's middleware wants so the authorise URL works from whatever host
+  // the browser used. `||` would treat it as "unset" and silently hand back
+  // localhost:8080 — the port the Playwright suite runs on.
+  const appOrigin = options.appOrigin === undefined ? DEFAULT_APP_ORIGIN : options.appOrigin;
   const verbose = options.log !== false;
 
   const world = {
@@ -508,6 +512,8 @@ async function interceptBackgroundWorker(page, options = {}) {
 module.exports = {
   interceptBackgroundWorker,
   createMockWorker,
+  shimHtml,
   MIN_TRACKS,
   DEFAULT_API_ORIGIN,
+  DEFAULT_APP_ORIGIN,
 };
