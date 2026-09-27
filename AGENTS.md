@@ -237,7 +237,9 @@ round outwards so a duplicate-check window can only widen, never miss.
 
 `npm run dev:mock` starts a dev server on **port 8090** whose Last.fm is served
 by mock middleware in `vue.config.js`. `npm run dev:mock:bg` adds a fake
-background worker. Open the printed URL in **any** browser — the mocking lives
+background worker, and prints a URL carrying `?beta=1` because the handoff
+offer is behind that opt-in (see "Background scrobbling beta gate" below).
+Open the printed URL in **any** browser — the mocking lives
 in the server, so every tab and every device on the LAN is covered. The app
 shows a hazard-striped **MOCK MODE** banner; if it isn't there, you aren't
 mocked.
@@ -298,6 +300,34 @@ Two traps already paid for:
   not `||`. An empty string is a deliberate *relative* origin; `||` treated it
   as unset and handed back `localhost:8080`, pointing the handoff at the
   Playwright port.
+
+## Background scrobbling beta gate
+
+The handoff offer is invite-only: visit any page with `?beta=1` to opt a
+browser in, `?beta=0` to opt out. An opted-in browser shows an info banner
+with a switch-off link. It is independent of `VUE_APP_BACKGROUND_API`, which
+only says whether the build *can* reach a worker.
+
+Two functions in `src/services/BackgroundScrobbling.ts`, and the split is
+load-bearing:
+
+- `isBackgroundEnabled()` — configured **and** opted in. Guards the *offer*
+  only: `probeBackgroundAvailability` and `preflight`.
+- `isBackgroundConfigured()` — configured. Guards every *recovery* path: the
+  live-job authority check, finishing a handoff on return from Last.fm, and
+  rendering an existing job.
+
+**Never gate a recovery path on the opt-in.** A browser that clears its
+storage loses the opt-in but can still have a job running on the server, and
+it is precisely the browser `enforceServerAuthority` exists to block from
+scrobbling the same queue underneath it.
+
+The opt-in is sticky (localStorage) rather than read from the URL, because
+the query string does not survive the flow: `stripQuery` discards all of it on
+a handoff return, and the Last.fm callback never carried it. A per-load flag
+would switch itself off exactly when a handoff came back. The parameter is
+read from the query string *and* the hash (dev runs the router in hash mode)
+and deliberately not stripped — see `consumeBetaParam`.
 
 ## Linting
 

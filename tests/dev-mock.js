@@ -50,10 +50,15 @@ const BASE_URL = `http://localhost:${PORT}`;
 // Must be the publicPath (see vue.config.js): webpack only serves the app
 // there, and `/` is not reliable for a non-browser probe.
 const READY_URL = `${BASE_URL}/scrobblify/`;
-const APP_URL = `${BASE_URL}/scrobblify/#/scrobble`;
 
 const args = process.argv.slice(2);
 const BACKGROUND = args.includes('--background');
+// With --background the URL carries `?beta=1`, because the handoff offer is
+// behind that opt-in. It is sticky (localStorage), so it only needs visiting
+// once per browser profile; `?beta=0` switches it back off.
+const APP_URL = BACKGROUND
+  ? `${BASE_URL}/scrobblify/?beta=1#/scrobble`
+  : `${BASE_URL}/scrobblify/#/scrobble`;
 const TRACK_COUNT = Number(args[args.indexOf('--tracks') + 1]) || MIN_TRACKS + 300;
 const LARGE_FIXTURE = path.join(__dirname, 'fixtures', 'test-spotify-data-large.zip');
 
@@ -115,6 +120,7 @@ function banner() {
   if (BACKGROUND) {
     console.log('');
     console.log('  Background worker MOCKED (no wrangler needed).');
+    console.log('  The offer is behind ?beta=1, which the URL above already has.');
     console.log(`  Upload this by hand:  ${LARGE_FIXTURE}`);
     console.log('  Then select every track, press Scrobble, then "Pause & Save".');
     console.log('  The handoff offer lives on the paused screen — that is by design.');

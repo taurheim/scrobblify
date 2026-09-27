@@ -849,6 +849,18 @@ deleting the R2 blob**, or the data needed to build it is already gone.
 
 - Opt-in only, offered at any of the four entry points above when the remaining
   selection exceeds 2,700 tracks.
+- **Invite-only via `?beta=1`.** Even with `VUE_APP_BACKGROUND_API` set, the
+  offer is hidden unless the browser has visited a URL with `?beta=1`. The
+  opt-in is sticky (`scrobblify.background.beta` in localStorage) because the
+  query string does not survive the handoff: `stripQuery` drops it on return
+  and the Last.fm callback never carried it. `?beta=0` clears it, and an
+  opted-in browser shows a banner with a switch-off link.
+- **The gate covers the offer only, never recovery.** `isBackgroundEnabled`
+  (configured *and* opted in) guards `probeBackgroundAvailability` and
+  `preflight`. The live-job authority check, finishing a handoff on return,
+  and rendering an existing job use `isBackgroundConfigured` alone, so a browser
+  that has lost its storage — and with it the opt-in — still learns it has a
+  job running and is blocked from scrobbling underneath it.
 - Labelled clearly as beta in the UI.
 - The opt-in must state plainly: the selected track list is uploaded to
   Scrobblify's server; a Last.fm credential is stored until the import finishes;

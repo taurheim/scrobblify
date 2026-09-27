@@ -18,6 +18,7 @@ import type { FailedTrackDetail } from '@/services/StateManager';
  */
 const API_BASE = process.env.VUE_APP_BACKGROUND_API || '';
 
+const BETA_STORAGE_KEY = 'scrobblify.background.beta';
 const SESSION_STORAGE_KEY = 'scrobblify.background.session';
 const HANDOFF_STORAGE_KEY = 'scrobblify.background.handoff';
 /**
@@ -90,8 +91,91 @@ export type HandoffOutcome =
    */
   | { status: 'unknown'; handoffId: string };
 
+/**
+ * Whether this build can talk to a worker at all.
+ *
+ * Deliberately separate from `isBackgroundEnabled`. This is the question the
+ * *recovery* paths ask — the live-job authority check, finishing a handoff on
+ * return from Last.fm, and rendering an existing job — and they must not be
+ * gated on the beta opt-in. A browser whose storage was cleared has lost the
+ * opt-in but may still have a job running on the server, and that browser is
+ * exactly the one `enforceServerAuthority` exists to stop from scrobbling
+ * underneath it.
+ */
 export function isBackgroundConfigured(): boolean {
   return API_BASE.length > 0;
+}
+
+export function isBetaOptedIn(): boolean {
+  try {
+    return window.localStorage.getItem(BETA_STORAGE_KEY) === '1';
+  } catch {
+    // Private browsing. The offer additionally requires `canCoordinateTabs`,
+    // which fails here too, so this only agrees with a decision already made.
+    return false;
+  }
+}
+
+/**
+ * Whether to *offer* the handoff to this user.
+ *
+ * The opt-in is sticky rather than read from the URL on each load, because
+ * the URL does not survive the flow: `stripQuery` discards the whole query
+ * string on a handoff return, and the trip out to Last.fm and back arrives on
+ * a callback URL that never carried the parameter. A per-load flag would
+ * therefore switch itself off precisely when a handoff came back, stranding a
+ * user whose tracks are already uploaded.
+ */
+export function isBackgroundEnabled(): boolean {
+  return isBackgroundConfigured() && isBetaOptedIn();
+}
+
+export function setBetaOptIn(on: boolean): void {
+  try {
+    if (on) {
+      window.localStorage.setItem(BETA_STORAGE_KEY, '1');
+    } else {
+      window.localStorage.removeItem(BETA_STORAGE_KEY);
+    }
+  } catch {
+    // Nothing to do; `isBetaOptedIn` will keep answering false.
+  }
+}
+
+/**
+ * Applies `?beta=1` / `?beta=0` from the current URL, and reports whether the
+ * opt-in is now on.
+ *
+ * Reads the hash as well as the query string: outside production the router
+ * runs in hash mode, so an invite link is `/?beta=1#/scrobble` but a link
+ * someone assembles by hand is just as likely to be `/#/scrobble?beta=1`.
+ *
+ * The parameter is **not** stripped afterwards. Stripping would mean a second
+ * URL rewrite racing the one `AuthenticateStep` already performs to remove a
+ * consumed Last.fm token, and the two use different mechanisms
+ * (`history.replaceState` against `$router.replace`), so whichever lands last
+ * silently reinstates what the other removed. Re-applying the same value on a
+ * later load is idempotent, and leaving it visible keeps the invite link
+ * shareable and the opt-out link honest.
+ */
+export function consumeBetaParam(): boolean {
+  let raw: string | null = null;
+  try {
+    raw = new URLSearchParams(window.location.search).get('beta');
+    if (raw === null) {
+      const hash = window.location.hash.replace(/^#/, '');
+      const qIndex = hash.indexOf('?');
+      if (qIndex !== -1) {
+        raw = new URLSearchParams(hash.slice(qIndex + 1)).get('beta');
+      }
+    }
+  } catch {
+    raw = null;
+  }
+  if (raw !== null) {
+    setBetaOptIn(raw !== '0' && raw !== 'false');
+  }
+  return isBetaOptedIn();
 }
 
 export function getSession(): string | null {
@@ -2119,7 +2203,10 @@ export async function preflight(
   chunkTracks: number,
   importId = '',
 ): Promise<{ handoffId: string; authoriseUrl: string } | null> {
-  if (!isBackgroundConfigured()) {
+  // `isBackgroundEnabled`, not `isBackgroundConfigured`: this is where a new
+  // handoff begins, and it is the only server call in the offer path that a
+  // caller could reach without having gone through `probeBackgroundAvailability`.
+  if (!isBackgroundEnabled()) {
     return null;
   }
   try {
