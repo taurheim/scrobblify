@@ -742,21 +742,28 @@ export default Vue.extend({
               }));
             }
             retrySameTrack = true;
-          } else if (LastFm.isSessionKeyError(e)) {
-            // The stored session key is dead, so every remaining track would
-            // fail identically. This used to burn ten tracks as "failed", then
-            // offer a retry with the same key — and keep the key, so every
-            // later visit failed the same way. The track is not at fault: leave
-            // it unconsumed, save, and send the user to sign in again.
-            this.pauseReason = 'Last.fm is no longer accepting your sign-in. This can happen after'
-              + ' signing in to Scrobblify on another device or browser, changing your Last.fm'
-              + ' password, or removing Scrobblify\'s access. Sign in again, then choose'
-              + ' "Resume" to carry on where you left off.';
+          } else if (LastFm.isSessionKeyError(e) || LastFm.isNotAuthenticatedError(e)) {
+            // The stored session key is dead (or already gone), so every
+            // remaining track would fail identically. This used to burn ten
+            // tracks as "failed", then offer a retry with the same key — and
+            // keep the key, so every later visit failed the same way. The track
+            // is not at fault: leave it unconsumed, save, and send the user to
+            // sign in again.
+            const missing = LastFm.isNotAuthenticatedError(e);
+            this.pauseReason = missing
+              ? 'You\'re not signed in to Last.fm. Your progress is saved — sign in, then choose'
+                + ' "Resume" to carry on where you left off.'
+              : 'Last.fm is no longer accepting your sign-in. This can happen after'
+                + ' signing in to Scrobblify on another device or browser, changing your Last.fm'
+                + ' password, or removing Scrobblify\'s access. Sign in again, then choose'
+                + ' "Resume" to carry on where you left off.';
             this.sessionInvalid = true;
             this.stopped = true;
             this.paused = true;
             this.autoSave();
-            this.trackStopped('session_invalid', { track_index: i });
+            // Kept apart from `session_invalid`: that is Last.fm rejecting a
+            // key, this is a route into the loop that skipped signing in.
+            this.trackStopped(missing ? 'not_authenticated' : 'session_invalid', { track_index: i });
             api.clearSessionKey();
             return;
           } else if (LastFm.isNetworkError(e)) {

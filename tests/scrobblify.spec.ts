@@ -570,6 +570,25 @@ async function seedSavedState(page: Page, state: Record<string, unknown>) {
   }, state);
 }
 
+async function readSavedState(page: Page): Promise<Record<string, any> | null> {
+  return page.evaluate(() => new Promise<Record<string, any> | null>((resolve, reject) => {
+    const request = indexedDB.open('scrobblify', 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('scrobbleState')) {
+        db.createObjectStore('scrobbleState');
+      }
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      const req = db.transaction('scrobbleState', 'readonly').objectStore('scrobbleState').get('current');
+      req.onsuccess = () => { db.close(); resolve(req.result || null); };
+      req.onerror = () => { db.close(); reject(req.error); };
+    };
+    request.onerror = () => reject(request.error);
+  }));
+}
+
 test.describe('Session Resume', () => {
   function buildState(overrides: Record<string, unknown> = {}) {
     const tracks = [1, 2, 3, 4, 5].map((n) => ({
@@ -2035,5 +2054,99 @@ test.describe('Invalid session key', () => {
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('text=/already used or has expired/i')).toBeHidden();
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBe('fake-session-key');
+  });
+
+  // Records every track.scrobble request and accepts it.
+  async function recordScrobbles(page: Page, scrobbled: string[]) {
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = requestParams(route);
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+  }
+
+  test('resuming without a session key asks to sign in and leaves the saved progress alone', async ({ page }) => {
+    // Regression: after a rejected key is cleared the username stays behind,
+    // which was all the resume checked. It jumped to the scrobble step with no
+    // key, every track failed as "Not authenticated." within ~100ms, and the
+    // nine consumed by the failures were saved as completed — never sent.
+    test.setTimeout(60000);
+    const scrobbled: string[] = [];
+    await recordScrobbles(page, scrobbled);
+
+    await page.goto('/#/scrobble');
+    // What `clearSessionKey()` leaves behind: a username but no key.
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    const seeded = savedQueue(12);
+    await seedSavedState(page, seeded);
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+
+    await expect(page.locator('text=Sign in to Last.fm first, then choose Resume.')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByRole('link', { name: 'Sign in to Last.fm', exact: true }))
+      .toHaveAttribute('href', /last\.fm\/api\/auth/);
+    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible();
+    await expect(page.locator('text=12 tracks ready to scrobble')).toBeHidden();
+
+    await page.waitForTimeout(1000);
+    expect(scrobbled).toHaveLength(0);
+    expect(await readSavedState(page)).toEqual(seeded);
+
+    // Back from Last.fm's authorize page, the same progress is offered again.
+    await loadFresh(page, '/#/scrobble?token=fresh-token');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Sign in to Last.fm first')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+  });
+
+  test('a run with no session key stops on the first track without using it up', async ({ page }) => {
+    // Any route into the loop that skips signing in must not burn tracks: the
+    // missing key used to be ten ordinary failures, nine of them consumed.
+    test.setTimeout(60000);
+    const scrobbled: string[] = [];
+    await recordScrobbles(page, scrobbled);
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, savedQueue(12));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.waitForTimeout(2500);
+    // Lose the key behind the resume guard's back.
+    await page.evaluate(() => {
+      (document.querySelector('.scrobblify') as any).__vue__.$store.state.lfmApi.clearSessionKey();
+    });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    const signIn = page.getByRole('link', { name: /sign in to last\.fm again/i });
+    await expect(signIn).toBeVisible({ timeout: 10000 });
+    await expect(signIn).toHaveAttribute('href', /last\.fm\/api\/auth/);
+    await expect(page.locator('text=not signed in to Last.fm')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Try Again Now' })).toHaveCount(0);
+    await expect(page.locator('text=failed track(s)')).toHaveCount(0);
+    await expect(page.locator('text=saved automatically')).toBeVisible();
+    expect(scrobbled).toHaveLength(0);
+
+    await expect.poll(async () => {
+      const saved = await readSavedState(page);
+      return saved && {
+        total: saved.totalTracks, completed: saved.completedIndices, failed: saved.failedIndices,
+      };
+    }).toEqual({ total: 12, completed: [], failed: [] });
   });
 });

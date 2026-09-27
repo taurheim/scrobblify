@@ -4,6 +4,18 @@
       Currently authenticated as: {{ this.$store.state.lfmApi.userName }}.
       <a role="button" tabindex="0" @click="clearToken" @keydown.enter="clearToken">Not you?</a>
     </div>
+    <!--
+      Resuming needs a session key to scrobble with. Without one, every track
+      used to fail in a burst and be saved as done, so the resume is held here
+      instead, with the saved progress left untouched.
+    -->
+    <v-alert v-if="resumeSignInMessage" type="warning" prominent class="mb-4">
+      <div><strong>{{ resumeSignInMessage }}</strong></div>
+      <div class="mt-1">Your saved progress is kept, and nothing has been scrobbled yet.</div>
+      <div class="mt-2">
+        <v-btn color="primary" :href="authorizeUrl">Sign in to Last.fm</v-btn>
+      </div>
+    </v-alert>
     <v-alert v-if="hasResumableState && currentStep <= 2" type="info" prominent class="mb-4">
       <div>
         <strong>Resume previous session?</strong>
@@ -113,7 +125,13 @@ export default Vue.extend({
       showError: false,
       errorMessage: '',
       errorDetails: '',
+      resumeSignInMessage: '',
     };
+  },
+  computed: {
+    authorizeUrl(): string {
+      return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
+    },
   },
   async mounted() {
     trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
@@ -141,6 +159,8 @@ export default Vue.extend({
      * later, losing the resumed session. Only ever move *forward* off step 1.
      */
     onAuthenticated() {
+      // Signed in now, so a resume held back for want of a key can go ahead.
+      this.resumeSignInMessage = '';
       if (this.currentStep === 1) {
         this.currentStep = 2;
       }
@@ -174,8 +194,7 @@ export default Vue.extend({
       try {
         const state = await this.stateManager.loadState();
         if (!state) { return; }
-        trackEvent('session_resumed', this.resumeProps(state, 'saved'));
-        this.restoreFromState(state);
+        this.restoreFromState(state, 'saved');
       } catch (e) {
         trackError('scrobblify.resumeFromSaved', e);
         this.errorMessage = 'Failed to load your saved progress.';
@@ -201,8 +220,7 @@ export default Vue.extend({
     async importProgressFile(file: File, source: string) {
       try {
         const state = await this.stateManager.importFromFile(file);
-        trackEvent('session_resumed', this.resumeProps(state, source));
-        this.restoreFromState(state);
+        this.restoreFromState(state, source);
       } catch (e) {
         if (e instanceof NotAProgressFileError) {
           // The user picked the wrong file; that's not an app error. Recorded
@@ -219,8 +237,24 @@ export default Vue.extend({
         this.showError = true;
       }
     },
-    restoreFromState(state: ScrobbleState) {
+    restoreFromState(state: ScrobbleState, source: string) {
       const api = this.$store.state.lfmApi as LastFm;
+      // A session key can be missing while the username is still stored:
+      // `clearSessionKey()` keeps it after Last.fm rejects a key. Resuming then
+      // sent every track unsigned, and the failures were saved as completed.
+      // Nothing is written here, so the saved state survives the sign-in
+      // redirect and the banner offers it again afterwards.
+      if (!api.isAuthenticated()) {
+        trackEvent('session_resume_blocked', { source, reason: 'not_authenticated' });
+        // Only the saved-state resume survives the redirect; a file has to be
+        // chosen again.
+        this.resumeSignInMessage = source === 'saved'
+          ? 'Sign in to Last.fm first, then choose Resume.'
+          : 'Sign in to Last.fm first, then import your progress file again.';
+        this.currentStep = 1;
+        return;
+      }
+      trackEvent('session_resumed', this.resumeProps(state, source));
       if (state.userName && api.getUserName() && api.getUserName() !== state.userName) {
         this.errorMessage = `This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`;
         this.showError = true;
@@ -245,6 +279,7 @@ export default Vue.extend({
       this.$store.commit('setResumedScrobbleCount', state.originalSucceededCount ?? completedSet.size);
       this.$store.commit('setOriginalTotalTracks', state.originalTotalTracks || state.totalTracks);
       this.hasResumableState = false;
+      this.resumeSignInMessage = '';
       // Skip to scrobble step (step 4)
       this.currentStep = 4;
     },
