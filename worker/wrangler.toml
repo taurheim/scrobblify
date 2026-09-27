@@ -1,0 +1,37 @@
+name = "scrobblify"
+main = "src/index.ts"
+compatibility_date = "2026-07-26"
+
+# One tick every 5 minutes. Deliberately not more often: a job advances at
+# roughly 2,700 scrobbles/day whatever we do, so a faster cron only spends the
+# shared free-tier invocation budget and pushes harder on Last.fm's per-IP
+# limit without finishing anything sooner.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "scrobblify"
+database_id = "set-me-after-wrangler-d1-create"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "scrobblify"
+
+[vars]
+CALLBACK_URL = "https://api.savas.ca/scrobblify/auth/callback"
+APP_URL = "https://savas.ca/scrobble"
+
+# Secrets are set with `wrangler secret put` and are never committed:
+#   LASTFM_API_KEY        the worker's own server-only Last.fm application
+#   LASTFM_SHARED_SECRET  its shared secret
+#   SIGNING_KEY           HMAC key for handoff state and session tokens
+#   CREDENTIAL_SECRET     AES-GCM key for session keys at rest
+#
+# For local development these live in .dev.vars, which is gitignored. Note that
+# `wrangler secret put` writes to the deployed environment only: setting a
+# secret locally does not set it in production, and vice versa.
+
+# The feasibility spike is kept as evidence for the concurrency cap but is not
+# deployed. Run it with:
+#   wrangler dev --local --config wrangler.spike.toml

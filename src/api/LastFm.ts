@@ -1,7 +1,16 @@
 import Scrobble from '@/models/Scrobble';
-import md5 from 'blueimp-md5';
+// The wire protocol lives in `src/shared` because the background scrobbling
+// worker runs the exact same signing and response parsing on Cloudflare
+// Workers. Anything here that describes how Last.fm behaves belongs there, not
+// in this class — if the two ever disagree, one of them silently corrupts a
+// user's history.
+import * as protocol from '@/shared/lastfm/protocol';
 
 const LFM_AUTH_CALLBACK = 'https://savas.ca/scrobblify/scrobble';
+// Overridable so `npm run dev:mock` can send the authorise link to the dev
+// server's mock instead of Last.fm, which makes sign-in clickable end to end
+// without a real account. `undefined` in a production build — see vue.config.js.
+const LFM_AUTH_BASE = process.env.VUE_APP_LASTFM_AUTH_BASE || 'https://www.last.fm/api/auth/';
 
 /** Outcome of a single track.scrobble call, as reported by Last.fm itself. */
 export interface ScrobbleResult {
@@ -13,7 +22,11 @@ export interface ScrobbleResult {
 }
 
 export default class LastFm {
-  private API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
+  // Overridable so `npm run dev:mock` can point the client at the dev server's
+  // mock middleware instead of the real API (see vue.config.js). VUE_APP_* is
+  // inlined by webpack at build time and is `undefined` in a production build,
+  // so the shipped bundle always talks to Last.fm itself.
+  private API_BASE_URL = process.env.VUE_APP_LASTFM_API_BASE || 'https://ws.audioscrobbler.com/2.0/';
 
   private API_RATE_BUFFER_MS = 250;
 
@@ -145,7 +158,7 @@ export default class LastFm {
   }
 
   public getAuthorizeUrl(): string {
-    return `https://www.last.fm/api/auth/?api_key=${this.lfmApiKey}&cb=${LFM_AUTH_CALLBACK}`;
+    return `${LFM_AUTH_BASE}?api_key=${this.lfmApiKey}&cb=${LFM_AUTH_CALLBACK}`;
   }
 
   public clearUser() {
@@ -183,6 +196,70 @@ export default class LastFm {
     return tracks
       .filter((track: any) => track.date)
       .map((track: any) => this.trackToScrobble(track));
+  }
+
+  /**
+   * Every completed scrobble in a second-range, paginated to completion.
+   *
+   * Distinct from `getPlaysInTimeRange`, which takes one page and is used
+   * where a miss only costs a redundant send. Callers of this one draw a
+   * conclusion from *absence* — "nothing is stored at this second, so our
+   * request never landed" — and a truncated page is indistinguishable from an
+   * empty window, so it must say when it could not see the whole thing.
+   *
+   * Last.fm caps `limit` at 200 whatever is asked for, and `from`/`to` are
+   * exclusive, so callers widen by a second on each side. Walks backwards
+   * using the oldest timestamp seen rather than `page`, which shifts under a
+   * concurrent scrobble.
+   */
+  public async getPlaysInSecondsWindow(
+    fromSec: number,
+    toSec: number,
+    maxPages = 5,
+  ): Promise<{ plays: { artist: string; track: string; timestampSec: number }[];
+    complete: boolean; }> {
+    if (this.userName === null) {
+      throw new Error('Couldn\'t find username');
+    }
+    const PAGE = 200;
+    const plays: { artist: string; track: string; timestampSec: number }[] = [];
+    let to = toSec;
+    for (let page = 0; page < maxPages; page += 1) {
+      const requestParams: {[key: string]: string} = {
+        method: 'user.getrecenttracks',
+        user: this.userName,
+        from: String(fromSec),
+        to: String(to),
+        limit: String(PAGE),
+      };
+      // eslint-disable-next-line no-await-in-loop
+      const response = await this.makeRequest('GET', requestParams);
+      let tracks = response && response.recenttracks && response.recenttracks.track;
+      if (tracks && !Array.isArray(tracks)) {
+        tracks = [tracks];
+      }
+      if (!Array.isArray(tracks)) {
+        return { plays, complete: true };
+      }
+      const rows = tracks
+        // A now-playing entry carries no date and is not a completed scrobble.
+        .filter((t: any) => t && t.date && t.date.uts)
+        .map((t: any) => ({
+          artist: (t.artist && (t.artist['#text'] || t.artist.name)) || '',
+          track: t.name || '',
+          timestampSec: Number(t.date.uts),
+        }));
+      plays.push(...rows);
+      if (tracks.length < PAGE) {
+        return { plays, complete: true };
+      }
+      const oldest = Math.min(...rows.map((r) => r.timestampSec));
+      if (!Number.isFinite(oldest) || oldest <= fromSec + 1) {
+        return { plays, complete: true };
+      }
+      to = oldest;
+    }
+    return { plays, complete: false };
   }
 
   /**
@@ -318,16 +395,12 @@ export default class LastFm {
     const timestampSec = timestampSecOverride !== undefined
       ? timestampSecOverride
       : Math.floor(play.timestamp.getTime() / 1000);
-    const params: {[key: string]: string} = {
-      method: 'track.scrobble',
-      'artist[0]': play.artist,
-      'track[0]': play.track,
-      'timestamp[0]': timestampSec.toString(),
-    };
-    // Add album if available
-    if (play.album) {
-      params['album[0]'] = play.album;
-    }
+    const params = protocol.buildScrobbleParams([{
+      artist: play.artist,
+      track: play.track,
+      album: play.album,
+      timestampSec,
+    }]);
     const response = await this.makeRequest('POST', params, true);
     return LastFm.parseScrobbleResponse(response);
   }
@@ -342,35 +415,19 @@ export default class LastFm {
    * response must never turn a working scrobble into a reported failure.
    */
   private static parseScrobbleResponse(response: any): ScrobbleResult {
-    const attr = (response && response.scrobbles && response.scrobbles['@attr']) || {};
-    let entry = response && response.scrobbles && response.scrobbles.scrobble;
-    if (Array.isArray(entry)) {
-      [entry] = entry;
-    }
-    const ignoredMessage = (entry && entry.ignoredMessage) || {};
-
-    const accepted = Number(attr.accepted);
-    const ignored = Number(attr.ignored);
-    const code = Number(ignoredMessage.code);
-
+    const { outcomes } = protocol.parseScrobbleResponse(response, 1);
+    const [outcome] = outcomes;
     return {
-      accepted: Number.isFinite(accepted) ? accepted : 1,
-      ignored: Number.isFinite(ignored) ? ignored : 0,
-      ignoredCode: Number.isFinite(code) ? code : 0,
-      ignoredMessage: ignoredMessage['#text'] || '',
+      accepted: outcome.accepted ? 1 : 0,
+      ignored: outcome.accepted ? 0 : 1,
+      ignoredCode: outcome.ignoredCode,
+      ignoredMessage: outcome.ignoredMessage,
     };
   }
 
   /** https://www.last.fm/api/show/track.scrobble — ignoredMessage codes. */
   public static describeIgnoreCode(code: number, message: string): string {
-    const known: {[key: number]: string} = {
-      1: 'Last.fm ignored this artist',
-      2: 'Last.fm ignored this track',
-      3: 'Timestamp was too far in the past (Last.fm only accepts the last 14 days)',
-      4: 'Timestamp was in the future',
-      5: 'Daily scrobble limit reached',
-    };
-    return known[code] || message || `Last.fm ignored this scrobble (code ${code})`;
+    return protocol.describeIgnoreCode(code, message);
   }
 
   private async makeRequest(
@@ -390,7 +447,7 @@ export default class LastFm {
       if (this.userAuthKey && params.method !== 'auth.getSession') {
         requestParams.sk = this.userAuthKey;
       }
-      const sig = this.getMethodSignature(requestParams, this.userAuthToken || '');
+      const sig = this.getMethodSignature(requestParams);
       requestParams.api_sig = sig;
     }
 
@@ -455,22 +512,12 @@ export default class LastFm {
     throw new Error('Last.fm request exhausted all retries without a response');
   }
 
-  private getMethodSignature(params: {[key: string]: any}, token: string) {
-    const keys = Object.keys(params);
-    keys.sort();
-    let signature = '';
-    keys.forEach((key) => {
-      signature += `${key}${params[key]}`;
-    });
-
-    // Signature format described here: https://www.last.fm/api/webauth
-    const toHash = signature + this.lfmSharedSecret;
-    const hash = md5(toHash);
-    return hash;
+  private getMethodSignature(params: {[key: string]: any}) {
+    return protocol.signParams(params, this.lfmSharedSecret);
   }
 
   private paramObjectToString(params: {[key: string]: string}) {
-    return Object.keys(params).map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`).join('&');
+    return protocol.encodeParams(params);
   }
 
   private buildLastFmErrorMessage(
@@ -479,62 +526,30 @@ export default class LastFm {
     errorMessage: string,
     params: {[key: string]: string},
   ): string {
-    const safeParams = this.sanitizeRequestParams(params);
-    const statusPart = httpStatus ? ` (HTTP ${httpStatus})` : '';
-    return `Last.fm API error ${errorCode}${statusPart}: ${errorMessage}. Request: ${JSON.stringify(safeParams)}`;
-  }
-
-  private sanitizeRequestParams(params: {[key: string]: string}): {[key: string]: string} {
-    const sensitiveKeys = new Set(['api_key', 'api_sig', 'sk', 'token']);
-    return Object.keys(params).reduce((acc, key) => {
-      acc[key] = sensitiveKeys.has(key) ? '[redacted]' : params[key];
-      return acc;
-    }, {} as {[key: string]: string});
+    return protocol.buildLastFmErrorMessage(httpStatus, errorCode, errorMessage, params);
   }
 
   private isLastFmApiError(error: unknown): boolean {
-    return error instanceof Error && error.message.startsWith('Last.fm API error');
+    return protocol.isLastFmApiError(error);
   }
 
   public static isRateLimitError(error: unknown): boolean {
-    // Last.fm error code 29 = Rate Limit Exceeded
-    return error instanceof Error && /^Last\.fm API error 29\b/.test(error.message);
+    return protocol.isRateLimitError(error);
   }
 
-  // Last.fm auth-token errors returned by auth.getSession. All of them mean the
-  // token can never be exchanged again, so the only recovery is to send the user
-  // back through the authorize flow to obtain a fresh token:
-  //   4  = Invalid/unissued token ("This token has not been issued") — e.g. the
-  //        single-use token was already consumed (by a link scanner, preview
-  //        bot, prefetch, or an earlier tab) before this exchange ran.
-  //   14 = This token has not been authorized by the user.
-  //   15 = This token has expired (tokens are valid for ~60 minutes).
   public static isAuthTokenError(error: unknown): boolean {
-    return error instanceof Error && /^Last\.fm API error (4|14|15)\b/.test(error.message);
+    return protocol.isAuthTokenError(error);
   }
 
   // Last.fm error 9 "Invalid session key - Please re-authenticate": the stored
   // session key has been invalidated. Nothing about the request is at fault and
   // retrying it can only fail the same way; the user has to sign in again.
   public static isSessionKeyError(error: unknown): boolean {
-    return error instanceof Error && /^Last\.fm API error 9\b/.test(error.message);
+    return protocol.isInvalidSessionKeyError(error);
   }
 
-  // A failed `fetch` (offline, DNS failure, connection reset, CORS, ad-blocker,
-  // etc.) rejects with a TypeError rather than an HTTP response. These are
-  // transient connectivity problems, not a problem with a specific track, so
-  // callers should pause and retry rather than treat the track as failed.
-  // The message differs per browser: "Failed to fetch" (Chrome/Edge),
-  // "NetworkError when attempting to fetch resource." (Firefox),
-  // "Load failed" (Safari).
   public static isNetworkError(error: unknown): boolean {
-    if (!(error instanceof Error)) {
-      return false;
-    }
-    if (error instanceof TypeError) {
-      return true;
-    }
-    return /failed to fetch|networkerror|network request failed|load failed/i.test(error.message);
+    return protocol.isNetworkError(error);
   }
 
   // TODO make a class for the api response instead of any

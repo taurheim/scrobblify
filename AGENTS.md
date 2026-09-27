@@ -292,6 +292,133 @@ Two Last.fm quirks the validation path has to absorb:
 Timestamps sent to Last.fm are always integer seconds — `from`/`to` window ends
 round outwards so a duplicate-check window can only widen, never miss.
 
+## Running locally with mocks
+
+`npm run dev:mock` starts a dev server on **port 8090** whose Last.fm is served
+by mock middleware in `vue.config.js`. `npm run dev:mock:bg` adds a fake
+background worker, and prints a URL carrying `?beta=1` because the handoff
+offer is behind that opt-in (see "Background scrobbling beta gate" below).
+Open the printed URL in **any** browser — the mocking lives
+in the server, so every tab and every device on the LAN is covered. The app
+shows a hazard-striped **MOCK MODE** banner; if it isn't there, you aren't
+mocked.
+
+This used to work very differently, and the difference is the point. `dev:mock`
+drove a headed Playwright window and installed `page.route()` on that single
+page. Exactly one tab was mocked. Opening the same dev server in your ordinary
+browser reached the *real* Last.fm and scrobbled to whatever account that
+profile held — while the script's console banner said "nothing is really
+scrobbled". Anything that reintroduces per-page interception reintroduces that.
+
+Three build-time seams make it work, each `process.env.VUE_APP_* || <real
+default>` so a production bundle is unchanged:
+
+| Var | Points at | Default |
+| --- | --- | --- |
+| `VUE_APP_LASTFM_API_BASE` | `/mock/lastfm` | `https://ws.audioscrobbler.com/2.0/` |
+| `VUE_APP_LASTFM_AUTH_BASE` | `/mock/lastfm/auth` | `https://www.last.fm/api/auth/` |
+| `VUE_APP_BACKGROUND_API` | `/mock/worker` | unset (feature hidden) |
+
+The values are **relative on purpose**; an absolute origin would bake in
+localhost and break the moment you opened the server from a phone. The banner
+keys off `VUE_APP_LASTFM_API_BASE` rather than a separate flag, so there is no
+way to be mocked without being told. `vue.config.js` throws if a *production*
+build is attempted with any of them set.
+
+`/mock/lastfm/auth` hands back a random single-use token and redirects to
+`<publicPath>#/scrobble?token=…` rather than pre-seeding localStorage, so the
+authenticate step runs for real: the app exchanges the token against the mocked
+`auth.getSession` exactly as it would in production. The token must be fresh per
+click, because `LastFm.init` records the token it has begun exchanging in
+sessionStorage and refuses to resubmit it.
+
+**dev:mock never reuses a server and never uses port 8080.** Both halves matter.
+`VUE_APP_*` is inlined by webpack at compile time, so adopting a server started
+without the mock env would mock nothing while announcing the opposite. And
+`playwright.config.ts` sets `reuseExistingServer` on 8080, so a mock server left
+there would be silently adopted by the next `npx playwright test` — whose specs
+intercept `ws.audioscrobbler.com`, a URL the mocked app no longer calls.
+
+The canned responses live in transport-free cores — `handleLastFm()` in
+`tests/lastfmMock.js` and `createMockWorker().handle()` in
+`tests/backgroundMock.js` — consumed by both the dev middleware and the
+Playwright suite. Keep it that way: two copies of "what Last.fm returns" is how
+the tests and the interactive run start quietly disagreeing. `interceptLastFm`
+remains a thin `page.route` wrapper so the suite's 20+ call sites are unaffected.
+
+Only `vue.config.js` (Node, build time) requires from `tests/`. Nothing under
+`src/` imports a mock.
+
+Two traps already paid for:
+
+- Mock middlewares are wrapped in `guard()`. They are async, so an uncaught
+  throw becomes an unhandled rejection and kills the whole `vue-cli-service
+  serve` process — losing the compile and the watch because one request had
+  malformed JSON.
+- `createMockWorker` reads `appOrigin` with an explicit `=== undefined` check,
+  not `||`. An empty string is a deliberate *relative* origin; `||` treated it
+  as unset and handed back `localhost:8080`, pointing the handoff at the
+  Playwright port.
+
+## Background scrobbling beta gate
+
+The handoff offer is invite-only: visit any page with `?beta=1` to opt a
+browser in, `?beta=0` to opt out. An opted-in browser shows an info banner
+with a switch-off link. It is independent of `VUE_APP_BACKGROUND_API`, which
+only says whether the build *can* reach a worker.
+
+Two functions in `src/services/BackgroundScrobbling.ts`, and the split is
+load-bearing:
+
+- `isBackgroundEnabled()` — configured **and** opted in. Guards the *offer*
+  only: `probeBackgroundAvailability` and `preflight`.
+- `isBackgroundConfigured()` — configured. Guards every *recovery* path: the
+  live-job authority check, finishing a handoff on return from Last.fm, and
+  rendering an existing job.
+
+**Never gate a recovery path on the opt-in.** A browser that clears its
+storage loses the opt-in but can still have a job running on the server, and
+it is precisely the browser `enforceServerAuthority` exists to block from
+scrobbling the same queue underneath it.
+
+**But an unanswered check only blocks a browser with a reason to worry.** The
+check runs for everyone and a `live: true` answer blocks everyone. When there
+is *no* answer (worker down, not yet deployed, timed out), a browser that has
+not opted in and holds no local handover evidence waits
+`FALLTHROUGH_TIMEOUT_MS` (3s) and then scrobbles normally — see
+`mayScrobbleWithoutAuthority`. Evidence means an ownership record, an
+unresolved-ownership or stale-snapshot record, a pending handoff, a known job,
+or `sawServerOwnership`. **Not** the handoff lineage: every backdating user
+has one, because the re-tag cursor lives there. Without this rule
+`.env.production` compiling in the worker URL was enough to stop every user of
+the site from scrobbling whenever the worker could not be reached.
+
+The accepted gap: a browser that lost its localStorage but kept a leftover
+handed-over queue in IndexedDB, while the worker is unreachable. A successful
+handover clears the saved queue, so this needs a stale copy as well.
+
+**An imported progress file is a queue from somewhere else**, so the local
+evidence above says nothing about it. `importProgressFile` asks
+`/scrobblify/import/:id` about the *file's* `importId` before restoring it
+(`importedQueueMaySend`): `known: true` refuses the file, because the worker
+was handed that queue and the file is a copy from before. An unanswered check
+follows the same fall-through rule. A file with no id cannot be checked. That
+is safe only for files that were never handed over, and it is the one gap
+here: a file exported before `beginHandoff` minted its id.
+
+`npx playwright test -c playwright.unreachable-worker.config.ts` covers this
+against a build whose worker URL cannot resolve; the default config ignores
+`tests/unreachable-worker/` because its build has no worker URL at all. CI
+runs both. It uses port 8471, because other local worktrees commonly occupy
+the 809x range.
+
+The opt-in is sticky (localStorage) rather than read from the URL, because
+the query string does not survive the flow: `stripQuery` discards all of it on
+a handoff return, and the Last.fm callback never carried it. A per-load flag
+would switch itself off exactly when a handoff came back. The parameter is
+read from the query string *and* the hash (dev runs the router in hash mode)
+and deliberately not stripped — see `consumeBetaParam`.
+
 ## Linting
 
 `npm run lint` auto-fixes; `npm run lint:check` (`--no-fix`) is what CI runs, so

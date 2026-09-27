@@ -2,6 +2,8 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests',
+  // Needs a build with a worker URL compiled in; see its own config.
+  testIgnore: '**/unreachable-worker/**',
   timeout: 30000,
   use: {
     baseURL: 'http://localhost:8080',

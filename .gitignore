@@ -3,6 +3,9 @@ node_modules
 /dist
 test-results/
 
+# Derived dev-mock fixture: regenerated on demand by `npm run dev:mock:bg`.
+tests/fixtures/test-spotify-data-large.zip
+
 # local env files
 .env.local
 .env.*.local
@@ -20,3 +23,10 @@ yarn-error.log*
 *.njsproj
 *.sln
 *.sw*
+
+# Cloudflare worker
+worker/.wrangler/
+# Local secrets for wrangler dev. NEVER commit — holds the server-only
+# Last.fm shared secret and the credential encryption key.
+worker/.dev.vars
+worker/.test-build/

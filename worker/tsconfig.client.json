@@ -1,0 +1,12 @@
+{
+  "//": "Type-checks the *client* modules that worker/test/client-*.test.ts exercises. The app has no unit runner of its own, so this is the only place src/services is checked outside a full webpack build - and the only place its logic can be tested at all. noUnusedLocals is off because the app's own build does not enforce it.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": "..",
+    "paths": { "@/*": ["src/*"] },
+    "types": ["node"],
+    "lib": ["ES2022", "DOM"],
+    "noUnusedLocals": false
+  },
+  "include": ["../src/services/BackgroundHandoff.ts", "test/client-*.test.ts", "test/stubs/*.ts"]
+}

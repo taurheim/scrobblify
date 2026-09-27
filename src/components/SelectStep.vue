@@ -156,6 +156,8 @@ import Vue from 'vue';
 import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
 import { trackEvent } from '@/services/Analytics';
+import StateManager from '@/services/StateManager';
+import * as background from '@/services/BackgroundScrobbling';
 
 const workerCode = `
   let count = 0;
@@ -513,6 +515,58 @@ export default Vue.extend({
       // import that all later resume progress is measured against.
       this.$store.commit('setOriginalTotalTracks', scrobbles.length);
       this.$store.commit('setResumedScrobbleCount', 0);
+      /*
+        Named failures *are* reset, unlike the re-tag lineage below. They
+        describe tracks the user chose in a previous import; carrying them into
+        a new run's results would report failures this run never had, and the
+        selection just made is the user's own statement about what they want
+        scrobbled now.
+      */
+      this.$store.commit('setCarriedFailures', []);
+      this.$store.commit('setCarriedFailuresDropped', 0);
+      background.clearCarriedFailures();
+      /*
+        The re-tag lineage is deliberately **not** reset here.
+
+        It looks like per-import state and it is not. Every value in it
+        describes seconds already written to the user's Last.fm timeline, and
+        that timeline is shared by every import this browser has ever run.
+        Last.fm silently discards a repeat of (artist, track, timestamp) while
+        reporting it accepted, so a fresh import that starts allocating from
+        the top of the window again will walk straight back over seconds the
+        previous import used — and if the two selections share a track, that
+        play is lost with no error anywhere.
+
+        So the cursor stays where it is, and a block stays in force. Both are
+        already bounded in time rather than by import: the cursor only matters
+        while its seconds are inside Last.fm's thirteen-day window, and the
+        block carries an absolute expiry for the same reason. Keeping them
+        costs at worst a delay; clearing them costs plays.
+
+        The one exception is the pending second, which is cleared. Unlike the
+        rest of the lineage it names a *particular track* — the one that was at
+        the head of the previous queue — and there is no such track here. Left
+        set, it would be handed to whatever track happens to be first now,
+        which is a collision rather than the deduplication it exists for.
+
+        Only this browser's *in-memory* copy, though. The durable journal is
+        origin-global and may be describing a send another queue is riding on
+        right now — selection happens outside the send lock — and deleting
+        that would leave a crash mid-send unrecoverable. It is keyed by import
+        identity, and this selection is about to mint a new one, so it can
+        never be adopted here by accident.
+      */
+      this.$store.commit('setPendingReTagSec', 0);
+      /*
+        A fresh identity for a fresh queue.
+
+        This one *is* per-import, unlike the lineage above. It exists so a
+        later question about this exact selection — "was it ever handed to the
+        background service?" — has an answer that survives the job finishing,
+        and so two tabs holding different selections can tell that their
+        progress counts are not comparable.
+      */
+      this.$store.commit('setImportId', StateManager.newImportId());
       trackEvent('tracks_selected', {
         selected_count: selected.length,
         total_count: this.totalTrackCount,
