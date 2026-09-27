@@ -64,13 +64,16 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `upload_parse_started` / `upload_parse_completed` / `upload_no_matching_files` →
 `tracks_selected` → `scrobble_started` / `scrobble_resumed` / `scrobble_paused` /
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
-`session_resumed`, and `user_logged_out`.
+`session_resumed`, `session_resume_blocked`, and `user_logged_out`.
 
 `upload_no_matching_files` carries `detected`: `progress_file` (a Scrobblify
 progress file was zipped up and is imported instead), `account_data` (Spotify's
 default "Account data" export, `StreamingHistory_music_*.json`, rather than the
 extended one) or `unknown`. Before 2026-09-27 it carried no properties.
-`session_resumed.source` is `saved`, `file`, or `zip`.
+`session_resumed.source` is `saved`, `file`, or `zip`. `session_resume_blocked`
+(same `source`, plus `reason: not_authenticated`) fires instead of
+`session_resumed` when a resume is attempted with no session key; it exists
+since 2026-09-27.
 
 Rate limiting has its own events: `scrobble_rate_limited`,
 `scrobble_rate_limit_cooldown_complete`, `scrobble_rate_limit_recovered`,
@@ -91,7 +94,8 @@ nothing at all.
   a bug: treat it as normal operation rather than signal.
 - `scrobble_stopped` — terminal; the run is over until the user comes back.
   Reasons: `daily_limit`, `lastfm_daily_limit`, `rate_limit_exhausted`,
-  `repeated_rejections`, `repeated_failures`, `session_invalid`, `manual`,
+  `repeated_rejections`, `repeated_failures`, `session_invalid`,
+  `not_authenticated`, `manual`,
   `save_and_exit`. Only `manual` and `save_and_exit` are user actions. Every
   one carries `auto_saved`, which is the difference between an interruption and
   lost work — all of them now save, so `auto_saved: false` in the data means the
@@ -123,6 +127,25 @@ with the same key, and the key stayed in localStorage, so every later visit
 failed identically: the top `scrobble.repeatedFailures` cause, with one user
 stuck for 8 days. Error 9 no longer reaches `scrobble.repeatedFailures`, so that
 context's volume drops from this fix on.
+
+**A cleared key must never be resumed past.** `clearSessionKey()` keeps the
+username, and the resume used to check only that, so "Save Progress & Leave" →
+sign-in step → **Resume** jumped to the scrobble step with no key. Every send
+threw `Not authenticated.` in ~100ms, it stopped as `repeated_failures`, and the
+nine tracks those failures consumed were saved as completed and never sent
+(seen in production right after the error-9 fix shipped, with no `auth_success`
+in between). Two guards now, since 2026-09-27:
+
+- `restoreFromState()` (saved-state and file resumes) refuses when
+  `!api.isAuthenticated()`: it stays on the sign-in step, writes nothing, and
+  shows a "Sign in to Last.fm first" prompt with a sign-in button. The saved
+  state survives the Last.fm redirect, so the banner comes back after it. It
+  emits `session_resume_blocked`, not `session_resumed`.
+- `scrobblePlay` throws a typed `NotAuthenticatedError`
+  (`LastFm.isNotAuthenticatedError`) when there is no key, and the loop treats
+  it like error 9 — first occurrence, track unconsumed, saved, sign-in link —
+  but stops as `not_authenticated`. That reason should stay at zero; any
+  occurrence means some other route into the loop skips signing in.
 
 `init()` exchanges a callback `?token=` **even when a key is already stored**.
 It used to skip the exchange whenever one was, which silently discarded the
