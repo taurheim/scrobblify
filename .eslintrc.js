@@ -65,7 +65,7 @@ module.exports = {
     {
       // Playwright specs and the dev-mock harness run in Node, not the browser,
       // and legitimately import from devDependencies.
-      files: ['tests/**/*.{js,ts}', '*.config.js', '.eslintrc.js'],
+      files: ['tests/**/*.{js,ts}', '*.config.{js,ts}', '.eslintrc.js'],
       rules: {
         'import/no-extraneous-dependencies': ['error', { devDependencies: true }],
       },
