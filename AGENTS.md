@@ -322,6 +322,27 @@ storage loses the opt-in but can still have a job running on the server, and
 it is precisely the browser `enforceServerAuthority` exists to block from
 scrobbling the same queue underneath it.
 
+**But an unanswered check only blocks a browser with a reason to worry.** The
+check runs for everyone and a `live: true` answer blocks everyone. When there
+is *no* answer (worker down, not yet deployed, timed out), a browser that has
+not opted in and holds no local handover evidence waits
+`FALLTHROUGH_TIMEOUT_MS` (3s) and then scrobbles normally — see
+`mayScrobbleWithoutAuthority`. Evidence means an ownership record, an
+unresolved-ownership or stale-snapshot record, a pending handoff, a known job,
+or `sawServerOwnership`. **Not** the handoff lineage: every backdating user
+has one, because the re-tag cursor lives there. Without this rule
+`.env.production` compiling in the worker URL was enough to stop every user of
+the site from scrobbling whenever the worker could not be reached.
+
+The accepted gap: a browser that lost its localStorage but kept a leftover
+handed-over queue in IndexedDB, while the worker is unreachable. A successful
+handover clears the saved queue, so this needs a stale copy as well.
+
+`npx playwright test -c playwright.unreachable-worker.config.ts` covers this
+against a build whose worker URL cannot resolve; the default config ignores
+`tests/unreachable-worker/` because its build has no worker URL at all. CI
+runs both.
+
 The opt-in is sticky (localStorage) rather than read from the URL, because
 the query string does not survive the flow: `stripQuery` discards all of it on
 a handoff return, and the Last.fm callback never carried it. A per-load flag

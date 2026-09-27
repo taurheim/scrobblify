@@ -394,11 +394,7 @@ export default Vue.extend({
       covers the same window in the template, since `mounted` renders at every
       await it makes.
     */
-    await this.enforceServerAuthority().catch(() => {
-      this.authorityPending = false;
-      this.authorityUnknown = true;
-      this.scheduleAuthorityRetry();
-    });
+    await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
 
     this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
       this.ownershipBlocked = next !== null;
@@ -714,7 +710,10 @@ export default Vue.extend({
       // can establish a freeze while the request is in flight.
       const observed = background.queueOwner();
       this.handedOverProgress = null;
-      const live = await background.liveJobForUsername(username);
+      const live = await background.liveJobForUsername(
+        username,
+        this.mayScrobbleWithoutAuthority(observed) ? background.FALLTHROUGH_TIMEOUT_MS : undefined,
+      );
       this.authorityPending = false;
 
       if (live === true) {
@@ -766,7 +765,7 @@ export default Vue.extend({
         */
         const handedOver = await this.queueWasHandedOver(savedImportId);
         if (handedOver === null) {
-          this.markAuthorityUnknown();
+          await this.onAuthorityUnanswered(observed);
           return;
         }
         if (handedOver === true) {
@@ -809,9 +808,61 @@ export default Vue.extend({
 
         The user is told why, and given a retry, rather than left looking at an
         app that silently refuses to work.
+
+        Except in a browser that has never opted in and holds no trace of a
+        handover — see `mayScrobbleWithoutAuthority`.
       */
-      this.markAuthorityUnknown();
-      trackEvent('background_authority_check', { result: 'unknown' });
+      await this.onAuthorityUnanswered(observed);
+    },
+
+    /**
+     * Whether an *unanswered* authority check may fall through to ordinary
+     * scrobbling.
+     *
+     * Only in a browser that has not opted in to the beta and holds no local
+     * trace of a handover. The check still runs for everyone and a `live` answer
+     * still blocks everyone; only the no-answer case differs. Without this, a
+     * worker outage — or a worker not yet deployed — stops every user of the
+     * site from scrobbling, including all the ones who have never seen the
+     * offer.
+     *
+     * The accepted cost: a browser that lost its localStorage (and with it the
+     * opt-in and every ownership record) while keeping a handed-over queue in
+     * IndexedDB, and that then cannot reach the worker, would scrobble that
+     * queue. A successful handover clears the saved queue, so this also needs
+     * a leftover copy.
+     */
+    mayScrobbleWithoutAuthority(
+      observed: ReturnType<typeof background.queueOwner> = background.queueOwner(),
+    ): boolean {
+      if (background.isBetaOptedIn()) {
+        return false;
+      }
+      return !observed
+        && !background.getOwnershipUnresolved()
+        && !background.getPendingHandoff()
+        && !background.staleSnapshotRecord()
+        && !this.backgroundJob
+        && !this.sawServerOwnership;
+    },
+
+    /** The authority check could not be answered, or threw. Never throws. */
+    async onAuthorityUnanswered(
+      observed: ReturnType<typeof background.queueOwner> = background.queueOwner(),
+    ): Promise<void> {
+      if (!this.mayScrobbleWithoutAuthority(observed)) {
+        this.markAuthorityUnknown();
+        trackEvent('background_authority_check', { result: 'unknown' });
+        return;
+      }
+      this.authorityPending = false;
+      this.authorityUnknown = false;
+      trackEvent('background_authority_check', { result: 'unknown_fell_through' });
+      try {
+        await this.exposeSavedStateUnlessStale('authority_unreachable');
+      } catch (e) {
+        // Resume stays hidden; scrobbling a fresh import is still allowed.
+      }
     },
 
     /**
@@ -1951,13 +2002,9 @@ export default Vue.extend({
         live across exactly the window the check is meant to cover.
       */
       this.authorityPending = true;
-      this.enforceServerAuthority().catch(() => {
-        // Leaves local records as they were, but never leaves the gate open on
-        // an unanswered question.
-        this.authorityPending = false;
-        this.authorityUnknown = true;
-        this.scheduleAuthorityRetry();
-      });
+      // Leaves local records as they were. The gate stays shut on an
+      // unanswered question unless `mayScrobbleWithoutAuthority` allows it.
+      this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
     },
     /**
      * `state.totalTracks` is only the tracks left to do, so on its own it makes
@@ -1993,7 +2040,9 @@ export default Vue.extend({
         carries its own refusal rather than trusting the view.
       */
       if (this.authorityPending || this.authorityUnknown || this.ownershipBlocked) {
-        this.backgroundNotice = 'Hold on — still checking whether an import is already running on the server for your account.';
+        this.backgroundNotice = background.isBetaOptedIn()
+          ? 'Hold on — still checking whether an import is already running on the server for your account.'
+          : 'Hold on, still getting ready. Try again in a moment.';
         return;
       }
       try {

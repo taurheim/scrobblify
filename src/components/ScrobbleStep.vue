@@ -675,7 +675,9 @@ export default Vue.extend({
         silently, which is the one failure with no recovery.
       */
       if (this.sendingBlocked) {
-        this.pauseReason = 'Checking whether your import is running in the background…';
+        this.pauseReason = background.isBetaOptedIn()
+          ? 'Checking whether your import is running in the background…'
+          : 'Getting ready…';
         this.paused = true;
         this.scrobbling = true;
         // Remembered so the watcher can pick the attempt back up the moment

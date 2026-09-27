@@ -48,6 +48,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps
       - run: npx playwright test
+      - run: npx playwright test -c playwright.unreachable-worker.config.ts
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

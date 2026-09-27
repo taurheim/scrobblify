@@ -1904,12 +1904,24 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
  */
 const STATUS_TIMEOUT_MS = 8000;
 
+/**
+ * How long a browser that never opted in to the beta waits for the authority
+ * check before carrying on without it. Short because that browser falls
+ * through to ordinary scrobbling on no answer, so the wait is the whole cost
+ * of a worker outage for almost every user of the site.
+ */
+export const FALLTHROUGH_TIMEOUT_MS = 3000;
+
 /** Wider than a status check: an export carries the whole remaining queue. */
 const EXPORT_TIMEOUT_MS = 30000;
 
-async function getWithTimeout(path: string, authorised: boolean): Promise<Response | null> {
+async function getWithTimeout(
+  path: string,
+  authorised: boolean,
+  timeoutMs = STATUS_TIMEOUT_MS,
+): Promise<Response | null> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return authorised
       ? await request(path, { signal: controller.signal })
@@ -1941,7 +1953,10 @@ async function getWithTimeout(path: string, authorised: boolean): Promise<Respon
  * The response carries a boolean and nothing else, so a `true` here cannot
  * render a status card — `fetchJob` does that, once the user has signed in.
  */
-export async function liveJobForUsername(username: string): Promise<boolean | null> {
+export async function liveJobForUsername(
+  username: string,
+  timeoutMs = STATUS_TIMEOUT_MS,
+): Promise<boolean | null> {
   if (!isBackgroundConfigured() || !username.trim()) {
     return null;
   }
@@ -1949,6 +1964,7 @@ export async function liveJobForUsername(username: string): Promise<boolean | nu
     const res = await getWithTimeout(
       `/scrobblify/job/live?username=${encodeURIComponent(username.trim())}`,
       false,
+      timeoutMs,
     );
     if (!res || !res.ok) {
       return null;

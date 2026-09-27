@@ -861,6 +861,14 @@ deleting the R2 blob**, or the data needed to build it is already gone.
   and rendering an existing job use `isBackgroundConfigured` alone, so a browser
   that has lost its storage — and with it the opt-in — still learns it has a
   job running and is blocked from scrobbling underneath it.
+- **An unanswered authority check falls through for non-beta browsers.** A
+  `live: true` answer blocks everyone, but when the worker cannot be reached a
+  browser that has not opted in and holds no local handover evidence waits
+  3s and scrobbles normally. Opted-in browsers, and any browser with an
+  ownership, unresolved or stale-snapshot record, a pending handoff or a known
+  job, stay blocked. Otherwise a worker outage would stop every user of the
+  site. Accepted gap: lost localStorage plus a leftover handed-over queue in
+  IndexedDB plus an unreachable worker.
 - Labelled clearly as beta in the UI.
 - The opt-in must state plainly: the selected track list is uploaded to
   Scrobblify's server; a Last.fm credential is stored until the import finishes;
