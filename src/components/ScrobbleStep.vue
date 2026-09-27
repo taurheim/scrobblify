@@ -92,9 +92,13 @@
         <!--
           Anything terminal needs a way back in. Without this a manual pause was
           a dead end: a disabled button waiting on an auto-resume that the loop
-          had already returned from.
+          had already returned from. A rejected session key is the exception:
+          retrying with it can only fail again, so the way back is signing in.
         -->
-        <v-btn v-if="canResume" outlined :disabled="handoffHalted" @click="scrobble">
+        <v-btn v-if="sessionInvalid" color="primary" :href="authorizeUrl">
+          Sign in to Last.fm again
+        </v-btn>
+        <v-btn v-else-if="canResume" outlined :disabled="handoffHalted" @click="scrobble">
           {{ manuallyPaused ? 'Resume Now' : 'Try Again Now' }}
         </v-btn>
         <v-btn v-else outlined disabled>Wait Here</v-btn>
@@ -193,6 +197,20 @@ const NETWORK_ERROR_COOLDOWN_SECONDS = Math.ceil(NETWORK_ERROR_COOLDOWN_MS / MS_
 // wait is long enough to be worth an explicit countdown, which happens when a
 // window saturated by an earlier session has to drain before we can start.
 const PACING_COUNTDOWN_THRESHOLD_MS = 10 * MS_PER_SECOND;
+
+// How many consecutive tracks must need *no* wait before a pacing stretch is
+// considered over.
+//
+// A saturated rolling window frees exactly one slot at a time and the loop
+// consumes it immediately, so `msUntilBurstSafe()` alternates between a small
+// positive wait and zero on every single track. Ending the stretch on the first
+// zero therefore ended it once per track: telemetry showed a median
+// `paced_tracks` of 1 with waits of 4-40ms, i.e. two events per track rather
+// than one per stretch. At saturation two zero-wait tracks in a row are
+// impossible, so requiring a short streak keeps one continuous stretch, while
+// still exiting promptly when the window genuinely clears or the adaptive
+// burst limit is raised and frees a block of slots at once.
+const PACING_EXIT_CLEAR_TRACKS = 3;
 
 const MAX_CONSECUTIVE_FAILURES = 10;
 
@@ -367,6 +385,9 @@ export default Vue.extend({
       // an error, so it gets its own flag rather than colouring a deliberate
       // action as a failure.
       manuallyPaused: false,
+      // Last.fm rejected the stored session key (error 9). Terminal, and the
+      // only way forward is a fresh sign-in, so it replaces the retry button.
+      sessionInvalid: false,
       autoSaved: false,
       pauseReason: '',
       countdown: 0,
@@ -384,6 +405,9 @@ export default Vue.extend({
       pacingStartedAtMs: 0,
       pacedTracks: 0,
       pacedWaitMs: 0,
+      // Consecutive tracks that needed no pacing wait. See
+      // PACING_EXIT_CLEAR_TRACKS — a single free slot does not end a stretch.
+      unpacedStreak: 0,
       // Mirrors of RateLimitTracker state. The tracker itself is deliberately
       // non-reactive (see created()), so these are refreshed explicitly.
       burstCount: 0,
@@ -487,6 +511,9 @@ export default Vue.extend({
     pacingNotice(): string {
       return `Pacing to stay under Last.fm's rate limit — ${this.burstCount} scrobbles in the`
         + ' last 10 minutes. Scrobbling continues automatically.';
+    },
+    authorizeUrl(): string {
+      return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
 
     /*
@@ -615,6 +642,7 @@ export default Vue.extend({
      * to call unconditionally — it is a no-op when we were not pacing.
      */
     endPacing() {
+      this.unpacedStreak = 0;
       if (!this.pacing) {
         return;
       }
@@ -875,6 +903,7 @@ export default Vue.extend({
       this.paused = false;
       this.stopped = false;
       this.manuallyPaused = false;
+      this.sessionInvalid = false;
       this.autoSaved = false;
       this.pauseReason = '';
       // A manual retry after giving up starts a fresh backoff ladder.
@@ -1078,6 +1107,7 @@ export default Vue.extend({
           // Reported once for the whole stretch, not once per track: the window
           // only ever frees one slot at a time, so this branch is taken for
           // every remaining track once the limit is reached.
+          this.unpacedStreak = 0;
           this.beginPacing(tracker, burstWaitMs);
           this.pacedTracks += 1;
           this.pacedWaitMs += burstWaitMs;
@@ -1093,8 +1123,14 @@ export default Vue.extend({
             await this.sleep(burstWaitMs);
           }
           this.syncRateLimitCounters();
-        } else {
-          this.endPacing();
+        } else if (this.pacing) {
+          // One free slot is not the end of a throttled stretch — it is the one
+          // slot this track is about to consume, after which the window is full
+          // again. Only a run of genuinely unimpeded tracks means we are clear.
+          this.unpacedStreak += 1;
+          if (this.unpacedStreak >= PACING_EXIT_CLEAR_TRACKS) {
+            this.endPacing();
+          }
         }
 
         // Re-checked after the waits above. A halt that arrived while this
@@ -1526,6 +1562,29 @@ export default Vue.extend({
               actual_pause_ms: Date.now() - rateLimitStartMs,
             }));
             retrySameTrack = true;
+          } else if (LastFm.isSessionKeyError(e)) {
+            // The stored session key is dead, so every remaining track would
+            // fail identically. This used to burn ten tracks as "failed", then
+            // offer a retry with the same key — and keep the key, so every
+            // later visit failed the same way. The track is not at fault: leave
+            // it unconsumed, save, and send the user to sign in again.
+            this.pauseReason = 'Last.fm is no longer accepting your sign-in. This can happen after'
+              + ' signing in to Scrobblify on another device or browser, changing your Last.fm'
+              + ' password, or removing Scrobblify\'s access. Sign in again, then choose'
+              + ' "Resume" to carry on where you left off.';
+            this.sessionInvalid = true;
+            this.stopped = true;
+            this.paused = true;
+            // Error 9 is a definite refusal, so a second this loop chose stored
+            // nothing; carrying it across the sign-in only lets it age out.
+            if (pendingSecondUnspent) {
+              this.clearPendingSecond(track);
+            }
+            // eslint-disable-next-line no-await-in-loop
+            await this.autoSave();
+            this.trackStopped('session_invalid', { track_index: i });
+            api.clearSessionKey();
+            return;
           } else if (LastFm.isNetworkError(e)) {
             // Transient connectivity problem (offline, DNS, connection reset,
             // etc.). Don't count this against the track: pause briefly and retry

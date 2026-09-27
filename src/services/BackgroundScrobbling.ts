@@ -2014,7 +2014,10 @@ export interface ImportStatus {
  * Returns null on any failure, and null is *not* permission — callers must
  * treat it the same way they treat an unresolved ownership check.
  */
-export async function importStatus(importId: string): Promise<ImportStatus | null> {
+export async function importStatus(
+  importId: string,
+  timeoutMs = STATUS_TIMEOUT_MS,
+): Promise<ImportStatus | null> {
   if (!isBackgroundConfigured() || !importId) {
     return null;
   }
@@ -2022,6 +2025,7 @@ export async function importStatus(importId: string): Promise<ImportStatus | nul
     const res = await getWithTimeout(
       `/scrobblify/import/${encodeURIComponent(importId)}`,
       false,
+      timeoutMs,
     );
     if (!res || !res.ok) {
       return null;

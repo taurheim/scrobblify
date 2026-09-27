@@ -141,7 +141,10 @@
           <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
         </v-stepper-content>
         <v-stepper-content step="2">
-          <upload-step v-on:complete="currentStep = 3"></upload-step>
+          <upload-step
+            v-on:complete="currentStep = 3"
+            v-on:import-progress="importProgressFile"
+          ></upload-step>
         </v-stepper-content>
         <v-stepper-content step="3">
           <select-step v-on:complete="currentStep = 4"></select-step>
@@ -881,11 +884,11 @@ export default Vue.extend({
      * from an older build and handed over by a *newer* one, which cannot
      * happen either, since the newer build mints an id before it uploads.
      */
-    async queueWasHandedOver(importId: string): Promise<boolean | null> {
+    async queueWasHandedOver(importId: string, timeoutMs?: number): Promise<boolean | null> {
       if (!importId) {
         return false;
       }
-      const status = await background.importStatus(importId);
+      const status = await background.importStatus(importId, timeoutMs);
       if (!status) {
         return null;
       }
@@ -2063,9 +2066,22 @@ export default Vue.extend({
     async onImportFile(event: Event) {
       const input = event.target as HTMLInputElement;
       if (!input.files || input.files.length === 0) { return; }
+      const file = input.files[0];
+      input.value = '';
+      await this.importProgressFile(file, 'file');
+    },
+    /**
+     * Also reachable from the upload step, because the resume banner (and its
+     * "Import from file" button) only appears when this browser already has
+     * saved state — which a new device or browser never does.
+     */
+    async importProgressFile(file: File, source: string) {
       try {
-        const state = await this.stateManager.importFromFile(input.files[0]);
-        trackEvent('session_resumed', this.resumeProps(state, 'file'));
+        const state = await this.stateManager.importFromFile(file);
+        if (!(await this.importedQueueMaySend(state))) {
+          return;
+        }
+        trackEvent('session_resumed', this.resumeProps(state, source));
         this.restoreFromState(state);
       } catch (e) {
         trackError('scrobblify.onImportFile', e);
@@ -2073,6 +2089,40 @@ export default Vue.extend({
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
       }
+    },
+    /**
+     * The authority check for a progress *file*.
+     *
+     * `enforceServerAuthority` asks about the queue saved in this browser, but
+     * an imported file carries its own identity and bypasses that entirely. A
+     * file exported before a handover, then imported on another device, is a
+     * stale copy of a queue the worker has been sending — resuming it sends
+     * everything again.
+     *
+     * Same rule as the page-load check: a handed-over queue is refused, and
+     * an unanswered question refuses only a browser with a reason to worry.
+     */
+    async importedQueueMaySend(state: ScrobbleState): Promise<boolean> {
+      if (!background.isBackgroundConfigured() || !state.importId) {
+        return true;
+      }
+      const fallThrough = this.mayScrobbleWithoutAuthority();
+      const handedOver = await this.queueWasHandedOver(
+        state.importId,
+        fallThrough ? background.FALLTHROUGH_TIMEOUT_MS : undefined,
+      );
+      if (handedOver === false || (handedOver === null && fallThrough)) {
+        return true;
+      }
+      trackEvent('background_authority_check', {
+        result: handedOver ? 'imported_file_handed_over' : 'imported_file_unknown',
+      });
+      this.errorMessage = handedOver
+        ? 'This progress file is for an import that was handed over to the background service. Resuming it here would send tracks the server has already sent. Check on it, or bring it back, from the browser you handed it over from.'
+        : "Can't reach the background service to check whether this import is already running there. Try again in a moment.";
+      this.errorDetails = '';
+      this.showError = true;
+      return false;
     },
     restoreFromState(state: ScrobbleState) {
       const api = this.$store.state.lfmApi as LastFm;

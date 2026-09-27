@@ -134,7 +134,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 
   test('accepts ZIP file via file picker', async ({ page }) => {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await expect(page.locator('text=test-spotify-data.zip')).toBeVisible();
   });
@@ -147,7 +147,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 
   test('Find tracks button is enabled after file selection', async ({ page }) => {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     const btn = page.locator('button:has-text("Find tracks")');
     await expect(btn).toBeEnabled();
@@ -160,7 +160,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
     page.on('pageerror', (e) => pageErrors.push(e.message));
 
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
@@ -173,7 +173,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 
   test('parses ZIP and shows track count', async ({ page }) => {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     // Check "scrobble old plays" since our test data is old
@@ -191,7 +191,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 
   test('filters out podcast entries (null track name)', async ({ page }) => {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
@@ -205,7 +205,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 test.describe('Select Step - Track Selection', () => {
   async function goToSelectStep(page: Page) {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
@@ -230,7 +230,7 @@ test.describe('Select Step - Track Selection', () => {
   test('date filtering reduces matching track count', async ({ page }) => {
     // Go to select step WITHOUT re-tagging old listens so dates remain original
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     // Don't check "Scrobble tracks older than 2 weeks" — keep original dates
     await page.locator('button:has-text("Find tracks")').click();
@@ -265,7 +265,7 @@ test.describe('Select Step - Track Selection', () => {
 test.describe('Scrobble Step', () => {
   async function goToScrobbleStep(page: Page) {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
@@ -329,7 +329,7 @@ test.describe('Scrobble Step', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -396,7 +396,7 @@ test.describe('Scrobble Step', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -463,7 +463,7 @@ test.describe('Scrobble Step', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -543,32 +543,32 @@ test.describe('LastFm API client', () => {
   });
 });
 
-test.describe('Session Resume', () => {
-  // Writes a saved session straight into IndexedDB, which is exactly what
-  // `StateManager.saveState` produces. Lets the resume path be exercised
-  // without first having to drive a real pause.
-  async function seedSavedState(page: Page, state: Record<string, unknown>) {
-    await page.evaluate(async (savedState) => {
-      await new Promise<void>((resolve, reject) => {
-        const request = indexedDB.open('scrobblify', 1);
-        request.onupgradeneeded = () => {
-          const db = request.result;
-          if (!db.objectStoreNames.contains('scrobbleState')) {
-            db.createObjectStore('scrobbleState');
-          }
-        };
-        request.onsuccess = () => {
-          const db = request.result;
-          const tx = db.transaction('scrobbleState', 'readwrite');
-          tx.objectStore('scrobbleState').put(savedState, 'current');
-          tx.oncomplete = () => { db.close(); resolve(); };
-          tx.onerror = () => { db.close(); reject(tx.error); };
-        };
-        request.onerror = () => reject(request.error);
-      });
-    }, state);
-  }
+// Writes a saved session straight into IndexedDB, which is exactly what
+// `StateManager.saveState` produces. Lets the resume path be exercised
+// without first having to drive a real pause.
+async function seedSavedState(page: Page, state: Record<string, unknown>) {
+  await page.evaluate(async (savedState) => {
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('scrobbleState')) {
+          db.createObjectStore('scrobbleState');
+        }
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction('scrobbleState', 'readwrite');
+        tx.objectStore('scrobbleState').put(savedState, 'current');
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }, state);
+}
 
+test.describe('Session Resume', () => {
   function buildState(overrides: Record<string, unknown> = {}) {
     const tracks = [1, 2, 3, 4, 5].map((n) => ({
       track: `Track ${n}`,
@@ -1050,6 +1050,67 @@ test.describe('Session Resume', () => {
     await expect(page.locator('.overall-progress')).toContainText('3 of 5');
   });
 
+  test('a progress file can be imported on a device with no saved session', async ({ page }) => {
+    // Regression: "Import from file" lived only in the resume banner, which is
+    // shown only when this browser already has saved state. On a new PC it
+    // never appears, and the upload zone rejected the .json outright.
+    await goToUploadStep(page);
+    await expect(page.locator('text=Resume previous session?')).toBeHidden();
+    let alerted = false;
+    page.on('dialog', async (dialog) => { alerted = true; await dialog.dismiss(); });
+
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(buildState())),
+    });
+
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+    expect(alerted).toBe(false);
+  });
+
+  test('a ZIP holding only a progress file resumes as soon as it is chosen', async ({ page }) => {
+    // What the reporter did once the .json was refused: zipped it together
+    // with their (account-data) Spotify export and uploaded that.
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Account Data/StreamingHistory_music_0.json', '[]');
+    zip.file('scrobblify-progress-2026-09-07.json', JSON.stringify(buildState()));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data (2).zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+
+    // No "Find tracks" click: the ZIP is recognised on selection.
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+  });
+
+  test('a history ZIP that also holds a progress file offers the resume, without forcing it', async ({ page }) => {
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024.json', JSON.stringify([{
+      ts: '2024-01-15T10:30:00Z',
+      master_metadata_track_name: 'Bohemian Rhapsody',
+      master_metadata_album_artist_name: 'Queen',
+      master_metadata_album_album_name: 'A Night at the Opera',
+      ms_played: 300000,
+    }]));
+    zip.file('scrobblify-progress-2026-09-07.json', JSON.stringify(buildState()));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data.zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+
+    await expect(page.locator('text=1 audio history file(s)')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('button:has-text("Find tracks")')).toBeEnabled();
+    await page.locator('text=Resume from it instead').click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+  });
+
   test('preventive pacing keeps scrobbling, it does not pause per track', async ({ page }) => {
     // Regression: `msUntilBurstSafe()` frees exactly one slot at a time, so once
     // the rolling window is full *every* remaining track waits a fraction of a
@@ -1134,6 +1195,114 @@ test.describe('Session Resume', () => {
 
     expect(sawPausedPanel).toBe(false);
     expect(finished).toBe(true);
+  });
+
+  test('a throttled stretch is continuous, it does not restart on every freed slot', async ({ page }) => {
+    // Regression: the stretch ended the moment `msUntilBurstSafe()` returned 0.
+    // But a saturated window frees exactly one slot, which the very next track
+    // consumes — so the state flapped once per track, and what should have been
+    // a single pacing stretch became one begin/end pair per scrobble. Telemetry
+    // showed a median `paced_tracks` of 1 with waits of 4-40ms.
+    test.setTimeout(120000);
+    await interceptLastFm(page);
+    // Every reply takes the same time, so the reproduction does not hinge on
+    // browser overhead landing inside some window. The alternation comes from
+    // the seeded history instead (see below), which the app cannot outrun.
+    const REPLY_MS = 600;
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        await new Promise((resolve) => { setTimeout(resolve, REPLY_MS); });
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+
+    // A full window, seeded so that slots free in *pairs*: two sends share an
+    // expiry, then nothing for SLOT_PAIR_GAP_MS. That makes the alternation
+    // structural rather than a race — the first track of each pair always waits
+    // and the second always finds a slot already free, whatever the machine is
+    // doing. Real histories produce the same alternation through network jitter
+    // around the steady-state spacing, just less predictably.
+    //
+    // The pairs are spread to just under the full 10 minute window so the oldest
+    // is about to expire; bunching them tighter would leave the window blocked
+    // for minutes before the first slot appeared.
+    const SLOT_PAIR_GAP_MS = 2400;
+    const SETUP_LEAD_MS = 8000;
+    const anchor = Date.now() + SETUP_LEAD_MS;
+    const sendTimestamps = Array.from({ length: 500 }, (_, k) => {
+      const pair = Math.floor(k / 2);
+      // The +1 keeps the array strictly ascending without meaningfully
+      // separating the two halves of a pair.
+      return anchor - (249 - pair) * SLOT_PAIR_GAP_MS + (k % 2);
+    });
+    const tracks = Array.from({ length: 24 }, (_, n) => ({
+      track: `Track ${n + 1}`,
+      artist: `Artist ${n + 1}`,
+      album: '',
+      timestamp: Date.UTC(2024, 0, n + 1),
+    }));
+    await seedSavedState(page, buildState({
+      totalTracks: 24,
+      completedIndices: [],
+      tracks,
+      originalTotalTracks: 24,
+      originalSucceededCount: 0,
+      sendTimestamps,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=24 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    const notice = page.locator('text=Pacing to stay under');
+    await expect(notice).toBeVisible({ timeout: 20000 });
+
+    // Count how often the notice comes *back* after going away. Counting
+    // reappearances rather than disappearances deliberately ignores the last
+    // one, which is the stretch legitimately ending as the queue drains.
+    let everVisible = false;
+    let hiddenSinceVisible = false;
+    let reappearances = 0;
+    let finished = false;
+    for (let i = 0; i < 1200 && !finished; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await page.waitForTimeout(50);
+      // eslint-disable-next-line no-await-in-loop
+      const visible = await notice.isVisible();
+      if (visible) {
+        if (hiddenSinceVisible) {
+          reappearances += 1;
+          hiddenSinceVisible = false;
+        }
+        everVisible = true;
+      } else if (everVisible) {
+        hiddenSinceVisible = true;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      finished = await page.locator('text=Finished scrobbling').isVisible();
+    }
+
+    expect(finished).toBe(true);
+    // The window stays saturated for the whole run, so there is exactly one
+    // stretch and it should never have restarted.
+    expect(reappearances).toBe(0);
   });
 
   test('a manual pause saves, offers a way back, and does not re-send the in-flight track', async ({ page }) => {
@@ -1331,7 +1500,7 @@ test.describe('Session Resume', () => {
       await route.fallback();
     });
 
-    await page.locator('input[type="file"][accept=".zip"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
     await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
@@ -1488,7 +1657,7 @@ test.describe('Complete Step', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -1576,7 +1745,7 @@ test.describe('URL Encoding', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -1685,7 +1854,7 @@ test.describe('Re-tagged old plays', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    await page.locator('input[type="file"][accept=".zip"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
@@ -1990,7 +2159,7 @@ test.describe('Import robustness', () => {
   }
 
   async function uploadZip(page: Page, buffer: Buffer) {
-    await page.locator('input[type="file"][accept=".zip"]').setInputFiles({
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
       name: 'my_spotify_data.zip',
       mimeType: 'application/zip',
       buffer,
@@ -2032,6 +2201,22 @@ test.describe('Import robustness', () => {
 
     await page.locator('button:has-text("Find tracks")').click();
     await expect(page.locator('text=None of the 1 history file(s) in this ZIP could be read')).toBeVisible({ timeout: 15000 });
+  });
+
+  test('Spotify\'s account-data export is identified, not reported as a generic wrong file', async ({ page }) => {
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Account Data/StreamingHistory_music_0.json', JSON.stringify([
+      {
+        endTime: '2024-01-15 10:30', artistName: 'Queen', trackName: 'Bohemian Rhapsody', msPlayed: 300000,
+      },
+    ]));
+    zip.file('Spotify Account Data/Playlist1.json', '{}');
+    await uploadZip(page, await zip.generateAsync({ type: 'nodebuffer' }));
+
+    // Caught on selection, before the user has clicked anything else.
+    await expect(page.locator('text=Account data')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('button:has-text("Find tracks")')).toBeDisabled();
   });
 
   test('macOS resource-fork sidecars are not mistaken for history files', async ({ page }) => {
@@ -2197,5 +2382,171 @@ test.describe('Import robustness', () => {
       expect(range.from).toMatch(/^\d+$/);
       expect(range.to).toMatch(/^\d+$/);
     }
+  });
+});
+
+test.describe('Invalid session key', () => {
+  // Last.fm error 9. A stored session key can stop working while the user is
+  // away (production data: mostly people who had signed in again on another
+  // device or browser). It used to be treated as ten per-track failures, and
+  // the dead key was kept, so every later visit failed the same way.
+  const INVALID_SESSION = { error: 9, message: 'Invalid session key - Please re-authenticate' };
+  const FRESH_KEY = 'fresh-session-key';
+
+  function requestParams(route: Route) {
+    return new URLSearchParams(
+      route.request().method() === 'POST'
+        ? route.request().postData() || ''
+        : new URL(route.request().url()).search,
+    );
+  }
+
+  // A hash-only change is a same-document navigation, which would not remount
+  // the app or re-run the token exchange. Leave the page first.
+  async function loadFresh(page: Page, url: string) {
+    await page.goto('about:blank');
+    await page.goto(url);
+  }
+
+  function savedQueue(count: number) {
+    return {
+      userName: 'testuser',
+      totalTracks: count,
+      completedIndices: [],
+      failedIndices: [],
+      tracks: Array.from({ length: count }, (_, i) => ({
+        track: `Track ${i + 1}`, artist: `Artist ${i + 1}`, album: '', timestamp: Date.UTC(2024, 0, i + 1),
+      })),
+      originalTotalTracks: count,
+      originalSucceededCount: 0,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+    };
+  }
+
+  test('a revoked session key stops at once, and signing in again finishes the import', async ({ page }) => {
+    test.setTimeout(60000);
+    const scrobbleKeys: string[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = requestParams(route);
+      const apiMethod = params.get('method');
+      if (apiMethod === 'track.scrobble') {
+        scrobbleKeys.push(params.get('sk') || '');
+        if (params.get('sk') === FRESH_KEY) {
+          await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+          });
+        } else {
+          await route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify(INVALID_SESSION) });
+        }
+        return;
+      }
+      if (apiMethod === 'auth.getSession') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ session: { name: 'testuser', key: FRESH_KEY, subscriber: 0 } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, savedQueue(12));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    const signInAgain = page.getByRole('link', { name: /sign in to last\.fm again/i });
+    await expect(signInAgain).toBeVisible({ timeout: 10000 });
+    await expect(signInAgain).toHaveAttribute('href', /last\.fm\/api\/auth/);
+    // The key is the problem, not the track: one request, not ten, and no
+    // track is written off as failed.
+    expect(scrobbleKeys).toHaveLength(1);
+    await expect(page.locator('text=failed in a row')).toHaveCount(0);
+    await expect(page.locator('text=failed track(s)')).toHaveCount(0);
+    // Retrying with the same dead key can only fail again.
+    await expect(page.getByRole('button', { name: 'Try Again Now' })).toHaveCount(0);
+    await expect(page.locator('text=saved automatically')).toBeVisible();
+    // ...and it must not be picked up again on the next visit.
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBeNull();
+
+    // Coming back later lands on sign-in, with the whole queue still waiting.
+    await page.reload();
+    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Resume previous session?')).toBeVisible();
+
+    // Returning from Last.fm's authorize page with a fresh token.
+    await loadFresh(page, '/#/scrobble?token=fresh-token');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+    expect(scrobbleKeys.slice(1)).toEqual(Array(12).fill(FRESH_KEY));
+  });
+
+  test('signing in again replaces a stored session key', async ({ page }) => {
+    // Regression: init() only exchanged a callback token when no key was
+    // stored, so re-authorizing with a dead key threw the fresh token away and
+    // kept the dead one. Production users re-authorized a dozen times each.
+    const getSessionRequests: URLSearchParams[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = requestParams(route);
+      if (params.get('method') === 'auth.getSession') {
+        getSessionRequests.push(params);
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ session: { name: 'testuser', key: FRESH_KEY, subscriber: 0 } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await loadFresh(page, '/#/scrobble?token=fresh-token');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    expect(getSessionRequests).toHaveLength(1);
+    // The old key must not ride along on (and be signed into) the exchange.
+    expect(getSessionRequests[0].get('sk')).toBeNull();
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBe(FRESH_KEY);
+  });
+
+  test('a sign-in link that cannot be exchanged does not log out a stored session', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (requestParams(route).get('method') === 'auth.getSession') {
+        await route.fulfill({
+          status: 403,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 4, message: 'Unauthorized Token - This token has not been issued.' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await loadFresh(page, '/#/scrobble?token=already-used-token');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=/already used or has expired/i')).toBeHidden();
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBe('fake-session-key');
   });
 });

@@ -13,7 +13,7 @@ import { defineConfig } from '@playwright/test';
   Its own port and never a reused server: `VUE_APP_*` is inlined at compile
   time, so adopting a server started without it would test nothing.
 */
-const PORT = 8097;
+const PORT = 8471;
 
 export default defineConfig({
   testDir: './tests/unreachable-worker',

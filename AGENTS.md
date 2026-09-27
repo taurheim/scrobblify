@@ -57,6 +57,12 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
 `session_resumed`, and `user_logged_out`.
 
+`upload_no_matching_files` carries `detected`: `progress_file` (a Scrobblify
+progress file was zipped up and is imported instead), `account_data` (Spotify's
+default "Account data" export, `StreamingHistory_music_*.json`, rather than the
+extended one) or `unknown`. Before 2026-09-27 it carried no properties.
+`session_resumed.source` is `saved`, `file`, or `zip`.
+
 Rate limiting has its own events: `scrobble_rate_limited`,
 `scrobble_rate_limit_cooldown_complete`, `scrobble_rate_limit_recovered`,
 `scrobble_rate_limit_gave_up` (the escalating backoff was exhausted and progress
@@ -76,10 +82,11 @@ nothing at all.
   a bug: treat it as normal operation rather than signal.
 - `scrobble_stopped` — terminal; the run is over until the user comes back.
   Reasons: `daily_limit`, `lastfm_daily_limit`, `rate_limit_exhausted`,
-  `repeated_rejections`, `repeated_failures`, `manual`. Only `manual` is a user
-  action. Every one carries `auto_saved`, which is the difference between an
-  interruption and lost work — all six now save, so `auto_saved: false` in the
-  data means the save itself failed and is worth investigating.
+  `repeated_rejections`, `repeated_failures`, `session_invalid`, `manual`. Only
+  `manual` is a user action. Every one carries `auto_saved`, which is the
+  difference between an interruption and lost work — all seven now save, so
+  `auto_saved: false` in the data means the save itself failed and is worth
+  investigating.
 
 All terminal paths go through the `trackStopped()` helper rather than emitting
 inline, so a new one cannot silently skip the event.
@@ -91,6 +98,27 @@ sets `manuallyPaused` and gets `info` styling via `pauseAlertType` instead of a
 red `error` banner. Setting only `paused` renders a **disabled** "Wait Here"
 button waiting on an auto-resume the loop has already returned from — a dead end
 that stranded manual pauses, `repeated_rejections` and `repeated_failures`.
+
+`session_invalid` is the one terminal path whose way back is *not* a retry.
+Last.fm error 9 ("Invalid session key") means the stored key has been
+invalidated while the user was away — in the data, mostly people who had since
+signed in on another device or browser. Nothing about the track is wrong, so the
+loop stops on the **first** error 9 without consuming the track, saves, clears
+the key (`clearSessionKey()`, which keeps the username that saved progress and
+the rate-limit window are keyed by) and replaces the retry button with a "Sign
+in to Last.fm again" link. It used to be ten per-track failures, then a retry
+with the same key, and the key stayed in localStorage, so every later visit
+failed identically: the top `scrobble.repeatedFailures` cause, with one user
+stuck for 8 days. Error 9 no longer reaches `scrobble.repeatedFailures`, so that
+context's volume drops from this fix on.
+
+`init()` exchanges a callback `?token=` **even when a key is already stored**.
+It used to skip the exchange whenever one was, which silently discarded the
+fresh token and kept the dead key — re-authorizing could never help (visible in
+the data as `auth_success` `returning: false` followed within a minute by error
+9). If that exchange fails while a key is stored, the stored key is kept rather
+than logging the user out; if it is dead too, the first scrobble says so.
+`auth.getSession` is never sent with (or signed over) the old `sk`.
 
 `manualPause()` deliberately does **not** save. It only raises the flags; the
 save and the `scrobble_stopped` event happen in the scrobble loop's pause check,
@@ -115,6 +143,17 @@ are inflated this way and are not comparable with later data**, and before
 Pacing waits under `PACING_COUNTDOWN_THRESHOLD_MS` (10s) are a plain sleep that
 leaves the scrobbling UI up; only longer waits show the paused panel and
 countdown.
+
+A stretch does **not** end at the first track that needs no wait. One free slot
+is just the slot that track is about to consume, after which the window is full
+again, so `msUntilBurstSafe()` alternates between a small positive wait and zero
+from one track to the next. Exiting on the first zero therefore replaced "one
+event per track" with "one begin/end *pair* per track" — a 34% reduction where
+~100x was intended. `PACING_EXIT_CLEAR_TRACKS` (3) requires a streak of
+genuinely unimpeded tracks instead, which saturation cannot produce. **The
+`paced_tracks` and `scrobble_pacing_ended` data from 2026-08-04 to 2026-08-10 is
+flap-inflated** — median `paced_tracks` of 1 and ~55% single-track stretches are
+the bug, not user behaviour, and are not comparable with later data.
 
 ### Measuring completion
 
@@ -215,6 +254,26 @@ affected user was on macOS, and all the failures landed within ~400ms of the
 parse starting (far too fast for the memory-exhaustion case this path exists
 for). The sidecars are also why some parse errors quote `"    Ma"` — that's the
 `Mac OS X` marker inside the AppleDouble header, not export data.
+
+**Resuming on a new device goes through the upload step.** The resume banner
+(and its "Import from file" button) only renders when *this browser* already has
+saved state in IndexedDB, so on a new PC or browser it never appears. The drop
+zone therefore takes both `.zip` and `.json` and **classifies the file the
+moment it's chosen** (`classifyZip`, by entry names only), not on "Find tracks":
+
+- `.json` → imported as a progress file.
+- ZIP with `Streaming_History_Audio_*` → ready; if it *also* holds a
+  `scrobblify-progress*.json`, a "Resume from it instead" link is offered but
+  not forced.
+- ZIP with only a `scrobblify-progress*.json` → imported immediately. This case
+  is real: a user whose `.json` was refused zipped it up with their Spotify
+  export to get it accepted.
+- ZIP of `StreamingHistory_music_*.json` → Spotify's default "Account data"
+  export, requested separately from (and delivered before) the extended one.
+  It gets its own error explaining which export to request.
+
+`upload_no_matching_files` therefore now fires on selection, **without** a
+preceding `upload_parse_started`.
 
 Two Last.fm quirks the validation path has to absorb:
 
@@ -338,10 +397,20 @@ The accepted gap: a browser that lost its localStorage but kept a leftover
 handed-over queue in IndexedDB, while the worker is unreachable. A successful
 handover clears the saved queue, so this needs a stale copy as well.
 
+**An imported progress file is a queue from somewhere else**, so the local
+evidence above says nothing about it. `importProgressFile` asks
+`/scrobblify/import/:id` about the *file's* `importId` before restoring it
+(`importedQueueMaySend`): `known: true` refuses the file, because the worker
+was handed that queue and the file is a copy from before. An unanswered check
+follows the same fall-through rule. A file with no id cannot be checked. That
+is safe only for files that were never handed over, and it is the one gap
+here: a file exported before `beginHandoff` minted its id.
+
 `npx playwright test -c playwright.unreachable-worker.config.ts` covers this
 against a build whose worker URL cannot resolve; the default config ignores
 `tests/unreachable-worker/` because its build has no worker URL at all. CI
-runs both.
+runs both. It uses port 8471, because other local worktrees commonly occupy
+the 809x range.
 
 The opt-in is sticky (localStorage) rather than read from the URL, because
 the query string does not survive the flow: `stripQuery` discards all of it on
@@ -364,3 +433,28 @@ track arrays cheaply. Renaming those fields would silently make them reactive
 and tank performance on big histories.
 
 Warnings (mostly `no-explicit-any`) do not fail the build; only errors do.
+
+## Running the tests
+
+Playwright is the only test framework here — there are no unit tests. Analytics
+is disabled on `localhost`, so **a test can never observe a PostHog event**;
+assert on the UI instead.
+
+`playwright.config.ts` sets `reuseExistingServer: true` on port 8080. If a
+`vue-cli-service serve` is already running there **from another checkout or
+worktree, Playwright will happily test that checkout's code instead of yours**
+and say nothing. This has already produced three "verified" results that were
+really the other tree's build. Before trusting a local run — especially one
+verifying a fix — confirm what owns the port:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "ProcessId = $((Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess)" |
+  Select-Object -ExpandProperty CommandLine
+```
+
+or run against a scratch config on its own port with `reuseExistingServer:
+false`. CI is unaffected, since it starts from nothing.
+
+Verify a regression test actually catches its bug with
+`git stash push -- <source file>`, re-run, `git stash pop`. A test that passes
+both ways is testing nothing.
