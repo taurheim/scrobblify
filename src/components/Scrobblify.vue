@@ -92,6 +92,7 @@ import LastFm from '@/api/LastFm';
 import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
+import NotAProgressFileError from '@/services/NotAProgressFileError';
 import RateLimitTracker from '@/services/RateLimitTracker';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError, resetUser } from '@/services/Analytics';
@@ -221,6 +222,15 @@ export default Vue.extend({
         const state = await this.stateManager.importFromFile(file);
         this.restoreFromState(state, source);
       } catch (e) {
+        if (e instanceof NotAProgressFileError) {
+          // The user picked the wrong file; that's not an app error. Recorded
+          // alongside the ZIP-level equivalent so both show up in one place.
+          trackEvent('upload_no_matching_files', { detected: e.detected, file_type: 'json', source });
+          this.errorMessage = e.message;
+          this.errorDetails = '';
+          this.showError = true;
+          return;
+        }
         trackError('scrobblify.onImportFile', e);
         this.errorMessage = 'The selected file is not a valid Scrobblify progress file.';
         this.errorDetails = (e as Error).message || String(e);

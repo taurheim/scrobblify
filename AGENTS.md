@@ -70,6 +70,10 @@ params** — an early version leaked a user's Last.fm session key into analytics
 progress file was zipped up and is imported instead), `account_data` (Spotify's
 default "Account data" export, `StreamingHistory_music_*.json`, rather than the
 extended one) or `unknown`. Before 2026-09-27 it carried no properties.
+A loose `.json` that turns out not to be a progress file (see "Import
+robustness") emits it too, with `file_type: 'json'`, a `source` and `detected`
+of `extended_history`, `account_data` or `unknown` — not a
+`scrobblify.onImportFile` error.
 `session_resumed.source` is `saved`, `file`, or `zip`. `session_resume_blocked`
 (same `source`, plus `reason: not_authenticated`) fires instead of
 `session_resumed` when a resume is attempted with no session key; it exists
@@ -314,7 +318,15 @@ saved state in IndexedDB, so on a new PC or browser it never appears. The drop
 zone therefore takes both `.zip` and `.json` and **classifies the file the
 moment it's chosen** (`classifyZip`, by entry names only), not on "Find tracks":
 
-- `.json` → imported as a progress file.
+- `.json` → imported as a progress file — *unless its content is a Spotify
+  history file* (`StateManager.assertIsProgressFile`, which also guards the
+  banner's "Import from file"). Users drag a `Streaming_History_Audio_*.json`
+  out of an opened ZIP, or pick one from the "Account data" export, and those
+  used to fail as `Invalid state file: missing required field "totalTracks"`,
+  reported under `scrobblify.onImportFile`. They now get a
+  `NotAProgressFileError` whose message tells them what to upload instead, so
+  **`totalTracks` errors before 2026-09-27 are mostly this wrong-file mistake,
+  not corrupted progress files.**
 - ZIP with `Streaming_History_Audio_*` → ready; if it *also* holds a
   `scrobblify-progress*.json`, a "Resume from it instead" link is offered but
   not forced.

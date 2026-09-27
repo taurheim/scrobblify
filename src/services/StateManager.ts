@@ -1,4 +1,5 @@
 import Scrobble from '@/models/Scrobble';
+import NotAProgressFileError from '@/services/NotAProgressFileError';
 
 export interface SerializedScrobble {
   track: string;
@@ -52,6 +53,10 @@ export interface ScrobbleState {
   dailyCountDate: string;
   savedAt: string;
 }
+
+export const ACCOUNT_DATA_MESSAGE = 'This is Spotify\'s "Account data" export, which doesn\'t contain the detailed history Scrobblify needs. '
+  + 'On Spotify\'s privacy page, request "Extended streaming history" instead — it arrives as a separate download '
+  + 'containing Streaming_History_Audio_*.json files.';
 
 const DB_NAME = 'scrobblify';
 const STORE_NAME = 'scrobbleState';
@@ -112,6 +117,33 @@ export default class StateManager {
       d.album,
       d.reTagged ?? inferReTagged,
     ));
+  }
+
+  /**
+   * Both import entry points take any `.json`, and the ones users most often
+   * pick by mistake are Spotify's own history files — dragged out of an opened
+   * ZIP, or from the "Account data" export. Those are arrays of plays, which
+   * used to fail the required-field check below as 'missing required field
+   * "totalTracks"'. Recognised by content, not name, so a renamed file is
+   * still caught.
+   */
+  static assertIsProgressFile(data: unknown): void {
+    if (Array.isArray(data)) {
+      const first = data.find((d) => d && typeof d === 'object') || {};
+      if ('ts' in first || 'master_metadata_track_name' in first) {
+        throw new NotAProgressFileError(
+          'extended_history',
+          'This is one of the history files from your Spotify export, not a Scrobblify progress file. '
+            + 'Upload the whole .zip Spotify sent you instead — there\'s no need to extract it.',
+        );
+      }
+      if ('endTime' in first || 'trackName' in first) {
+        throw new NotAProgressFileError('account_data', ACCOUNT_DATA_MESSAGE);
+      }
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new NotAProgressFileError('unknown', 'This file is not a Scrobblify progress file.');
+    }
   }
 
   public async saveState(state: ScrobbleState): Promise<void> {
@@ -175,6 +207,7 @@ export default class StateManager {
       reader.readAsText(file);
     });
     const data = JSON.parse(text);
+    StateManager.assertIsProgressFile(data);
 
     // Only the fields needed to actually restore scrobbles are required.
     // Everything else is optional metadata that is defaulted below, so an

@@ -736,6 +736,44 @@ test.describe('Session Resume', () => {
     expect(alerted).toBe(false);
   });
 
+  test('a Spotify history .json dropped on the upload zone is identified, not called an invalid progress file', async ({ page }) => {
+    // Regression: every .json was assumed to be a progress file, so a history
+    // file dragged out of an opened ZIP failed with 'missing required field
+    // "totalTracks"'.
+    await goToUploadStep(page);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'Streaming_History_Audio_2024_0.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify([{
+        ts: '2024-01-15T10:30:00Z',
+        master_metadata_track_name: 'Bohemian Rhapsody',
+        master_metadata_album_artist_name: 'Queen',
+        master_metadata_album_album_name: 'A Night at the Opera',
+        ms_played: 300000,
+      }])),
+    });
+
+    const dialog = page.locator('.v-dialog--active');
+    await expect(dialog).toContainText('Upload the whole .zip', { timeout: 5000 });
+    await expect(dialog).not.toContainText('not a valid Scrobblify progress file');
+    await expect(dialog).not.toContainText('totalTracks');
+  });
+
+  test('an account-data history .json is identified as the wrong Spotify export', async ({ page }) => {
+    await goToUploadStep(page);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'StreamingHistory_music_0.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify([{
+        endTime: '2024-01-15 10:30', artistName: 'Queen', trackName: 'Bohemian Rhapsody', msPlayed: 300000,
+      }])),
+    });
+
+    const dialog = page.locator('.v-dialog--active');
+    await expect(dialog).toContainText('"Account data" export', { timeout: 5000 });
+    await expect(dialog).not.toContainText('totalTracks');
+  });
+
   test('a ZIP holding only a progress file resumes as soon as it is chosen', async ({ page }) => {
     // What the reporter did once the .json was refused: zipped it together
     // with their (account-data) Spotify export and uploaded that.
