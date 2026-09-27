@@ -1,5 +1,5 @@
 import {
-  test, expect, Page, Route,
+  test, expect, Locator, Page, Route,
 } from '@playwright/test';
 import path from 'path';
 import JSZip from 'jszip';
@@ -535,32 +535,32 @@ test.describe('LastFm API client', () => {
   });
 });
 
-test.describe('Session Resume', () => {
-  // Writes a saved session straight into IndexedDB, which is exactly what
-  // `StateManager.saveState` produces. Lets the resume path be exercised
-  // without first having to drive a real pause.
-  async function seedSavedState(page: Page, state: Record<string, unknown>) {
-    await page.evaluate(async (savedState) => {
-      await new Promise<void>((resolve, reject) => {
-        const request = indexedDB.open('scrobblify', 1);
-        request.onupgradeneeded = () => {
-          const db = request.result;
-          if (!db.objectStoreNames.contains('scrobbleState')) {
-            db.createObjectStore('scrobbleState');
-          }
-        };
-        request.onsuccess = () => {
-          const db = request.result;
-          const tx = db.transaction('scrobbleState', 'readwrite');
-          tx.objectStore('scrobbleState').put(savedState, 'current');
-          tx.oncomplete = () => { db.close(); resolve(); };
-          tx.onerror = () => { db.close(); reject(tx.error); };
-        };
-        request.onerror = () => reject(request.error);
-      });
-    }, state);
-  }
+// Writes a saved session straight into IndexedDB, which is exactly what
+// `StateManager.saveState` produces. Lets the resume path be exercised
+// without first having to drive a real pause.
+async function seedSavedState(page: Page, state: Record<string, unknown>) {
+  await page.evaluate(async (savedState) => {
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('scrobbleState')) {
+          db.createObjectStore('scrobbleState');
+        }
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction('scrobbleState', 'readwrite');
+        tx.objectStore('scrobbleState').put(savedState, 'current');
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }, state);
+}
 
+test.describe('Session Resume', () => {
   function buildState(overrides: Record<string, unknown> = {}) {
     const tracks = [1, 2, 3, 4, 5].map((n) => ({
       track: `Track ${n}`,
@@ -1242,9 +1242,8 @@ test.describe('Rate limit handling', () => {
     // Regression: the old handler paused a flat 60s and retried the same track
     // indefinitely. Two production users sat through 200+ consecutive retries.
     //
-    // The backoff ladder spans ~50 minutes, so time is faked. With the clock
-    // frozen nothing advances on its own — including the API client's own retry
-    // backoff — so the clock has to be driven forward while polling.
+    // The backoff ladder spans ~50 minutes, so time is faked and driven forward
+    // while polling — including through the API client's own retry backoff.
     await page.clock.install();
     await alwaysRateLimited(page);
     await page.goto('/#/scrobble');
@@ -1258,25 +1257,44 @@ test.describe('Rate limit handling', () => {
     await page.clock.runFor(3000);
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
 
-    // Advance simulated time until the loop reaches a terminal state, recording
-    // whether the escalating backoff was surfaced along the way.
-    let sawFirstBackoff = false;
-    let gaveUp = false;
-    for (let i = 0; i < 250 && !gaveUp; i++) {
-      // eslint-disable-next-line no-await-in-loop
-      await page.clock.runFor(30 * 1000);
-      // eslint-disable-next-line no-await-in-loop
-      await page.waitForTimeout(50);
-      if (!sawFirstBackoff) {
+    // Jump simulated time forward until `locator` appears.
+    //
+    // fastForward, not runFor: runFor replays every 1s countdown tick (each a
+    // re-render), which over ~50 simulated minutes cost more than the whole
+    // test budget on slower machines (#79). fastForward fires each due timer
+    // at most once, which is enough because the countdown resolves off a
+    // wall-clock deadline rather than by counting ticks.
+    //
+    // Each jump fires at most one of the API client's chained retry timers, so
+    // this takes a step per retry. The short real-time wait lets route
+    // handlers answer and the page re-render; it returns as soon as the target
+    // shows, so it only costs anything on steps that don't reach it.
+    async function advanceUntilVisible(locator: Locator, stepMs: number) {
+      for (let step = 0; step < 40; step++) {
         // eslint-disable-next-line no-await-in-loop
-        sawFirstBackoff = await page.locator('text=attempt 1 of 3').isVisible();
+        if (await locator.isVisible()) return true;
+        // eslint-disable-next-line no-await-in-loop
+        await page.clock.fastForward(stepMs);
+        // eslint-disable-next-line no-await-in-loop
+        await locator.waitFor({ timeout: 100 }).catch(() => undefined);
       }
-      // eslint-disable-next-line no-await-in-loop
-      gaveUp = await page.locator('text=still rate limiting your account').isVisible();
+      return locator.isVisible();
     }
 
     // The user is told how long we'll wait, instead of a bare 1-minute countdown.
+    // The step must stay well under the 5-minute first backoff, or a single
+    // jump could carry the loop straight past the state being checked for.
+    const sawFirstBackoff = await advanceUntilVisible(
+      page.locator('text=attempt 1 of 3'),
+      60 * 1000,
+    );
     expect(sawFirstBackoff).toBe(true);
+
+    // Giving up is terminal, so overshooting it is harmless: take big steps.
+    const gaveUp = await advanceUntilVisible(
+      page.locator('text=still rate limiting your account'),
+      30 * 60 * 1000,
+    );
     // The loop must terminate with an actionable message, not keep spinning.
     expect(gaveUp).toBe(true);
     await expect(page.getByRole('button', { name: 'Try Again Now' })).toBeVisible();
@@ -1803,5 +1821,171 @@ test.describe('Import robustness', () => {
       expect(range.from).toMatch(/^\d+$/);
       expect(range.to).toMatch(/^\d+$/);
     }
+  });
+});
+
+test.describe('Invalid session key', () => {
+  // Last.fm error 9. A stored session key can stop working while the user is
+  // away (production data: mostly people who had signed in again on another
+  // device or browser). It used to be treated as ten per-track failures, and
+  // the dead key was kept, so every later visit failed the same way.
+  const INVALID_SESSION = { error: 9, message: 'Invalid session key - Please re-authenticate' };
+  const FRESH_KEY = 'fresh-session-key';
+
+  function requestParams(route: Route) {
+    return new URLSearchParams(
+      route.request().method() === 'POST'
+        ? route.request().postData() || ''
+        : new URL(route.request().url()).search,
+    );
+  }
+
+  // A hash-only change is a same-document navigation, which would not remount
+  // the app or re-run the token exchange. Leave the page first.
+  async function loadFresh(page: Page, url: string) {
+    await page.goto('about:blank');
+    await page.goto(url);
+  }
+
+  function savedQueue(count: number) {
+    return {
+      userName: 'testuser',
+      totalTracks: count,
+      completedIndices: [],
+      failedIndices: [],
+      tracks: Array.from({ length: count }, (_, i) => ({
+        track: `Track ${i + 1}`, artist: `Artist ${i + 1}`, album: '', timestamp: Date.UTC(2024, 0, i + 1),
+      })),
+      originalTotalTracks: count,
+      originalSucceededCount: 0,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+    };
+  }
+
+  test('a revoked session key stops at once, and signing in again finishes the import', async ({ page }) => {
+    test.setTimeout(60000);
+    const scrobbleKeys: string[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = requestParams(route);
+      const apiMethod = params.get('method');
+      if (apiMethod === 'track.scrobble') {
+        scrobbleKeys.push(params.get('sk') || '');
+        if (params.get('sk') === FRESH_KEY) {
+          await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+          });
+        } else {
+          await route.fulfill({ status: 403, contentType: 'application/json', body: JSON.stringify(INVALID_SESSION) });
+        }
+        return;
+      }
+      if (apiMethod === 'auth.getSession') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ session: { name: 'testuser', key: FRESH_KEY, subscriber: 0 } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, savedQueue(12));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    const signInAgain = page.getByRole('link', { name: /sign in to last\.fm again/i });
+    await expect(signInAgain).toBeVisible({ timeout: 10000 });
+    await expect(signInAgain).toHaveAttribute('href', /last\.fm\/api\/auth/);
+    // The key is the problem, not the track: one request, not ten, and no
+    // track is written off as failed.
+    expect(scrobbleKeys).toHaveLength(1);
+    await expect(page.locator('text=failed in a row')).toHaveCount(0);
+    await expect(page.locator('text=failed track(s)')).toHaveCount(0);
+    // Retrying with the same dead key can only fail again.
+    await expect(page.getByRole('button', { name: 'Try Again Now' })).toHaveCount(0);
+    await expect(page.locator('text=saved automatically')).toBeVisible();
+    // ...and it must not be picked up again on the next visit.
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBeNull();
+
+    // Coming back later lands on sign-in, with the whole queue still waiting.
+    await page.reload();
+    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Resume previous session?')).toBeVisible();
+
+    // Returning from Last.fm's authorize page with a fresh token.
+    await loadFresh(page, '/#/scrobble?token=fresh-token');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+    expect(scrobbleKeys.slice(1)).toEqual(Array(12).fill(FRESH_KEY));
+  });
+
+  test('signing in again replaces a stored session key', async ({ page }) => {
+    // Regression: init() only exchanged a callback token when no key was
+    // stored, so re-authorizing with a dead key threw the fresh token away and
+    // kept the dead one. Production users re-authorized a dozen times each.
+    const getSessionRequests: URLSearchParams[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = requestParams(route);
+      if (params.get('method') === 'auth.getSession') {
+        getSessionRequests.push(params);
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ session: { name: 'testuser', key: FRESH_KEY, subscriber: 0 } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await loadFresh(page, '/#/scrobble?token=fresh-token');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    expect(getSessionRequests).toHaveLength(1);
+    // The old key must not ride along on (and be signed into) the exchange.
+    expect(getSessionRequests[0].get('sk')).toBeNull();
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBe(FRESH_KEY);
+  });
+
+  test('a sign-in link that cannot be exchanged does not log out a stored session', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (requestParams(route).get('method') === 'auth.getSession') {
+        await route.fulfill({
+          status: 403,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 4, message: 'Unauthorized Token - This token has not been issued.' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await loadFresh(page, '/#/scrobble?token=already-used-token');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=/already used or has expired/i')).toBeHidden();
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBe('fake-session-key');
   });
 });

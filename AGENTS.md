@@ -82,13 +82,14 @@ nothing at all.
   a bug: treat it as normal operation rather than signal.
 - `scrobble_stopped` — terminal; the run is over until the user comes back.
   Reasons: `daily_limit`, `lastfm_daily_limit`, `rate_limit_exhausted`,
-  `repeated_rejections`, `repeated_failures`, `manual`, `save_and_exit`. Only
-  `manual` and `save_and_exit` are user actions. Every one carries `auto_saved`,
-  which is the difference between an interruption and lost work — all of them
-  now save, so `auto_saved: false` in the data means the save itself failed and
-  is worth investigating. `save_and_exit` exists since 2026-09-27 and only fires
-  when "Save Progress & Leave" is clicked during a *transient* countdown (after a
-  terminal stop the loop has already returned and reported).
+  `repeated_rejections`, `repeated_failures`, `session_invalid`, `manual`,
+  `save_and_exit`. Only `manual` and `save_and_exit` are user actions. Every
+  one carries `auto_saved`, which is the difference between an interruption and
+  lost work — all of them now save, so `auto_saved: false` in the data means the
+  save itself failed and is worth investigating. `save_and_exit` exists since
+  2026-09-27 and only fires when "Save Progress & Leave" is clicked during a
+  *transient* countdown (after a terminal stop the loop has already returned and
+  reported).
 
 All terminal paths go through the `trackStopped()` helper rather than emitting
 inline, so a new one cannot silently skip the event.
@@ -100,6 +101,27 @@ sets `manuallyPaused` and gets `info` styling via `pauseAlertType` instead of a
 red `error` banner. Setting only `paused` renders a **disabled** "Wait Here"
 button waiting on an auto-resume the loop has already returned from — a dead end
 that stranded manual pauses, `repeated_rejections` and `repeated_failures`.
+
+`session_invalid` is the one terminal path whose way back is *not* a retry.
+Last.fm error 9 ("Invalid session key") means the stored key has been
+invalidated while the user was away — in the data, mostly people who had since
+signed in on another device or browser. Nothing about the track is wrong, so the
+loop stops on the **first** error 9 without consuming the track, saves, clears
+the key (`clearSessionKey()`, which keeps the username that saved progress and
+the rate-limit window are keyed by) and replaces the retry button with a "Sign
+in to Last.fm again" link. It used to be ten per-track failures, then a retry
+with the same key, and the key stayed in localStorage, so every later visit
+failed identically: the top `scrobble.repeatedFailures` cause, with one user
+stuck for 8 days. Error 9 no longer reaches `scrobble.repeatedFailures`, so that
+context's volume drops from this fix on.
+
+`init()` exchanges a callback `?token=` **even when a key is already stored**.
+It used to skip the exchange whenever one was, which silently discarded the
+fresh token and kept the dead key — re-authorizing could never help (visible in
+the data as `auth_success` `returning: false` followed within a minute by error
+9). If that exchange fails while a key is stored, the stored key is kept rather
+than logging the user out; if it is dead too, the first scrobble says so.
+`auth.getSession` is never sent with (or signed over) the old `sk`.
 
 `manualPause()` deliberately does **not** save. It only raises the flags; the
 save and the `scrobble_stopped` event happen in the scrobble loop's pause check,

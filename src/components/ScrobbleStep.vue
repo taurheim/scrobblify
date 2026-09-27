@@ -72,9 +72,13 @@
         <!--
           Anything terminal needs a way back in. Without this a manual pause was
           a dead end: a disabled button waiting on an auto-resume that the loop
-          had already returned from.
+          had already returned from. A rejected session key is the exception:
+          retrying with it can only fail again, so the way back is signing in.
         -->
-        <v-btn v-if="canResume" outlined @click="scrobble">
+        <v-btn v-if="sessionInvalid" color="primary" :href="authorizeUrl">
+          Sign in to Last.fm again
+        </v-btn>
+        <v-btn v-else-if="canResume" outlined @click="scrobble">
           {{ manuallyPaused ? 'Resume Now' : 'Try Again Now' }}
         </v-btn>
         <v-btn v-else outlined disabled>Wait Here</v-btn>
@@ -241,6 +245,9 @@ export default Vue.extend({
       // on once its countdown ends: the save has already been taken, so every
       // track sent after it would be re-sent by the next resume.
       leaving: false,
+      // Last.fm rejected the stored session key (error 9). Terminal, and the
+      // only way forward is a fresh sign-in, so it replaces the retry button.
+      sessionInvalid: false,
       autoSaved: false,
       tracksSinceCheckpoint: 0,
       pauseReason: '',
@@ -311,6 +318,9 @@ export default Vue.extend({
     pacingNotice(): string {
       return `Pacing to stay under Last.fm's rate limit — ${this.burstCount} scrobbles in the`
         + ' last 10 minutes. Scrobbling continues automatically.';
+    },
+    authorizeUrl(): string {
+      return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
 
     /*
@@ -470,6 +480,7 @@ export default Vue.extend({
       this.stopped = false;
       this.manuallyPaused = false;
       this.leaving = false;
+      this.sessionInvalid = false;
       this.autoSaved = false;
       this.tracksSinceCheckpoint = 0;
       this.pauseReason = '';
@@ -731,6 +742,23 @@ export default Vue.extend({
               }));
             }
             retrySameTrack = true;
+          } else if (LastFm.isSessionKeyError(e)) {
+            // The stored session key is dead, so every remaining track would
+            // fail identically. This used to burn ten tracks as "failed", then
+            // offer a retry with the same key — and keep the key, so every
+            // later visit failed the same way. The track is not at fault: leave
+            // it unconsumed, save, and send the user to sign in again.
+            this.pauseReason = 'Last.fm is no longer accepting your sign-in. This can happen after'
+              + ' signing in to Scrobblify on another device or browser, changing your Last.fm'
+              + ' password, or removing Scrobblify\'s access. Sign in again, then choose'
+              + ' "Resume" to carry on where you left off.';
+            this.sessionInvalid = true;
+            this.stopped = true;
+            this.paused = true;
+            this.autoSave();
+            this.trackStopped('session_invalid', { track_index: i });
+            api.clearSessionKey();
+            return;
           } else if (LastFm.isNetworkError(e)) {
             // Transient connectivity problem (offline, DNS, connection reset,
             // etc.). Don't count this against the track: pause briefly and retry
