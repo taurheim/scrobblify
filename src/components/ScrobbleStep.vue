@@ -84,6 +84,10 @@
           Your progress has been saved automatically — just come back to this page later
           and choose "Resume".
         </div>
+        <v-alert v-else-if="saveFailed" type="warning" text dense class="mb-2 text-left save-failed">
+          Scrobblify couldn't save your progress in this browser. Press
+          "Save Progress &amp; Leave" to download it as a file before you close this page.
+        </v-alert>
         <div class="mb-3 overall-progress">
           {{ totalSucceeded }} of {{ originalTotalTracks }} completed so far
         </div>
@@ -164,6 +168,14 @@ const MIN_TRACKS_FOR_BACKGROUND = 2700;
 
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
+
+/*
+  Shown when this browser can't store what a backdated send needs. Says
+  nothing about whether progress was saved: the panel reports that from the
+  actual outcome of the save, and the usual cause of this stop is the same
+  storage refusal that would make a save fail too.
+*/
+const STORAGE_STOP_REASON = 'Scrobblify couldn\'t store data in this browser, and it needs to before it sends plays older than two weeks. It has stopped so they don\'t get scrobbled twice. Private browsing or strict cookie settings usually cause this. Allow this site to store data, then press "Try Again Now".';
 
 // Escalating backoff between retries of a rate-limited track.
 //
@@ -388,7 +400,13 @@ export default Vue.extend({
       // Last.fm rejected the stored session key (error 9). Terminal, and the
       // only way forward is a fresh sign-in, so it replaces the retry button.
       sessionInvalid: false,
+      // A save this browser confirmed. Never set on the strength of an attempt:
+      // it is what tells the user they can safely close the page.
       autoSaved: false,
+      // The latest save was attempted and did not land.
+      saveFailed: false,
+      // Why a storage write the run depended on failed, for telemetry.
+      storageFailure: '',
       pauseReason: '',
       countdown: 0,
       countdownTimer: null as number | null,
@@ -814,11 +832,13 @@ export default Vue.extend({
     setPendingSecond(track: Scrobble, sec: number): boolean {
       this.pendingReTagSec = sec;
       this.$store.commit('setPendingReTagSec', sec);
-      return background.recordInFlightSecond(
+      const write = background.recordInFlightSecond(
         (this.$store.state.importId as string) || '',
         this.reTagTrackKey(track),
         sec,
       );
+      this.storageFailure = write.ok ? '' : write.failure;
+      return write.ok;
     },
 
     /**
@@ -863,7 +883,10 @@ export default Vue.extend({
     async ensureImportIdentity(): Promise<boolean> {
       if ((this.$store.state.importId as string) || '') { return true; }
       const minted = StateManager.newImportId();
-      if (!minted) { return false; }
+      if (!minted) {
+        this.storageFailure = 'no_random_source';
+        return false;
+      }
       this.$store.commit('setImportId', minted);
       /*
         `autoSave` is the wrong door here: it swallows a failed write, because
@@ -881,9 +904,16 @@ export default Vue.extend({
         try {
           await persist(this.progressSnapshot());
           written = true;
-        } catch {
+          this.autoSaved = true;
+          this.saveFailed = false;
+        } catch (e) {
           written = false;
+          this.autoSaved = false;
+          this.saveFailed = true;
+          this.storageFailure = background.storageErrorName(e);
         }
+      } else {
+        this.storageFailure = 'no_persist_channel';
       }
       if (!written) {
         /*
@@ -905,6 +935,8 @@ export default Vue.extend({
       this.manuallyPaused = false;
       this.sessionInvalid = false;
       this.autoSaved = false;
+      this.saveFailed = false;
+      this.storageFailure = '';
       this.pauseReason = '';
       // A manual retry after giving up starts a fresh backoff ladder.
       this.rateLimitPauseCount = 0;
@@ -970,8 +1002,8 @@ export default Vue.extend({
         this.endPacing();
         this.stopped = true;
         this.paused = true;
-        this.pauseReason = 'Scrobblify could not save the information it needs to send your older plays safely, so it has stopped rather than risk duplicating them. Your progress is saved. This usually means the browser is blocking storage for this site.';
-        this.trackStopped('retag_identity_unavailable');
+        this.pauseReason = STORAGE_STOP_REASON;
+        this.trackStopped('retag_identity_unavailable', { storage_failure: this.storageFailure });
         return;
       }
       /*
@@ -1204,7 +1236,7 @@ export default Vue.extend({
           this.endPacing();
           this.stopped = true;
           this.paused = true;
-          this.pauseReason = `Some of your plays are too old to scrobble with their original times, and Scrobblify can't yet tell which substitute times are safe to use. They're still saved — come back after ${new Date(blockedUntilSec * MS_PER_SECOND).toLocaleDateString()} and they'll go through.`;
+          this.pauseReason = `Some of your plays are too old to scrobble with their original times, and Scrobblify can't yet tell which substitute times are safe to use. They're still in the queue. Come back after ${new Date(blockedUntilSec * MS_PER_SECOND).toLocaleDateString()} and they'll go through.`;
           await this.autoSave();
           this.trackStopped('retag_blocked', { track_index: i });
           return;
@@ -1255,7 +1287,7 @@ export default Vue.extend({
             this.endPacing();
             this.stopped = true;
             this.paused = true;
-            this.pauseReason = 'Scrobblify has run out of substitute times for your older plays for the moment. They are still saved — resume in a little while and they will go through.';
+            this.pauseReason = 'Scrobblify has run out of substitute times for your older plays for the moment. They are still in the queue. Resume in a little while and they will go through.';
             await this.autoSave();
             this.trackStopped('retag_no_second', { track_index: i });
             return;
@@ -1296,10 +1328,13 @@ export default Vue.extend({
             */
             pendingReTagTimestampSec = undefined;
             this.clearPendingSecond(track);
-            this.pauseReason = 'Scrobblify could not save the information it needs to send your older plays safely, so it has stopped rather than risk duplicating them. Your progress is saved. This usually means the browser is blocking storage for this site.';
+            this.pauseReason = STORAGE_STOP_REASON;
             // eslint-disable-next-line no-await-in-loop
             await this.autoSave();
-            this.trackStopped('retag_journal_unavailable', { track_index: i });
+            this.trackStopped('retag_journal_unavailable', {
+              track_index: i,
+              storage_failure: this.storageFailure,
+            });
             return;
           }
           pendingSecondUnspent = true;
@@ -1350,7 +1385,7 @@ export default Vue.extend({
               if (pendingSecondUnspent) {
                 this.clearPendingSecond(track);
               }
-              this.pauseReason = 'Last.fm says you have hit your daily scrobble limit. Your progress is saved — come back tomorrow and resume.';
+              this.pauseReason = 'Last.fm says you have hit your daily scrobble limit. Come back tomorrow and resume.';
               this.stopped = true;
               this.paused = true;
               // eslint-disable-next-line no-await-in-loop
@@ -1439,7 +1474,7 @@ export default Vue.extend({
               this.endPacing();
               this.stopped = true;
               this.paused = true;
-              this.pauseReason = 'Last.fm rejected the substitute times Scrobblify chose for your older plays. That usually means this device\'s clock is wrong. Your progress is saved — check the clock and resume.';
+              this.pauseReason = 'Last.fm rejected the substitute times Scrobblify chose for your older plays. That usually means this device\'s clock is wrong. Check the clock and resume.';
               // eslint-disable-next-line no-await-in-loop
               await this.autoSave();
               this.trackStopped('retag_second_refused', { track_index: i });
@@ -1465,7 +1500,7 @@ export default Vue.extend({
           }
 
           if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-            this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} scrobbles in a row were rejected by Last.fm. Your progress is saved.`;
+            this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} scrobbles in a row were rejected by Last.fm.`;
             this.errorDetails = this.failedTracks[this.failedTracks.length - 1].error;
             this.showError = true;
             this.pauseReason = 'Paused because Last.fm rejected several scrobbles in a row.';
@@ -1614,7 +1649,7 @@ export default Vue.extend({
               this.errorMessage = `${MAX_CONSECUTIVE_FAILURES} tracks failed in a row. There may be a problem with Last.fm or your authentication.`;
               this.errorDetails = (e as Error).message || String(e);
               this.showError = true;
-              this.pauseReason = 'Paused due to repeated failures. Your progress is saved.';
+              this.pauseReason = 'Paused due to repeated failures.';
               this.stopped = true;
               this.paused = true;
               // The track is left unconsumed (scrobbledTracks is not advanced):
@@ -1727,7 +1762,7 @@ export default Vue.extend({
     },
 
     manualPause() {
-      this.pauseReason = 'Paused. Your progress is saved — resume whenever you like.';
+      this.pauseReason = 'Paused. Resume whenever you like.';
       this.paused = true;
       // Tracked separately from `stopped`, which drives the red error styling.
       // A deliberate pause is not a failure, but it is just as terminal: the
@@ -1822,7 +1857,7 @@ export default Vue.extend({
      */
     releaseHandoffHalt() {
       this.handoffHalted = false;
-      this.pauseReason = 'Paused. Your progress is saved — resume whenever you like.';
+      this.pauseReason = 'Paused. Resume whenever you like.';
     },
 
     requestBackground() {
@@ -1835,19 +1870,24 @@ export default Vue.extend({
      */
     async autoSave() {
       const snapshot = this.progressSnapshot();
-      this.autoSaved = true;
       if (this.persistProgress) {
         try {
           await this.persistProgress(snapshot);
           // A confirmed write is the only thing that clears this. The emit
           // path below cannot confirm anything, so it does not.
           this.progressDirty = false;
+          this.autoSaved = true;
+          this.saveFailed = false;
         } catch {
           // The parent reports it. Swallowed here so a failed save cannot
-          // leave the loop holding its lock.
+          // leave the loop holding its lock — but not hidden: an earlier save
+          // no longer covers this progress, so the panel must stop saying so.
+          this.autoSaved = false;
+          this.saveFailed = true;
         }
         return;
       }
+      this.autoSaved = true;
       this.$emit('auto-save', snapshot);
     },
 
@@ -1871,11 +1911,11 @@ export default Vue.extend({
      */
     async persistForHalt(): Promise<boolean> {
       const snapshot = this.progressSnapshot();
-      this.autoSaved = true;
       const persist = this.persistProgressIfAhead || this.persistProgress;
       if (!persist) {
         // No awaitable channel at all: an emit cannot be confirmed, so this
         // has to count as unconfirmed rather than quietly as success.
+        this.autoSaved = true;
         this.$emit('auto-save', snapshot);
         this.persistFailed = true;
         return false;
@@ -1889,6 +1929,8 @@ export default Vue.extend({
           await persist(snapshot);
           this.persistFailed = false;
           this.progressDirty = false;
+          this.autoSaved = true;
+          this.saveFailed = false;
           return true;
         } catch {
           // eslint-disable-next-line no-await-in-loop
@@ -1896,6 +1938,8 @@ export default Vue.extend({
         }
       }
       this.persistFailed = true;
+      this.autoSaved = false;
+      this.saveFailed = true;
       trackEvent('scrobble_halt_persist_failed', this.progressProps());
       return false;
     },

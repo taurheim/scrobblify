@@ -921,7 +921,7 @@ test.describe('Session Resume', () => {
       `autoSave` swallows a failed write — nothing is normally waiting on one —
       so this has to go through the awaitable channel and refuse on failure.
     */
-    await expect(page.locator('text=risk duplicating them')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator("text=couldn't store data in this browser >> visible=true")).toBeVisible({ timeout: 15000 });
     expect(sent).toHaveLength(0);
 
     /*
@@ -2033,7 +2033,7 @@ test.describe('Re-tagged old plays', () => {
     const timestamps = await runReTaggedImport(
       page,
       { scrobbles: { '@attr': { accepted: 1, ignored: 0 } } },
-      'risk duplicating them',
+      "couldn't store data in this browser",
     );
 
     /*
@@ -2566,5 +2566,177 @@ test.describe('Invalid session key', () => {
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('text=/already used or has expired/i')).toBeHidden();
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBe('fake-session-key');
+  });
+});
+
+test.describe('Browser storage unavailable', () => {
+  const JOURNAL_KEY = 'scrobblify.background.inflightSecond';
+  const STOPPED = "text=couldn't store data in this browser >> visible=true";
+  const SAVE_FAILED = "text=couldn't save your progress in this browser >> visible=true";
+
+  type Tracked = { name: string; props: Record<string, unknown> };
+
+  // What `trackEvent` would have sent, read from its dev-build console echo:
+  // nothing is captured from localhost, so this is the only place it shows.
+  function captureEvents(page: Page): Tracked[] {
+    const events: Tracked[] = [];
+    page.on('console', (msg) => {
+      const match = msg.text().match(/^\[scrobblify:event\] (\S+) ([\s\S]*)$/);
+      if (!match) return;
+      try {
+        events.push({ name: match[1], props: JSON.parse(match[2]) });
+      } catch {
+        // Not ours.
+      }
+    });
+    return events;
+  }
+
+  // The journal write fails the way a full localStorage does.
+  async function blockJournal(page: Page) {
+    await page.addInitScript((key) => {
+      const original = Storage.prototype.setItem;
+      Storage.prototype.setItem = function setItem(this: Storage, k: string, v: string) {
+        if (k === key) {
+          throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+        }
+        return original.call(this, k, v);
+      };
+    }, JOURNAL_KEY);
+  }
+
+  // From here on IndexedDB refuses this site, as Firefox does with storage
+  // blocked. Installed after load, so the page gets as far as the scrobble step.
+  async function blockIndexedDb(page: Page) {
+    await page.evaluate(() => {
+      IDBFactory.prototype.open = function open() {
+        throw new DOMException('The operation is insecure.', 'SecurityError');
+      };
+    });
+  }
+
+  async function countScrobbles(page: Page): Promise<string[]> {
+    const scrobbled: string[] = [];
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+      }
+      await route.fallback();
+    });
+    return scrobbled;
+  }
+
+  async function selectBackdatedImport(page: Page) {
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
+    await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+  }
+
+  function stopEvent(events: Tracked[]) {
+    return events.find((e) => e.name === 'scrobble_stopped');
+  }
+
+  test('a backdated play the journal cannot record is not sent, and the stop says why', async ({ page }) => {
+    test.setTimeout(90000);
+    const events = captureEvents(page);
+    await blockJournal(page);
+    await goToUploadStep(page);
+    const scrobbled = await countScrobbles(page);
+    await selectBackdatedImport(page);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator(STOPPED)).toBeVisible({ timeout: 20000 });
+    // IndexedDB still works here, so this one really was saved.
+    await expect(page.locator('text=saved automatically')).toBeVisible();
+    await expect(page.locator(SAVE_FAILED)).toHaveCount(0);
+    expect(scrobbled).toEqual([]);
+    await expect.poll(() => stopEvent(events)?.props).toMatchObject({
+      reason: 'retag_journal_unavailable',
+      storage_failure: 'QuotaExceededError',
+      auto_saved: true,
+    });
+  });
+
+  test('when nothing can be stored, the page says so and still hands over a file', async ({ page }) => {
+    test.setTimeout(90000);
+    const events = captureEvents(page);
+    await blockJournal(page);
+    await goToUploadStep(page);
+    const scrobbled = await countScrobbles(page);
+    await selectBackdatedImport(page);
+    await blockIndexedDb(page);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator(STOPPED)).toBeVisible({ timeout: 20000 });
+    await expect(page.locator(SAVE_FAILED)).toBeVisible();
+    await expect(page.locator('text=saved automatically')).toHaveCount(0);
+    expect(scrobbled).toEqual([]);
+    await expect.poll(() => stopEvent(events)?.props).toMatchObject({
+      reason: 'retag_journal_unavailable',
+      auto_saved: false,
+    });
+
+    // The download must not depend on the browser save that just failed.
+    const download = page.waitForEvent('download');
+    await page.getByRole('button', { name: 'Save Progress & Leave' }).click();
+    expect((await download).suggestedFilename()).toMatch(/^scrobblify-progress-.*\.json$/);
+    await expect(page.locator('text=downloaded as a file instead >> visible=true')).toBeVisible();
+    expect(events.find((e) => e.name === 'session_saved')?.props).toMatchObject({ saved_in_browser: false });
+  });
+
+  test('a queue with no identity that cannot be given one is not sent', async ({ page }) => {
+    test.setTimeout(90000);
+    const events = captureEvents(page);
+    await interceptLastFm(page);
+    const scrobbled = await countScrobbles(page);
+    // A save from before import identities existed: no `importId`.
+    const tracks = [1, 2, 3].map((n) => ({
+      track: `Track ${n}`,
+      artist: `Artist ${n}`,
+      album: `Album ${n}`,
+      timestamp: Date.UTC(2024, 0, n),
+      reTagged: true,
+    }));
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, {
+      userName: 'testuser',
+      totalTracks: 3,
+      completedIndices: [],
+      failedIndices: [],
+      tracks,
+      originalTotalTracks: 3,
+      originalSucceededCount: 0,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+    });
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=3 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await blockIndexedDb(page);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator(STOPPED)).toBeVisible({ timeout: 20000 });
+    await expect(page.locator(SAVE_FAILED)).toBeVisible();
+    expect(scrobbled).toEqual([]);
+    await expect.poll(() => stopEvent(events)?.props).toMatchObject({
+      reason: 'retag_identity_unavailable',
+      storage_failure: 'SecurityError',
+      auto_saved: false,
+    });
   });
 });

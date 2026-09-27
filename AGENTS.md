@@ -82,11 +82,39 @@ nothing at all.
   a bug: treat it as normal operation rather than signal.
 - `scrobble_stopped` — terminal; the run is over until the user comes back.
   Reasons: `daily_limit`, `lastfm_daily_limit`, `rate_limit_exhausted`,
-  `repeated_rejections`, `repeated_failures`, `session_invalid`, `manual`. Only
-  `manual` is a user action. Every one carries `auto_saved`, which is the
-  difference between an interruption and lost work — all seven now save, so
-  `auto_saved: false` in the data means the save itself failed and is worth
-  investigating.
+  `repeated_rejections`, `repeated_failures`, `session_invalid`, `manual`, and
+  the backdating guards `retag_blocked`, `retag_no_second`,
+  `retag_second_refused`, `retag_identity_unavailable`,
+  `retag_journal_unavailable`. Only `manual` is a user action. Every one
+  carries `auto_saved`, which is the difference between an interruption and
+  lost work.
+
+`auto_saved: true` means the progress write to IndexedDB **resolved** before the
+event was emitted — every stop path awaits its save first, and a failed write
+sets it `false`. So `false` means the save itself failed and is worth
+investigating. **Events from before this was fixed (2026-09) set it before the
+write started, so in older data it only means "a save was attempted"**: a
+failed save still reported `true`, and nothing distinguished the two.
+
+The two storage stops (`retag_identity_unavailable`, `retag_journal_unavailable`)
+also carry `storage_failure`, saying *why* this browser couldn't store data:
+
+| Value | Meaning |
+| --- | --- |
+| `QuotaExceededError`, `SecurityError`, … | the `DOMException` name the write threw. `SecurityError` is storage blocked outright (private browsing, strict cookie settings); `QuotaExceededError` is full or zero-quota storage |
+| `not_persisted` | the journal write didn't throw but read back as something else — private modes have done this |
+| `invalid_record` | the journal refused the record itself (e.g. an empty import id) |
+| `no_random_source` | no `crypto.getRandomValues`, so no import identity could be minted |
+| `no_persist_channel` | the scrobble step had no awaitable save to confirm the identity with |
+| `unknown` | something without a `.name` was thrown |
+
+These stops only affect **backdated** ("older than 2 weeks") plays; an import
+of recent listens never touches the journal. Both leave the whole queue in
+place. When the save also fails, the paused panel says so (`.save-failed`)
+instead of claiming progress is saved, and "Save Progress & Leave" still
+downloads the progress file. It no longer skips the download when the browser
+save fails. `session_saved.saved_in_browser` records which happened; `false`
+means the user left with only the file.
 
 All terminal paths go through the `trackStopped()` helper rather than emitting
 inline, so a new one cannot silently skip the event.
@@ -185,6 +213,11 @@ threw — so coercion goes through `toError()`, which guards `String(value)`
 `normalizeErrorForTracking` is called inside the try. Doing either before the
 guard loses the report *and* throws a fresh error out of a `catch` block or a
 global handler, which is exactly where it does the most damage.
+
+Outside production builds, `trackEvent` also logs each event to the console as
+`[scrobblify:event] <name> <json>`. Nothing is captured from localhost, so this
+is how Playwright asserts on telemetry (see `captureEvents` in the "Browser
+storage unavailable" tests). Production bundles don't include it.
 
 ## Scrobble timestamps
 

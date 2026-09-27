@@ -956,7 +956,33 @@ function readJournal(): InFlightSecond[] {
   }
 }
 
-export function recordInFlightSecond(importId: string, trackKey: string, sec: number): boolean {
+/**
+ * A short, grouping-friendly name for a failed storage write, for telemetry.
+ *
+ * The browser's exception name where there is one (`QuotaExceededError`: the
+ * storage is full; `SecurityError`: the browser refuses this site storage at
+ * all), since that is the difference between "free some space" and "change a
+ * setting". Never the message, which can quote the value being written.
+ */
+export function storageErrorName(e: unknown): string {
+  try {
+    const name = e && typeof (e as { name?: unknown }).name === 'string'
+      ? (e as { name: string }).name
+      : '';
+    return name || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * The outcome of a journal write. `failure` says why it can't be relied on:
+ * `invalid_record` (nothing to bind it to), `not_persisted` (the browser
+ * accepted the write and then stored nothing), or `storageErrorName`'s answer.
+ */
+export type InFlightWrite = { ok: true } | { ok: false; failure: string };
+
+export function recordInFlightSecond(importId: string, trackKey: string, sec: number): InFlightWrite {
   /*
     An empty identity is refused rather than stored.
 
@@ -966,7 +992,9 @@ export function recordInFlightSecond(importId: string, trackKey: string, sec: nu
     identity by now; refusing here is what makes that a requirement rather
     than a hope.
   */
-  if (!importId || !trackKey || !Number.isFinite(sec) || sec <= 0) { return false; }
+  if (!importId || !trackKey || !Number.isFinite(sec) || sec <= 0) {
+    return { ok: false, failure: 'invalid_record' };
+  }
   try {
     // Only this queue's own previous record is displaced: a queue has one send
     // in flight at a time, so its earlier second is either resolved or has
@@ -982,9 +1010,11 @@ export function recordInFlightSecond(importId: string, trackKey: string, sec: nu
     // send on the strength of this. A quota failure that throws is caught
     // below; one that silently stores nothing is not, and private-mode
     // storage has historically done both.
-    return window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY) === encoded;
-  } catch {
-    return false;
+    return window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY) === encoded
+      ? { ok: true }
+      : { ok: false, failure: 'not_persisted' };
+  } catch (e) {
+    return { ok: false, failure: storageErrorName(e) };
   }
 }
 

@@ -2401,14 +2401,32 @@ export default Vue.extend({
     async onSaveAndExit(info: ProgressSnapshot) {
       const state = this.buildState(info);
 
+      /*
+        The browser save and the download are attempted independently. The file
+        is the only way out for a browser that can't store anything, so a failed
+        save must not also cost the user the download.
+      */
+      let saveError: unknown = null;
       try {
         await this.stateManager.saveState(state);
-        this.stateManager.exportToFile(state);
-        trackEvent('session_saved', this.saveProps(info, false));
       } catch (e) {
+        saveError = e;
         trackError('scrobblify.onSaveAndExit', e);
+      }
+      try {
+        this.stateManager.exportToFile(state);
+      } catch (e) {
+        trackError('scrobblify.onSaveAndExit', e, { stage: 'export' });
         this.errorMessage = 'Failed to save your scrobbling progress. You can try the "Save Progress" button again.';
         this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+        return;
+      }
+      trackEvent('session_saved', { ...this.saveProps(info, false), saved_in_browser: !saveError });
+      if (saveError) {
+        // Not the "come back later" screen: coming back here would find nothing.
+        this.errorMessage = 'Scrobblify couldn\'t save your progress in this browser, so it has been downloaded as a file instead. To carry on later, open Scrobblify and drop that file on the upload page.';
+        this.errorDetails = (saveError as Error).message || String(saveError);
         this.showError = true;
         return;
       }
