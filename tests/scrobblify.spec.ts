@@ -1,5 +1,5 @@
 import {
-  test, expect, Page, Route,
+  test, expect, Locator, Page, Route,
 } from '@playwright/test';
 import path from 'path';
 import JSZip from 'jszip';
@@ -1606,9 +1606,8 @@ test.describe('Rate limit handling', () => {
     // Regression: the old handler paused a flat 60s and retried the same track
     // indefinitely. Two production users sat through 200+ consecutive retries.
     //
-    // The backoff ladder spans ~50 minutes, so time is faked. With the clock
-    // frozen nothing advances on its own — including the API client's own retry
-    // backoff — so the clock has to be driven forward while polling.
+    // The backoff ladder spans ~50 minutes, so time is faked and driven forward
+    // while polling — including through the API client's own retry backoff.
     await page.clock.install();
     await alwaysRateLimited(page);
     await page.goto('/#/scrobble');
@@ -1622,25 +1621,44 @@ test.describe('Rate limit handling', () => {
     await page.clock.runFor(3000);
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
 
-    // Advance simulated time until the loop reaches a terminal state, recording
-    // whether the escalating backoff was surfaced along the way.
-    let sawFirstBackoff = false;
-    let gaveUp = false;
-    for (let i = 0; i < 250 && !gaveUp; i++) {
-      // eslint-disable-next-line no-await-in-loop
-      await page.clock.runFor(30 * 1000);
-      // eslint-disable-next-line no-await-in-loop
-      await page.waitForTimeout(50);
-      if (!sawFirstBackoff) {
+    // Jump simulated time forward until `locator` appears.
+    //
+    // fastForward, not runFor: runFor replays every 1s countdown tick (each a
+    // re-render), which over ~50 simulated minutes cost more than the whole
+    // test budget on slower machines (#79). fastForward fires each due timer
+    // at most once, which is enough because the countdown resolves off a
+    // wall-clock deadline rather than by counting ticks.
+    //
+    // Each jump fires at most one of the API client's chained retry timers, so
+    // this takes a step per retry. The short real-time wait lets route
+    // handlers answer and the page re-render; it returns as soon as the target
+    // shows, so it only costs anything on steps that don't reach it.
+    async function advanceUntilVisible(locator: Locator, stepMs: number) {
+      for (let step = 0; step < 40; step++) {
         // eslint-disable-next-line no-await-in-loop
-        sawFirstBackoff = await page.locator('text=attempt 1 of 3').isVisible();
+        if (await locator.isVisible()) return true;
+        // eslint-disable-next-line no-await-in-loop
+        await page.clock.fastForward(stepMs);
+        // eslint-disable-next-line no-await-in-loop
+        await locator.waitFor({ timeout: 100 }).catch(() => undefined);
       }
-      // eslint-disable-next-line no-await-in-loop
-      gaveUp = await page.locator('text=still rate limiting your account').isVisible();
+      return locator.isVisible();
     }
 
     // The user is told how long we'll wait, instead of a bare 1-minute countdown.
+    // The step must stay well under the 5-minute first backoff, or a single
+    // jump could carry the loop straight past the state being checked for.
+    const sawFirstBackoff = await advanceUntilVisible(
+      page.locator('text=attempt 1 of 3'),
+      60 * 1000,
+    );
     expect(sawFirstBackoff).toBe(true);
+
+    // Giving up is terminal, so overshooting it is harmless: take big steps.
+    const gaveUp = await advanceUntilVisible(
+      page.locator('text=still rate limiting your account'),
+      30 * 60 * 1000,
+    );
     // The loop must terminate with an actionable message, not keep spinning.
     expect(gaveUp).toBe(true);
     await expect(page.getByRole('button', { name: 'Try Again Now' })).toBeVisible();
