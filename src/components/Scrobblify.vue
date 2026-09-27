@@ -53,6 +53,7 @@
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
             v-on:auto-save="onAutoSave"
+            v-on:checkpoint="onCheckpoint"
           ></scrobble-step>
         </v-stepper-content>
         <v-stepper-content step="5">
@@ -260,15 +261,29 @@ export default Vue.extend({
     },
     async clearSavedState() {
       try {
-        await this.stateManager.clearState();
+        await this.persist(() => this.stateManager.clearState());
       } catch (e) {
         // Not critical — continue anyway
       }
       this.hasResumableState = false;
     },
+    /**
+     * Run a write to the saved session after every write queued before it.
+     * Checkpoints make writes frequent, and each opens its own IndexedDB
+     * connection, so without this a checkpoint issued just before completion
+     * could land *after* the completion's clear and resurrect a finished
+     * import as a resumable one.
+     */
+    persist(write: () => Promise<void>): Promise<void> {
+      const self = this as any;
+      const previous: Promise<void> = self._persistQueue || Promise.resolve();
+      const next = previous.catch(() => undefined).then(write);
+      self._persistQueue = next;
+      return next;
+    },
     async onScrobbleComplete() {
       try {
-        await this.stateManager.clearState();
+        await this.persist(() => this.stateManager.clearState());
       } catch (e) {
         // Not critical — continue anyway
       }
@@ -321,17 +336,37 @@ export default Vue.extend({
      */
     async onAutoSave(info: ProgressSnapshot) {
       try {
-        await this.stateManager.saveState(this.buildState(info));
+        const state = this.buildState(info);
+        await this.persist(() => this.stateManager.saveState(state));
         trackEvent('session_saved', this.saveProps(info, true));
       } catch (e) {
         trackError('scrobblify.onAutoSave', e);
+      }
+    },
+    /**
+     * Periodic mid-run save, so closing the tab costs at most a few tracks
+     * instead of everything since the last stop. Deliberately silent: it runs
+     * every few dozen tracks, so it reports neither `session_saved` nor more
+     * than one error per page load.
+     */
+    async onCheckpoint(info: ProgressSnapshot) {
+      try {
+        // Built before the first await, so it captures the queue as it is now.
+        const state = this.buildState(info);
+        await this.persist(() => this.stateManager.saveState(state));
+      } catch (e) {
+        const self = this as any;
+        if (!self._checkpointErrorReported) {
+          self._checkpointErrorReported = true;
+          trackError('scrobblify.onCheckpoint', e);
+        }
       }
     },
     async onSaveAndExit(info: ProgressSnapshot) {
       const state = this.buildState(info);
 
       try {
-        await this.stateManager.saveState(state);
+        await this.persist(() => this.stateManager.saveState(state));
         this.stateManager.exportToFile(state);
         trackEvent('session_saved', this.saveProps(info, false));
       } catch (e) {
