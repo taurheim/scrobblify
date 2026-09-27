@@ -46,7 +46,9 @@ project; adapt it instead of writing from scratch.
    related merges, split at each one.
 5. **Timeline** (Q10) for 1–2 example users per lead. Narrate the sequence.
 6. **Code.** Find the path that produces that sequence; cite `file:line`.
-7. **Classify and report** (below). Don't fix anything unless asked.
+7. **Classify** (below).
+8. **Try to disprove it** (below) — every Bug, Regression and Silent failure.
+9. **Report.** Don't fix anything unless asked.
 
 ## Invariants
 
@@ -71,11 +73,41 @@ project; adapt it instead of writing from scratch.
 | **Expected** | Last.fm throttling (`burst_limit`, `rate_limit`, `daily_limit`); `scrobble_ignored` code 1; `window.onerror` "Script error." (cross-origin, no stack — noise unless it spikes); wrong Spotify export, which already has its own message |
 | **Telemetry artifact** | Falls in a known-inflated window in `AGENTS.md`, or predates the fields it's missing |
 
+## Try to disprove it
+
+You built the case, so you are the worst person to test it. Before reporting a
+**Bug**, **Regression** or **Silent failure**, hand it to a fresh subagent
+whose only job is to prove it wrong. Use the `general-purpose` agent type (it
+needs PostHog and the code), one per finding, all dispatched in parallel.
+Use the prompt in [disproving-findings.md](disproving-findings.md).
+
+- Give it the **claim and the raw evidence**: the queries, example users and
+  time windows, `file:line`. Not your reasoning, and not your confidence.
+- Frame it as a refutation ("find why this is wrong"), never a confirmation
+  ("check this bug"). A reviewer asked to confirm will confirm.
+- It must run **its own** queries and read the code itself; re-running yours
+  only re-checks your arithmetic.
+
+Act on its verdict:
+
+| Verdict | Do |
+| --- | --- |
+| **Disproved** | Reclassify (Expected / Artifact / Already fixed). Mention it under "Checked and ruled out" so nobody chases it again |
+| **Weakened** | Narrow the claim to what survived (fewer users, a sub-case, a smaller mechanism) and lower confidence |
+| **Survived** | Keep it; record the strongest alternative it tried and why that failed |
+
+You may rebut a refutation **once**, and only with new evidence (e.g. it
+misread an event's semantics — cite `AGENTS.md` or the code). Never re-dispatch
+until you get the answer you wanted. If you still disagree, report both views.
+
 ## Report
 
 Ranked by users affected. For each: verdict, one-line mechanism, impact (users,
 occurrences, first/last seen, before/after deploy), the query, a short timeline
-excerpt, suspected `file:line`, suggested next step. State uncertainty plainly.
+excerpt, suspected `file:line`, suggested next step, and the adversarial
+outcome (Survived / Weakened, plus the strongest alternative ruled out). State
+uncertainty plainly. Usernames are Last.fm handles: fine in a local report,
+**never** in commits, PRs or issues.
 Usernames are Last.fm handles: fine in a local report, **never** in commits,
 PRs or issues.
 
@@ -88,3 +120,5 @@ PRs or issues.
 | Stopping at "progress went backwards" | Name the mechanism: which save was stale, and why nothing newer was saved |
 | Ranking errors by count | One stuck user produces dozens; rank by users |
 | Treating every drop-off as a bug | Drop-off with no error and plausible timing is abandonment; flag only silent failures |
+| Skipping the disproof step for the "obvious" findings | Obvious findings carry the unexamined assumptions; test every one |
+| Sending the adversary your conclusion, or asking it to confirm | Claim + raw evidence only, framed as "prove this wrong" |

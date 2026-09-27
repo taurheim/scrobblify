@@ -68,9 +68,13 @@ ORDER BY days DESC, n DESC LIMIT 30
 
 Invariant: within one import — one `(distinct_id, original_total_tracks)` —
 `total_succeeded` only rises. A different `original_total_tracks` is a new
-import and resetting is fine. Every run event carries these fields, not just
-`scrobble_paused`, so sample all of them and do **not** collapse to one row per
-day: rollbacks happen within minutes.
+import and resetting is fine. The same `original_total_tracks` is *not* proof of
+the same import: re-uploading the same export gives the same count, so a fresh
+`scrobble_started` at `total_succeeded = 0` also starts a new import
+(`import_seq` below). Without that split, 4a over-counts rollbacks by ~15%.
+Every run event carries these fields, not just `scrobble_paused`, so sample all
+of them and do **not** collapse to one row per day: rollbacks happen within
+minutes.
 
 **4a. Rollbacks on resume, split by where the state came from.** `saved` is
 this browser's IndexedDB; `file` is an imported progress file (a stale file is
@@ -82,17 +86,26 @@ SELECT source, count() AS resumes,
   uniqIf(user, succ < prev_max - 0.5) AS users_rolled_back,
   sumIf(prev_max - succ, succ < prev_max - 0.5) AS tracks_rolled_back
 FROM (
-  SELECT distinct_id AS user, event, toString(properties.source) AS source,
-    toFloat(properties.total_succeeded) AS succ,
-    max(toFloat(properties.total_succeeded)) OVER (
-      PARTITION BY distinct_id, toFloat(properties.original_total_tracks)
-      ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+  SELECT user, event, source, succ,
+    max(succ) OVER (
+      PARTITION BY user, otot, import_seq
+      ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ) AS prev_max
-  FROM events
-  WHERE properties.app = 'scrobblify'
-    AND properties.total_succeeded IS NOT NULL
-    AND properties.original_total_tracks IS NOT NULL
-    AND timestamp >= now() - INTERVAL 30 DAY
+  FROM (
+    SELECT distinct_id AS user, timestamp AS ts, event,
+      toString(properties.source) AS source,
+      toFloat(properties.total_succeeded) AS succ,
+      toFloat(properties.original_total_tracks) AS otot,
+      sum(if(event = 'scrobble_started' AND toFloat(properties.total_succeeded) = 0, 1, 0)) OVER (
+        PARTITION BY distinct_id, toFloat(properties.original_total_tracks)
+        ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) AS import_seq
+    FROM events
+    WHERE properties.app = 'scrobblify'
+      AND properties.total_succeeded IS NOT NULL
+      AND properties.original_total_tracks IS NOT NULL
+      AND timestamp >= now() - INTERVAL 30 DAY
+  )
 )
 WHERE event = 'session_resumed'
 GROUP BY source ORDER BY resumes DESC
@@ -165,7 +178,9 @@ Per browser session, the last run event. Anything other than `scrobble_stopped`
 / `scrobble_completed` is a run that vanished (tab closed, crash, mobile tab
 killed). Harmless on its own; it is the precondition for Q4 rollbacks, since
 state is only saved on a terminal stop. Excludes the last day so live runs don't
-count.
+count. Circumstantial only: `$session_id` is a PostHog *browser* session, not a
+run or an import, so one row can span several runs. Tie a vanished run to a
+rollback per user with Q10.
 
 ```sql
 SELECT last_event, count() AS runs, uniq(user) AS users
