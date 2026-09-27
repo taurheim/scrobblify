@@ -35,9 +35,6 @@ import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError, identifyUser } from '@/services/Analytics';
 
-const LFM_API_KEY = '2bf354b70b4a9a8a4420b2c48333d23e';
-const LFM_AUTH_CALLBACK = 'https://savas.ca/scrobblify/scrobble';
-
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
   data() {
@@ -51,7 +48,7 @@ export default Vue.extend({
   },
   computed: {
     authorizeUrl(): string {
-      return `https://www.last.fm/api/auth/?api_key=${LFM_API_KEY}&cb=${LFM_AUTH_CALLBACK}`;
+      return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
   },
   methods: {
