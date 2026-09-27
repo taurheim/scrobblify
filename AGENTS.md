@@ -235,16 +235,23 @@ for). The sidecars are also why some parse errors quote `"    Ma"` — that's th
 
 **Resuming on a new device goes through the upload step.** The resume banner
 (and its "Import from file" button) only renders when *this browser* already has
-saved state in IndexedDB, so on a new PC or browser it never appears. The upload
-step therefore has its own "Import a Scrobblify progress file" link, routes any
-`.json` dropped on the ZIP zone to the import instead of rejecting it, and — if
-a ZIP has no history files but contains a `scrobblify-progress*.json` — imports
-that. The last case is real: a user whose `.json` was refused zipped it up with
-their Spotify export to get it accepted.
+saved state in IndexedDB, so on a new PC or browser it never appears. The drop
+zone therefore takes both `.zip` and `.json` and **classifies the file the
+moment it's chosen** (`classifyZip`, by entry names only), not on "Find tracks":
 
-A ZIP of `StreamingHistory_music_*.json` is Spotify's default "Account data"
-export, requested separately from (and delivered before) the extended one.
-It gets its own error explaining which export to request.
+- `.json` → imported as a progress file.
+- ZIP with `Streaming_History_Audio_*` → ready; if it *also* holds a
+  `scrobblify-progress*.json`, a "Resume from it instead" link is offered but
+  not forced.
+- ZIP with only a `scrobblify-progress*.json` → imported immediately. This case
+  is real: a user whose `.json` was refused zipped it up with their Spotify
+  export to get it accepted.
+- ZIP of `StreamingHistory_music_*.json` → Spotify's default "Account data"
+  export, requested separately from (and delivered before) the extended one.
+  It gets its own error explaining which export to request.
+
+`upload_no_matching_files` therefore now fires on selection, **without** a
+preceding `upload_parse_started`.
 
 Two Last.fm quirks the validation path has to absorb:
 

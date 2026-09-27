@@ -26,36 +26,30 @@
         <input
           ref="fileInput"
           type="file"
-          accept=".zip"
-          aria-label="Spotify streaming history ZIP file"
+          accept=".zip,.json"
+          aria-label="Spotify export ZIP or Scrobblify progress file"
           style="display: none"
           @change="onFileSelected"
         >
         <v-icon large class="mb-2">mdi-cloud-upload</v-icon>
         <div v-if="selectedFileName">
           <strong>{{ selectedFileName }}</strong>
+          <div v-if="detecting" class="zip-summary">Checking what's inside…</div>
+          <div v-else-if="zipSummary" class="zip-summary">{{ zipSummary }}</div>
         </div>
         <div v-else>
-          Drag &amp; drop your .zip file here, or click to browse
+          Drag &amp; drop your Spotify .zip here, or click to browse
+          <div class="zip-summary">
+            Continuing on another device? Drop your Scrobblify progress file here instead.
+          </div>
         </div>
       </div>
-      <div class="import-progress mt-2">
-        Continuing on another device or browser?
-        <a
-          role="button"
-          tabindex="0"
-          @click="openProgressPicker"
-          @keydown.enter="openProgressPicker"
-        >Import a Scrobblify progress file</a>
-        <input
-          ref="progressFileInput"
-          type="file"
-          accept=".json"
-          aria-label="Scrobblify progress file"
-          style="display: none"
-          @change="onProgressFileSelected"
-        >
-      </div>
+      <v-alert v-if="embeddedProgress" type="info" text dense class="mt-2">
+        This ZIP also contains a Scrobblify progress file.
+        <a role="button" tabindex="0" @click="resumeEmbeddedProgress" @keydown.enter="resumeEmbeddedProgress">
+          Resume from it instead
+        </a>
+      </v-alert>
       <br>
       <v-checkbox
         color="primary"
@@ -99,6 +93,11 @@
   border-color: #b71c1c;
 }
 
+.zip-summary {
+  font-size: 0.875rem;
+  opacity: 0.7;
+}
+
 .logs {
   text-align: left;
   flex-wrap: wrap;
@@ -116,6 +115,41 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+interface ZipContents {
+  historyFiles: string[];
+  progressFile: { name: string; baseName: string } | null;
+  isAccountData: boolean;
+  fileCount: number;
+}
+
+/**
+ * Works out what a user actually dropped, from file names alone (so it's
+ * cheap: JSZip only reads the central directory until an entry is extracted).
+ *
+ * Patterns are anchored to the *basename*, not the full path. macOS writes an
+ * AppleDouble sidecar (`__MACOSX/._<name>`) for every entry when a ZIP is
+ * created or re-zipped on a Mac, so an unanchored test matched one extra
+ * "history file" per real one — doubling the count, failing every sidecar in
+ * JSON.parse, and telling the user half their history was missing when none
+ * of it was.
+ */
+function classifyZip(zip: JSZip): ZipContents {
+  const entries = Object.keys(zip.files)
+    .filter((name) => !zip.files[name].dir)
+    .map((name) => ({ name, baseName: name.split('/').pop() || name }));
+
+  return {
+    historyFiles: entries
+      .filter(({ baseName }) => /^Streaming_History_Audio_.*\.json$/.test(baseName))
+      .map(({ name }) => name),
+    progressFile: entries.find(({ baseName }) => /^scrobblify-progress.*\.json$/i.test(baseName)) || null,
+    // Spotify's default "Account data" export — requested separately from, and
+    // delivered before, the extended one, so it's easy to upload by mistake.
+    isAccountData: entries.some(({ baseName }) => /^StreamingHistory_?(music|podcast)?_?\d*\.json$/i.test(baseName)),
+    fileCount: entries.filter(({ baseName }) => !baseName.startsWith('._')).length,
+  };
+}
+
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
   data() {
@@ -124,6 +158,10 @@ export default Vue.extend({
         + 'or played for less than half their duration / 4 minutes)',
       selectedFile: null as File | null,
       selectedFileName: '',
+      detecting: false,
+      zipSummary: '',
+      embeddedProgress: null as File | null,
+      selectionId: 0,
       isDragging: false,
       scrobbleOldPlays: false,
       followLfmRules: false,
@@ -162,6 +200,8 @@ export default Vue.extend({
       if (input.files && input.files.length > 0) {
         this.setFile(input.files[0]);
       }
+      // Allow picking the same file again after it was rejected.
+      input.value = '';
     },
     onDrop(event: DragEvent) {
       this.isDragging = false;
@@ -169,78 +209,102 @@ export default Vue.extend({
         this.setFile(event.dataTransfer.files[0]);
       }
     },
-    openProgressPicker() {
-      (this.$refs.progressFileInput as HTMLInputElement).click();
-    },
-    onProgressFileSelected(event: Event) {
-      const input = event.target as HTMLInputElement;
-      if (input.files && input.files.length > 0) {
-        this.$emit('import-progress', input.files[0], 'file');
+    resumeEmbeddedProgress() {
+      if (this.embeddedProgress) {
+        this.$emit('import-progress', this.embeddedProgress, 'zip');
       }
-      // Allow picking the same file again after a failed import.
-      input.value = '';
     },
-    setFile(file: File) {
+    showUploadError(message: string, details = '') {
+      this.errorMessage = message;
+      this.errorDetails = details;
+      this.showError = true;
+    },
+    /**
+     * Inspects the file the moment it's chosen rather than on "Find tracks", so
+     * the wrong kind of file is caught (or routed) before any options are set.
+     */
+    async setFile(file: File) {
       const name = file.name.toLowerCase();
-      // The only .json a user is ever handed by this site is a progress file,
-      // and on a new device the upload zone is the only place they'll think to
-      // put it — so route it to the import rather than rejecting it.
+      // The only .json this site ever hands a user is a progress file, and on
+      // a new device (no saved state, so no resume banner) the upload zone is
+      // the only place they'll think to put it.
       if (name.endsWith('.json')) {
         this.$emit('import-progress', file, 'file');
         return;
       }
       if (!name.endsWith('.zip')) {
-        alert('Please upload a .zip file');
+        alert('Please upload your Spotify .zip export, or a Scrobblify progress .json file');
         return;
       }
-      this.selectedFile = file;
-      this.selectedFileName = file.name;
-    },
-    /**
-     * A ZIP with no extended-history files is almost always one of two
-     * mistakes, and the generic "wrong export" message helped with neither:
-     * - a progress file zipped up because the upload zone only takes ZIPs;
-     * - Spotify's default "Account data" export (`StreamingHistory_music_*`),
-     *   which is requested separately from, and arrives before, the extended one.
-     */
-    async handleNoHistoryFiles(zip: JSZip) {
-      const baseNames = Object.keys(zip.files)
-        .filter((name) => !zip.files[name].dir && !name.startsWith('__MACOSX/'))
-        .map((name) => ({ name, baseName: name.split('/').pop() || name }));
 
-      const progressFile = baseNames.find(({ baseName }) => /^scrobblify-progress.*\.json$/i.test(baseName));
-      const isAccountData = baseNames.some(({ baseName }) => /^StreamingHistory_?(music|podcast)?_?\d*\.json$/i.test(baseName));
+      this.selectionId += 1;
+      const { selectionId } = this;
+      this.selectedFile = null;
+      this.selectedFileName = file.name;
+      this.zipSummary = '';
+      this.embeddedProgress = null;
+      this.detecting = true;
+
+      let contents: ZipContents;
+      let progress: File | null = null;
+      let progressError: unknown = null;
+      try {
+        const zip = await JSZip.loadAsync(file);
+        contents = classifyZip(zip);
+        if (contents.progressFile) {
+          try {
+            const blob = await zip.files[contents.progressFile.name].async('blob');
+            progress = new File([blob], contents.progressFile.baseName, { type: 'application/json' });
+          } catch (e) {
+            progressError = e;
+            trackError('upload.extractFile', e, { file: contents.progressFile.baseName });
+          }
+        }
+      } catch (e) {
+        if (selectionId !== this.selectionId) { return; }
+        trackError('upload.loadZip', e);
+        this.detecting = false;
+        this.selectedFileName = '';
+        this.showUploadError(
+          'Failed to read the ZIP file. It may be corrupted or not a valid ZIP archive.',
+          (e as Error).message || String(e),
+        );
+        return;
+      }
+      // A newer selection superseded this one while it was being read.
+      if (selectionId !== this.selectionId) { return; }
+      this.detecting = false;
+
+      if (contents.historyFiles.length > 0) {
+        this.selectedFile = file;
+        this.zipSummary = `Spotify Extended Streaming History — ${contents.historyFiles.length} audio history file(s)`;
+        this.embeddedProgress = progress;
+        return;
+      }
+
       let detected = 'unknown';
-      if (progressFile) {
+      if (contents.progressFile) {
         detected = 'progress_file';
-      } else if (isAccountData) {
+      } else if (contents.isAccountData) {
         detected = 'account_data';
       }
-      trackEvent('upload_no_matching_files', { detected, file_count: baseNames.length });
+      trackEvent('upload_no_matching_files', { detected, file_count: contents.fileCount });
+      this.selectedFileName = '';
 
-      if (progressFile) {
-        this.logs = [];
-        try {
-          const blob = await zip.files[progressFile.name].async('blob');
-          this.$emit('import-progress', new File([blob], progressFile.baseName, { type: 'application/json' }), 'zip');
-        } catch (e) {
-          trackError('upload.extractFile', e, { file: progressFile.baseName });
-          this.errorMessage = `Found "${progressFile.baseName}" in the ZIP but couldn't read it. Try importing the .json file directly.`;
-          this.errorDetails = (e as Error).message || String(e);
-          this.showError = true;
-        }
-        return;
-      }
-
-      this.logs = [];
-      if (isAccountData) {
-        this.errorMessage = 'This ZIP is Spotify\'s "Account data" export, which doesn\'t contain the detailed history Scrobblify needs. '
+      if (progress) {
+        this.$emit('import-progress', progress, 'zip');
+      } else if (contents.progressFile) {
+        this.showUploadError(
+          `Found "${contents.progressFile.baseName}" in the ZIP but couldn't read it. Try uploading the .json file directly.`,
+          (progressError as Error)?.message || String(progressError),
+        );
+      } else if (contents.isAccountData) {
+        this.showUploadError('This ZIP is Spotify\'s "Account data" export, which doesn\'t contain the detailed history Scrobblify needs. '
           + 'On Spotify\'s privacy page, request "Extended streaming history" instead — it arrives as a separate download '
-          + 'containing Streaming_History_Audio_*.json files.';
+          + 'containing Streaming_History_Audio_*.json files.');
       } else {
-        this.errorMessage = 'No Streaming_History_Audio_*.json files found in the ZIP. Make sure you uploaded the correct Spotify Extended Streaming History export.';
+        this.showUploadError('No Streaming_History_Audio_*.json files found in the ZIP. Make sure you uploaded the correct Spotify Extended Streaming History export.');
       }
-      this.showError = true;
     },
     async parseSpotifyData() {
       if (!this.selectedFile) { return; }
@@ -266,23 +330,13 @@ export default Vue.extend({
         this.showError = true;
         return;
       }
-      // Anchored to the *basename*, not the full path. macOS writes an
-      // AppleDouble sidecar (`__MACOSX/._<name>`) for every entry when a ZIP is
-      // created or re-zipped on a Mac, so an unanchored test matched one extra
-      // "history file" per real one — doubling the count, failing every sidecar
-      // in JSON.parse, and telling the user half their history was missing when
-      // none of it was.
-      const audioFilePattern = /^Streaming_History_Audio_.*\.json$/;
-      const matchingFiles = Object.keys(zip.files).filter((name) => {
-        if (zip.files[name].dir) {
-          return false;
-        }
-        const baseName = name.split('/').pop() || name;
-        return audioFilePattern.test(baseName);
-      });
+      // Already classified on selection; re-reading here only costs the
+      // central directory, and keeps a JSZip instance out of reactive data.
+      const matchingFiles = classifyZip(zip).historyFiles;
 
       if (matchingFiles.length === 0) {
-        await this.handleNoHistoryFiles(zip);
+        this.logs = [];
+        this.showUploadError('No Streaming_History_Audio_*.json files found in the ZIP. Make sure you uploaded the correct Spotify Extended Streaming History export.');
         return;
       }
 
