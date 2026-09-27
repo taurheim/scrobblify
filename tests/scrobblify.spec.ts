@@ -33,6 +33,16 @@ test.describe('Home Page', () => {
     // Should have a link to scrobble
     await expect(page.locator('a[href*="scrobble"]').first()).toBeVisible();
   });
+
+  test('footer exposes the build commit and number on hover', async ({ page }) => {
+    await page.goto('/');
+    const footer = page.locator('#site-footer');
+    await expect(footer).toContainText('built by Niko Savas');
+    await expect(footer.locator('span[title]')).toHaveAttribute(
+      'title',
+      /^([0-9a-f]{7}|dev) · Build (\d+|local)$/,
+    );
+  });
 });
 
 test.describe('About Page', () => {
