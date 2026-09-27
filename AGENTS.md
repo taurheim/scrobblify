@@ -41,7 +41,7 @@ Errors arrive two ways: a filterable `scrobblify_error` event (properties:
 | Upload / parsing | `upload.loadZip`, `upload.extractFile`, `upload.parseJson`, `upload.removeInvalidListens`, `upload.filterDuplicates` |
 | Auth | `auth.init`, `auth.strip_token_url` |
 | Scrobbling | `scrobble.repeatedFailures` |
-| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit` |
+| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load) |
 | Uncaught | `vue.errorHandler`, `window.onerror`, `unhandledrejection` |
 
 Last.fm failures are normalized to `Last.fm API error <code> (HTTP <status>)`
@@ -82,17 +82,20 @@ nothing at all.
   a bug: treat it as normal operation rather than signal.
 - `scrobble_stopped` — terminal; the run is over until the user comes back.
   Reasons: `daily_limit`, `lastfm_daily_limit`, `rate_limit_exhausted`,
-  `repeated_rejections`, `repeated_failures`, `manual`. Only `manual` is a user
-  action. Every one carries `auto_saved`, which is the difference between an
-  interruption and lost work — all six now save, so `auto_saved: false` in the
-  data means the save itself failed and is worth investigating.
+  `repeated_rejections`, `repeated_failures`, `manual`, `save_and_exit`. Only
+  `manual` and `save_and_exit` are user actions. Every one carries `auto_saved`,
+  which is the difference between an interruption and lost work — all of them
+  now save, so `auto_saved: false` in the data means the save itself failed and
+  is worth investigating. `save_and_exit` exists since 2026-09-27 and only fires
+  when "Save Progress & Leave" is clicked during a *transient* countdown (after a
+  terminal stop the loop has already returned and reported).
 
 All terminal paths go through the `trackStopped()` helper rather than emitting
 inline, so a new one cannot silently skip the event.
 
 Every terminal path must also leave the user a way back in. The paused panel's
-resume button is gated on the `canResume` computed (`stopped || manuallyPaused`),
-not on `stopped` alone: a manual pause is terminal but is *not* an error, so it
+resume button is gated on the `canResume` computed (`stopped || manuallyPaused
+|| leaving`), not on `stopped` alone: a manual pause is terminal but is *not* an error, so it
 sets `manuallyPaused` and gets `info` styling via `pauseAlertType` instead of a
 red `error` banner. Setting only `paused` renders a **disabled** "Wait Here"
 button waiting on an auto-resume the loop has already returned from — a dead end
@@ -104,6 +107,24 @@ which runs *between* tracks. Saving on the click would snapshot a
 `scrobbledTracks` that omits the in-flight track, so the resume would re-send it
 — and for a re-tagged play that means a freshly allocated timestamp and a
 phantom duplicate scrobble.
+
+**Progress is checkpointed mid-run**, silently (no `session_saved`): every
+`CHECKPOINT_EVERY_TRACKS` (25) tracks, between tracks, and at the start of every
+countdown wait. Before 2026-09-27 a save only happened on a terminal stop or a
+save button, so closing the tab mid-run lost everything since. Separately, "Save
+Progress & Leave" during a transient countdown saved and navigated away but did
+**not** stop the loop — it carried on scrobbling unseen behind the Complete step
+once the countdown ended. Both made the next resume replay already-sent tracks:
+42% of resuming users had a resume with *lower* `completion_pct` than their
+previous event, replaying a median of ~340 tracks (143k in total over 60 days).
+**Session-over-session drops in `completion_pct` before 2026-09-27 are this bug**,
+and those replays also inflate `total_succeeded` and burn daily budget.
+`saveAndExit()` now sets `leaving` and cancels the countdown so the loop returns.
+
+All writes to the saved session go through `persist()` in `Scrobblify.vue`,
+which serializes them. Each save opens its own IndexedDB connection, so without
+the queue a checkpoint issued just before completion could land after the
+completion's clear and resurrect a finished import as resumable.
 
 `burst_limit` is **preventive pacing, not a stoppage**, and it is emitted once
 per *stretch* of throttled sends — paired with a `scrobble_pacing_ended` event

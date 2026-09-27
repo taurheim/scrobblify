@@ -1022,6 +1022,148 @@ test.describe('Session Resume', () => {
     // would be allocated a fresh timestamp and become a phantom scrobble.
     expect(scrobbled).toEqual(tracks.slice(2).map((t) => t.track));
   });
+
+  test('"Save Progress & Leave" during a countdown really stops scrobbling', async ({ page }) => {
+    // Regression: the button is offered on the paused panel during transient
+    // waits too, but it only saved and navigated away. The loop was still
+    // awaiting its countdown, so when that ran out it carried on scrobbling
+    // behind the Complete step with nothing saving it. The next resume then
+    // replayed every one of those tracks — which is why completion_pct went
+    // *down* between sessions in telemetry.
+    test.setTimeout(90000);
+    const scrobbled: string[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+
+    // A full burst window that drains all at once WINDOW_FREES_IN_MS from now:
+    // long enough that the wait gets the paused panel and its countdown, and
+    // once it ends the whole queue is free to go out immediately.
+    const WINDOW_FREES_IN_MS = 20000;
+    const freesAt = Date.now() + WINDOW_FREES_IN_MS;
+    const sendTimestamps = Array.from({ length: 500 }, () => freesAt - 10 * 60 * 1000);
+    const tracks = Array.from({ length: 30 }, (_, n) => ({
+      track: `Track ${n + 1}`,
+      artist: `Artist ${n + 1}`,
+      album: '',
+      timestamp: Date.UTC(2024, 0, n + 1),
+    }));
+    await seedSavedState(page, buildState({
+      totalTracks: 30,
+      completedIndices: [],
+      tracks,
+      originalTotalTracks: 30,
+      originalSucceededCount: 0,
+      sendTimestamps,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator('text=Auto-resuming in')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Save Progress & Leave' }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 10000 });
+
+    // Outlast the countdown the loop was waiting on, with margin.
+    await page.waitForTimeout(Math.max(0, freesAt - Date.now()) + 5000);
+    expect(scrobbled).toEqual([]);
+  });
+
+  test('progress survives closing the tab mid-run', async ({ page }) => {
+    // Regression: progress was only saved when a run stopped for good or the
+    // user clicked a save button. Closing or reloading the tab mid-run lost
+    // everything since, and the resume re-sent all of it.
+    test.setTimeout(90000);
+    const scrobbled: string[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+        await new Promise((resolve) => { setTimeout(resolve, 150); });
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ scrobbles: { '@attr': { accepted: 1, ignored: 0 } } }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    const tracks = Array.from({ length: 40 }, (_, n) => ({
+      track: `Track ${n + 1}`,
+      artist: `Artist ${n + 1}`,
+      album: '',
+      timestamp: Date.UTC(2024, 0, n + 1),
+    }));
+    await seedSavedState(page, buildState({
+      totalTracks: 40,
+      completedIndices: [],
+      tracks,
+      originalTotalTracks: 40,
+      originalSucceededCount: 0,
+    }));
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    // Past the first checkpoint, then gone without saving.
+    await expect.poll(() => scrobbled.length, { timeout: 30000 }).toBeGreaterThanOrEqual(30);
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    const ready = page.locator('text=/\\d+ tracks ready to scrobble/');
+    await expect(ready).toBeVisible({ timeout: 5000 });
+    const remaining = Number(((await ready.textContent()) || '').match(/(\d+) tracks ready/)?.[1]);
+    expect(remaining).toBeLessThanOrEqual(15);
+
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+
+    // The checkpointed tracks were not replayed...
+    expect(scrobbled.filter((t) => t === 'Track 1')).toHaveLength(1);
+    // ...and every track went out at least once.
+    expect(new Set(scrobbled).size).toBe(40);
+
+    // A checkpoint still in flight at completion must not resurrect the
+    // finished import as a resumable one.
+    await page.reload();
+    await page.waitForTimeout(2000);
+    await expect(page.locator('text=Resume previous session?')).toBeHidden();
+  });
 });
 
 test.describe('Rate limit handling', () => {
