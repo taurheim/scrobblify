@@ -141,21 +141,21 @@ test.describe('Importing a progress file', () => {
   const IMPORT_ID = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
   const IDLE = { ok: true, live: false };
 
-  function progressFile() {
-    const tracks = [1, 2, 3, 4, 5].map((n) => ({
+  function progressFile(count = 5, completed = [0, 1, 2]) {
+    const tracks = Array.from({ length: count }, (_, i) => i + 1).map((n) => ({
       track: `Track ${n}`,
       artist: `Artist ${n}`,
       album: `Album ${n}`,
-      timestamp: Date.UTC(2024, 0, n),
+      timestamp: Date.UTC(2024, 0, 1) + n * 60000,
     }));
     const state = {
       userName: 'testuser',
-      totalTracks: 5,
-      completedIndices: [0, 1, 2],
+      totalTracks: count,
+      completedIndices: completed,
       failedIndices: [],
       tracks,
-      originalTotalTracks: 5,
-      originalSucceededCount: 3,
+      originalTotalTracks: count,
+      originalSucceededCount: completed.length,
       importId: IMPORT_ID,
       savedAt: new Date().toISOString(),
     };
@@ -204,5 +204,62 @@ test.describe('Importing a progress file', () => {
 
     await expect(page.getByText("Can't reach the background service to check")).toBeVisible({ timeout: 15000 });
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeHidden();
+  });
+});
+test.describe('Offering background scrobbling', () => {
+  // A worker that would say yes to everything, so only the opt-in stands
+  // between a large import and the offer.
+  const WILLING_WORKER = {
+    '/scrobblify/job/live': { ok: true, live: false },
+    '/scrobblify/import/': { ok: true, known: false, live: false },
+    '/scrobblify/capacity': {
+      available: true, used: 0, capacity: 100, minTracks: 2700, maxTracks: 200000, chunkTracks: 5000,
+    },
+  };
+  const OFFER = 'text=Finish this in the background >> visible=true';
+
+  function largeProgressFile() {
+    const count = 3000;
+    const tracks = Array.from({ length: count }, (_, i) => ({
+      track: `Track ${i}`,
+      artist: `Artist ${i % 50}`,
+      album: `Album ${i % 50}`,
+      timestamp: Date.UTC(2024, 0, 1) + i * 60000,
+    }));
+    return {
+      name: 'scrobblify-progress.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify({
+        userName: 'testuser',
+        totalTracks: count,
+        completedIndices: [],
+        failedIndices: [],
+        tracks,
+        originalTotalTracks: count,
+        originalSucceededCount: 0,
+        importId: 'b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6',
+        savedAt: new Date().toISOString(),
+      })),
+    };
+  }
+
+  test('a large import is not offered background scrobbling without the beta flag', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile());
+
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 15000 });
+    // The offer opens straight after the restore; give it time to have done so.
+    await page.waitForTimeout(2000);
+    await expect(page.locator(OFFER)).toHaveCount(0);
+    // Not even asked: without the flag the offer path makes no request at all.
+    expect(workerCalls).not.toContain('/scrobblify/capacity');
+  });
+
+  test('the same import is offered it with the beta flag', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile());
+
+    await expect(page.locator(OFFER)).toBeVisible({ timeout: 15000 });
   });
 });
