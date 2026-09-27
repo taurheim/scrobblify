@@ -28,6 +28,14 @@ jobs:
           node-version: 18
           cache: npm
       - run: npm ci
+      - name: Generate version.json
+        run: |
+          echo '{
+            "sha": "'${GITHUB_SHA::7}'",
+            "fullSha": "'$GITHUB_SHA'",
+            "run": '$GITHUB_RUN_NUMBER',
+            "builtAt": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+          }' > public/version.json
       - run: npm run build
       - uses: actions/upload-artifact@v4
         with:

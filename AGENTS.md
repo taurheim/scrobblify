@@ -30,6 +30,15 @@ silently. Absence of events is not evidence that a code path did not run.
 Users are identified by their Last.fm username (`lastfm_username`), so a bug
 report from a named user can be traced to their session.
 
+Every event also carries `build_sha` (7-char commit) and `build_number` (the CI
+run number), so you can tell which deploy an error came from — e.g. whether it
+predates a fix. Events from before 2026-09-27 have neither. Values come from
+`src/buildInfo.ts`, injected by `vue.config.js` from `GITHUB_SHA` /
+`GITHUB_RUN_NUMBER` (locally: `git rev-parse` / `local`). The same values show
+on the site as a hover tooltip on "Scrobblify" in the footer, and the deployed
+`/scrobblify/version.json` (written by the CI build job) has the full SHA and
+build time.
+
 ### Errors
 
 Errors arrive two ways: a filterable `scrobblify_error` event (properties:
