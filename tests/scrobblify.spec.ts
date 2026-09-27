@@ -687,6 +687,56 @@ test.describe('Session Resume', () => {
     await expect(page.locator('.overall-progress')).toContainText('3 of 5');
   });
 
+  test('a progress file can be imported on a device with no saved session', async ({ page }) => {
+    // Regression: "Import from file" lived only in the resume banner, which is
+    // shown only when this browser already has saved state. On a new PC it
+    // never appears, so the downloaded progress file had nowhere to go.
+    await goToUploadStep(page);
+    await expect(page.locator('text=Resume previous session?')).toBeHidden();
+
+    await page.locator('input[type="file"][aria-label="Scrobblify progress file"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(buildState())),
+    });
+
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+  });
+
+  test('a progress file dropped into the ZIP upload is imported, not rejected', async ({ page }) => {
+    await goToUploadStep(page);
+    let alerted = false;
+    page.on('dialog', async (dialog) => { alerted = true; await dialog.dismiss(); });
+
+    await page.locator('input[type="file"][accept=".zip"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(buildState())),
+    });
+
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    expect(alerted).toBe(false);
+  });
+
+  test('a progress file zipped up to get past the upload is still imported', async ({ page }) => {
+    // What the reporter did once the .json was refused: zipped it together
+    // with their (account-data) Spotify export and uploaded that.
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Account Data/StreamingHistory_music_0.json', '[]');
+    zip.file('scrobblify-progress-2026-09-07.json', JSON.stringify(buildState()));
+    await page.locator('input[type="file"][accept=".zip"]').setInputFiles({
+      name: 'my_spotify_data (2).zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+    await page.locator('button:has-text("Find tracks")').click();
+
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+  });
+
   test('preventive pacing keeps scrobbling, it does not pause per track', async ({ page }) => {
     // Regression: `msUntilBurstSafe()` frees exactly one slot at a time, so once
     // the rolling window is full *every* remaining track waits a fraction of a
@@ -1419,6 +1469,21 @@ test.describe('Import robustness', () => {
 
     await page.locator('button:has-text("Find tracks")').click();
     await expect(page.locator('text=None of the 1 history file(s) in this ZIP could be read')).toBeVisible({ timeout: 15000 });
+  });
+
+  test('Spotify\'s account-data export is identified, not reported as a generic wrong file', async ({ page }) => {
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Account Data/StreamingHistory_music_0.json', JSON.stringify([
+      {
+        endTime: '2024-01-15 10:30', artistName: 'Queen', trackName: 'Bohemian Rhapsody', msPlayed: 300000,
+      },
+    ]));
+    zip.file('Spotify Account Data/Playlist1.json', '{}');
+    await uploadZip(page, await zip.generateAsync({ type: 'nodebuffer' }));
+    await page.locator('button:has-text("Find tracks")').click();
+
+    await expect(page.locator('text=Account data')).toBeVisible({ timeout: 15000 });
   });
 
   test('macOS resource-fork sidecars are not mistaken for history files', async ({ page }) => {

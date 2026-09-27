@@ -39,6 +39,23 @@
           Drag &amp; drop your .zip file here, or click to browse
         </div>
       </div>
+      <div class="import-progress mt-2">
+        Continuing on another device or browser?
+        <a
+          role="button"
+          tabindex="0"
+          @click="openProgressPicker"
+          @keydown.enter="openProgressPicker"
+        >Import a Scrobblify progress file</a>
+        <input
+          ref="progressFileInput"
+          type="file"
+          accept=".json"
+          aria-label="Scrobblify progress file"
+          style="display: none"
+          @change="onProgressFileSelected"
+        >
+      </div>
       <br>
       <v-checkbox
         color="primary"
@@ -152,13 +169,78 @@ export default Vue.extend({
         this.setFile(event.dataTransfer.files[0]);
       }
     },
+    openProgressPicker() {
+      (this.$refs.progressFileInput as HTMLInputElement).click();
+    },
+    onProgressFileSelected(event: Event) {
+      const input = event.target as HTMLInputElement;
+      if (input.files && input.files.length > 0) {
+        this.$emit('import-progress', input.files[0], 'file');
+      }
+      // Allow picking the same file again after a failed import.
+      input.value = '';
+    },
     setFile(file: File) {
-      if (!file.name.endsWith('.zip')) {
+      const name = file.name.toLowerCase();
+      // The only .json a user is ever handed by this site is a progress file,
+      // and on a new device the upload zone is the only place they'll think to
+      // put it — so route it to the import rather than rejecting it.
+      if (name.endsWith('.json')) {
+        this.$emit('import-progress', file, 'file');
+        return;
+      }
+      if (!name.endsWith('.zip')) {
         alert('Please upload a .zip file');
         return;
       }
       this.selectedFile = file;
       this.selectedFileName = file.name;
+    },
+    /**
+     * A ZIP with no extended-history files is almost always one of two
+     * mistakes, and the generic "wrong export" message helped with neither:
+     * - a progress file zipped up because the upload zone only takes ZIPs;
+     * - Spotify's default "Account data" export (`StreamingHistory_music_*`),
+     *   which is requested separately from, and arrives before, the extended one.
+     */
+    async handleNoHistoryFiles(zip: JSZip) {
+      const baseNames = Object.keys(zip.files)
+        .filter((name) => !zip.files[name].dir && !name.startsWith('__MACOSX/'))
+        .map((name) => ({ name, baseName: name.split('/').pop() || name }));
+
+      const progressFile = baseNames.find(({ baseName }) => /^scrobblify-progress.*\.json$/i.test(baseName));
+      const isAccountData = baseNames.some(({ baseName }) => /^StreamingHistory_?(music|podcast)?_?\d*\.json$/i.test(baseName));
+      let detected = 'unknown';
+      if (progressFile) {
+        detected = 'progress_file';
+      } else if (isAccountData) {
+        detected = 'account_data';
+      }
+      trackEvent('upload_no_matching_files', { detected, file_count: baseNames.length });
+
+      if (progressFile) {
+        this.logs = [];
+        try {
+          const blob = await zip.files[progressFile.name].async('blob');
+          this.$emit('import-progress', new File([blob], progressFile.baseName, { type: 'application/json' }), 'zip');
+        } catch (e) {
+          trackError('upload.extractFile', e, { file: progressFile.baseName });
+          this.errorMessage = `Found "${progressFile.baseName}" in the ZIP but couldn't read it. Try importing the .json file directly.`;
+          this.errorDetails = (e as Error).message || String(e);
+          this.showError = true;
+        }
+        return;
+      }
+
+      this.logs = [];
+      if (isAccountData) {
+        this.errorMessage = 'This ZIP is Spotify\'s "Account data" export, which doesn\'t contain the detailed history Scrobblify needs. '
+          + 'On Spotify\'s privacy page, request "Extended streaming history" instead — it arrives as a separate download '
+          + 'containing Streaming_History_Audio_*.json files.';
+      } else {
+        this.errorMessage = 'No Streaming_History_Audio_*.json files found in the ZIP. Make sure you uploaded the correct Spotify Extended Streaming History export.';
+      }
+      this.showError = true;
     },
     async parseSpotifyData() {
       if (!this.selectedFile) { return; }
@@ -200,9 +282,7 @@ export default Vue.extend({
       });
 
       if (matchingFiles.length === 0) {
-        trackEvent('upload_no_matching_files');
-        this.errorMessage = 'No Streaming_History_Audio_*.json files found in the ZIP. Make sure you uploaded the correct Spotify Extended Streaming History export.';
-        this.showError = true;
+        await this.handleNoHistoryFiles(zip);
         return;
       }
 

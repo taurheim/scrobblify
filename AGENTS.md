@@ -57,6 +57,12 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
 `session_resumed`, and `user_logged_out`.
 
+`upload_no_matching_files` carries `detected`: `progress_file` (a Scrobblify
+progress file was zipped up and is imported instead), `account_data` (Spotify's
+default "Account data" export, `StreamingHistory_music_*.json`, rather than the
+extended one) or `unknown`. Before 2026-09-27 it carried no properties.
+`session_resumed.source` is `saved`, `file`, or `zip`.
+
 Rate limiting has its own events: `scrobble_rate_limited`,
 `scrobble_rate_limit_cooldown_complete`, `scrobble_rate_limit_recovered`,
 `scrobble_rate_limit_gave_up` (the escalating backoff was exhausted and progress
@@ -226,6 +232,19 @@ affected user was on macOS, and all the failures landed within ~400ms of the
 parse starting (far too fast for the memory-exhaustion case this path exists
 for). The sidecars are also why some parse errors quote `"    Ma"` — that's the
 `Mac OS X` marker inside the AppleDouble header, not export data.
+
+**Resuming on a new device goes through the upload step.** The resume banner
+(and its "Import from file" button) only renders when *this browser* already has
+saved state in IndexedDB, so on a new PC or browser it never appears. The upload
+step therefore has its own "Import a Scrobblify progress file" link, routes any
+`.json` dropped on the ZIP zone to the import instead of rejecting it, and — if
+a ZIP has no history files but contains a `scrobblify-progress*.json` — imports
+that. The last case is real: a user whose `.json` was refused zipped it up with
+their Spotify export to get it accepted.
+
+A ZIP of `StreamingHistory_music_*.json` is Spotify's default "Account data"
+export, requested separately from (and delivered before) the extended one.
+It gets its own error explaining which export to request.
 
 Two Last.fm quirks the validation path has to absorb:
 

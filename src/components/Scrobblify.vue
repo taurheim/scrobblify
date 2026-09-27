@@ -40,7 +40,10 @@
           <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
         </v-stepper-content>
         <v-stepper-content step="2">
-          <upload-step v-on:complete="currentStep = 3"></upload-step>
+          <upload-step
+            v-on:complete="currentStep = 3"
+            v-on:import-progress="importProgressFile"
+          ></upload-step>
         </v-stepper-content>
         <v-stepper-content step="3">
           <select-step v-on:complete="currentStep = 4"></select-step>
@@ -184,9 +187,19 @@ export default Vue.extend({
     async onImportFile(event: Event) {
       const input = event.target as HTMLInputElement;
       if (!input.files || input.files.length === 0) { return; }
+      const file = input.files[0];
+      input.value = '';
+      await this.importProgressFile(file, 'file');
+    },
+    /**
+     * Also reachable from the upload step, because the resume banner (and its
+     * "Import from file" button) only appears when this browser already has
+     * saved state — which a new device or browser never does.
+     */
+    async importProgressFile(file: File, source: string) {
       try {
-        const state = await this.stateManager.importFromFile(input.files[0]);
-        trackEvent('session_resumed', this.resumeProps(state, 'file'));
+        const state = await this.stateManager.importFromFile(file);
+        trackEvent('session_resumed', this.resumeProps(state, source));
         this.restoreFromState(state);
       } catch (e) {
         trackError('scrobblify.onImportFile', e);
