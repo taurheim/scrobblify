@@ -123,7 +123,7 @@ export interface ApiEnv {
   credentialSecret: string;
   /** Where the Last.fm callback lands, e.g. https://api.savas.ca/scrobblify/auth/callback */
   callbackUrl: string;
-  /** Where the user is sent back to, e.g. https://savas.ca/scrobble */
+  /** Where the user is sent back to, e.g. https://savas.ca/scrobblify/scrobble */
   appUrl: string;
   /** The worker's own Last.fm API key, for building authorise URLs. */
   lastfmApiKey: string;

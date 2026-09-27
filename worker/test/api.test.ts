@@ -21,7 +21,7 @@ const SIGNING = 'signing-key-for-tests-0123456789';
 const CRED = 'credential-secret-for-tests-01234';
 /** Export claim token. The endpoint requires one of at least 16 characters. */
 const EXPORT_CLAIM = 'export-claim-token-for-tests';
-const APP = 'https://savas.ca/scrobble';
+const APP = 'https://savas.ca/scrobblify/scrobble';
 const CB = 'https://api.savas.ca/scrobblify/auth/callback';
 
 class NodeSql implements Sql {

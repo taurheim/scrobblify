@@ -13,7 +13,7 @@ placeholder `database_id`.
 
 Verified end to end against `wrangler dev --local`: the startup secret guard
 passes with all four names set, and `/scrobblify/capacity` and
-`/scrobblify/job/live` answer `200` once the three migrations are applied to the
+`/scrobblify/job/live` answer `200` once the four migrations are applied to the
 local D1.
 
 ```powershell
@@ -22,12 +22,22 @@ npm test   # typechecks, then runs every suite against a real SQLite schema
 
 ## Deploying
 
-Steps 1–3 create infrastructure and only need doing once.
+Everything runs from `worker/`. Steps 0–3 create infrastructure and only need
+doing once; after that, a redeploy is just `npx wrangler deploy`.
 
 ```powershell
+cd worker
+npm install
 npx wrangler login
 
-# 1. D1. Copy the printed database_id into wrangler.toml.
+# 0. Register the worker's own Last.fm application at
+#    https://www.last.fm/api/account/create with callback
+#    https://api.savas.ca/scrobblify/auth/callback. Keep its key and secret
+#    for step 4. Do NOT reuse the browser's key (see "The two Last.fm
+#    applications" below).
+
+# 1. D1. Copy the printed database_id into wrangler.toml, replacing
+#    "set-me-after-wrangler-d1-create". The id is not a secret; commit it.
 npx wrangler d1 create scrobblify
 
 # 2. R2, for the uploaded track blobs.
@@ -39,8 +49,15 @@ npx wrangler d1 execute scrobblify --remote --file schema/002_synthetic_floor.sq
 npx wrangler d1 execute scrobblify --remote --file schema/003_export_claim.sql
 npx wrangler d1 execute scrobblify --remote --file schema/004_import_id.sql
 
-# 4. Secrets (see below).
-# 5. Deploy, then point api.savas.ca at the worker via a Cloudflare route.
+# 4. Secrets (see below). Each command prompts for its value.
+npx wrangler secret put LASTFM_API_KEY
+npx wrangler secret put LASTFM_SHARED_SECRET
+npx wrangler secret put CREDENTIAL_SECRET
+npx wrangler secret put SIGNING_KEY
+
+# 5. Deploy. `routes` in wrangler.toml makes api.savas.ca a custom domain, so
+#    this also creates its DNS record and certificate; the first request can
+#    take a few minutes while the certificate is issued.
 npx wrangler deploy
 
 # 6. Smoke test. This is a public route, so no session is needed.
@@ -89,6 +106,14 @@ Setting it does not switch the feature on by itself: the client asks
 `/scrobblify/capacity` on load and stays silent unless the worker answers, so
 deploying the SPA before the worker degrades to the old behaviour rather than
 offering a handoff that cannot complete.
+
+### 8. Try it
+
+The worker and the SPA can be deployed in either order. The SPA ships through
+the normal CD on merge to master. Nobody is offered the feature without opting
+in: open `https://savas.ca/scrobblify/?beta=1` (sticky; `?beta=0` turns it
+off), start an import with at least 2,700 tracks left, and press
+Pause & Save to see the offer. `npx wrangler tail` streams the worker's logs.
 
 ## Secrets
 

@@ -2,6 +2,11 @@ name = "scrobblify"
 main = "src/index.ts"
 compatibility_date = "2026-07-26"
 
+# `wrangler deploy` creates the DNS record and certificate for this hostname
+# itself. It claims the whole of api.savas.ca, which nothing else uses; every
+# route here is under /scrobblify/ so it can move to a path route later.
+routes = [{ pattern = "api.savas.ca", custom_domain = true }]
+
 # One tick every 5 minutes. Deliberately not more often: a job advances at
 # roughly 2,700 scrobbles/day whatever we do, so a faster cron only spends the
 # shared free-tier invocation budget and pushes harder on Last.fm's per-IP
@@ -20,7 +25,10 @@ bucket_name = "scrobblify"
 
 [vars]
 CALLBACK_URL = "https://api.savas.ca/scrobblify/auth/callback"
-APP_URL = "https://savas.ca/scrobble"
+# Where Last.fm auth returns the user. Must be a page the SPA actually serves:
+# it is built with base `/scrobblify/` in history mode, so `/scrobble` alone is
+# a 404. Only its origin is used for CORS.
+APP_URL = "https://savas.ca/scrobblify/scrobble"
 
 # Secrets are set with `wrangler secret put` and are never committed:
 #   LASTFM_API_KEY        the worker's own server-only Last.fm application
