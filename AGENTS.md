@@ -6,6 +6,10 @@ This app reports usage and errors to PostHog from the browser. The PostHog MCP
 server is configured in `.mcp.json` at the repo root, so any MCP-aware agent
 picks it up automatically.
 
+To go looking for bugs rather than chase a known one, use the
+`hunting-posthog-bugs` skill (`.github/skills/hunting-posthog-bugs/`): a
+workflow, journey invariants, and validated HogQL for each check.
+
 ### Setup (once per machine)
 
 `.mcp.json` reads the token from an environment variable — **never commit a key**.
