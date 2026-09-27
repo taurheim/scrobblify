@@ -57,6 +57,12 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
 `session_resumed`, and `user_logged_out`.
 
+`upload_no_matching_files` carries `detected`: `progress_file` (a Scrobblify
+progress file was zipped up and is imported instead), `account_data` (Spotify's
+default "Account data" export, `StreamingHistory_music_*.json`, rather than the
+extended one) or `unknown`. Before 2026-09-27 it carried no properties.
+`session_resumed.source` is `saved`, `file`, or `zip`.
+
 Rate limiting has its own events: `scrobble_rate_limited`,
 `scrobble_rate_limit_cooldown_complete`, `scrobble_rate_limit_recovered`,
 `scrobble_rate_limit_gave_up` (the escalating backoff was exhausted and progress
@@ -226,6 +232,26 @@ affected user was on macOS, and all the failures landed within ~400ms of the
 parse starting (far too fast for the memory-exhaustion case this path exists
 for). The sidecars are also why some parse errors quote `"    Ma"` — that's the
 `Mac OS X` marker inside the AppleDouble header, not export data.
+
+**Resuming on a new device goes through the upload step.** The resume banner
+(and its "Import from file" button) only renders when *this browser* already has
+saved state in IndexedDB, so on a new PC or browser it never appears. The drop
+zone therefore takes both `.zip` and `.json` and **classifies the file the
+moment it's chosen** (`classifyZip`, by entry names only), not on "Find tracks":
+
+- `.json` → imported as a progress file.
+- ZIP with `Streaming_History_Audio_*` → ready; if it *also* holds a
+  `scrobblify-progress*.json`, a "Resume from it instead" link is offered but
+  not forced.
+- ZIP with only a `scrobblify-progress*.json` → imported immediately. This case
+  is real: a user whose `.json` was refused zipped it up with their Spotify
+  export to get it accepted.
+- ZIP of `StreamingHistory_music_*.json` → Spotify's default "Account data"
+  export, requested separately from (and delivered before) the extended one.
+  It gets its own error explaining which export to request.
+
+`upload_no_matching_files` therefore now fires on selection, **without** a
+preceding `upload_parse_started`.
 
 Two Last.fm quirks the validation path has to absorb:
 

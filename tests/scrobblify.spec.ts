@@ -134,7 +134,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 
   test('accepts ZIP file via file picker', async ({ page }) => {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await expect(page.locator('text=test-spotify-data.zip')).toBeVisible();
   });
@@ -147,7 +147,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 
   test('Find tracks button is enabled after file selection', async ({ page }) => {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     const btn = page.locator('button:has-text("Find tracks")');
     await expect(btn).toBeEnabled();
@@ -160,7 +160,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
     page.on('pageerror', (e) => pageErrors.push(e.message));
 
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
@@ -173,7 +173,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 
   test('parses ZIP and shows track count', async ({ page }) => {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     // Check "scrobble old plays" since our test data is old
@@ -191,7 +191,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 
   test('filters out podcast entries (null track name)', async ({ page }) => {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
@@ -205,7 +205,7 @@ test.describe('Upload Step - ZIP Drag & Drop', () => {
 test.describe('Select Step - Track Selection', () => {
   async function goToSelectStep(page: Page) {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
@@ -230,7 +230,7 @@ test.describe('Select Step - Track Selection', () => {
   test('date filtering reduces matching track count', async ({ page }) => {
     // Go to select step WITHOUT re-tagging old listens so dates remain original
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     // Don't check "Scrobble tracks older than 2 weeks" — keep original dates
     await page.locator('button:has-text("Find tracks")').click();
@@ -265,7 +265,7 @@ test.describe('Select Step - Track Selection', () => {
 test.describe('Scrobble Step', () => {
   async function goToScrobbleStep(page: Page) {
     await goToUploadStep(page);
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
 
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
@@ -329,7 +329,7 @@ test.describe('Scrobble Step', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -396,7 +396,7 @@ test.describe('Scrobble Step', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -463,7 +463,7 @@ test.describe('Scrobble Step', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -685,6 +685,67 @@ test.describe('Session Resume', () => {
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
     // Falls back to this file's own totals rather than reporting nothing.
     await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+  });
+
+  test('a progress file can be imported on a device with no saved session', async ({ page }) => {
+    // Regression: "Import from file" lived only in the resume banner, which is
+    // shown only when this browser already has saved state. On a new PC it
+    // never appears, and the upload zone rejected the .json outright.
+    await goToUploadStep(page);
+    await expect(page.locator('text=Resume previous session?')).toBeHidden();
+    let alerted = false;
+    page.on('dialog', async (dialog) => { alerted = true; await dialog.dismiss(); });
+
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(buildState())),
+    });
+
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+    expect(alerted).toBe(false);
+  });
+
+  test('a ZIP holding only a progress file resumes as soon as it is chosen', async ({ page }) => {
+    // What the reporter did once the .json was refused: zipped it together
+    // with their (account-data) Spotify export and uploaded that.
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Account Data/StreamingHistory_music_0.json', '[]');
+    zip.file('scrobblify-progress-2026-09-07.json', JSON.stringify(buildState()));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data (2).zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+
+    // No "Find tracks" click: the ZIP is recognised on selection.
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+  });
+
+  test('a history ZIP that also holds a progress file offers the resume, without forcing it', async ({ page }) => {
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024.json', JSON.stringify([{
+      ts: '2024-01-15T10:30:00Z',
+      master_metadata_track_name: 'Bohemian Rhapsody',
+      master_metadata_album_artist_name: 'Queen',
+      master_metadata_album_album_name: 'A Night at the Opera',
+      ms_played: 300000,
+    }]));
+    zip.file('scrobblify-progress-2026-09-07.json', JSON.stringify(buildState()));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data.zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+
+    await expect(page.locator('text=1 audio history file(s)')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('button:has-text("Find tracks")')).toBeEnabled();
+    await page.locator('text=Resume from it instead').click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   });
 
   test('preventive pacing keeps scrobbling, it does not pause per track', async ({ page }) => {
@@ -1090,7 +1151,7 @@ test.describe('Complete Step', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -1178,7 +1239,7 @@ test.describe('URL Encoding', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    const fileInput = page.locator('input[type="file"][accept=".zip"]');
+    const fileInput = page.locator('.drop-zone input[type="file"]');
     await fileInput.setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
@@ -1284,7 +1345,7 @@ test.describe('Re-tagged old plays', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
 
-    await page.locator('input[type="file"][accept=".zip"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
@@ -1377,7 +1438,7 @@ test.describe('Import robustness', () => {
   }
 
   async function uploadZip(page: Page, buffer: Buffer) {
-    await page.locator('input[type="file"][accept=".zip"]').setInputFiles({
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
       name: 'my_spotify_data.zip',
       mimeType: 'application/zip',
       buffer,
@@ -1419,6 +1480,22 @@ test.describe('Import robustness', () => {
 
     await page.locator('button:has-text("Find tracks")').click();
     await expect(page.locator('text=None of the 1 history file(s) in this ZIP could be read')).toBeVisible({ timeout: 15000 });
+  });
+
+  test('Spotify\'s account-data export is identified, not reported as a generic wrong file', async ({ page }) => {
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Account Data/StreamingHistory_music_0.json', JSON.stringify([
+      {
+        endTime: '2024-01-15 10:30', artistName: 'Queen', trackName: 'Bohemian Rhapsody', msPlayed: 300000,
+      },
+    ]));
+    zip.file('Spotify Account Data/Playlist1.json', '{}');
+    await uploadZip(page, await zip.generateAsync({ type: 'nodebuffer' }));
+
+    // Caught on selection, before the user has clicked anything else.
+    await expect(page.locator('text=Account data')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('button:has-text("Find tracks")')).toBeDisabled();
   });
 
   test('macOS resource-fork sidecars are not mistaken for history files', async ({ page }) => {
