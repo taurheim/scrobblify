@@ -307,26 +307,51 @@ and tank performance on big histories.
 
 Warnings (mostly `no-explicit-any`) do not fail the build; only errors do.
 
+## Local servers and ports
+
+Several worktrees of this repo are often checked out and running at once, so
+**never start a local server on the default port 8080**. Pick a free port for
+your worktree and pass it through the `PORT` environment variable, which
+everything here honours — `vue-cli-service serve` (so `npm run serve`),
+`playwright.config.ts` (both the server it starts and `baseURL`), and
+`npm run dev:mock`:
+
+```powershell
+$port = Get-Random -Minimum 8100 -Maximum 9000
+while (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { $port++ }
+$env:PORT = $port
+npx playwright test   # or: npm run serve / npm run dev:mock
+```
+
+Set `PORT` in the **same command** that starts the server or runs the tests —
+agent shells don't keep environment variables between calls, and a run that
+loses it falls back to 8080 without complaint. Reuse the same port for the rest
+of the session so later runs find your server instead of starting another, and
+stop any server you started when you're done.
+
+`vue-cli-service` quietly moves to the next free port if the one requested is
+taken, so read the URL it prints rather than assuming.
+
 ## Running the tests
 
 Playwright is the only test framework here — there are no unit tests. Analytics
 is disabled on `localhost`, so **a test can never observe a PostHog event**;
 assert on the UI instead.
 
-`playwright.config.ts` sets `reuseExistingServer: true` on port 8080. If a
-`vue-cli-service serve` is already running there **from another checkout or
-worktree, Playwright will happily test that checkout's code instead of yours**
-and say nothing. This has already produced three "verified" results that were
-really the other tree's build. Before trusting a local run — especially one
-verifying a fix — confirm what owns the port:
+`playwright.config.ts` sets `reuseExistingServer: true` on `$PORT` (default
+8080). If a `vue-cli-service serve` is already running there **from another
+checkout or worktree, Playwright will happily test that checkout's code instead
+of yours** and say nothing. This has already produced three "verified" results
+that were really the other tree's build — the main reason for the per-worktree
+port above. Before trusting a local run — especially one verifying a fix —
+confirm what owns the port:
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "ProcessId = $((Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess)" |
+Get-CimInstance Win32_Process -Filter "ProcessId = $((Get-NetTCPConnection -LocalPort $env:PORT -State Listen).OwningProcess)" |
   Select-Object -ExpandProperty CommandLine
 ```
 
-or run against a scratch config on its own port with `reuseExistingServer:
-false`. CI is unaffected, since it starts from nothing.
+CI is unaffected, since it starts from nothing and uses the default.
 
 Verify a regression test actually catches its bug with
 `git stash push -- <source file>`, re-run, `git stash pop`. A test that passes

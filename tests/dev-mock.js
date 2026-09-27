@@ -8,15 +8,16 @@
 // without a real Last.fm account. Reuses the exact mock the Playwright tests
 // use (tests/lastfmMock.js).
 //
-// If a dev server is already running on port 8080 it is reused; otherwise this
-// script starts `vue-cli-service serve` for you and shuts it down on exit.
+// If a dev server is already running on $PORT (default 8080) it is reused;
+// otherwise this script starts `vue-cli-service serve` for you and shuts it
+// down on exit.
 
 const http = require('http');
 const { spawn } = require('child_process');
 const { chromium } = require('@playwright/test');
 const { interceptLastFm, mockLastFmAuth } = require('./lastfmMock');
 
-const PORT = 8080;
+const PORT = Number(process.env.PORT) || 8080;
 const BASE_URL = `http://localhost:${PORT}`;
 const START_PATH = '/#/scrobble';
 
