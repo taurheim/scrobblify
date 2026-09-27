@@ -1,5 +1,6 @@
 import Scrobble from '@/models/Scrobble';
 import md5 from 'blueimp-md5';
+import NotAuthenticatedError from '@/api/NotAuthenticatedError';
 
 const LFM_AUTH_CALLBACK = 'https://savas.ca/scrobblify/scrobble';
 
@@ -313,7 +314,7 @@ export default class LastFm {
   // https://www.last.fm/api/show/track.scrobble
   public async scrobblePlay(play: Scrobble, timestampSecOverride?: number): Promise<ScrobbleResult> {
     if (!this.userAuthKey) {
-      throw new Error('Not authenticated.');
+      throw new NotAuthenticatedError();
     }
     const timestampSec = timestampSecOverride !== undefined
       ? timestampSecOverride
@@ -518,6 +519,12 @@ export default class LastFm {
   // retrying it can only fail the same way; the user has to sign in again.
   public static isSessionKeyError(error: unknown): boolean {
     return error instanceof Error && /^Last\.fm API error 9\b/.test(error.message);
+  }
+
+  // No session key at all, so nothing was sent. Like error 9 the only way
+  // forward is signing in, and the track is not at fault.
+  public static isNotAuthenticatedError(error: unknown): boolean {
+    return error instanceof NotAuthenticatedError;
   }
 
   // A failed `fetch` (offline, DNS failure, connection reset, CORS, ad-blocker,
