@@ -17,7 +17,7 @@ crons = ["*/5 * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "scrobblify"
-database_id = "set-me-after-wrangler-d1-create"
+database_id = "ac6eddb8-f920-4ec3-9230-a224a64ab367"
 
 [[r2_buckets]]
 binding = "BLOBS"
