@@ -774,6 +774,44 @@ test.describe('Session Resume', () => {
     await expect(dialog).not.toContainText('totalTracks');
   });
 
+  test('another JSON object is identified as the wrong file, not an invalid progress file', async ({ page }) => {
+    // Regression: only arrays were recognised as the wrong file, so Spotify's
+    // own non-history JSON (an object, and this one even has a "tracks" key)
+    // still failed with 'missing required field "totalTracks"'.
+    await goToUploadStep(page);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'YourLibrary.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify({
+        tracks: [{
+          artist: 'Queen', album: 'A Night at the Opera', track: 'Bohemian Rhapsody', uri: 'spotify:track:x',
+        }],
+        albums: [],
+        artists: [],
+      })),
+    });
+
+    const dialog = page.locator('.v-dialog--active');
+    await expect(dialog).toContainText('scrobblify-progress-', { timeout: 5000 });
+    await expect(dialog).not.toContainText('not a valid Scrobblify progress file');
+    await expect(dialog).not.toContainText('totalTracks');
+  });
+
+  test('a damaged progress file is still reported as invalid', async ({ page }) => {
+    await goToUploadStep(page);
+    const damaged: Record<string, unknown> = { ...buildState() };
+    delete damaged.tracks;
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(damaged)),
+    });
+
+    const dialog = page.locator('.v-dialog--active');
+    await expect(dialog).toContainText('not a valid Scrobblify progress file', { timeout: 5000 });
+    await expect(dialog).not.toContainText('Progress files are named like');
+  });
+
   test('a ZIP holding only a progress file resumes as soon as it is chosen', async ({ page }) => {
     // What the reporter did once the .json was refused: zipped it together
     // with their (account-data) Spotify export and uploaded that.

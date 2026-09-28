@@ -326,7 +326,13 @@ moment it's chosen** (`classifyZip`, by entry names only), not on "Find tracks":
   reported under `scrobblify.onImportFile`. They now get a
   `NotAProgressFileError` whose message tells them what to upload instead, so
   **`totalTracks` errors before 2026-09-27 are mostly this wrong-file mistake,
-  not corrupted progress files.**
+  not corrupted progress files.** Any other JSON *object* (Spotify's
+  `YourLibrary.json`, `Userdata.json`, …) is refused the same way, as
+  `detected: unknown`. A file only counts as a progress file if it has at least
+  one of the Scrobblify-only counters `totalTracks` / `completedIndices` /
+  `failedIndices`, and `tracks` alone doesn't count, because `YourLibrary.json`
+  has one. So a `missing required field` error now means a genuinely damaged
+  progress file.
 - ZIP with `Streaming_History_Audio_*` → ready; if it *also* holds a
   `scrobblify-progress*.json`, a "Resume from it instead" link is offered but
   not forced.

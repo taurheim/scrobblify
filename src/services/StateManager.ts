@@ -141,8 +141,19 @@ export default class StateManager {
         throw new NotAProgressFileError('account_data', ACCOUNT_DATA_MESSAGE);
       }
     }
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
-      throw new NotAProgressFileError('unknown', 'This file is not a Scrobblify progress file.');
+    // Any other JSON object — Spotify's own YourLibrary.json, Userdata.json,
+    // Playlist1.json, or an unrelated download — has none of the counters only
+    // Scrobblify writes. (`tracks` alone proves nothing: YourLibrary.json has
+    // one.) A file with some of them but not all is a damaged progress file
+    // and is left to the required-field check to report.
+    const signature = ['totalTracks', 'completedIndices', 'failedIndices'];
+    if (!data || typeof data !== 'object' || Array.isArray(data)
+      || !signature.some((field) => field in data)) {
+      throw new NotAProgressFileError(
+        'unknown',
+        'This file is not a Scrobblify progress file. Progress files are named like '
+          + '"scrobblify-progress-2026-01-31.json".',
+      );
     }
   }
 
