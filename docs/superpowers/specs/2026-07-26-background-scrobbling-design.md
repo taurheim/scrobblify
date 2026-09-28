@@ -104,8 +104,11 @@ queries.
 
 Selects due jobs, scrobbles a batch for each, commits progress.
 
-**Storage:** D1 for job rows, cursors, and encrypted session keys. R2 for
-track-list blobs.
+**Storage:** D1 for job rows, cursors, and encrypted session keys. Track-list blobs in a second D1 database
+(`BLOB_DB`). They were in R2 until deployment; R2 bills past its free tier with no
+spending cap, where every D1 Free-plan limit is a refusal. Chunks are capped at
+1 MB (D1's row limit is 2 MB) and jobs at 8 MB, so 50 slots fit in one 500 MB
+database.
 
 ### Why Cloudflare, and when to leave
 
@@ -126,7 +129,7 @@ it is easy to "fix" into being wrong.
 | Constraint | Value |
 | --- | --- |
 | Cron ticks/day | 1,440 (1/min) |
-| Subrequests per invocation (free) | 50, **including D1 and R2 binding calls** |
+| Subrequests per invocation (free) | 50, **including D1 binding calls** |
 | Free-tier CPU per invocation | 10ms (wall time awaiting `fetch` does not count) |
 | D1 rows written/day (free) | **100,000**, including index write amplification |
 | D1 rows read/day (free) | 5,000,000 |
@@ -154,7 +157,7 @@ which WebCrypto does not implement**. There is no platform primitive to fall
 back on; the hash is pure JS on the CPU budget, and it is the single largest
 compute cost in a tick. Any move to per-track signing would multiply it by 50.
 
-**Subrequests bind first.** A job costs ~5 per tick (R2 chunk read, CAS acquire,
+**Subrequests bind first.** A job costs ~5 per tick (blob chunk read, CAS acquire,
 mapping insert, the Last.fm call, one batched commit), plus one shared
 job-selection query. That allows **~9 jobs per tick**.
 
@@ -242,8 +245,8 @@ The worker must be movable to a plain VM without a rewrite:
 - Plain `fetch` and WebCrypto only in the scrobbling core. Both exist in Workers
   and Node 18+. No `node:` imports, no Workers-only APIs.
 - Portable SQL only, so D1's SQLite can be swapped for Postgres.
-- R2 access behind a minimal get/put-by-key interface, so it can become S3 or
-  the filesystem.
+- Blob access behind a minimal get/put-by-key interface (`BlobStore`), so it
+  can become R2, S3 or the filesystem.
 - **No Durable Objects for scheduling.** This is the principal lock-in trap.
   Scheduling stays "SELECT due jobs → process batch → commit", which runs
   identically under Workers Cron, a systemd timer, or pg_cron.
@@ -458,7 +461,8 @@ do not control:
   D1 alongside the ciphertext.
 - **Delete it the instant** the job completes, fails permanently, is cancelled,
   or reaches its TTL of 60 days.
-- Delete the R2 blob at the same time. Retain summary statistics and the failed-
+- Delete the blob too: cancel deletes it inline, and an hourly cron sweeps the
+  chunks of every completed, failed or cancelled job. Retain summary statistics and the failed-
   track list the completion page promises — nothing else. (An earlier draft said
   "summary statistics only", which contradicted that promise.)
 - **Expose no generic Last.fm proxy.** The worker may only scrobble tracks
@@ -707,7 +711,7 @@ a single API call, not a paginated crawl of the user's history.
 
 ### Safe-deploy mechanics
 
-- **Immutable job payload — but bytes are not behaviour.** The R2 chunks are
+- **Immutable job payload — but bytes are not behaviour.** The blob chunks are
   written once at job creation and never mutated. That prevents the *data* from
   changing; it does **not** prevent new code from parsing, normalising, ordering,
   or timestamping the same bytes differently. Immutability alone is not a
@@ -835,7 +839,7 @@ clients.
 The export escape hatch must emit exactly the `ScrobbleState` shape
 `importFromFile` accepts, so a user can always return to the client-side flow.
 Ordering matters on cancellation: **generate and deliver the export before
-deleting the R2 blob**, or the data needed to build it is already gone.
+deleting the blob**, or the data needed to build it is already gone.
 
 ### Conflict rules
 

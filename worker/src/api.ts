@@ -678,7 +678,7 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       entryCount: Number(url.searchParams.get('count') ?? CHUNK_TRACKS),
       compressed: await request.arrayBuffer(),
     }, nowSec);
-    return json(env, result, result.ok ? 200 : 400);
+    return json(env, result, result.ok ? 200 : (result.reason === 'storage_unavailable' ? 503 : 400));
   }
 
   // ---- step 4: finalise ----

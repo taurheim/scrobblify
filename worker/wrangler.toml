@@ -12,16 +12,22 @@ routes = [{ pattern = "api.savas.ca", custom_domain = true }]
 # shared free-tier invocation budget and pushes harder on Last.fm's per-IP
 # limit without finishing anything sooner.
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/5 * * * *", "17 * * * *"]
+# The second entry is the hourly blob sweep (BLOB_SWEEP_CRON in src/index.ts),
+# which deletes the uploaded track lists of finished jobs.
 
 [[d1_databases]]
 binding = "DB"
 database_name = "scrobblify"
 database_id = "ac6eddb8-f920-4ec3-9230-a224a64ab367"
 
-[[r2_buckets]]
-binding = "BLOBS"
-bucket_name = "scrobblify"
+# Uploaded track chunks, kept apart from DB so a full one only refuses uploads.
+# D1 rather than R2 because D1 on the Free plan stops at its limits, while R2
+# bills past them with no cap. Schema: schema-blobs/.
+[[d1_databases]]
+binding = "BLOB_DB"
+database_name = "scrobblify-blobs"
+database_id = "4d3d1705-8d46-4d13-a1f0-8508bf4cd563"
 
 [vars]
 CALLBACK_URL = "https://api.savas.ca/scrobblify/auth/callback"

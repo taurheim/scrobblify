@@ -6,7 +6,8 @@
  * moving to a VM means replacing this file and `d1.ts`, not the scheduler.
  */
 import { D1Sql, D1Database } from './d1';
-import { BlobStore } from './chunks';
+import { sweepTerminalJobBlobs } from './chunks';
+import { SqlBlobs } from './blobs';
 import { LastFmClient } from './lastfm';
 import { handleRequest, ApiEnv } from './api';
 import { runTick } from './scheduler';
@@ -14,7 +15,8 @@ import { reapExpiredHandoffs } from './handoff';
 
 export interface Env {
   DB: D1Database;
-  BLOBS: R2Bucket;
+  /** A second D1 database holding only chunk bytes. See `blobs.ts`. */
+  BLOB_DB: D1Database;
   LASTFM_API_KEY: string;
   LASTFM_SHARED_SECRET: string;
   /** HMAC key for handoff state and session tokens. */
@@ -26,27 +28,10 @@ export interface Env {
 }
 
 /**
- * R2 behind a get/put-by-key interface, so it can become S3 or a filesystem
- * without touching anything above it.
+ * Must match the second entry of `[triggers] crons` in wrangler.toml. Any
+ * other trigger runs the scheduler.
  */
-class R2Blobs implements BlobStore {
-  constructor(private readonly bucket: R2Bucket) {}
-
-  async put(key: string, value: ArrayBuffer | Uint8Array): Promise<void> {
-    await this.bucket.put(key, value as ArrayBuffer);
-  }
-
-  async get(key: string): Promise<ArrayBuffer | null> {
-    const object = await this.bucket.get(key);
-    return object ? object.arrayBuffer() : null;
-  }
-
-  async delete(keys: string[]): Promise<void> {
-    if (keys.length > 0) {
-      await this.bucket.delete(keys);
-    }
-  }
-}
+const BLOB_SWEEP_CRON = '17 * * * *';
 
 /**
  * Secrets that must be present and non-trivial for the worker to be safe.
@@ -79,7 +64,7 @@ function missingSecrets(env: Env): string[] {
 function buildEnv(env: Env): ApiEnv {
   return {
     sql: new D1Sql(env.DB),
-    blobs: new R2Blobs(env.BLOBS),
+    blobs: new SqlBlobs(new D1Sql(env.BLOB_DB)),
     lastfm: new LastFmClient({
       apiKey: env.LASTFM_API_KEY,
       sharedSecret: env.LASTFM_SHARED_SECRET,
@@ -120,7 +105,7 @@ export default {
     }
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const missing = missingSecrets(env);
     if (missing.length > 0) {
       // A tick with the wrong credential secret cannot decrypt anything, so
@@ -131,6 +116,15 @@ export default {
     }
     const api = buildEnv(env);
     const nowSec = api.now();
+    if (event.cron === BLOB_SWEEP_CRON) {
+      // Its own trigger, so its subrequests never come out of a scrobbling
+      // tick's budget.
+      ctx.waitUntil((async () => {
+        const swept = await sweepTerminalJobBlobs(api.sql, api.blobs);
+        console.log('blob sweep', JSON.stringify({ swept }));
+      })());
+      return;
+    }
     ctx.waitUntil((async () => {
       // Reaping first: an abandoned handoff holds both a concurrency slot and
       // a permanent write credential, and neither should outlive the tab that

@@ -40,14 +40,16 @@ npx wrangler login
 #    "set-me-after-wrangler-d1-create". The id is not a secret; commit it.
 npx wrangler d1 create scrobblify
 
-# 2. R2, for the uploaded track blobs.
-npx wrangler r2 bucket create scrobblify
+# 2. A second D1 for the uploaded track blobs. Copy its database_id into the
+#    BLOB_DB block of wrangler.toml. (See "Why blobs live in D1" below.)
+npx wrangler d1 create scrobblify-blobs
 
-# 3. Schema. Every file in schema/, in order.
+# 3. Schema. Every file in schema/, in order, then the blob schema.
 npx wrangler d1 execute scrobblify --remote --file schema/001_init.sql
 npx wrangler d1 execute scrobblify --remote --file schema/002_synthetic_floor.sql
 npx wrangler d1 execute scrobblify --remote --file schema/003_export_claim.sql
 npx wrangler d1 execute scrobblify --remote --file schema/004_import_id.sql
+npx wrangler d1 execute scrobblify-blobs --remote --file schema-blobs/001_blobs.sql
 
 # 4. Secrets (see below). Each command prompts for its value.
 npx wrangler secret put LASTFM_API_KEY
@@ -107,6 +109,21 @@ Setting it does not switch the feature on by itself: the client asks
 deploying the SPA before the worker degrades to the old behaviour rather than
 offering a handoff that cannot complete.
 
+### Why blobs live in D1, and what this costs
+
+Nothing, provided the account stays on **Workers Free** and **R2 is never
+enabled**. Every Free-plan limit is a refusal, not a bill: past its daily
+quota D1 errors, and so does the worker past its request quota. R2 is the
+exception, because it charges for anything past its free tier and has no
+spending cap, which is why the uploaded chunks moved out of it.
+
+The blobs get their own database so a full one refuses only new uploads (the
+client falls back to scrobbling locally) and never touches the scheduler's
+data. Storage is bounded by construction: each compressed chunk is capped at
+1 MB (D1 rows max out at 2 MB), each job at 8 MB, and at most 50 jobs hold a
+slot, so 400 MB against D1's 500 MB. A second cron (`17 * * * *`) deletes the
+chunks of completed, failed and cancelled jobs within the hour.
+
 ### 8. Try it
 
 The worker and the SPA can be deployed in either order. The SPA ships through
@@ -130,6 +147,7 @@ npx wrangler d1 execute scrobblify --local --file schema/001_init.sql
 npx wrangler d1 execute scrobblify --local --file schema/002_synthetic_floor.sql
 npx wrangler d1 execute scrobblify --local --file schema/003_export_claim.sql
 npx wrangler d1 execute scrobblify --local --file schema/004_import_id.sql
+npx wrangler d1 execute scrobblify-blobs --local --file schema-blobs/001_blobs.sql
 npx wrangler dev --local
 ```
 
