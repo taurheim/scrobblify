@@ -181,6 +181,16 @@ const PACING_EXIT_CLEAR_TRACKS = 3;
 
 const MAX_CONSECUTIVE_FAILURES = 10;
 
+// Progress used to be saved only when a run stopped for good or the user
+// clicked a save button, so closing or reloading the tab mid-run lost
+// everything since. The resume then re-sent those tracks: telemetry showed 42%
+// of resuming users going *backwards* in completion, replaying a median of 340
+// tracks each — burning daily budget and, for re-tagged plays (which get a
+// fresh timestamp on every send), creating duplicate scrobbles. A checkpoint
+// every this-many tracks bounds that loss. Countdown waits checkpoint too,
+// since that is exactly where users walk away.
+const CHECKPOINT_EVERY_TRACKS = 25;
+
 // Re-tagged plays (see Scrobble.reTagged) are stamped at send time, starting
 // this far back and stepping forward one second per scrobble. Last.fm rejects
 // timestamps in the future and anything older than 14 days, so the cursor is
@@ -231,13 +241,19 @@ export default Vue.extend({
       // an error, so it gets its own flag rather than colouring a deliberate
       // action as a failure.
       manuallyPaused: false,
+      // Set by "Save Progress & Leave". The loop must return rather than carry
+      // on once its countdown ends: the save has already been taken, so every
+      // track sent after it would be re-sent by the next resume.
+      leaving: false,
       // Last.fm rejected the stored session key (error 9). Terminal, and the
       // only way forward is a fresh sign-in, so it replaces the retry button.
       sessionInvalid: false,
       autoSaved: false,
+      tracksSinceCheckpoint: 0,
       pauseReason: '',
       countdown: 0,
       countdownTimer: null as number | null,
+      countdownResolve: null as (() => void) | null,
       // Preventive pacing is a *stretch* of throttled sends, not a single
       // pause: it is entered once when the rolling window fills and left once
       // the window has room again. Telemetry and UI both describe the stretch,
@@ -313,7 +329,9 @@ export default Vue.extend({
       waits (which clear `paused` themselves) do not.
     */
     canResume(): boolean {
-      return this.stopped || this.manuallyPaused;
+      // `leaving` only lingers on this step if the save itself failed, and the
+      // loop has already returned, so the user needs the way back in too.
+      return this.stopped || this.manuallyPaused || this.leaving;
     },
 
     // A deliberate pause is not a failure, so it must not be styled as one.
@@ -461,8 +479,10 @@ export default Vue.extend({
       this.paused = false;
       this.stopped = false;
       this.manuallyPaused = false;
+      this.leaving = false;
       this.sessionInvalid = false;
       this.autoSaved = false;
+      this.tracksSinceCheckpoint = 0;
       this.pauseReason = '';
       // A manual retry after giving up starts a fresh backoff ladder.
       this.rateLimitPauseCount = 0;
@@ -498,6 +518,11 @@ export default Vue.extend({
 
       // `i` is incremented conditionally at the end so a rate-limited track can be retried.
       for (let i = this.scrobbledTracks; i < tracks.length;) {
+        if (this.leaving) {
+          this.stopForLeave(i);
+          return;
+        }
+
         // Check if manually paused. Transient waits clear `paused` before
         // returning, so reaching here with it set means the user asked to stop.
         // The save happens *here* rather than in `manualPause` so the snapshot
@@ -538,6 +563,12 @@ export default Vue.extend({
             await this.sleep(burstWaitMs);
           }
           this.syncRateLimitCounters();
+          // The wait is followed by a send in this same iteration, so the
+          // top-of-loop check would come one track too late.
+          if (this.leaving) {
+            this.stopForLeave(i);
+            return;
+          }
         } else if (this.pacing) {
           // One free slot is not the end of a throttled stretch — it is the one
           // slot this track is about to consume, after which the window is full
@@ -699,31 +730,40 @@ export default Vue.extend({
             this.pauseReason = `Rate limited by Last.fm. Waiting ${formatDuration(backoffMs)} before retrying (attempt ${this.rateLimitPauseCount} of ${MAX_RATE_LIMIT_RETRIES}).`;
             trackEvent('scrobble_paused', this.progressProps({ reason: 'rate_limit' }));
             await this.pauseWithCountdown(backoffMs);
-            trackEvent('scrobble_rate_limit_cooldown_complete', this.progressProps({
-              track_index: i,
-              burst_count: tracker.burstCount,
-              burst_limit: tracker.burstLimit,
-              daily_count: tracker.dailyCount,
-              rate_limit_pause_count: this.rateLimitPauseCount,
-              configured_cooldown_ms: backoffMs,
-              actual_pause_ms: Date.now() - rateLimitStartMs,
-            }));
+            if (!this.leaving) {
+              trackEvent('scrobble_rate_limit_cooldown_complete', this.progressProps({
+                track_index: i,
+                burst_count: tracker.burstCount,
+                burst_limit: tracker.burstLimit,
+                daily_count: tracker.dailyCount,
+                rate_limit_pause_count: this.rateLimitPauseCount,
+                configured_cooldown_ms: backoffMs,
+                actual_pause_ms: Date.now() - rateLimitStartMs,
+              }));
+            }
             retrySameTrack = true;
-          } else if (LastFm.isSessionKeyError(e)) {
-            // The stored session key is dead, so every remaining track would
-            // fail identically. This used to burn ten tracks as "failed", then
-            // offer a retry with the same key — and keep the key, so every
-            // later visit failed the same way. The track is not at fault: leave
-            // it unconsumed, save, and send the user to sign in again.
-            this.pauseReason = 'Last.fm is no longer accepting your sign-in. This can happen after'
-              + ' signing in to Scrobblify on another device or browser, changing your Last.fm'
-              + ' password, or removing Scrobblify\'s access. Sign in again, then choose'
-              + ' "Resume" to carry on where you left off.';
+          } else if (LastFm.isSessionKeyError(e) || LastFm.isNotAuthenticatedError(e)) {
+            // The stored session key is dead (or already gone), so every
+            // remaining track would fail identically. This used to burn ten
+            // tracks as "failed", then offer a retry with the same key — and
+            // keep the key, so every later visit failed the same way. The track
+            // is not at fault: leave it unconsumed, save, and send the user to
+            // sign in again.
+            const missing = LastFm.isNotAuthenticatedError(e);
+            this.pauseReason = missing
+              ? 'You\'re not signed in to Last.fm. Your progress is saved — sign in, then choose'
+                + ' "Resume" to carry on where you left off.'
+              : 'Last.fm is no longer accepting your sign-in. This can happen after'
+                + ' signing in to Scrobblify on another device or browser, changing your Last.fm'
+                + ' password, or removing Scrobblify\'s access. Sign in again, then choose'
+                + ' "Resume" to carry on where you left off.';
             this.sessionInvalid = true;
             this.stopped = true;
             this.paused = true;
             this.autoSave();
-            this.trackStopped('session_invalid', { track_index: i });
+            // Kept apart from `session_invalid`: that is Last.fm rejecting a
+            // key, this is a route into the loop that skipped signing in.
+            this.trackStopped(missing ? 'not_authenticated' : 'session_invalid', { track_index: i });
             api.clearSessionKey();
             return;
           } else if (LastFm.isNetworkError(e)) {
@@ -765,6 +805,13 @@ export default Vue.extend({
         if (!retrySameTrack) {
           this.scrobbledTracks += 1;
           pendingReTagTimestampSec = undefined;
+          // Taken here, between tracks, for the same reason the manual pause
+          // saves between tracks: the snapshot must not omit an in-flight send.
+          // Not on the last track, whose completion clears the save anyway.
+          this.tracksSinceCheckpoint += 1;
+          if (this.tracksSinceCheckpoint >= CHECKPOINT_EVERY_TRACKS && i + 1 < tracks.length) {
+            this.checkpoint();
+          }
           if (recoveredFromRateLimit) {
             trackEvent('scrobble_rate_limit_recovered', this.progressProps({
               burst_count: this.burstCount,
@@ -785,11 +832,16 @@ export default Vue.extend({
     },
 
     pauseWithCountdown(durationMs: number): Promise<void> {
+      // Every caller waits between tracks (before a send, or after an attempt
+      // that did not consume its track), so this is a consistent snapshot —
+      // and the paused panel is where users most often close the tab.
+      this.checkpoint();
       this.paused = true;
       const deadline = Date.now() + durationMs;
       this.countdown = Math.ceil(durationMs / MS_PER_SECOND);
 
       return new Promise((resolve) => {
+        this.countdownResolve = resolve;
         // Driven off a wall-clock deadline rather than by decrementing a
         // counter: background tabs throttle setInterval, which would otherwise
         // stretch a 30-minute backoff into something much longer.
@@ -801,12 +853,30 @@ export default Vue.extend({
               clearInterval(this.countdownTimer);
               this.countdownTimer = null;
             }
+            this.countdownResolve = null;
             this.paused = false;
             this.pauseReason = '';
             resolve();
           }
         }, 1000);
       });
+    },
+
+    /**
+     * End a countdown early, releasing the loop that is awaiting it. `paused`
+     * is deliberately left set: the caller is stopping the run, not resuming it.
+     */
+    cancelCountdown() {
+      if (this.countdownTimer) {
+        clearInterval(this.countdownTimer);
+        this.countdownTimer = null;
+      }
+      this.countdown = 0;
+      const resolve = this.countdownResolve;
+      this.countdownResolve = null;
+      if (resolve) {
+        resolve();
+      }
     },
 
     manualPause() {
@@ -830,6 +900,29 @@ export default Vue.extend({
 
     saveAndExit() {
       this.$emit('save-and-exit', this.progressSnapshot());
+      // Reachable during a transient countdown, whose loop used to simply carry
+      // on once the timer ran out — scrobbling unseen behind the Complete step
+      // with nothing saving it, so the next resume re-sent all of it.
+      this.leaving = true;
+      this.cancelCountdown();
+    },
+
+    /**
+     * The loop's exit once "Save Progress & Leave" has been taken. The parent
+     * already saved, so this only reports the stop.
+     */
+    stopForLeave(trackIndex: number) {
+      this.endPacing();
+      this.trackStopped('save_and_exit', { track_index: trackIndex, auto_saved: true });
+    },
+
+    /**
+     * Silent, periodic save. Unlike autoSave() this is not a stop: nothing is
+     * shown, no `session_saved` is reported, and `autoSaved` is left alone.
+     */
+    checkpoint() {
+      this.tracksSinceCheckpoint = 0;
+      this.$emit('checkpoint', this.progressSnapshot());
     },
 
     progressSnapshot() {

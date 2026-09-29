@@ -10,6 +10,10 @@
         <router-link to="/about">About</router-link>
       </div>
       <router-view/>
+      <footer id="site-footer">
+        <span :title="buildLabel">Scrobblify</span> &middot; built by
+        <a href="https://savas.ca">Niko Savas</a>
+      </footer>
     </v-app>
   </div>
 </template>
@@ -34,10 +38,28 @@
 #nav a {
   font-weight: bold;
 }
+
+#site-footer {
+  margin-top: 40px;
+  padding-bottom: 16px;
+  font-size: 12px;
+  letter-spacing: 0.05em;
+  color: rgba(44, 62, 80, 0.4);
+}
+
+#site-footer a {
+  color: inherit;
+}
 </style>
 <script lang="ts">
 import Vue from 'vue';
+import { BUILD_NUMBER, GIT_SHA } from './buildInfo';
 
 export default Vue.extend({
+  computed: {
+    buildLabel(): string {
+      return `${GIT_SHA} · Build ${BUILD_NUMBER}`;
+    },
+  },
 });
 </script>
