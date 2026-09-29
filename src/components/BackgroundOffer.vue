@@ -31,8 +31,9 @@
               <strong>Listen dates will change.</strong>
               Last.fm rejects scrobbles older than 14 days, and this import
               takes longer than that. Tracks played before the cutoff get the
-              date they were sent instead of the date you played them. Anything
-              inside the 14 days keeps its real date.
+              date they were sent instead of the date you played them. A play
+              keeps its real date only if the server sends it within 13 days of
+              when you played it.
               <span v-if="allReTagged">
                 You already chose to move your old plays to today, so this
                 changes nothing you hadn't already accepted.
@@ -42,7 +43,8 @@
               <strong>The server keeps a key that can scrobble as you.</strong>
               Last.fm asks you to approve it on the next screen. It is stored
               encrypted and used only for this import. It gets deleted when the
-              import ends, when you cancel, or after 60 days unused. You can
+              import ends, when you cancel, or 60 days after you hand the import
+              over, whichever comes first. You can
               also revoke it yourself in
               <a href="https://www.last.fm/settings/applications" target="_blank" rel="noopener">
                 your Last.fm settings</a>.

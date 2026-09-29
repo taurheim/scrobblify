@@ -92,11 +92,14 @@ one rule is included on the free plan):
 | Field | Value |
 | --- | --- |
 | If incoming requests match | `URI Path` equals `/scrobblify/job/live` |
-| Rate | 20 requests per 1 minute, per IP |
-| Action | Block for 1 minute |
+| Characteristics | IP |
+| Rate | 5 requests per 10 seconds |
+| Action | Block, for 10 seconds |
 
-Genuine clients call this at most a couple of times per page load, so 20/min
-is far above real use and far below useful enumeration.
+The free plan only offers a 10-second period and a 10-second block, so the rule
+is expressed in those units. Genuine clients call this at most a couple of times
+per page load, and a blocked caller gets at most 5 answers per 20 seconds
+(about 15 a minute): far above real use, far below useful enumeration.
 
 **Not enforced with a counter in D1**, deliberately: a row written per request
 would let an enumerator burn the free tier's daily write quota on our behalf,
