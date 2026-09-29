@@ -512,8 +512,9 @@ and one of the 50 places for ever. The hourly housekeeping cron
 | 30 days after any job ends | its `failures` rows are deleted | No |
 
 - **The clock is a column, not `updated_at`.** Migration 005 adds a trigger
-  that sets `inactivity_deadline` when a job *enters* a parked or dormant state
-  and clears it on the way out. `updated_at` moves every time the sweep drains
+  that sets `inactivity_deadline` when a job *enters* a parked or dormant state.
+  It is left behind when the job moves on, which is harmless: housekeeping only
+  reads it on jobs that are parked, and re-entering one resets it. `updated_at` moves every time the sweep drains
   a lease, so a job parked for a month could look fresh. The migration also
   backfills jobs already parked when it runs.
 - **Dormant is not terminal.** It holds the queue, so `/import/:id` still
