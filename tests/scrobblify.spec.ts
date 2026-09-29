@@ -10,6 +10,19 @@ import { interceptLastFm, mockLastFmAuth } from './lastfmMock';
 
 const FIXTURE_ZIP = path.resolve(__dirname, 'fixtures', 'test-spotify-data.zip');
 
+// public/index.html pulls stylesheets from Google Fonts and jsDelivr, and
+// page.goto() waits for `load`, which waits for them. A slow CDN from the CI
+// runner then times out whichever test happens to be navigating. No test
+// depends on fonts or icons, so serve them empty.
+const THIRD_PARTY_ASSETS = /^https:\/\/(fonts\.googleapis\.com|fonts\.gstatic\.com|cdn\.jsdelivr\.net)\//;
+test.beforeEach(async ({ context }) => {
+  await context.route(THIRD_PARTY_ASSETS, (route) => route.fulfill({
+    status: 200,
+    contentType: 'text/css',
+    body: '',
+  }));
+});
+
 // Navigate past auth (step 1 -> step 2) with mocked auth
 async function goToUploadStep(page: Page) {
   await interceptLastFm(page);
