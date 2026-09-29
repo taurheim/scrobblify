@@ -44,7 +44,12 @@ class NodeSql implements Sql {
   }
 
   async run(query: string, params: unknown[] = []): Promise<SqlResult> {
-    return { changes: Number(this.db.prepare(query).run(...(params as any[])).changes) };
+    // D1 counts rows written by triggers in `changes`; SQLite's `changes()`
+    // does not. Reporting the D1 number keeps a count mistake visible here.
+    const before = Number((this.db.prepare('SELECT total_changes() AS n').get() as any).n);
+    this.db.prepare(query).run(...(params as any[]));
+    const after = Number((this.db.prepare('SELECT total_changes() AS n').get() as any).n);
+    return { changes: after - before };
   }
 
   async batch(statements: { query: string; params?: unknown[] }[]): Promise<SqlResult[]> {
@@ -1260,6 +1265,23 @@ async function main() {
       job.state === 'needs_attention', job.state);
     check('the claim is cleared', job.export_claim === null, job.export_claim);
     check('and so is its deadline', job.locked_until === 0, job.locked_until);
+    const logged = await h.sql.first<{ detail: string }>(
+      "SELECT detail FROM audit WHERE event = 'export_claim_expired'",
+    );
+    check('the audit counts jobs, not the rows the inactivity trigger also wrote',
+      JSON.parse(logged?.detail ?? '{}').jobs === 1, logged);
+
+    // A take-back of a dormant job that is abandoned leaves it dormant, with
+    // no key and no slot, rather than resurrecting it as a keyless `paused`.
+    const dormant = await harness({ total: 10 });
+    await dormant.sql.run(
+      `UPDATE jobs SET state = 'exporting', export_claim = 'abandoned-claim',
+          export_prev_state = 'dormant', locked_until = ? WHERE id = ?`,
+      [NOW - 1, dormant.jobId],
+    );
+    await runTick(dormant.env, NOW);
+    check('a claim taken from dormant reverts to dormant',
+      (await dormant.job()).state === 'dormant', (await dormant.job()).state);
 
     // A claim that has not lapsed is left alone: the take-back is still going.
     const live = await harness({ total: 10 });

@@ -47,8 +47,13 @@ export const MAX_COMPRESSED_BYTES = 1_000_000;
  */
 export const MAX_JOB_COMPRESSED_BYTES = 8_000_000;
 
-/** Jobs whose blobs one sweep will delete. Each costs three subrequests. */
-export const BLOB_SWEEP_JOB_LIMIT = 10;
+/**
+ * Jobs whose blobs one sweep will delete. Each costs four D1 statements (the
+ * chunk lookup, the blob delete, and the chunk and batch deletes), and the
+ * sweep shares the hourly invocation with the rest of `runHousekeeping`
+ * under Workers Free's 50-query limit.
+ */
+export const BLOB_SWEEP_JOB_LIMIT = 8;
 
 /**
  * The bomb defence. Decompression stops at this many bytes rather than
@@ -359,7 +364,14 @@ export async function deleteJobBlobs(
   if (chunks.length > 0) {
     await blobs.delete(chunks.map((c) => c.r2_key));
   }
-  await sql.run('DELETE FROM chunks WHERE job_id = ?', [jobId]);
+  // Batch records go too: `assigned_timestamps` names every track sent, and
+  // the consent copy promises the uploaded list is deleted when the import
+  // ends. Nothing reads a terminal job's batches; failures are kept until the
+  // purge because the completion page lists them.
+  await sql.batch([
+    { query: 'DELETE FROM chunks WHERE job_id = ?', params: [jobId] },
+    { query: 'DELETE FROM batches WHERE job_id = ?', params: [jobId] },
+  ]);
 }
 
 /**

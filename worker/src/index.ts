@@ -6,7 +6,7 @@
  * moving to a VM means replacing this file and `d1.ts`, not the scheduler.
  */
 import { D1Sql, D1Database } from './d1';
-import { sweepTerminalJobBlobs } from './chunks';
+import { runHousekeeping } from './housekeeping';
 import { SqlBlobs } from './blobs';
 import { LastFmClient } from './lastfm';
 import { handleRequest, ApiEnv } from './api';
@@ -120,8 +120,8 @@ export default {
       // Its own trigger, so its subrequests never come out of a scrobbling
       // tick's budget.
       ctx.waitUntil((async () => {
-        const swept = await sweepTerminalJobBlobs(api.sql, api.blobs);
-        console.log('blob sweep', JSON.stringify({ swept }));
+        const report = await runHousekeeping(api.sql, api.blobs, nowSec);
+        console.log('housekeeping', JSON.stringify(report));
       })());
       return;
     }

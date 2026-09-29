@@ -1203,6 +1203,140 @@ async function main() {
       job.state === 'paused' && job.credential_expires_at > NOW, job);
   }
 
+  const signInAs = async (env: ApiEnv, username: string) => {
+    const state = await signHandoffState(
+      {
+        h: '', exp: NOW + 600, k: 'signin', u: username, n: 'nonce-that-is-long-enough',
+      },
+      SIGNING,
+    );
+    return handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    );
+  };
+  const seedDormant = async (sql: Sql, blobs: BlobStore, username: string) => {
+    const id = await seedJob(sql, blobs, username, { state: 'dormant', live: false });
+    await sql.run(
+      'UPDATE jobs SET session_key_ct = NULL, session_key_iv = NULL WHERE id = ?', [id],
+    );
+    return id;
+  };
+
+  console.log('\n-- signing in brings a dormant job back while there is room --');
+  {
+    /*
+      Housekeeping deletes the key of a job left parked for two weeks and gives
+      its slot to someone else. The tracks are kept precisely so a user who
+      comes back can carry on, and reconnecting is how they say so.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs, {
+      getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'listener' }),
+    });
+    const jobId = await seedDormant(sql, blobs, 'listener');
+    const res = await signInAs(env, 'listener');
+    check('the sign-in succeeds', res.status === 302, res.status);
+    const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [jobId]);
+    check('the job is paused, ready to resume', job.state === 'paused', job.state);
+    check('with a credential', !!job.session_key_ct);
+    check('holding the account slot', job.live_username === 'listener', job.live_username);
+    check('its inactivity clock restarted', job.inactivity_deadline > NOW, job.inactivity_deadline);
+    const logged = await sql.first<{ detail: string }>(
+      "SELECT detail FROM audit WHERE job_id = ? AND event = 'credential_reattached'",
+      [jobId],
+    );
+    check('recorded as coming back from dormant',
+      JSON.parse(logged?.detail ?? '{}').from === 'dormant', logged);
+  }
+
+  console.log('\n-- but not into a slot that is not there --');
+  {
+    /*
+      A dormant job gave its slot up. Taking one back past capacity would
+      overcommit the worker for every other user, so it waits. A job in
+      `needs_reauth` never gave its slot up and is not held to this.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs, {
+      getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'listener' }),
+    });
+    await sql.run('UPDATE control SET max_concurrent_jobs = 1 WHERE id = 1');
+    await seedJob(sql, blobs, 'someone-else');
+    const dormant = await seedDormant(sql, blobs, 'listener');
+
+    const status: any = await (await handleRequest(env, req('/scrobblify/job', {
+      token: await issueSession('listener', SIGNING, NOW),
+    }))).json();
+    check('the status says reconnecting will not help yet',
+      status.job?.state === 'dormant' && status.job.reconnectAvailable === false, status);
+
+    const res = await signInAs(env, 'listener');
+    check('the sign-in still succeeds', res.status === 302, res.status);
+    const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [dormant]);
+    check('the job stays dormant', job.state === 'dormant', job.state);
+    check('with no credential', job.session_key_ct === null);
+
+    const sql2 = freshSql();
+    const blobs2 = new MemoryBlobs();
+    const env2 = makeEnv(sql2, blobs2, {
+      getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'listener' }),
+    });
+    await sql2.run('UPDATE control SET max_concurrent_jobs = 1 WHERE id = 1');
+    const reauth = await seedJob(sql2, blobs2, 'listener', { state: 'needs_reauth', live: false });
+    await signInAs(env2, 'listener');
+    const kept = await sql2.first<any>('SELECT state FROM jobs WHERE id = ?', [reauth]);
+    check('a re-auth job at full capacity is still restored: it held its slot',
+      kept.state === 'paused', kept.state);
+  }
+
+  console.log('\n-- a job waiting on the user is reported even without a live slot --');
+  {
+    /*
+      `needs_reauth` and `dormant` both clear `live_username`, so looking the
+      job up by it found nothing and the user was shown their last finished
+      job, or none, instead of the one holding their tracks.
+    */
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const token = await issueSession('listener', SIGNING, NOW);
+    const done = await seedJob(sql, blobs, 'listener', { state: 'completed', live: false });
+    await sql.run('UPDATE jobs SET updated_at = ? WHERE id = ?', [NOW + 10, done]);
+    const dormant = await seedDormant(sql, blobs, 'listener');
+    await sql.run('UPDATE jobs SET inactivity_deadline = ? WHERE id = ?', [NOW + 30 * 86400, dormant]);
+
+    const body: any = await (await handleRequest(env, req('/scrobblify/job', { token }))).json();
+    check('the dormant job is reported over a newer finished one',
+      body.job?.id === dormant, body.job);
+    check('with the date it will be cancelled',
+      body.job?.inactivityDeadline === NOW + 30 * 86400, body.job);
+    check('and that reconnecting would bring it back', body.job?.reconnectAvailable === true, body.job);
+
+    await sql.run("UPDATE jobs SET state = 'needs_reauth' WHERE id = ?", [dormant]);
+    const reauth: any = await (await handleRequest(env, req('/scrobblify/job', { token }))).json();
+    check('a re-auth job is reported too', reauth.job?.state === 'needs_reauth', reauth.job);
+  }
+
+  console.log('\n-- a dormant job can still be taken back --');
+  {
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const token = await issueSession('listener', SIGNING, NOW);
+    const id = await seedDormant(sql, blobs, 'listener');
+    const res = await handleRequest(env, req(`/scrobblify/job/${id}/export`, {
+      method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }),
+    }));
+    const body: any = await res.json();
+    check('the export succeeds without a credential', res.status === 200, body);
+    check('with every track', body.state?.tracks?.length === 100, body.state?.tracks?.length);
+    const held = await sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [id]);
+    check('remembering to go back to dormant if abandoned',
+      held!.export_prev_state === 'dormant', held!.export_prev_state);
+  }
+
   console.log('\n-- an unconfirmed send comes back pinned to the second it rode on --');
   {
     /*

@@ -9,7 +9,12 @@
  */
 
 export interface SqlResult {
-  /** Rows changed by the statement. Load-bearing: every CAS checks it. */
+  /**
+   * Rows changed by the statement. Only ever compare it with zero: every CAS
+   * checks it, and zero versus non-zero is reliable. It is not a count. D1
+   * includes rows written by triggers (`schema/005_dormancy.sql`), so a
+   * one-row state change reports 2. Use `RETURNING` when the number matters.
+   */
   changes: number;
 }
 
@@ -48,6 +53,17 @@ export type JobState =
   | 'exporting'
   | 'needs_reauth'
   | 'needs_attention'
+  /**
+   * Parked for `DORMANT_AFTER_SECONDS` with nobody coming back
+   * (`src/housekeeping.ts`). The credential is deleted and `live_username`
+   * cleared, so it cannot send, and it no longer holds a slot. The tracks are
+   * kept: the user can still take them back, or reconnect if a slot is free.
+   * Cancelled after `EXPIRE_AFTER_SECONDS` more.
+   *
+   * Not terminal. Its `import_id` still answers `known: true`, which keeps
+   * stale browser copies of the queue blocked.
+   */
+  | 'dormant'
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -56,8 +72,8 @@ export type JobState =
  * States that consume one of the scarce concurrency slots.
  *
  * Parked states count, because a job sitting in `needs_reauth` still holds a
- * credential. They are released by the inactivity deadline, not by being
- * excluded here.
+ * credential. They are released by the inactivity deadline, which moves them
+ * to `dormant` (deliberately absent here) rather than by being excluded.
  */
 export const SLOT_CONSUMING_STATES: JobState[] = [
   'pending',
@@ -220,8 +236,9 @@ export async function acquireJob(
  * Inlined into SQL rather than bound, because the list is a constant and
  * SQLite cannot bind an IN list.
  */
-export const DRAINABLE_STATES = ['paused', 'needs_attention', 'needs_reauth'] as const;
+export const DRAINABLE_STATES = ['paused', 'needs_attention', 'needs_reauth', 'dormant'] as const;
 const DRAINABLE_STATES_SQL = `('${DRAINABLE_STATES.join("', '")}')`;
+const SWEPT_DRAINABLE_STATES_SQL = `('${DRAINABLE_STATES.filter((s) => s !== 'dormant').join("', '")}')`;
 
 export async function acquireJobForDrain(
   sql: Sql,
@@ -253,16 +270,21 @@ export async function acquireJobForDrain(
  * The grace period is the caller's, so this stays honest about the fact that
  * "still sending" and "response lost" are indistinguishable until enough time
  * has passed.
+ *
+ * `dormant` jobs are only included on demand. They have no credential, so the
+ * sweep can never settle their batches and would acquire the same jobs every
+ * tick for nothing; only a take-back, which may abandon them, can.
  */
 export async function selectDrainableJobs(
   sql: Sql,
   nowSec: number,
   staleBefore: number,
   limit: number,
+  includeDormant = false,
 ): Promise<JobRow[]> {
   return sql.all<JobRow>(
     `SELECT j.* FROM jobs j
-      WHERE j.state IN ${DRAINABLE_STATES_SQL}
+      WHERE j.state IN ${includeDormant ? DRAINABLE_STATES_SQL : SWEPT_DRAINABLE_STATES_SQL}
         AND j.locked_until < ?
         AND EXISTS (
           SELECT 1 FROM batches b
@@ -665,22 +687,31 @@ export async function countActiveSlots(sql: Sql): Promise<number> {
   return row ? Number(row.n) : 0;
 }
 
+const SLOT_CONSUMING_STATES_SQL = `('${SLOT_CONSUMING_STATES.join("', '")}')`;
+
 /**
  * Total slots committed: live jobs, plus handoffs that have not yet produced a
- * job row.
+ * job row, as one SQL expression so a write can be conditioned on capacity in
+ * the same statement that takes the slot. Checking first and writing second
+ * lets two writers both see the last free slot.
  *
  * The `job_id IS NULL` predicate is what stops a handoff being counted twice.
- * Once the exchange succeeds the handoff owns a `pending` job, which
- * `countActiveSlots` already counts; counting both would halve real capacity.
+ * Once the exchange succeeds the handoff owns a `pending` job, which the first
+ * count already includes; counting both would halve real capacity.
  */
+const COMMITTED_SLOTS_SQL = `(
+  (SELECT COUNT(*) FROM jobs WHERE state IN ${SLOT_CONSUMING_STATES_SQL})
+  + (SELECT COUNT(*) FROM handoffs
+      WHERE state IN ('issued', 'exchanging', 'pending_upload', 'finalizing')
+        AND job_id IS NULL))`;
+
+/** True, inside SQL, while at least one concurrency slot is free. */
+export const SLOT_AVAILABLE_SQL = `${COMMITTED_SLOTS_SQL}
+  < (SELECT max_concurrent_jobs FROM control WHERE id = 1)`;
+
 export async function countCommittedSlots(sql: Sql): Promise<number> {
-  const used = await countActiveSlots(sql);
-  const pending = await sql.first<{ n: number }>(
-    `SELECT COUNT(*) AS n FROM handoffs
-      WHERE state IN ('issued','exchanging','pending_upload','finalizing')
-        AND job_id IS NULL`,
-  );
-  return used + (pending ? Number(pending.n) : 0);
+  const row = await sql.first<{ n: number }>(`SELECT ${COMMITTED_SLOTS_SQL} AS n`);
+  return row ? Number(row.n) : 0;
 }
 
 /**

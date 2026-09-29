@@ -55,6 +55,17 @@ export interface JobStatus {
   createdAt: number;
   completedAt: number | null;
   credentialExpiresAt: number;
+  /**
+   * For a job waiting on the user: when a parked job goes dormant, or when a
+   * dormant one is cancelled. Null otherwise, and for jobs parked before the
+   * worker started recording it.
+   */
+  inactivityDeadline?: number | null;
+  /**
+   * Sent only with a job that has no key (`needs_reauth`, `dormant`). False
+   * when reconnecting would be refused because the service is full.
+   */
+  reconnectAvailable?: boolean;
 }
 
 export interface UploadTrack {
@@ -2126,6 +2137,9 @@ export function isSessionExpired(): boolean {
  * Job states in which the server has definitively stopped scrobbling. Anything
  * else — including states added later — counts as live, so an unknown state
  * errs towards withholding Resume rather than towards duplicates.
+ *
+ * `dormant` is deliberately absent. The job cannot send, but it still holds
+ * the queue and can be reconnected, so a browser copy must stay blocked.
  */
 const TERMINAL_JOB_STATES = ['completed', 'failed', 'cancelled'];
 

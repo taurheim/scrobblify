@@ -498,6 +498,53 @@ Completed job rows are retained (without the session key) for 30 days so a
 returning user sees "done — 94,203 scrobbled, 112 failed" with a downloadable
 failure list, rather than "no job found".
 
+### Stalled jobs: dormant, then cancelled, then purged
+
+A parked job (`paused`, `needs_reauth`, `needs_attention`) waits on a person,
+and some people never come back. Without a limit it would hold a Last.fm key
+and one of the 50 places for ever. The hourly housekeeping cron
+(`worker/src/housekeeping.ts`) enforces three deadlines:
+
+| After | What happens | Reversible? |
+| --- | --- | --- |
+| 14 days parked | `dormant`: key and `live_username` deleted, place freed, tracks kept | Yes: reconnect, if a place is free |
+| 30 more days dormant | `cancelled`; its chunks are swept within the hour | No |
+| 30 days after any job ends | its `failures` rows are deleted | No |
+
+- **The clock is a column, not `updated_at`.** Migration 005 adds a trigger
+  that sets `inactivity_deadline` when a job *enters* a parked or dormant state
+  and clears it on the way out. `updated_at` moves every time the sweep drains
+  a lease, so a job parked for a month could look fresh. The migration also
+  backfills jobs already parked when it runs.
+- **Dormant is not terminal.** It holds the queue, so `/import/:id` still
+  answers `known: true` and a stale browser copy stays blocked. `/job/live`
+  answers `false`, because nothing can send. Take-back and cancel both work
+  from it. Resume does not; the job has no key.
+- **Reconnecting is the only way back.** The sign-in callback re-attaches the
+  credential and returns the job to `paused`, but only if a place is free,
+  checked inside the same `UPDATE`. A `needs_reauth` job never gave its place
+  up, so it is exempt. `GET /job` reports `reconnectAvailable` for keyless jobs
+  so the client can say "full" rather than offer a button that does nothing.
+- **The job row is never purged.** Its `import_id` is what keeps `/import/:id`
+  answering `known: true`; deleting it would let a browser that kept its copy
+  replay the whole queue. It holds no key and no tracks.
+- **Batches go with the chunks**, when a job ends. They hold the seconds the
+  worker assigned, which only matter while the job can still send or export.
+- **Accepted:** a `needs_attention` job that stalled through our own fault
+  goes dormant on the same clock. Take-back still returns the queue.
+- **Storage bound, weakened.** A dormant job keeps its chunks without holding a
+  place, so "50 places × 8 MB" no longer bounds the blob database. If it fills,
+  new uploads are refused and the browser keeps scrobbling locally. That is a
+  refusal, not a bill.
+
+Every housekeeping pass stays under the Free plan's 50 D1 queries per
+invocation: dormancy and expiry are one `UPDATE … RETURNING` plus one audit
+insert each, and the blob sweep handles at most 8 jobs.
+
+**D1 counts trigger writes in `meta.changes`.** A one-row state change reports
+2 once the trigger fires. Compare `changes` only with zero and use `RETURNING`
+to count rows. Verified with Miniflare.
+
 ## Scheduler
 
 **Fairness is round-robin, not FIFO.** Due jobs are selected ordered by

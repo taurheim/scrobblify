@@ -9,7 +9,7 @@
  */
 import {
   Sql, JobRow, readControl, countCommittedSlots, unresolvedSeconds,
-  REPEATABLE_HANDOFF_WINDOW_SECONDS,
+  REPEATABLE_HANDOFF_WINDOW_SECONDS, SLOT_AVAILABLE_SQL,
 } from './store';
 import {
   BlobStore, uploadChunk, deleteJobBlobs, readChunkFor, CHUNK_TRACKS,
@@ -171,14 +171,16 @@ function authoriseUrl(env: ApiEnv, state: string): string {
 }
 
 /**
- * Gives a job parked in `needs_reauth` a working write credential again.
+ * Gives a job parked in `needs_reauth`, or gone `dormant`, a working write
+ * credential again.
  *
  * The only path in the system that can. `needs_reauth` is entered when the
- * stored key is gone or has been revoked, and it clears `live_username`, so
- * the job cannot send and is not resumable — the user's alternatives are a
- * take-back (which abandons any batch still in flight, risking duplicates) or
- * a cancel (which discards the queue). The status card has always told them to
- * reconnect Last.fm; this is what makes that true.
+ * stored key is gone or has been revoked, and `dormant` when housekeeping
+ * deletes the key of a job left parked for two weeks. Both clear
+ * `live_username`, so the job cannot send and is not resumable. The user's
+ * alternatives are a take-back (which abandons any batch still in flight,
+ * risking duplicates) or a cancel (which discards the queue). The status card
+ * tells them to reconnect Last.fm; this is what makes that true.
  *
  * Best effort, and silent. Signing in must succeed even when the re-attach
  * cannot: this is a bonus on a flow whose actual job is to prove identity, and
@@ -196,7 +198,7 @@ async function reattachCredential(
 ): Promise<void> {
   try {
     const job = await env.sql.first<JobRow>(
-      `SELECT * FROM jobs WHERE username = ? AND state = 'needs_reauth'
+      `SELECT * FROM jobs WHERE username = ? AND state IN ('needs_reauth', 'dormant')
         ORDER BY created_at DESC LIMIT 1`,
       [username],
     );
@@ -233,6 +235,11 @@ async function reattachCredential(
       expired deadline is re-parked by the very next tick — the user reconnects,
       resumes, and is parked again before a single track is sent, forever. The
       key really is new, so the clock really does start again.
+
+      A `dormant` job gave its slot up, so it may only take one back if one is
+      free. `needs_reauth` still holds its slot and needs no check. The count
+      is in the same statement as the write: checked separately, two users
+      reconnecting at once could both take the last slot.
     */
     const updated = await env.sql.run(
       `UPDATE jobs
@@ -240,7 +247,8 @@ async function reattachCredential(
               state = 'paused', state_reason = NULL, consecutive_failures = 0,
               credential_expires_at = ?,
               next_eligible_at = ?, locked_until = 0, updated_at = ?
-        WHERE id = ? AND state = 'needs_reauth' AND locked_until <= ?`,
+        WHERE id = ? AND locked_until <= ?
+          AND (state = 'needs_reauth' OR (state = 'dormant' AND ${SLOT_AVAILABLE_SQL}))`,
       [
         credential.ciphertext,
         credential.iv,
@@ -255,7 +263,7 @@ async function reattachCredential(
     if (updated.changes > 0) {
       await env.sql.run(
         'INSERT INTO audit (id, job_id, generation, event, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        [randomId(), job.id, job.generation, 'credential_reattached', null, nowSec],
+        [randomId(), job.id, job.generation, 'credential_reattached', JSON.stringify({ from: job.state }), nowSec],
       );
     }
   } catch {
@@ -269,6 +277,35 @@ async function liveJobFor(sql: Sql, username: string): Promise<JobRow | null> {
     [normalizeUsername(username)],
   );
 }
+
+/**
+ * Whether signing in again would bring this job back, so the status card can
+ * say so before the user goes through Last.fm for nothing. Advisory: the
+ * re-attach itself re-checks both conditions atomically.
+ */
+async function canReattach(sql: Sql, job: JobRow): Promise<boolean> {
+  if (job.state !== 'needs_reauth' && job.state !== 'dormant') {
+    return false;
+  }
+  const slotHeld = await sql.first<{ n: number }>(
+    `SELECT 1 AS n FROM jobs WHERE live_username = ?
+      UNION ALL
+     SELECT 1 AS n FROM handoffs WHERE live_username = ?
+      LIMIT 1`,
+    [job.username, job.username],
+  );
+  if (slotHeld) {
+    return false;
+  }
+  if (job.state === 'needs_reauth') {
+    return true;
+  }
+  const free = await sql.first<{ ok: number }>(`SELECT (${SLOT_AVAILABLE_SQL}) AS ok`);
+  return Boolean(free && Number(free.ok));
+}
+
+/** States waiting on the user, whose `inactivity_deadline` is a real date. */
+const PARKED_STATES: JobRow['state'][] = ['paused', 'needs_reauth', 'needs_attention', 'dormant'];
 
 /**
  * The user-facing view of a job.
@@ -297,6 +334,11 @@ function describeJob(job: JobRow, nowSec: number) {
     createdAt: job.created_at,
     completedAt: job.completed_at,
     credentialExpiresAt: job.credential_expires_at,
+    /*
+      When a parked job goes dormant, or a dormant one is cancelled. Null for
+      rows parked before migration 005, whose deadline is only a fallback.
+    */
+    inactivityDeadline: PARKED_STATES.includes(job.state) ? job.inactivity_deadline : null,
   };
 }
 
@@ -734,6 +776,25 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
   if (path === '/scrobblify/job' && request.method === 'GET') {
     const job = await liveJobFor(env.sql, username);
     if (!job) {
+      /*
+        A job that has no key cannot be found by `live_username`, but it
+        still holds the user's tracks and needs them to act: reconnect or take
+        back. It is reported ahead of any finished job, which is only news.
+      */
+      const waiting = await env.sql.first<JobRow>(
+        `SELECT * FROM jobs WHERE username = ? AND state IN ('needs_reauth', 'dormant', 'exporting')
+          ORDER BY updated_at DESC LIMIT 1`,
+        [normalizeUsername(username)],
+      );
+      if (waiting) {
+        return json(env, {
+          ok: true,
+          job: {
+            ...describeJob(waiting, nowSec),
+            reconnectAvailable: await canReattach(env.sql, waiting),
+          },
+        });
+      }
       const recent = await env.sql.first<JobRow>(
         `SELECT * FROM jobs WHERE username = ? AND state IN ('completed', 'failed', 'cancelled')
           ORDER BY updated_at DESC LIMIT 1`,
@@ -1026,7 +1087,7 @@ async function exportJob(
             updated_at = ?
       WHERE id = ?
         AND (
-          (state IN ('paused', 'needs_attention', 'needs_reauth') AND locked_until <= ?)
+          (state IN ('paused', 'needs_attention', 'needs_reauth', 'dormant') AND locked_until <= ?)
           OR (state = 'exporting' AND export_claim = ?)
         )
         AND NOT EXISTS (

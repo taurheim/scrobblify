@@ -39,7 +39,30 @@
         >, {{ backgroundJob.failed.toLocaleString() }} rejected by Last.fm</span>.
         <span v-if="jobEta">{{ jobEta }}</span>
       </div>
-      <div v-if="backgroundJob.reason" class="mt-1 text-body-2">{{ backgroundJob.reason }}</div>
+      <div
+        v-if="backgroundJob.reason && backgroundJob.state !== 'dormant'"
+        class="mt-1 text-body-2"
+      >{{ backgroundJob.reason }}</div>
+      <!--
+        A parked job that nobody touches goes dormant after 14 days: its
+        Last.fm key is deleted and its place freed. It is cancelled if it is
+        still dormant 30 days after that. Both dates come from the server.
+      -->
+      <div v-if="backgroundJob.state === 'dormant'" class="mt-1 text-body-2">
+        Nothing happened with this import for 14 days, so Scrobblify deleted
+        its Last.fm access and gave its place to someone else. Your remaining
+        tracks are kept<span v-if="inactivityDate"> until {{ inactivityDate }}</span>.
+        Reconnect Last.fm to carry on, or take your progress back and finish in
+        this browser.
+        <span v-if="backgroundJob.reconnectAvailable === false">
+          The background service is full right now, so reconnecting won't work
+          until a place opens up.
+        </span>
+      </div>
+      <div v-else-if="inactivityDate" class="mt-1 text-body-2">
+        If it's still waiting on {{ inactivityDate }}, Scrobblify will delete
+        its Last.fm access and put it on hold.
+      </div>
       <div class="mt-2">
         <v-btn
           v-if="backgroundJob.state === 'active'"
@@ -63,10 +86,11 @@
           in flight) as their only exit.
         -->
         <v-btn
-          v-else-if="backgroundJob.state === 'needs_reauth'"
+          v-else-if="backgroundJob.state === 'needs_reauth' || backgroundJob.state === 'dormant'"
           color="primary"
           class="mr-2"
           :loading="reauthBusy"
+          :disabled="backgroundJob.reconnectAvailable === false"
           @click="reauthenticate"
         >Reconnect Last.fm</v-btn>
         <v-btn outlined class="mr-2" :loading="backgroundBusy" @click="takeBackProgress">
@@ -577,9 +601,16 @@ export default Vue.extend({
           return 'Your background import needs you to reconnect Last.fm.';
         case 'needs_attention':
           return 'Your background import has stopped and needs a look.';
+        case 'dormant':
+          return 'Your background import is on hold.';
         default:
           return 'Your background import has stopped.';
       }
+    },
+    inactivityDate(): string {
+      const job = this.backgroundJob;
+      const sec = job ? job.inactivityDeadline : null;
+      return sec ? new Date(sec * 1000).toLocaleDateString() : '';
     },
     jobEta(): string {
       const job = this.backgroundJob;

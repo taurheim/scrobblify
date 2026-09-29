@@ -49,6 +49,7 @@ npx wrangler d1 execute scrobblify --remote --file schema/001_init.sql
 npx wrangler d1 execute scrobblify --remote --file schema/002_synthetic_floor.sql
 npx wrangler d1 execute scrobblify --remote --file schema/003_export_claim.sql
 npx wrangler d1 execute scrobblify --remote --file schema/004_import_id.sql
+npx wrangler d1 execute scrobblify --remote --file schema/005_dormancy.sql
 npx wrangler d1 execute scrobblify-blobs --remote --file schema-blobs/001_blobs.sql
 
 # 4. Secrets (see below). Each command prompts for its value.
@@ -127,6 +128,13 @@ data. Storage is bounded by construction: each compressed chunk is capped at
 slot, so 400 MB against D1's 500 MB. A second cron (`17 * * * *`) deletes the
 chunks of completed, failed and cancelled jobs within the hour.
 
+That cron also handles stalled jobs. A job left paused (or waiting for a
+reconnect) for 14 days goes `dormant`: its Last.fm key is deleted and its place
+freed, but its chunks stay so the user can reconnect or take them back. After
+30 more days it is cancelled and its chunks are swept. Because dormant jobs
+keep chunks without a place, the 400 MB figure is no longer a hard bound; a
+full blob database refuses new uploads and costs nothing.
+
 ### 8. Try it
 
 The worker and the SPA can be deployed in either order. The SPA ships through
@@ -150,6 +158,7 @@ npx wrangler d1 execute scrobblify --local --file schema/001_init.sql
 npx wrangler d1 execute scrobblify --local --file schema/002_synthetic_floor.sql
 npx wrangler d1 execute scrobblify --local --file schema/003_export_claim.sql
 npx wrangler d1 execute scrobblify --local --file schema/004_import_id.sql
+npx wrangler d1 execute scrobblify --local --file schema/005_dormancy.sql
 npx wrangler d1 execute scrobblify-blobs --local --file schema-blobs/001_blobs.sql
 npx wrangler dev --local
 ```

@@ -1280,10 +1280,10 @@ async function drainPausedJobs(
     still has to act on, turning a job that is waiting for them into one that
     merely looks idle.
   */
-  const reverted = await env.sql.run(
+  const reverted = await env.sql.all<{ id: string }>(
     `UPDATE jobs
         SET state = CASE
-              WHEN export_prev_state IN ('paused', 'needs_attention', 'needs_reauth')
+              WHEN export_prev_state IN ('paused', 'needs_attention', 'needs_reauth', 'dormant')
                 THEN export_prev_state
               ELSE 'paused'
             END,
@@ -1291,11 +1291,14 @@ async function drainPausedJobs(
             export_prev_state = NULL,
             locked_until = 0,
             updated_at = ?
-      WHERE state = 'exporting' AND locked_until <= ?`,
+      WHERE state = 'exporting' AND locked_until <= ?
+      RETURNING id`,
     [nowSec, nowSec],
   );
-  if (reverted.changes > 0) {
-    await audit(env.sql, null, null, 'export_claim_expired', { jobs: reverted.changes }, nowSec);
+  if (reverted.length > 0) {
+    // Counted from RETURNING: D1's `changes` includes the rows the inactivity
+    // trigger rewrites, so it would report every job twice.
+    await audit(env.sql, null, null, 'export_claim_expired', { jobs: reverted.length }, nowSec);
   }
 
   const drainable = await selectDrainableJobs(
@@ -1335,7 +1338,7 @@ export async function drainJobOnDemand(
     return;
   }
   const eligible = await selectDrainableJobs(
-    env.sql, nowSec, nowSec - RECONCILE_GRACE_SECONDS, MAX_JOBS_PER_TICK,
+    env.sql, nowSec, nowSec - RECONCILE_GRACE_SECONDS, MAX_JOBS_PER_TICK, true,
   );
   if (!eligible.some((j) => j.id === jobId)) {
     // Too new to reconcile safely, already settled, or not drainable at all.
