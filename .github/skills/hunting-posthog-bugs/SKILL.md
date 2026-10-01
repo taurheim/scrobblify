@@ -49,6 +49,8 @@ project; adapt it instead of writing from scratch.
 7. **Classify** (below).
 8. **Try to disprove it** (below) — every Bug, Regression and Silent failure.
 9. **Report.** Don't fix anything unless asked.
+10. **File issues** (below) for every finding that is still a Bug, Regression
+    or Silent failure after the disproof step.
 
 ## Invariants
 
@@ -108,8 +110,34 @@ excerpt, suspected `file:line`, suggested next step, and the adversarial
 outcome (Survived / Weakened, plus the strongest alternative ruled out). State
 uncertainty plainly. Usernames are Last.fm handles: fine in a local report,
 **never** in commits, PRs or issues.
-Usernames are Last.fm handles: fine in a local report, **never** in commits,
-PRs or issues.
+
+## File issues
+
+Open one GitHub issue per Bug, Regression or Silent failure that survived the
+disproof step, whether as Survived or narrowed to what's left after Weakened.
+Don't file issues for findings that were Disproved, Already fixed, Expected or
+a Telemetry artifact. First search existing issues (`gh issue list --state all
+--search "<keywords>"`); if a match exists, comment on it instead of opening a
+duplicate. The report links each issue.
+
+Issues are public, so they hold **no user-identifying data**:
+
+- No Last.fm usernames, `distinct_id`s, `$session_id`s, emails or person
+  properties. Call them "a user" or "user A" instead.
+- No exact per-user timestamps or exact import sizes: those single a person
+  out to anyone with PostHog access. Give rough figures ("about 1.3k of a 100k+
+  import", "on 2026-09-30") and the order things happened in.
+- Counts across users (users, occurrences, tracks), build numbers, deploy
+  times and event/property names are fine.
+- Paste queries only if they contain no literal user values. Swap any
+  `distinct_id = '...'` filter for a placeholder.
+- Raw `message` / `stack` text may embed user data (file names, track names);
+  quote only the generic part.
+
+Body: summary and impact, evidence (aggregate numbers + anonymized timeline),
+the query, `file:line` code path, adversarial outcome, suggested fix and
+a regression test to add. Use the `bug` label. Re-read the body for usernames
+before submitting.
 
 ## Common mistakes
 
@@ -122,3 +150,4 @@ PRs or issues.
 | Treating every drop-off as a bug | Drop-off with no error and plausible timing is abandonment; flag only silent failures |
 | Skipping the disproof step for the "obvious" findings | Obvious findings carry the unexamined assumptions; test every one |
 | Sending the adversary your conclusion, or asking it to confirm | Claim + raw evidence only, framed as "prove this wrong" |
+| Pasting the local report's timeline into an issue | Anonymize it first: no usernames, exact per-user timestamps or import sizes |
