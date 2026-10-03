@@ -341,11 +341,22 @@ export default Vue.extend({
       }
       return this.stopped ? 'error' : 'warning';
     },
+
+    // Transient countdowns count as running: the loop resumes by itself.
+    runActive(): boolean {
+      return this.scrobbling && !this.completed && !this.canResume;
+    },
+  },
+  watch: {
+    runActive(active: boolean) {
+      this.$store.commit('setScrobbleRunActive', active);
+    },
   },
   created() {
     this.syncRateLimitCounters();
   },
   beforeDestroy() {
+    this.$store.commit('setScrobbleRunActive', false);
     if (this.countdownTimer) {
       clearInterval(this.countdownTimer);
       this.countdownTimer = null;

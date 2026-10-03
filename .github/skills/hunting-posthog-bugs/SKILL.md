@@ -116,6 +116,7 @@ PRs or issues.
 | Mistake | Instead |
 | --- | --- |
 | Reporting a bug as live when its last occurrence predates the fix | Deploy split, step 4 |
+| Calling an occurrence after the merge a regression | Check its `build_sha`: tabs on superseded builds keep running for days (see `AGENTS.md`, "Old builds keep running") |
 | Reading two events for one user as contradictory ("got `session_invalid` *and* `repeated_failures`") | Read the timeline — it is usually a sequence, and the sequence is the bug |
 | Stopping at "progress went backwards" | Name the mechanism: which save was stale, and why nothing newer was saved |
 | Ranking errors by count | One stuck user produces dozens; rank by users |

@@ -1,0 +1,13 @@
+# Deployed to the server alongside the build (copied from public/ into dist/).
+#
+# index.html names the current build's hashed JS/CSS chunks, so it must be
+# revalidated on every load. Without a Cache-Control header browsers cache it
+# heuristically (often for days), and because the FTP deploy leaves old chunks
+# on the server a stale copy still boots, running code missing every fix since.
+# version.json is what the app polls to detect that, so it can't be cached
+# either. "no-cache" still allows a cheap 304 when nothing changed.
+<IfModule mod_headers.c>
+  <FilesMatch "^(index\.html|version\.json)$">
+    Header set Cache-Control "no-cache"
+  </FilesMatch>
+</IfModule>
