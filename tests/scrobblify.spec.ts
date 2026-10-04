@@ -2201,3 +2201,87 @@ test.describe('Invalid session key', () => {
     }).toEqual({ total: 12, completed: [], failed: [] });
   });
 });
+
+test.describe('Stale build detection', () => {
+  const VERSION_JSON = '**/scrobblify/version.json';
+
+  function serveVersion(page: Page, sha: () => string) {
+    return page.route(VERSION_JSON, (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ sha: sha(), run: 999 }),
+    }));
+  }
+
+  async function runningSha(page: Page): Promise<string> {
+    const title = await page.locator('#site-footer span[title]').getAttribute('title');
+    return (title || '').split(' ')[0];
+  }
+
+  test('offers a reload when a newer build is deployed, and clears once current', async ({ page }) => {
+    let deployed = '0000000';
+    await serveVersion(page, () => deployed);
+    await page.goto('/');
+
+    const banner = page.locator('#update-available');
+    await expect(banner).toBeVisible({ timeout: 10000 });
+    await expect(banner).toContainText('newer version of Scrobblify');
+    await expect(page.locator('#site-footer span[data-build-check]')).toHaveAttribute('data-build-check', 'stale');
+
+    deployed = await runningSha(page);
+    await Promise.all([
+      page.waitForEvent('load'),
+      banner.getByRole('button', { name: 'Reload' }).click(),
+    ]);
+    await expect(page.locator('#site-footer span[data-build-check]')).toHaveAttribute('data-build-check', 'current');
+    await expect(banner).toHaveCount(0);
+  });
+
+  test('stays quiet when version.json is missing or unreadable', async ({ page }) => {
+    await page.route(VERSION_JSON, (route) => route.fulfill({ status: 404, body: 'Not found' }));
+    await page.goto('/');
+    await expect(page.locator('#site-footer span[data-build-check]')).toHaveAttribute('data-build-check', 'unknown');
+    await expect(page.locator('#update-available')).toHaveCount(0);
+
+    await page.unroute(VERSION_JSON);
+    await page.route(VERSION_JSON, (route) => route.fulfill({
+      status: 200, contentType: 'text/html', body: '<!DOCTYPE html><html></html>',
+    }));
+    await page.reload();
+    await expect(page.locator('#site-footer span[data-build-check]')).toHaveAttribute('data-build-check', 'unknown');
+    await expect(page.locator('#update-available')).toHaveCount(0);
+  });
+
+  test('hides the reload prompt while a run is scrobbling', async ({ page }) => {
+    await serveVersion(page, () => '0000000');
+    await goToUploadStep(page);
+    const banner = page.locator('#update-available');
+    await expect(banner).toBeVisible({ timeout: 10000 });
+
+    // Hold every scrobble until released, so the run is observably in flight.
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    await page.route('https://ws.audioscrobbler.com/**', async (route) => {
+      const params = new URLSearchParams(route.request().postData() || '');
+      if (params.get('method') === 'track.scrobble') {
+        await released;
+      }
+      await route.fallback();
+    });
+
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await page.locator('button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator('text=Scrobbling...')).toBeVisible({ timeout: 10000 });
+    await expect(banner).toHaveCount(0);
+
+    release();
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+    await expect(banner).toBeVisible();
+  });
+});

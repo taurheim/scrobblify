@@ -43,6 +43,28 @@ on the site as a hover tooltip on "Scrobblify" in the footer, and the deployed
 `/scrobblify/version.json` (written by the CI build job) has the full SHA and
 build time.
 
+**Old builds keep running long after a deploy.** Until 2026-10-03 `index.html`
+was served with no `Cache-Control`, so browsers cached it heuristically, and the
+FTP deploy never deletes old hashed chunks, so a stale copy still boots. About
+5–7% of fresh page loads ran a superseded build for days after each deploy (one
+user was on code two months old), and those users kept hitting already-fixed
+bugs. **Before calling a fix ineffective, check `build_sha`**: an occurrence on
+a build older than the fix is this, not a regression. Two mitigations:
+
+- `public/.htaccess` sets `Cache-Control: no-cache` on `index.html` and
+  `version.json` (Vue CLI copies dotfiles from `public/`). Verify after a
+  deploy with `curl -I https://savas.ca/scrobblify/`.
+- The app fetches `version.json` (`src/services/BuildCheck.ts`) on load, every
+  30 minutes and when a backgrounded tab returns, and if its `sha` differs from
+  `build_sha` shows a "newer version — Reload" banner. It is hidden while a run
+  is actively scrobbling (`scrobbleRunActive` in the store), because a reload
+  then drops everything since the last checkpoint. It emits
+  `stale_build_detected` (`latest_sha`, `latest_run`, `reloaded_for_latest` —
+  true means a reload came back stale anyway, i.e. something is still caching
+  `index.html`) and `stale_build_reload_clicked`. Tabs on builds from before
+  this shipped can't detect themselves, so they still show up as old
+  `build_sha`s until they reload.
+
 ### Errors
 
 Errors arrive two ways: a filterable `scrobblify_error` event (properties:
@@ -69,6 +91,8 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `tracks_selected` → `scrobble_started` / `scrobble_resumed` / `scrobble_paused` /
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
 `session_resumed`, `session_resume_blocked`, and `user_logged_out`.
+`stale_build_detected` / `stale_build_reload_clicked` are outside the funnel
+(see "Old builds keep running" above).
 
 `upload_no_matching_files` carries `detected`: `progress_file` (a Scrobblify
 progress file was zipped up and is imported instead), `account_data` (Spotify's
