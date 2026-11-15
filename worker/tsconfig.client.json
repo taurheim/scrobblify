@@ -3,7 +3,10 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "baseUrl": "..",
-    "paths": { "@/*": ["src/*"] },
+    "paths": {
+      "@/*": ["src/*"],
+      "blueimp-md5": ["worker/node_modules/@types/blueimp-md5"]
+    },
     "types": ["node"],
     "lib": ["ES2022", "DOM"],
     "noUnusedLocals": false
