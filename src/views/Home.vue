@@ -37,12 +37,19 @@
     You can also <strong>save your progress</strong> and come back later if you need to close the page.
     Your progress will be waiting for you when you return!
 
-    <h2>Why does scrobblify only backfill the last two weeks?</h2>
-    This is a limitation enforced by last.fm — scrobbles are supposed to be for the past two weeks only.
-    See the community topic <a href="https://getsatisfaction.com/lastfm/topics/scrobbles-more-than-14-days">here</a>.
-    However, Scrobblify gives you the option to <strong>re-tag older listens to today's date</strong>, so you can still
-    import your full history if you'd like. Don't worry, once you've connected your accounts all future plays will be
-    kept forever!
+    <h2>Have a big listening history?</h2>
+    Last.fm only accepts scrobbles from the past two weeks with their real dates. Scrobblify can still import
+    older plays, but only by <strong>giving each one the date it is sent</strong>: plays from months or years
+    ago show up on your profile as if you listened to them over the coming days. And with at most 750 scrobbles
+    a day, a history of tens of thousands of plays takes weeks of coming back each day. Last.fm has no way to
+    delete scrobbles in bulk, so this is hard to undo.
+    <br><br>
+    If most of your history is older than two weeks, consider
+    <a href="https://listenbrainz.org/settings/import/" target="_blank" rel="noopener noreferrer">ListenBrainz</a>
+    instead. It imports the same Spotify ZIP directly, in one go, and keeps every play on the day you actually
+    listened to it. Scrobblify is the better fit for recent plays, or if you specifically want your history on
+    Last.fm and don't mind the dates. Once your accounts are connected, all future plays keep their real dates
+    either way.
   </div>
 </template>
 <style>
