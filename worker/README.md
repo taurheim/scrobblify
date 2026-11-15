@@ -7,14 +7,9 @@ Design: [`docs/superpowers/specs/2026-07-26-background-scrobbling-design.md`](..
 
 ## Status
 
-Implemented and tested, **not yet deployed**. `api.savas.ca` does not resolve,
-so the registered Last.fm callback goes nowhere and `wrangler.toml` still has a
-placeholder `database_id`.
-
-Verified end to end against `wrangler dev --local`: the startup secret guard
-passes with all four names set, and `/scrobblify/capacity` and
-`/scrobblify/job/live` answer `200` once the four migrations are applied to the
-local D1.
+Deployed at `https://api.savas.ca`. Pushes to `master` that touch `worker/`,
+`src/shared/` or `src/services/` test and redeploy it through
+`.github/workflows/worker.yml` (see "Deploying from CI" below).
 
 ```powershell
 npm test   # typechecks, then runs every suite against a real SQLite schema
@@ -22,8 +17,9 @@ npm test   # typechecks, then runs every suite against a real SQLite schema
 
 ## Deploying
 
-Everything runs from `worker/`. Steps 0–3 create infrastructure and only need
-doing once; after that, a redeploy is just `npx wrangler deploy`.
+Everything runs from `worker/`. Steps 0–4 create infrastructure and only need
+doing once; after that, CI redeploys on every merge (see "Deploying from CI").
+`npx wrangler deploy` by hand still works.
 
 ```powershell
 cd worker
@@ -115,6 +111,32 @@ Setting it does not switch the feature on by itself: the client asks
 `/scrobblify/capacity` on load and stays silent unless the worker answers, so
 deploying the SPA before the worker degrades to the old behaviour rather than
 offering a handoff that cannot complete.
+
+### Deploying from CI
+
+`.github/workflows/worker.yml` runs `npm test` on every PR that can affect the
+worker, and on a push to `master` also runs `npx wrangler deploy` followed by
+the step 6 smoke test. It can be started by hand from the Actions tab
+(`workflow_dispatch`). It needs two repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `CLOUDFLARE_ACCOUNT_ID` | the account id (`npx wrangler whoami`, or the dashboard's Workers overview) |
+| `CLOUDFLARE_API_TOKEN` | an API token from the **Edit Cloudflare Workers** template, scoped to this account and the `savas.ca` zone |
+
+The template's zone permissions are what let the deploy keep the
+`api.savas.ca` custom domain; an account-only token fails on `routes`.
+
+**CI does not apply schema changes.** A PR that adds a `schema/*.sql` file
+must have it run against production with `npx wrangler d1 execute … --remote`
+*before* it merges, since the merge deploys code that expects it. Keep
+migrations additive so the code still running in the meantime is unaffected.
+
+The deploy installs only `worker/`'s dependencies. `src/shared/` lives outside
+`worker/`, so `wrangler.toml` aliases `blueimp-md5` (its one package import) to
+`worker/node_modules`, and `tsconfig.json` maps its types the same way; without
+that, the bundle only built when the SPA was installed too. The test job does
+install the SPA, because the `client-*` suites typecheck `src/services/`.
 
 ### Why blobs live in D1, and what this costs
 

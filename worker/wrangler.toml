@@ -7,6 +7,13 @@ compatibility_date = "2026-07-26"
 # route here is under /scrobblify/ so it can move to a path route later.
 routes = [{ pattern = "api.savas.ca", custom_domain = true }]
 
+# src/shared/ sits outside worker/, so a bare import there resolves against the
+# repo root's node_modules, which only exists if the SPA was installed too. Pin
+# it to the worker's own copy so `npm ci` in worker/ is enough to deploy (CI
+# installs nothing else). scripts/run-tests.mjs mirrors this alias.
+[alias]
+"blueimp-md5" = "./node_modules/blueimp-md5"
+
 # One tick every 5 minutes. Deliberately not more often: a job advances at
 # roughly 2,700 scrobbles/day whatever we do, so a faster cron only spends the
 # shared free-tier invocation budget and pushes harder on Last.fm's per-IP

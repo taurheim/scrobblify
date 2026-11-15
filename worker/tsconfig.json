@@ -11,7 +11,8 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node", "@cloudflare/workers-types"]
+    "types": ["node", "@cloudflare/workers-types"],
+    "paths": { "blueimp-md5": ["./node_modules/@types/blueimp-md5"] }
   },
   "include": ["src/**/*.ts", "test/**/*.ts", "../src/shared/**/*.ts"],
   "//": "spike.ts is throwaway benchmark code kept only as evidence for the concurrency cap; it is not part of the worker. client-*.test.ts and its stubs are checked by tsconfig.client.json instead, which supplies the @/ alias and DOM lib they need.",
