@@ -6,6 +6,8 @@ const PORT = Number(process.env.PORT) || 8080;
 
 export default defineConfig({
   testDir: './tests',
+  // Needs a build with a worker URL compiled in; see its own config.
+  testIgnore: '**/unreachable-worker/**',
   timeout: 30000,
   use: {
     baseURL: `http://localhost:${PORT}`,

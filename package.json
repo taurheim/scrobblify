@@ -7,7 +7,10 @@
     "build": "vue-cli-service build",
     "lint": "vue-cli-service lint",
     "lint:check": "vue-cli-service lint --no-fix",
-    "dev:mock": "node tests/dev-mock.js"
+    "test:e2e:container": "node tests/run-playwright-container.js",
+    "test:e2e:container:check": "node tests/run-playwright-container.test.js",
+    "dev:mock": "node tests/dev-mock.js",
+    "dev:mock:bg": "node tests/dev-mock.js --background"
   },
   "dependencies": {
     "@types/blueimp-md5": "^2.7.0",

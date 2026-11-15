@@ -1,0 +1,16 @@
+-- 002: synthetic timestamp low-water mark.
+--
+-- The worker assigns scrobble timestamps at send time. Synthetic ones march
+-- downwards from the present, one second each, and this column remembers how
+-- far down a job has got.
+--
+-- It cannot be derived. Deriving it from `cursor` would assume every track so
+-- far consumed a synthetic second, but tracks still inside Last.fm's 14-day
+-- window keep their real timestamp and consume none. Guessing high wastes
+-- window; guessing low reuses seconds a previous batch already sent, and
+-- Last.fm may dedupe identical (artist, track, timestamp) tuples — turning our
+-- bookkeeping error into scrobbles the user never receives and we never notice.
+--
+-- 0 means "not yet allocated"; the assigner treats it as unusable and starts
+-- from the present.
+ALTER TABLE jobs ADD COLUMN synthetic_floor INTEGER NOT NULL DEFAULT 0;

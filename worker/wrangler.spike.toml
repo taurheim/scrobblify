@@ -1,0 +1,13 @@
+name = "scrobblify-spike"
+main = "src/spike.ts"
+compatibility_date = "2026-07-26"
+
+# Local-only feasibility harness. Not deployed.
+[[d1_databases]]
+binding = "DB"
+database_name = "scrobblify-spike"
+database_id = "local-spike-placeholder"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "scrobblify-spike"
