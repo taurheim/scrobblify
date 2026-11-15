@@ -13,7 +13,7 @@ placeholder `database_id`.
 
 Verified end to end against `wrangler dev --local`: the startup secret guard
 passes with all four names set, and `/scrobblify/capacity` and
-`/scrobblify/job/live` answer `200` once the three migrations are applied to the
+`/scrobblify/job/live` answer `200` once the four migrations are applied to the
 local D1.
 
 ```powershell
@@ -22,26 +22,48 @@ npm test   # typechecks, then runs every suite against a real SQLite schema
 
 ## Deploying
 
-Steps 1–3 create infrastructure and only need doing once.
+Everything runs from `worker/`. Steps 0–3 create infrastructure and only need
+doing once; after that, a redeploy is just `npx wrangler deploy`.
 
 ```powershell
+cd worker
+npm install
 npx wrangler login
 
-# 1. D1. Copy the printed database_id into wrangler.toml.
+# 0. Register the worker's own Last.fm application at
+#    https://www.last.fm/api/account/create with callback
+#    https://api.savas.ca/scrobblify/auth/callback. Keep its key and secret
+#    for step 4. Do NOT reuse the browser's key (see "The two Last.fm
+#    applications" below).
+
+# 1. D1. Copy the printed database_id into wrangler.toml, replacing
+#    "set-me-after-wrangler-d1-create". The id is not a secret; commit it.
 npx wrangler d1 create scrobblify
 
-# 2. R2, for the uploaded track blobs.
-npx wrangler r2 bucket create scrobblify
+# 2. A second D1 for the uploaded track blobs. Copy its database_id into the
+#    BLOB_DB block of wrangler.toml. (See "Why blobs live in D1" below.)
+npx wrangler d1 create scrobblify-blobs
 
-# 3. Schema. Every file in schema/, in order.
+# 3. Schema. Every file in schema/, in order, then the blob schema.
 npx wrangler d1 execute scrobblify --remote --file schema/001_init.sql
 npx wrangler d1 execute scrobblify --remote --file schema/002_synthetic_floor.sql
 npx wrangler d1 execute scrobblify --remote --file schema/003_export_claim.sql
 npx wrangler d1 execute scrobblify --remote --file schema/004_import_id.sql
+npx wrangler d1 execute scrobblify --remote --file schema/005_dormancy.sql
+npx wrangler d1 execute scrobblify-blobs --remote --file schema-blobs/001_blobs.sql
 
-# 4. Secrets (see below). PostHog uses the non-secret ingestion variables
-#    already declared in wrangler.toml.
-# 5. Deploy, then point api.savas.ca at the worker via a Cloudflare route.
+# 4. Secrets (see below). Each command prompts for its value.
+npx wrangler secret put LASTFM_API_KEY
+npx wrangler secret put LASTFM_SHARED_SECRET
+npx wrangler secret put CREDENTIAL_SECRET
+npx wrangler secret put SIGNING_KEY
+
+#    PostHog uses the non-secret ingestion variables already declared in
+#    wrangler.toml.
+#
+# 5. Deploy. `routes` in wrangler.toml makes api.savas.ca a custom domain, so
+#    this also creates its DNS record and certificate; the first request can
+#    take a few minutes while the certificate is issued.
 npx wrangler deploy
 
 # 6. Smoke test. This is a public route, so no session is needed.
@@ -74,11 +96,14 @@ one rule is included on the free plan):
 | Field | Value |
 | --- | --- |
 | If incoming requests match | `URI Path` equals `/scrobblify/job/live` |
-| Rate | 20 requests per 1 minute, per IP |
-| Action | Block for 1 minute |
+| Characteristics | IP |
+| Rate | 5 requests per 10 seconds |
+| Action | Block, for 10 seconds |
 
-Genuine clients call this at most a couple of times per page load, so 20/min
-is far above real use and far below useful enumeration.
+The free plan only offers a 10-second period and a 10-second block, so the rule
+is expressed in those units. Genuine clients call this at most a couple of times
+per page load, and a blocked caller gets at most 5 answers per 20 seconds
+(about 15 a minute): far above real use, far below useful enumeration.
 
 **Not enforced with a counter in D1**, deliberately: a row written per request
 would let an enumerator burn the free tier's daily write quota on our behalf,
@@ -90,6 +115,36 @@ Setting it does not switch the feature on by itself: the client asks
 `/scrobblify/capacity` on load and stays silent unless the worker answers, so
 deploying the SPA before the worker degrades to the old behaviour rather than
 offering a handoff that cannot complete.
+
+### Why blobs live in D1, and what this costs
+
+Nothing, provided the account stays on **Workers Free** and **R2 is never
+enabled**. Every Free-plan limit is a refusal, not a bill: past its daily
+quota D1 errors, and so does the worker past its request quota. R2 is the
+exception, because it charges for anything past its free tier and has no
+spending cap, which is why the uploaded chunks moved out of it.
+
+The blobs get their own database so a full one refuses only new uploads (the
+client falls back to scrobbling locally) and never touches the scheduler's
+data. Storage is bounded by construction: each compressed chunk is capped at
+1 MB (D1 rows max out at 2 MB), each job at 8 MB, and at most 50 jobs hold a
+slot, so 400 MB against D1's 500 MB. A second cron (`17 * * * *`) deletes the
+chunks of completed, failed and cancelled jobs within the hour.
+
+That cron also handles stalled jobs. A job left paused (or waiting for a
+reconnect) for 14 days goes `dormant`: its Last.fm key is deleted and its place
+freed, but its chunks stay so the user can reconnect or take them back. After
+30 more days it is cancelled and its chunks are swept. Because dormant jobs
+keep chunks without a place, the 400 MB figure is no longer a hard bound; a
+full blob database refuses new uploads and costs nothing.
+
+### 8. Try it
+
+The worker and the SPA can be deployed in either order. The SPA ships through
+the normal CD on merge to master. Nobody is offered the feature without opting
+in: open `https://savas.ca/scrobblify/?beta=1` (sticky; `?beta=0` turns it
+off), start an import with at least 2,700 tracks left, and press
+Pause & Save to see the offer. `npx wrangler tail` streams the worker's logs.
 
 ## Secrets
 
@@ -106,6 +161,8 @@ npx wrangler d1 execute scrobblify --local --file schema/001_init.sql
 npx wrangler d1 execute scrobblify --local --file schema/002_synthetic_floor.sql
 npx wrangler d1 execute scrobblify --local --file schema/003_export_claim.sql
 npx wrangler d1 execute scrobblify --local --file schema/004_import_id.sql
+npx wrangler d1 execute scrobblify --local --file schema/005_dormancy.sql
+npx wrangler d1 execute scrobblify-blobs --local --file schema-blobs/001_blobs.sql
 npx wrangler dev --local
 ```
 

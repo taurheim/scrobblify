@@ -35,13 +35,6 @@ import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError, identifyUser } from '@/services/Analytics';
 
-const LFM_API_KEY = '2bf354b70b4a9a8a4420b2c48333d23e';
-const LFM_AUTH_CALLBACK = 'https://savas.ca/scrobblify/scrobble';
-// Overridable so `npm run dev:mock` can send the authorise link to the dev
-// server's mock instead of Last.fm, which makes this step clickable end to end
-// without a real account. `undefined` in a production build — see vue.config.js.
-const LFM_AUTH_BASE = process.env.VUE_APP_LASTFM_AUTH_BASE || 'https://www.last.fm/api/auth/';
-
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },
   data() {
@@ -55,7 +48,7 @@ export default Vue.extend({
   },
   computed: {
     authorizeUrl(): string {
-      return `${LFM_AUTH_BASE}?api_key=${LFM_API_KEY}&cb=${LFM_AUTH_CALLBACK}`;
+      return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
   },
   methods: {

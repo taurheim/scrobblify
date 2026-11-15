@@ -104,8 +104,11 @@ queries.
 
 Selects due jobs, scrobbles a batch for each, commits progress.
 
-**Storage:** D1 for job rows, cursors, and encrypted session keys. R2 for
-track-list blobs.
+**Storage:** D1 for job rows, cursors, and encrypted session keys. Track-list blobs in a second D1 database
+(`BLOB_DB`). They were in R2 until deployment; R2 bills past its free tier with no
+spending cap, where every D1 Free-plan limit is a refusal. Chunks are capped at
+1 MB (D1's row limit is 2 MB) and jobs at 8 MB, so 50 slots fit in one 500 MB
+database.
 
 ### Why Cloudflare, and when to leave
 
@@ -126,7 +129,7 @@ it is easy to "fix" into being wrong.
 | Constraint | Value |
 | --- | --- |
 | Cron ticks/day | 1,440 (1/min) |
-| Subrequests per invocation (free) | 50, **including D1 and R2 binding calls** |
+| Subrequests per invocation (free) | 50, **including D1 binding calls** |
 | Free-tier CPU per invocation | 10ms (wall time awaiting `fetch` does not count) |
 | D1 rows written/day (free) | **100,000**, including index write amplification |
 | D1 rows read/day (free) | 5,000,000 |
@@ -154,7 +157,7 @@ which WebCrypto does not implement**. There is no platform primitive to fall
 back on; the hash is pure JS on the CPU budget, and it is the single largest
 compute cost in a tick. Any move to per-track signing would multiply it by 50.
 
-**Subrequests bind first.** A job costs ~5 per tick (R2 chunk read, CAS acquire,
+**Subrequests bind first.** A job costs ~5 per tick (blob chunk read, CAS acquire,
 mapping insert, the Last.fm call, one batched commit), plus one shared
 job-selection query. That allows **~9 jobs per tick**.
 
@@ -242,8 +245,8 @@ The worker must be movable to a plain VM without a rewrite:
 - Plain `fetch` and WebCrypto only in the scrobbling core. Both exist in Workers
   and Node 18+. No `node:` imports, no Workers-only APIs.
 - Portable SQL only, so D1's SQLite can be swapped for Postgres.
-- R2 access behind a minimal get/put-by-key interface, so it can become S3 or
-  the filesystem.
+- Blob access behind a minimal get/put-by-key interface (`BlobStore`), so it
+  can become R2, S3 or the filesystem.
 - **No Durable Objects for scheduling.** This is the principal lock-in trap.
   Scheduling stays "SELECT due jobs → process batch → commit", which runs
   identically under Workers Cron, a systemd timer, or pg_cron.
@@ -458,7 +461,8 @@ do not control:
   D1 alongside the ciphertext.
 - **Delete it the instant** the job completes, fails permanently, is cancelled,
   or reaches its TTL of 60 days.
-- Delete the R2 blob at the same time. Retain summary statistics and the failed-
+- Delete the blob too: cancel deletes it inline, and an hourly cron sweeps the
+  chunks of every completed, failed or cancelled job. Retain summary statistics and the failed-
   track list the completion page promises — nothing else. (An earlier draft said
   "summary statistics only", which contradicted that promise.)
 - **Expose no generic Last.fm proxy.** The worker may only scrobble tracks
@@ -493,6 +497,54 @@ at 2,700/day does not warrant more.
 Completed job rows are retained (without the session key) for 30 days so a
 returning user sees "done — 94,203 scrobbled, 112 failed" with a downloadable
 failure list, rather than "no job found".
+
+### Stalled jobs: dormant, then cancelled, then purged
+
+A parked job (`paused`, `needs_reauth`, `needs_attention`) waits on a person,
+and some people never come back. Without a limit it would hold a Last.fm key
+and one of the 50 places for ever. The hourly housekeeping cron
+(`worker/src/housekeeping.ts`) enforces three deadlines:
+
+| After | What happens | Reversible? |
+| --- | --- | --- |
+| 14 days parked | `dormant`: key and `live_username` deleted, place freed, tracks kept | Yes: reconnect, if a place is free |
+| 30 more days dormant | `cancelled`; its chunks are swept within the hour | No |
+| 30 days after any job ends | its `failures` rows are deleted | No |
+
+- **The clock is a column, not `updated_at`.** Migration 005 adds a trigger
+  that sets `inactivity_deadline` when a job *enters* a parked or dormant state.
+  It is left behind when the job moves on, which is harmless: housekeeping only
+  reads it on jobs that are parked, and re-entering one resets it. `updated_at` moves every time the sweep drains
+  a lease, so a job parked for a month could look fresh. The migration also
+  backfills jobs already parked when it runs.
+- **Dormant is not terminal.** It holds the queue, so `/import/:id` still
+  answers `known: true` and a stale browser copy stays blocked. `/job/live`
+  answers `false`, because nothing can send. Take-back and cancel both work
+  from it. Resume does not; the job has no key.
+- **Reconnecting is the only way back.** The sign-in callback re-attaches the
+  credential and returns the job to `paused`, but only if a place is free,
+  checked inside the same `UPDATE`. A `needs_reauth` job never gave its place
+  up, so it is exempt. `GET /job` reports `reconnectAvailable` for keyless jobs
+  so the client can say "full" rather than offer a button that does nothing.
+- **The job row is never purged.** Its `import_id` is what keeps `/import/:id`
+  answering `known: true`; deleting it would let a browser that kept its copy
+  replay the whole queue. It holds no key and no tracks.
+- **Batches go with the chunks**, when a job ends. They hold the seconds the
+  worker assigned, which only matter while the job can still send or export.
+- **Accepted:** a `needs_attention` job that stalled through our own fault
+  goes dormant on the same clock. Take-back still returns the queue.
+- **Storage bound, weakened.** A dormant job keeps its chunks without holding a
+  place, so "50 places × 8 MB" no longer bounds the blob database. If it fills,
+  new uploads are refused and the browser keeps scrobbling locally. That is a
+  refusal, not a bill.
+
+Every housekeeping pass stays under the Free plan's 50 D1 queries per
+invocation: dormancy and expiry are one `UPDATE … RETURNING` plus one audit
+insert each, and the blob sweep handles at most 8 jobs.
+
+**D1 counts trigger writes in `meta.changes`.** A one-row state change reports
+2 once the trigger fires. Compare `changes` only with zero and use `RETURNING`
+to count rows. Verified with Miniflare.
 
 ## Scheduler
 
@@ -707,7 +759,7 @@ a single API call, not a paginated crawl of the user's history.
 
 ### Safe-deploy mechanics
 
-- **Immutable job payload — but bytes are not behaviour.** The R2 chunks are
+- **Immutable job payload — but bytes are not behaviour.** The blob chunks are
   written once at job creation and never mutated. That prevents the *data* from
   changing; it does **not** prevent new code from parsing, normalising, ordering,
   or timestamping the same bytes differently. Immutability alone is not a
@@ -835,7 +887,7 @@ clients.
 The export escape hatch must emit exactly the `ScrobbleState` shape
 `importFromFile` accepts, so a user can always return to the client-side flow.
 Ordering matters on cancellation: **generate and deliver the export before
-deleting the R2 blob**, or the data needed to build it is already gone.
+deleting the blob**, or the data needed to build it is already gone.
 
 ### Conflict rules
 
@@ -849,6 +901,26 @@ deleting the R2 blob**, or the data needed to build it is already gone.
 
 - Opt-in only, offered at any of the four entry points above when the remaining
   selection exceeds 2,700 tracks.
+- **Invite-only via `?beta=1`.** Even with `VUE_APP_BACKGROUND_API` set, the
+  offer is hidden unless the browser has visited a URL with `?beta=1`. The
+  opt-in is sticky (`scrobblify.background.beta` in localStorage) because the
+  query string does not survive the handoff: `stripQuery` drops it on return
+  and the Last.fm callback never carried it. `?beta=0` clears it, and an
+  opted-in browser shows a banner with a switch-off link.
+- **The gate covers the offer only, never recovery.** `isBackgroundEnabled`
+  (configured *and* opted in) guards `probeBackgroundAvailability` and
+  `preflight`. The live-job authority check, finishing a handoff on return,
+  and rendering an existing job use `isBackgroundConfigured` alone, so a browser
+  that has lost its storage — and with it the opt-in — still learns it has a
+  job running and is blocked from scrobbling underneath it.
+- **An unanswered authority check falls through for non-beta browsers.** A
+  `live: true` answer blocks everyone, but when the worker cannot be reached a
+  browser that has not opted in and holds no local handover evidence waits
+  3s and scrobbles normally. Opted-in browsers, and any browser with an
+  ownership, unresolved or stale-snapshot record, a pending handoff or a known
+  job, stay blocked. Otherwise a worker outage would stop every user of the
+  site. Accepted gap: lost localStorage plus a leftover handed-over queue in
+  IndexedDB plus an unreachable worker.
 - Labelled clearly as beta in the UI.
 - The opt-in must state plainly: the selected track list is uploaded to
   Scrobblify's server; a Last.fm credential is stored until the import finishes;

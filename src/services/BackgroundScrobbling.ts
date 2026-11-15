@@ -18,6 +18,7 @@ import type { FailedTrackDetail } from '@/services/StateManager';
  */
 const API_BASE = process.env.VUE_APP_BACKGROUND_API || '';
 
+const BETA_STORAGE_KEY = 'scrobblify.background.beta';
 const SESSION_STORAGE_KEY = 'scrobblify.background.session';
 const HANDOFF_STORAGE_KEY = 'scrobblify.background.handoff';
 /**
@@ -54,6 +55,17 @@ export interface JobStatus {
   createdAt: number;
   completedAt: number | null;
   credentialExpiresAt: number;
+  /**
+   * For a job waiting on the user: when a parked job goes dormant, or when a
+   * dormant one is cancelled. Null otherwise, and for jobs parked before the
+   * worker started recording it.
+   */
+  inactivityDeadline?: number | null;
+  /**
+   * Sent only with a job that has no key (`needs_reauth`, `dormant`). False
+   * when reconnecting would be refused because the service is full.
+   */
+  reconnectAvailable?: boolean;
 }
 
 export interface UploadTrack {
@@ -90,8 +102,91 @@ export type HandoffOutcome =
    */
   | { status: 'unknown'; handoffId: string };
 
+/**
+ * Whether this build can talk to a worker at all.
+ *
+ * Deliberately separate from `isBackgroundEnabled`. This is the question the
+ * *recovery* paths ask — the live-job authority check, finishing a handoff on
+ * return from Last.fm, and rendering an existing job — and they must not be
+ * gated on the beta opt-in. A browser whose storage was cleared has lost the
+ * opt-in but may still have a job running on the server, and that browser is
+ * exactly the one `enforceServerAuthority` exists to stop from scrobbling
+ * underneath it.
+ */
 export function isBackgroundConfigured(): boolean {
   return API_BASE.length > 0;
+}
+
+export function isBetaOptedIn(): boolean {
+  try {
+    return window.localStorage.getItem(BETA_STORAGE_KEY) === '1';
+  } catch {
+    // Private browsing. The offer additionally requires `canCoordinateTabs`,
+    // which fails here too, so this only agrees with a decision already made.
+    return false;
+  }
+}
+
+/**
+ * Whether to *offer* the handoff to this user.
+ *
+ * The opt-in is sticky rather than read from the URL on each load, because
+ * the URL does not survive the flow: `stripQuery` discards the whole query
+ * string on a handoff return, and the trip out to Last.fm and back arrives on
+ * a callback URL that never carried the parameter. A per-load flag would
+ * therefore switch itself off precisely when a handoff came back, stranding a
+ * user whose tracks are already uploaded.
+ */
+export function isBackgroundEnabled(): boolean {
+  return isBackgroundConfigured() && isBetaOptedIn();
+}
+
+export function setBetaOptIn(on: boolean): void {
+  try {
+    if (on) {
+      window.localStorage.setItem(BETA_STORAGE_KEY, '1');
+    } else {
+      window.localStorage.removeItem(BETA_STORAGE_KEY);
+    }
+  } catch {
+    // Nothing to do; `isBetaOptedIn` will keep answering false.
+  }
+}
+
+/**
+ * Applies `?beta=1` / `?beta=0` from the current URL, and reports whether the
+ * opt-in is now on.
+ *
+ * Reads the hash as well as the query string: outside production the router
+ * runs in hash mode, so an invite link is `/?beta=1#/scrobble` but a link
+ * someone assembles by hand is just as likely to be `/#/scrobble?beta=1`.
+ *
+ * The parameter is **not** stripped afterwards. Stripping would mean a second
+ * URL rewrite racing the one `AuthenticateStep` already performs to remove a
+ * consumed Last.fm token, and the two use different mechanisms
+ * (`history.replaceState` against `$router.replace`), so whichever lands last
+ * silently reinstates what the other removed. Re-applying the same value on a
+ * later load is idempotent, and leaving it visible keeps the invite link
+ * shareable and the opt-out link honest.
+ */
+export function consumeBetaParam(): boolean {
+  let raw: string | null = null;
+  try {
+    raw = new URLSearchParams(window.location.search).get('beta');
+    if (raw === null) {
+      const hash = window.location.hash.replace(/^#/, '');
+      const qIndex = hash.indexOf('?');
+      if (qIndex !== -1) {
+        raw = new URLSearchParams(hash.slice(qIndex + 1)).get('beta');
+      }
+    }
+  } catch {
+    raw = null;
+  }
+  if (raw !== null) {
+    setBetaOptIn(raw !== '0' && raw !== 'false');
+  }
+  return isBetaOptedIn();
 }
 
 export function getSession(): string | null {
@@ -872,7 +967,33 @@ function readJournal(): InFlightSecond[] {
   }
 }
 
-export function recordInFlightSecond(importId: string, trackKey: string, sec: number): boolean {
+/**
+ * A short, grouping-friendly name for a failed storage write, for telemetry.
+ *
+ * The browser's exception name where there is one (`QuotaExceededError`: the
+ * storage is full; `SecurityError`: the browser refuses this site storage at
+ * all), since that is the difference between "free some space" and "change a
+ * setting". Never the message, which can quote the value being written.
+ */
+export function storageErrorName(e: unknown): string {
+  try {
+    const name = e && typeof (e as { name?: unknown }).name === 'string'
+      ? (e as { name: string }).name
+      : '';
+    return name || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * The outcome of a journal write. `failure` says why it can't be relied on:
+ * `invalid_record` (nothing to bind it to), `not_persisted` (the browser
+ * accepted the write and then stored nothing), or `storageErrorName`'s answer.
+ */
+export type InFlightWrite = { ok: true } | { ok: false; failure: string };
+
+export function recordInFlightSecond(importId: string, trackKey: string, sec: number): InFlightWrite {
   /*
     An empty identity is refused rather than stored.
 
@@ -882,7 +1003,9 @@ export function recordInFlightSecond(importId: string, trackKey: string, sec: nu
     identity by now; refusing here is what makes that a requirement rather
     than a hope.
   */
-  if (!importId || !trackKey || !Number.isFinite(sec) || sec <= 0) { return false; }
+  if (!importId || !trackKey || !Number.isFinite(sec) || sec <= 0) {
+    return { ok: false, failure: 'invalid_record' };
+  }
   try {
     // Only this queue's own previous record is displaced: a queue has one send
     // in flight at a time, so its earlier second is either resolved or has
@@ -898,9 +1021,11 @@ export function recordInFlightSecond(importId: string, trackKey: string, sec: nu
     // send on the strength of this. A quota failure that throws is caught
     // below; one that silently stores nothing is not, and private-mode
     // storage has historically done both.
-    return window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY) === encoded;
-  } catch {
-    return false;
+    return window.localStorage.getItem(IN_FLIGHT_STORAGE_KEY) === encoded
+      ? { ok: true }
+      : { ok: false, failure: 'not_persisted' };
+  } catch (e) {
+    return { ok: false, failure: storageErrorName(e) };
   }
 }
 
@@ -1820,12 +1945,24 @@ async function request(path: string, init: RequestInit = {}): Promise<Response> 
  */
 const STATUS_TIMEOUT_MS = 8000;
 
+/**
+ * How long a browser that never opted in to the beta waits for the authority
+ * check before carrying on without it. Short because that browser falls
+ * through to ordinary scrobbling on no answer, so the wait is the whole cost
+ * of a worker outage for almost every user of the site.
+ */
+export const FALLTHROUGH_TIMEOUT_MS = 3000;
+
 /** Wider than a status check: an export carries the whole remaining queue. */
 const EXPORT_TIMEOUT_MS = 30000;
 
-async function getWithTimeout(path: string, authorised: boolean): Promise<Response | null> {
+async function getWithTimeout(
+  path: string,
+  authorised: boolean,
+  timeoutMs = STATUS_TIMEOUT_MS,
+): Promise<Response | null> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return authorised
       ? await request(path, { signal: controller.signal })
@@ -1857,7 +1994,10 @@ async function getWithTimeout(path: string, authorised: boolean): Promise<Respon
  * The response carries a boolean and nothing else, so a `true` here cannot
  * render a status card — `fetchJob` does that, once the user has signed in.
  */
-export async function liveJobForUsername(username: string): Promise<boolean | null> {
+export async function liveJobForUsername(
+  username: string,
+  timeoutMs = STATUS_TIMEOUT_MS,
+): Promise<boolean | null> {
   if (!isBackgroundConfigured() || !username.trim()) {
     return null;
   }
@@ -1865,6 +2005,7 @@ export async function liveJobForUsername(username: string): Promise<boolean | nu
     const res = await getWithTimeout(
       `/scrobblify/job/live?username=${encodeURIComponent(username.trim())}`,
       false,
+      timeoutMs,
     );
     if (!res || !res.ok) {
       return null;
@@ -1914,7 +2055,10 @@ export interface ImportStatus {
  * Returns null on any failure, and null is *not* permission — callers must
  * treat it the same way they treat an unresolved ownership check.
  */
-export async function importStatus(importId: string): Promise<ImportStatus | null> {
+export async function importStatus(
+  importId: string,
+  timeoutMs = STATUS_TIMEOUT_MS,
+): Promise<ImportStatus | null> {
   if (!isBackgroundConfigured() || !importId) {
     return null;
   }
@@ -1922,6 +2066,7 @@ export async function importStatus(importId: string): Promise<ImportStatus | nul
     const res = await getWithTimeout(
       `/scrobblify/import/${encodeURIComponent(importId)}`,
       false,
+      timeoutMs,
     );
     if (!res || !res.ok) {
       return null;
@@ -1992,6 +2137,9 @@ export function isSessionExpired(): boolean {
  * Job states in which the server has definitively stopped scrobbling. Anything
  * else — including states added later — counts as live, so an unknown state
  * errs towards withholding Resume rather than towards duplicates.
+ *
+ * `dormant` is deliberately absent. The job cannot send, but it still holds
+ * the queue and can be reconnected, so a browser copy must stay blocked.
  */
 const TERMINAL_JOB_STATES = ['completed', 'failed', 'cancelled'];
 
@@ -2119,7 +2267,10 @@ export async function preflight(
   chunkTracks: number,
   importId = '',
 ): Promise<{ handoffId: string; authoriseUrl: string } | null> {
-  if (!isBackgroundConfigured()) {
+  // `isBackgroundEnabled`, not `isBackgroundConfigured`: this is where a new
+  // handoff begins, and it is the only server call in the offer path that a
+  // caller could reach without having gone through `probeBackgroundAvailability`.
+  if (!isBackgroundEnabled()) {
     return null;
   }
   try {

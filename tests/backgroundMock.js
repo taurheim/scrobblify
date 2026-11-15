@@ -51,6 +51,39 @@ const CORS = {
 
 /** States in which the worker has definitively stopped sending. */
 const TERMINAL = ['completed', 'failed', 'cancelled'];
+/** States waiting on the user, which carry an inactivity deadline. */
+const PARKED = ['paused', 'needs_reauth', 'needs_attention', 'dormant'];
+/** States whose Last.fm key is gone, so only a reconnect can revive them. */
+const KEYLESS = ['needs_reauth', 'dormant'];
+const DORMANT_AFTER_SEC = 14 * 86400;
+const EXPIRE_AFTER_SEC = 30 * 86400;
+
+/**
+ * Changes a job's state the way the worker's `jobs_inactivity_deadline`
+ * trigger sees it: entering a parked state starts a 14-day clock, entering
+ * `dormant` a 30-day one, and anything else clears it.
+ */
+function setState(job, state, nowMs) {
+  const nowSec = Math.floor(nowMs / 1000);
+  /* eslint-disable no-param-reassign */
+  if (state !== job.state) {
+    if (state === 'dormant') {
+      job.inactivityDeadlineSec = nowSec + EXPIRE_AFTER_SEC;
+    } else if (PARKED.includes(state)) {
+      job.inactivityDeadlineSec = nowSec + DORMANT_AFTER_SEC;
+    } else {
+      job.inactivityDeadlineSec = null;
+    }
+  }
+  if (state === 'active') {
+    job.lastTickMs = nowMs;
+  }
+  if (TERMINAL.includes(state) && !job.completedAtMs) {
+    job.completedAtMs = nowMs;
+  }
+  job.state = state;
+  /* eslint-enable no-param-reassign */
+}
 
 function hex(n) {
   let out = '';
@@ -179,6 +212,20 @@ function createMockWorker(options = {}) {
     return !!world.job && !TERMINAL.includes(world.job.state);
   }
 
+  /**
+   * The real worker's `/job/live` reads `live_username`, which is cleared the
+   * moment a job loses its key. A keyless job still holds the queue, but it
+   * cannot send, so it answers "not live" and `/import/:id` does the blocking.
+   */
+  function isSending() {
+    return isLive() && !KEYLESS.includes(world.job.state);
+  }
+
+  /** Mirrors `canReattach`: re-auth always fits, dormant needs a free place. */
+  function reconnectAvailable() {
+    return world.job.state === 'needs_reauth' || world.capacityAvailable;
+  }
+
   function jobView() {
     const { job } = world;
     if (!job) {
@@ -211,6 +258,8 @@ function createMockWorker(options = {}) {
       // Fourteen days out, so the status card never renders its expiry warning
       // by accident.
       credentialExpiresAt: nowSec + 14 * 86400,
+      inactivityDeadline: PARKED.includes(job.state) ? job.inactivityDeadlineSec : null,
+      ...(KEYLESS.includes(job.state) ? { reconnectAvailable: reconnectAvailable() } : {}),
     };
   }
 
@@ -244,7 +293,7 @@ function createMockWorker(options = {}) {
     return json({
       ok: true,
       known: true,
-      live: mine && isLive(),
+      live: mine && isSending(),
       state: mine ? world.job.state : 'completed',
       cursor: scrobbled,
       scrobbledCount: scrobbled,
@@ -300,6 +349,7 @@ function createMockWorker(options = {}) {
         createdAtMs: nowMs,
         lastTickMs: nowMs,
         completedAtMs: null,
+        inactivityDeadlineSec: null,
         exportClaim: '',
       };
       if (rec.importId) {
@@ -333,7 +383,7 @@ function createMockWorker(options = {}) {
     const { job } = world;
     const scrobbled = Math.floor(job.scrobbled);
     const remaining = Math.max(0, job.totalTracks - scrobbled - job.failed);
-    job.state = 'exporting';
+    setState(job, 'exporting', nowMs);
     job.exportClaim = String(body.claim || '');
     if (verbose) {
       console.log(`[worker-mock] export: ${remaining} back, ${scrobbled} already sent`);
@@ -363,15 +413,15 @@ function createMockWorker(options = {}) {
       return json({ ok: false, reason: 'unknown_job' }, 404);
     }
     if (action === 'pause') {
-      if (!TERMINAL.includes(job.state)) {
-        job.state = 'paused';
+      // The worker pauses only a job that is sending.
+      if (job.state === 'active') {
+        setState(job, 'paused', nowMs);
       }
       return json({ ok: true });
     }
     if (action === 'resume') {
       if (job.state === 'paused' || job.state === 'needs_attention') {
-        job.state = 'active';
-        job.lastTickMs = nowMs;
+        setState(job, 'active', nowMs);
       }
       return json({ ok: true });
     }
@@ -382,8 +432,7 @@ function createMockWorker(options = {}) {
       if (job.state === 'exporting' && job.exportClaim && body.claim !== job.exportClaim) {
         return json({ ok: false, reason: 'export_in_progress' }, 409);
       }
-      job.state = 'cancelled';
-      job.completedAtMs = nowMs;
+      setState(job, 'cancelled', nowMs);
       return json({ ok: true });
     }
     return handleExport(body, nowMs);
@@ -405,7 +454,7 @@ function createMockWorker(options = {}) {
     // browser that has lost its session can still ask.
     if (path === '/scrobblify/job/live' && method === 'GET') {
       const username = query.get('username') || '';
-      return json({ ok: true, live: isLive() && world.job.username === username });
+      return json({ ok: true, live: isSending() && world.job.username === username });
     }
 
     // Public for the same reason, plus the import id *is* the credential.
@@ -455,10 +504,32 @@ function createMockWorker(options = {}) {
     if (path === '/scrobblify/auth/signin' && method === 'POST') {
       const body = JSON.parse(bodyText || '{}');
       const nonce = encodeURIComponent(body.nonce || '');
+      // The real worker re-attaches in the sign-in *callback*; the shim has no
+      // server side, so it happens here instead. Same outcome either way.
+      const { job } = world;
+      if (job && KEYLESS.includes(job.state) && reconnectAvailable()) {
+        setState(job, 'paused', nowMs);
+      }
       return json({
         ok: true,
         authoriseUrl: `${appOrigin}/mock-auth?session=s-${hex(24)}&nonce=${nonce}`,
       });
+    }
+
+    // Mock only: puts the current job into any state, so every status card
+    // can be looked at without waiting 14 days. Not a worker route.
+    if (path === '/scrobblify/__mock/job' && method === 'POST') {
+      const body = JSON.parse(bodyText || '{}');
+      if (!world.job) {
+        return json({ ok: false, reason: 'no_job' }, 404);
+      }
+      if (typeof body.capacityAvailable === 'boolean') {
+        world.capacityAvailable = body.capacityAvailable;
+      }
+      if (body.state) {
+        setState(world.job, String(body.state), nowMs);
+      }
+      return json({ ok: true, job: jobView() });
     }
 
     return json({ ok: false, reason: 'not_found' }, 404);
@@ -473,8 +544,10 @@ function createMockWorker(options = {}) {
  * Installs the mock. Call before any navigation, like `interceptLastFm`.
  *
  * Returns the mock so a caller can drive the simulation — flipping
- * `world.capacityAvailable`, changing `world.rate`, or forcing
- * `world.job.state` to `needs_reauth` to look at the reconnect card.
+ * `world.capacityAvailable`, changing `world.rate`, or forcing a state with
+ * `setState(world.job, 'dormant', Date.now())`. Under `dev:mock:bg` the same is
+ * reachable over HTTP: `POST /mock/worker/scrobblify/__mock/job` with
+ * `{"state":"dormant","capacityAvailable":false}`.
  */
 async function interceptBackgroundWorker(page, options = {}) {
   const mock = createMockWorker(options);
@@ -512,6 +585,7 @@ async function interceptBackgroundWorker(page, options = {}) {
 module.exports = {
   interceptBackgroundWorker,
   createMockWorker,
+  setState,
   shimHtml,
   MIN_TRACKS,
   DEFAULT_API_ORIGIN,

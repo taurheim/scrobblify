@@ -6,6 +6,22 @@
     </div>
 
     <!--
+      Sticky opt-in, so it needs to be visible and reversible: a flag the user
+      cannot see is one they cannot report a bug against or switch off. Hidden
+      once a job exists, where the job banner is the more useful thing to read.
+    -->
+    <v-alert
+      v-if="betaOptedIn && !backgroundJob"
+      type="info"
+      text
+      dense
+      class="mb-4"
+    >
+      Background scrobbling (beta) is switched on for this browser.
+      <a :href="betaOffHref">Switch it off</a>.
+    </v-alert>
+
+    <!--
       A live server-side job outranks everything else on this page. If it is
       running and the user also has local progress, offering "Resume" would
       invite them to scrobble the same tracks the server is scrobbling, so the
@@ -23,7 +39,30 @@
         >, {{ backgroundJob.failed.toLocaleString() }} rejected by Last.fm</span>.
         <span v-if="jobEta">{{ jobEta }}</span>
       </div>
-      <div v-if="backgroundJob.reason" class="mt-1 text-body-2">{{ backgroundJob.reason }}</div>
+      <div
+        v-if="backgroundJob.reason && backgroundJob.state !== 'dormant'"
+        class="mt-1 text-body-2"
+      >{{ backgroundJob.reason }}</div>
+      <!--
+        A parked job that nobody touches goes dormant after 14 days: its
+        Last.fm key is deleted and its place freed. It is cancelled if it is
+        still dormant 30 days after that. Both dates come from the server.
+      -->
+      <div v-if="backgroundJob.state === 'dormant'" class="mt-1 text-body-2">
+        Nothing happened with this import for 14 days, so Scrobblify deleted
+        its Last.fm access and gave its place to someone else. Your remaining
+        tracks are kept<span v-if="inactivityDate"> until {{ inactivityDate }}</span>.
+        Reconnect Last.fm to carry on, or take your progress back and finish in
+        this browser.
+        <span v-if="backgroundJob.reconnectAvailable === false">
+          The background service is full right now, so reconnecting won't work
+          until a place opens up.
+        </span>
+      </div>
+      <div v-else-if="inactivityDate" class="mt-1 text-body-2">
+        If it's still waiting on {{ inactivityDate }}, Scrobblify will delete
+        its Last.fm access and put it on hold.
+      </div>
       <div class="mt-2">
         <v-btn
           v-if="backgroundJob.state === 'active'"
@@ -47,10 +86,11 @@
           in flight) as their only exit.
         -->
         <v-btn
-          v-else-if="backgroundJob.state === 'needs_reauth'"
+          v-else-if="backgroundJob.state === 'needs_reauth' || backgroundJob.state === 'dormant'"
           color="primary"
           class="mr-2"
           :loading="reauthBusy"
+          :disabled="backgroundJob.reconnectAvailable === false"
           @click="reauthenticate"
         >Reconnect Last.fm</v-btn>
         <v-btn outlined class="mr-2" :loading="backgroundBusy" @click="takeBackProgress">
@@ -125,7 +165,10 @@
           <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
         </v-stepper-content>
         <v-stepper-content step="2">
-          <upload-step v-on:complete="currentStep = 3"></upload-step>
+          <upload-step
+            v-on:complete="currentStep = 3"
+            v-on:import-progress="importProgressFile"
+          ></upload-step>
         </v-stepper-content>
         <v-stepper-content step="3">
           <select-step v-on:complete="currentStep = 4"></select-step>
@@ -235,6 +278,8 @@ export default Vue.extend({
       backgroundBusy: false,
       backgroundJob: null as background.JobStatus | null,
       backgroundNotice: '',
+      /** Set from `?beta=1`. Gates the offer only — never recovery. */
+      betaOptedIn: false,
       /** Snapshot from the scrobble step, held while the offer dialog is open. */
       pendingSnapshot: null as ProgressSnapshot | null,
       /** State to hand off, when the offer came from a resume rather than a live queue. */
@@ -300,6 +345,14 @@ export default Vue.extend({
   },
   async mounted() {
     trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
+
+    /*
+      Before anything else, because it is pure local state and the handoff
+      return below can navigate away. Only the *offer* reads it; the recovery
+      paths further down deliberately do not, so a browser that arrives here
+      without the flag still learns about a job it left running.
+    */
+    this.betaOptedIn = background.consumeBetaParam();
 
     // Ordering matters. A handoff coming back from Last.fm must be finished
     // before anything reads local state, because the upload derives its bytes
@@ -368,11 +421,7 @@ export default Vue.extend({
       covers the same window in the template, since `mounted` renders at every
       await it makes.
     */
-    await this.enforceServerAuthority().catch(() => {
-      this.authorityPending = false;
-      this.authorityUnknown = true;
-      this.scheduleAuthorityRetry();
-    });
+    await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
 
     this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
       this.ownershipBlocked = next !== null;
@@ -552,9 +601,16 @@ export default Vue.extend({
           return 'Your background import needs you to reconnect Last.fm.';
         case 'needs_attention':
           return 'Your background import has stopped and needs a look.';
+        case 'dormant':
+          return 'Your background import is on hold.';
         default:
           return 'Your background import has stopped.';
       }
+    },
+    inactivityDate(): string {
+      const job = this.backgroundJob;
+      const sec = job ? job.inactivityDeadline : null;
+      return sec ? new Date(sec * 1000).toLocaleDateString() : '';
     },
     jobEta(): string {
       const job = this.backgroundJob;
@@ -575,6 +631,23 @@ export default Vue.extend({
       const days = Math.ceil(secondsLeft / 86400);
       if (days <= 1) { return 'Should finish within a day.'; }
       return `Should finish in about ${days} days.`;
+    },
+
+    /**
+     * An opt-out link for the current page.
+     *
+     * Built from `location` rather than the router because the parameter lives
+     * in the real query string in both routing modes — outside production the
+     * router runs in hash mode, where `$route` owns only what follows the `#`.
+     */
+    betaOffHref(): string {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        params.set('beta', '0');
+        return `${window.location.pathname}?${params.toString()}${window.location.hash}`;
+      } catch (e) {
+        return '?beta=0';
+      }
     },
   },
   methods: {
@@ -642,7 +715,6 @@ export default Vue.extend({
       */
       let username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
       let savedImportId = (this.$store.state.importId as string) || '';
-      let savedQueueIsLegacyLocalOnly = false;
       try {
         const saved = await this.stateManager.loadState();
         if (saved) {
@@ -655,8 +727,7 @@ export default Vue.extend({
             record on disk is the queue that would actually be resumed — and
             resuming is the action being gated.
           */
-          savedImportId = saved.importId || '';
-          savedQueueIsLegacyLocalOnly = !savedImportId;
+          savedImportId = saved.importId || savedImportId;
         }
       } catch (e) {
         // Unreadable state. There is nothing to resume either, so the
@@ -673,27 +744,10 @@ export default Vue.extend({
       // can establish a freeze while the request is in flight.
       const observed = background.queueOwner();
       this.handedOverProgress = null;
-      /*
-        A handoff mints and persists an import id before uploading anything.
-        Therefore a saved queue without one cannot have reached the worker.
-        Use that local proof before asking the worker so an outage cannot
-        strand old browser-only progress.
-
-        The exception stays deliberately narrow: any ownership evidence still
-        requires server reconciliation, even when the saved format is old.
-      */
-      const hasBackgroundOwnershipEvidence = !!observed
-        || !!background.getOwnershipUnresolved()
-        || !!background.getPendingHandoff()
-        || !!background.staleSnapshotRecord()
-        || !!this.backgroundJob
-        || this.sawServerOwnership;
-      if (savedQueueIsLegacyLocalOnly && !hasBackgroundOwnershipEvidence) {
-        this.authorityPending = false;
-        this.authorityUnknown = false;
-        return;
-      }
-      const live = await background.liveJobForUsername(username);
+      const live = await background.liveJobForUsername(
+        username,
+        this.mayScrobbleWithoutAuthority(observed) ? background.FALLTHROUGH_TIMEOUT_MS : undefined,
+      );
       this.authorityPending = false;
 
       if (live === true) {
@@ -745,7 +799,7 @@ export default Vue.extend({
         */
         const handedOver = await this.queueWasHandedOver(savedImportId);
         if (handedOver === null) {
-          this.markAuthorityUnknown();
+          await this.onAuthorityUnanswered(observed);
           return;
         }
         if (handedOver === true) {
@@ -788,9 +842,61 @@ export default Vue.extend({
 
         The user is told why, and given a retry, rather than left looking at an
         app that silently refuses to work.
+
+        Except in a browser that has never opted in and holds no trace of a
+        handover — see `mayScrobbleWithoutAuthority`.
       */
-      this.markAuthorityUnknown();
-      trackEvent('background_authority_check', { result: 'unknown' });
+      await this.onAuthorityUnanswered(observed);
+    },
+
+    /**
+     * Whether an *unanswered* authority check may fall through to ordinary
+     * scrobbling.
+     *
+     * Only in a browser that has not opted in to the beta and holds no local
+     * trace of a handover. The check still runs for everyone and a `live` answer
+     * still blocks everyone; only the no-answer case differs. Without this, a
+     * worker outage — or a worker not yet deployed — stops every user of the
+     * site from scrobbling, including all the ones who have never seen the
+     * offer.
+     *
+     * The accepted cost: a browser that lost its localStorage (and with it the
+     * opt-in and every ownership record) while keeping a handed-over queue in
+     * IndexedDB, and that then cannot reach the worker, would scrobble that
+     * queue. A successful handover clears the saved queue, so this also needs
+     * a leftover copy.
+     */
+    mayScrobbleWithoutAuthority(
+      observed: ReturnType<typeof background.queueOwner> = background.queueOwner(),
+    ): boolean {
+      if (background.isBetaOptedIn()) {
+        return false;
+      }
+      return !observed
+        && !background.getOwnershipUnresolved()
+        && !background.getPendingHandoff()
+        && !background.staleSnapshotRecord()
+        && !this.backgroundJob
+        && !this.sawServerOwnership;
+    },
+
+    /** The authority check could not be answered, or threw. Never throws. */
+    async onAuthorityUnanswered(
+      observed: ReturnType<typeof background.queueOwner> = background.queueOwner(),
+    ): Promise<void> {
+      if (!this.mayScrobbleWithoutAuthority(observed)) {
+        this.markAuthorityUnknown();
+        trackEvent('background_authority_check', { result: 'unknown' });
+        return;
+      }
+      this.authorityPending = false;
+      this.authorityUnknown = false;
+      trackEvent('background_authority_check', { result: 'unknown_fell_through' });
+      try {
+        await this.exposeSavedStateUnlessStale('authority_unreachable');
+      } catch (e) {
+        // Resume stays hidden; scrobbling a fresh import is still allowed.
+      }
     },
 
     /**
@@ -809,11 +915,11 @@ export default Vue.extend({
      * from an older build and handed over by a *newer* one, which cannot
      * happen either, since the newer build mints an id before it uploads.
      */
-    async queueWasHandedOver(importId: string): Promise<boolean | null> {
+    async queueWasHandedOver(importId: string, timeoutMs?: number): Promise<boolean | null> {
       if (!importId) {
         return false;
       }
-      const status = await background.importStatus(importId);
+      const status = await background.importStatus(importId, timeoutMs);
       if (!status) {
         return null;
       }
@@ -1203,9 +1309,12 @@ export default Vue.extend({
      * the first request, after they had already agreed to it.
      *
      * Failure is silent and simply means "don't offer".
+     *
+     * `isBackgroundEnabled` rather than `isBackgroundConfigured`: this is the
+     * offer path, so it is the one place the beta opt-in applies.
      */
     async probeBackgroundAvailability() {
-      if (!background.isBackgroundConfigured() || !background.canCompress()) {
+      if (!background.isBackgroundEnabled() || !background.canCompress()) {
         return;
       }
       /*
@@ -1927,13 +2036,9 @@ export default Vue.extend({
         live across exactly the window the check is meant to cover.
       */
       this.authorityPending = true;
-      this.enforceServerAuthority().catch(() => {
-        // Leaves local records as they were, but never leaves the gate open on
-        // an unanswered question.
-        this.authorityPending = false;
-        this.authorityUnknown = true;
-        this.scheduleAuthorityRetry();
-      });
+      // Leaves local records as they were. The gate stays shut on an
+      // unanswered question unless `mayScrobbleWithoutAuthority` allows it.
+      this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
     },
     /**
      * `state.totalTracks` is only the tracks left to do, so on its own it makes
@@ -1969,7 +2074,9 @@ export default Vue.extend({
         carries its own refusal rather than trusting the view.
       */
       if (this.authorityPending || this.authorityUnknown || this.ownershipBlocked) {
-        this.backgroundNotice = 'Hold on — still checking whether an import is already running on the server for your account.';
+        this.backgroundNotice = background.isBetaOptedIn()
+          ? 'Hold on — still checking whether an import is already running on the server for your account.'
+          : 'Hold on, still getting ready. Try again in a moment.';
         return;
       }
       try {
@@ -1990,9 +2097,22 @@ export default Vue.extend({
     async onImportFile(event: Event) {
       const input = event.target as HTMLInputElement;
       if (!input.files || input.files.length === 0) { return; }
+      const file = input.files[0];
+      input.value = '';
+      await this.importProgressFile(file, 'file');
+    },
+    /**
+     * Also reachable from the upload step, because the resume banner (and its
+     * "Import from file" button) only appears when this browser already has
+     * saved state — which a new device or browser never does.
+     */
+    async importProgressFile(file: File, source: string) {
       try {
-        const state = await this.stateManager.importFromFile(input.files[0]);
-        trackEvent('session_resumed', this.resumeProps(state, 'file'));
+        const state = await this.stateManager.importFromFile(file);
+        if (!(await this.importedQueueMaySend(state))) {
+          return;
+        }
+        trackEvent('session_resumed', this.resumeProps(state, source));
         this.restoreFromState(state);
       } catch (e) {
         trackError('scrobblify.onImportFile', e);
@@ -2000,6 +2120,40 @@ export default Vue.extend({
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
       }
+    },
+    /**
+     * The authority check for a progress *file*.
+     *
+     * `enforceServerAuthority` asks about the queue saved in this browser, but
+     * an imported file carries its own identity and bypasses that entirely. A
+     * file exported before a handover, then imported on another device, is a
+     * stale copy of a queue the worker has been sending — resuming it sends
+     * everything again.
+     *
+     * Same rule as the page-load check: a handed-over queue is refused, and
+     * an unanswered question refuses only a browser with a reason to worry.
+     */
+    async importedQueueMaySend(state: ScrobbleState): Promise<boolean> {
+      if (!background.isBackgroundConfigured() || !state.importId) {
+        return true;
+      }
+      const fallThrough = this.mayScrobbleWithoutAuthority();
+      const handedOver = await this.queueWasHandedOver(
+        state.importId,
+        fallThrough ? background.FALLTHROUGH_TIMEOUT_MS : undefined,
+      );
+      if (handedOver === false || (handedOver === null && fallThrough)) {
+        return true;
+      }
+      trackEvent('background_authority_check', {
+        result: handedOver ? 'imported_file_handed_over' : 'imported_file_unknown',
+      });
+      this.errorMessage = handedOver
+        ? 'This progress file is for an import that was handed over to the background service. Resuming it here would send tracks the server has already sent. Check on it, or bring it back, from the browser you handed it over from.'
+        : "Can't reach the background service to check whether this import is already running there. Try again in a moment.";
+      this.errorDetails = '';
+      this.showError = true;
+      return false;
     },
     restoreFromState(state: ScrobbleState) {
       const api = this.$store.state.lfmApi as LastFm;
@@ -2278,14 +2432,32 @@ export default Vue.extend({
     async onSaveAndExit(info: ProgressSnapshot) {
       const state = this.buildState(info);
 
+      /*
+        The browser save and the download are attempted independently. The file
+        is the only way out for a browser that can't store anything, so a failed
+        save must not also cost the user the download.
+      */
+      let saveError: unknown = null;
       try {
         await this.stateManager.saveState(state);
-        this.stateManager.exportToFile(state);
-        trackEvent('session_saved', this.saveProps(info, false));
       } catch (e) {
+        saveError = e;
         trackError('scrobblify.onSaveAndExit', e);
+      }
+      try {
+        this.stateManager.exportToFile(state);
+      } catch (e) {
+        trackError('scrobblify.onSaveAndExit', e, { stage: 'export' });
         this.errorMessage = 'Failed to save your scrobbling progress. You can try the "Save Progress" button again.';
         this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+        return;
+      }
+      trackEvent('session_saved', { ...this.saveProps(info, false), saved_in_browser: !saveError });
+      if (saveError) {
+        // Not the "come back later" screen: coming back here would find nothing.
+        this.errorMessage = 'Scrobblify couldn\'t save your progress in this browser, so it has been downloaded as a file instead. To carry on later, open Scrobblify and drop that file on the upload page.';
+        this.errorDetails = (saveError as Error).message || String(saveError);
         this.showError = true;
         return;
       }

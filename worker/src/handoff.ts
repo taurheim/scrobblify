@@ -339,7 +339,7 @@ export type FinalizeResult =
  * The `active` transition is conditional on every chunk being present,
  * hash-verified, contiguous and non-overlapping — checked from the chunk rows
  * alone, so a missing, duplicated or reordered chunk is detectable without
- * reading R2.
+ * reading the blobs.
  *
  * The client clears its own state only after this returns success. If the
  * response is lost, the client must ask the server rather than assume failure:

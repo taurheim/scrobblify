@@ -6,6 +6,12 @@ import Scrobble from '@/models/Scrobble';
 // user's history.
 import * as protocol from '@/shared/lastfm/protocol';
 
+const LFM_AUTH_CALLBACK = 'https://savas.ca/scrobblify/scrobble';
+// Overridable so `npm run dev:mock` can send the authorise link to the dev
+// server's mock instead of Last.fm, which makes sign-in clickable end to end
+// without a real account. `undefined` in a production build — see vue.config.js.
+const LFM_AUTH_BASE = process.env.VUE_APP_LASTFM_AUTH_BASE || 'https://www.last.fm/api/auth/';
+
 /** Outcome of a single track.scrobble call, as reported by Last.fm itself. */
 export interface ScrobbleResult {
   accepted: number;
@@ -67,7 +73,13 @@ export default class LastFm {
     // fresh value from the URL query (returned by Last.fm's auth callback).
     this.userAuthToken = queryParams.token || null;
 
-    if (!this.isAuthenticated() && this.userAuthToken) {
+    // A fresh token means the user has just been through Last.fm's authorize
+    // page, so it is exchanged even when a session key is already stored. That
+    // stored key may be exactly why they came back: Last.fm can invalidate one
+    // (error 9) while the user is away, and skipping the exchange here threw
+    // the new token away and kept the dead key, so re-authorizing never helped.
+    const hadStoredSession = this.isAuthenticated();
+    if (this.userAuthToken) {
       // Guard against exchanging the same single-use token twice. Last.fm
       // consumes the token on auth.getSession and rejects any re-use with
       // error 4 "Unauthorized Token - This token has not been issued". A reload
@@ -91,6 +103,12 @@ export default class LastFm {
         // marker so a subsequent attempt (e.g. after reconnecting) can proceed.
         if (LastFm.isNetworkError(e)) {
           sessionStorage.removeItem(this.ATTEMPTED_AUTH_TOKEN_SESSIONSTORAGE_KEY);
+        }
+        // A stale or reused callback link must not log out a session that may
+        // still work. If the stored key is dead too, the first scrobble
+        // reports it and sends the user back here.
+        if (hadStoredSession) {
+          return;
         }
         throw e;
       } finally {
@@ -127,6 +145,20 @@ export default class LastFm {
 
   public getUserName() {
     return this.userName;
+  }
+
+  /**
+   * Forget a session key Last.fm has rejected, so the next visit asks the user
+   * to sign in instead of failing with it again. The username is kept: saved
+   * progress and the rate-limit window are both keyed by it.
+   */
+  public clearSessionKey() {
+    this.userAuthKey = null;
+    localStorage.removeItem(this.USER_AUTH_KEY_LOCALSTORAGE_KEY);
+  }
+
+  public getAuthorizeUrl(): string {
+    return `${LFM_AUTH_BASE}?api_key=${this.lfmApiKey}&cb=${LFM_AUTH_CALLBACK}`;
   }
 
   public clearUser() {
@@ -410,7 +442,9 @@ export default class LastFm {
 
     // Decide which api key to use
     if (authenticatedRequest) {
-      if (this.userAuthKey) {
+      // auth.getSession is how a replacement key is obtained, so it must not
+      // carry (or be signed with) the key it is replacing.
+      if (this.userAuthKey && params.method !== 'auth.getSession') {
         requestParams.sk = this.userAuthKey;
       }
       const sig = this.getMethodSignature(requestParams);
@@ -505,6 +539,13 @@ export default class LastFm {
 
   public static isAuthTokenError(error: unknown): boolean {
     return protocol.isAuthTokenError(error);
+  }
+
+  // Last.fm error 9 "Invalid session key - Please re-authenticate": the stored
+  // session key has been invalidated. Nothing about the request is at fault and
+  // retrying it can only fail the same way; the user has to sign in again.
+  public static isSessionKeyError(error: unknown): boolean {
+    return protocol.isInvalidSessionKeyError(error);
   }
 
   public static isNetworkError(error: unknown): boolean {

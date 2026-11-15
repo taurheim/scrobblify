@@ -44,6 +44,16 @@ export function initAnalytics(): void {
 }
 
 export function trackEvent(event: string, properties: Record<string, any> = {}): void {
+  if (process.env.NODE_ENV !== 'production') {
+    // Mirrors `trackError`'s console echo. Nothing is captured from localhost,
+    // so this is the only way a test or a developer can see what would be sent.
+    try {
+      // eslint-disable-next-line no-console
+      console.debug(`[scrobblify:event] ${event} ${JSON.stringify(properties)}`);
+    } catch (e) {
+      // ignore
+    }
+  }
   if (!initialized) {
     return;
   }

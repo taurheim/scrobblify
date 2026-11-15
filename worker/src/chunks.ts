@@ -15,8 +15,9 @@ import { sha256Hex } from './crypto';
 import type { Sql } from './store';
 
 /**
- * Minimal blob interface, so R2 can become S3 or a filesystem without touching
- * the scheduler (spec "Portability requirements").
+ * Minimal blob interface, so the store (a dedicated D1 database, `blobs.ts`)
+ * can become S3 or a filesystem without touching the scheduler (spec
+ * "Portability requirements").
  */
 export interface BlobStore {
   put(key: string, value: ArrayBuffer | Uint8Array): Promise<void>;
@@ -27,12 +28,36 @@ export interface BlobStore {
 /** Tracks per chunk. Chosen so a chunk decompresses well inside a tick. */
 export const CHUNK_TRACKS = 1000;
 
-/** Refuses a chunk whose compressed form is implausible for CHUNK_TRACKS. */
-export const MAX_COMPRESSED_BYTES = 2 * 1024 * 1024;
+/**
+ * Refuses a chunk whose compressed form is implausible for CHUNK_TRACKS.
+ *
+ * Measured: 1,000 realistic plays gzip to 20-30 KB. The cap also has to sit
+ * under D1's 2,000,000-byte row limit, since each chunk is one row.
+ */
+export const MAX_COMPRESSED_BYTES = 1_000_000;
+
+/**
+ * Compressed bytes one job may store in total.
+ *
+ * This is what bounds the blob database. Every non-terminal job holds a
+ * capacity slot (`SLOT_CONSUMING_STATES`) and terminal ones are swept, so
+ * storage never exceeds `max_concurrent_jobs` (50) times this: 400 MB against
+ * D1's 500 MB. The largest accepted job, `MAX_TRACKS_PER_JOB` with every play
+ * distinct, measured at about 5 MB.
+ */
+export const MAX_JOB_COMPRESSED_BYTES = 8_000_000;
+
+/**
+ * Jobs whose blobs one sweep will delete. Each costs four D1 statements (the
+ * chunk lookup, the blob delete, and the chunk and batch deletes), and the
+ * sweep shares the hourly invocation with the rest of `runHousekeeping`
+ * under Workers Free's 50-query limit.
+ */
+export const BLOB_SWEEP_JOB_LIMIT = 8;
 
 /**
  * The bomb defence. Decompression stops at this many bytes rather than
- * allocating whatever the archive claims, so a 2MB upload cannot expand into
+ * allocating whatever the archive claims, so a 1MB upload cannot expand into
  * gigabytes of Worker memory.
  */
 export const MAX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024;
@@ -200,7 +225,7 @@ export interface UploadChunkRequest {
  * Validates and stores one chunk.
  *
  * Order matters: validate before writing. Storing first and checking later
- * leaves attacker-controlled bytes in the bucket, and a crash between the two
+ * leaves attacker-controlled bytes in storage, and a crash between the two
  * leaves a chunk that no row describes.
  *
  * Chunks are write-once — a chunk already recorded is never overwritten, so it
@@ -230,6 +255,14 @@ export async function uploadChunk(
       : { ok: false, reason: 'chunk already uploaded with different content' };
   }
 
+  const stored = await sql.first<{ n: number | null }>(
+    'SELECT SUM(compressed_bytes) AS n FROM chunks WHERE job_id = ?',
+    [req.jobId],
+  );
+  if (Number(stored?.n ?? 0) + req.compressed.byteLength > MAX_JOB_COMPRESSED_BYTES) {
+    return { ok: false, reason: 'job too large' };
+  }
+
   const actualDigest = await sha256Hex(req.compressed);
   if (actualDigest !== req.digest) {
     return { ok: false, reason: 'digest mismatch' };
@@ -247,7 +280,14 @@ export async function uploadChunk(
   }
 
   const key = `jobs/${req.jobId}/chunks/${req.chunkIndex}`;
-  await blobs.put(key, req.compressed);
+  try {
+    await blobs.put(key, req.compressed);
+  } catch {
+    // Most likely the blob database is full, which D1 reports by refusing the
+    // write. Nothing is live until finalise, so the client falls back to
+    // scrobbling in the browser.
+    return { ok: false, reason: 'storage_unavailable' };
+  }
 
   try {
     await sql.run(
@@ -280,7 +320,7 @@ export async function uploadChunk(
  * Reads the chunk containing a track index and returns its entries.
  *
  * Re-validates on read rather than trusting the upload-time check: the bytes
- * have been sitting in a bucket, and the cost is a few hundred microseconds
+ * have been sitting in storage, and the cost is a few hundred microseconds
  * against the risk of feeding corrupt data to Last.fm.
  */
 export async function readChunkFor(
@@ -324,5 +364,43 @@ export async function deleteJobBlobs(
   if (chunks.length > 0) {
     await blobs.delete(chunks.map((c) => c.r2_key));
   }
-  await sql.run('DELETE FROM chunks WHERE job_id = ?', [jobId]);
+  // Batch records go too: `assigned_timestamps` names every track sent, and
+  // the consent copy promises the uploaded list is deleted when the import
+  // ends. Nothing reads a terminal job's batches; failures are kept until the
+  // purge because the completion page lists them.
+  await sql.batch([
+    { query: 'DELETE FROM chunks WHERE job_id = ?', params: [jobId] },
+    { query: 'DELETE FROM batches WHERE job_id = ?', params: [jobId] },
+  ]);
+}
+
+/**
+ * Deletes the blobs of jobs that have finished.
+ *
+ * Only cancellation deleted blobs inline. A completed job, or a pending job
+ * cancelled because its handoff was reaped, kept its whole listening history
+ * forever, against the spec's retention rule and against the storage bound
+ * `MAX_JOB_COMPRESSED_BYTES` depends on. A sweep covers every such path,
+ * including a cancel that died between its update and its cleanup, without
+ * adding subrequests to the tick that does the scrobbling.
+ *
+ * Returns the number of jobs cleaned.
+ */
+export async function sweepTerminalJobBlobs(
+  sql: Sql,
+  blobs: BlobStore,
+  limit: number = BLOB_SWEEP_JOB_LIMIT,
+): Promise<number> {
+  const done = await sql.all<{ job_id: string }>(
+    `SELECT DISTINCT c.job_id AS job_id
+       FROM chunks c JOIN jobs j ON j.id = c.job_id
+      WHERE j.state IN ('completed', 'failed', 'cancelled')
+      LIMIT ?`,
+    [limit],
+  );
+  for (const row of done) {
+    // eslint-disable-next-line no-await-in-loop
+    await deleteJobBlobs(sql, blobs, row.job_id);
+  }
+  return done.length;
 }
