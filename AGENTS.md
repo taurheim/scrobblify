@@ -399,10 +399,14 @@ use that to see what CI will see. The config is ESLint + `@vue/airbnb` +
 
 Several airbnb rules are switched off in `.eslintrc.js` because they fight
 patterns this codebase uses on purpose — each has a comment explaining why.
-The load-bearing one: **`no-underscore-dangle` is off because Vue 2 skips
-reactivity for keys starting with `_`**, which is how `SelectStep` holds large
-track arrays cheaply. Renaming those fields would silently make them reactive
-and tank performance on big histories.
+The load-bearing one: **`no-underscore-dangle` is off because large or
+deliberately non-reactive state lives in `_`-prefixed properties assigned
+straight onto the component instance, outside `data()`** — that is how
+`SelectStep` holds large track arrays cheaply (`ScrobbleStep` and `Scrobblify`
+do the same for the rate-limit tracker and the save queue). Vue never makes
+those reactive, and Vue 3 refuses to proxy `_`-prefixed `data()` keys at all, so
+moving them into `data()` would either break them or make every element
+reactive and tank performance on big histories.
 
 Warnings (mostly `no-explicit-any`) do not fail the build; only errors do.
 

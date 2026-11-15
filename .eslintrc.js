@@ -5,7 +5,7 @@ module.exports = {
     browser: true,
   },
   extends: [
-    'plugin:vue/essential',
+    'plugin:vue/vue3-essential',
     '@vue/airbnb',
     '@vue/typescript/recommended',
   ],
@@ -28,9 +28,13 @@ module.exports = {
       ignoreRegExpLiterals: true,
     }],
 
-    // Vue 2 deliberately skips reactivity for keys beginning with `_`.
-    // SelectStep relies on that to hold large track arrays without paying the
-    // cost of making every element reactive, so the prefix is load-bearing.
+    // SelectStep, ScrobbleStep and Scrobblify keep large or deliberately
+    // non-reactive state (track arrays, the rate-limit tracker, the save queue)
+    // as `_`-prefixed properties assigned straight onto the instance, outside
+    // data(). Vue never makes those reactive, and Vue 3 refuses to proxy
+    // `_`-prefixed data() keys at all, so the prefix marks that state as
+    // intentionally off-reactivity. Moving it into data() would make every
+    // element reactive and tank performance on big histories.
     'no-underscore-dangle': 'off',
 
     // Scrobbling is intentionally sequential: Last.fm rate-limits aggressively

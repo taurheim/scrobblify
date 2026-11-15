@@ -14,18 +14,18 @@
         </p>
         <v-expansion-panels v-if="details" flat class="mt-2">
           <v-expansion-panel>
-            <v-expansion-panel-header class="pa-0 caption">
+            <v-expansion-panel-title class="pa-0 text-caption">
               Technical details
-            </v-expansion-panel-header>
-            <v-expansion-panel-content>
+            </v-expansion-panel-title>
+            <v-expansion-panel-text>
               <code class="error-details">{{ details }}</code>
-            </v-expansion-panel-content>
+            </v-expansion-panel-text>
           </v-expansion-panel>
         </v-expansion-panels>
       </v-card-text>
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn color="primary" text @click="close">OK</v-btn>
+        <v-btn color="primary" variant="text" @click="close">OK</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
@@ -45,18 +45,19 @@
 }
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
-export default Vue.extend({
+export default defineComponent({
   props: {
-    value: { type: Boolean, default: false },
+    modelValue: { type: Boolean, default: false },
     message: { type: String, default: 'An unexpected error occurred.' },
     details: { type: String, default: '' },
   },
+  emits: ['update:modelValue'],
   computed: {
     visible: {
-      get(): boolean { return this.value; },
-      set(val: boolean) { this.$emit('input', val); },
+      get(): boolean { return this.modelValue; },
+      set(val: boolean) { this.$emit('update:modelValue', val); },
     },
     mailtoLink(): string {
       const subject = encodeURIComponent('Scrobblify error report');

@@ -23,8 +23,8 @@
       </div>
       <div class="mt-2">
         <v-btn color="primary" class="mr-2" @click="resumeFromSaved">Resume</v-btn>
-        <v-btn outlined @click="importStateFile">Import from file</v-btn>
-        <v-btn text color="error" @click="clearSavedState">Discard</v-btn>
+        <v-btn variant="outlined" @click="importStateFile">Import from file</v-btn>
+        <v-btn variant="text" color="error" @click="clearSavedState">Discard</v-btn>
       </div>
       <input
         ref="importFileInput"
@@ -37,49 +37,64 @@
     </v-alert>
     <v-stepper v-model="currentStep">
       <v-stepper-header>
-        <v-stepper-step :complete="currentStep > 1" step="1">Authenticate with last.fm</v-stepper-step>
+        <v-stepper-item
+          color="primary" :complete="currentStep > 1" :value="1" title="Authenticate with last.fm"
+        />
         <v-divider></v-divider>
-        <v-stepper-step :complete="currentStep > 2" step="2">Upload your spotify play history</v-stepper-step>
+        <v-stepper-item
+          color="primary" :complete="currentStep > 2" :value="2" title="Upload your spotify play history"
+        />
         <v-divider></v-divider>
-        <v-stepper-step :complete="currentStep > 3" step="3">Choose which tracks to scrobble</v-stepper-step>
+        <v-stepper-item
+          color="primary" :complete="currentStep > 3" :value="3" title="Choose which tracks to scrobble"
+        />
         <v-divider></v-divider>
-        <v-stepper-step :complete="currentStep > 4" step="4">Scrobble!</v-stepper-step>
+        <v-stepper-item color="primary" :complete="currentStep > 4" :value="4" title="Scrobble!" />
         <v-divider></v-divider>
-        <v-stepper-step step="5">Complete</v-stepper-step>
+        <v-stepper-item color="primary" :value="5" title="Complete" />
       </v-stepper-header>
-      <v-stepper-items>
-        <v-stepper-content step="1">
+      <!--
+        Every step is `eager` so all of them mount up front, as they did under
+        Vuetify 2: the steps hand state to each other through the store and
+        expect to already be listening when an earlier step finishes.
+      -->
+      <v-stepper-window>
+        <v-stepper-window-item :value="1" eager>
           <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
-        </v-stepper-content>
-        <v-stepper-content step="2">
+        </v-stepper-window-item>
+        <v-stepper-window-item :value="2" eager>
           <upload-step
             v-on:complete="currentStep = 3"
             v-on:import-progress="importProgressFile"
           ></upload-step>
-        </v-stepper-content>
-        <v-stepper-content step="3">
+        </v-stepper-window-item>
+        <v-stepper-window-item :value="3" eager>
           <select-step v-on:complete="currentStep = 4"></select-step>
-        </v-stepper-content>
-        <v-stepper-content step="4">
+        </v-stepper-window-item>
+        <v-stepper-window-item :value="4" eager>
           <scrobble-step
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
             v-on:auto-save="onAutoSave"
             v-on:checkpoint="onCheckpoint"
           ></scrobble-step>
-        </v-stepper-content>
-        <v-stepper-content step="5">
+        </v-stepper-window-item>
+        <v-stepper-window-item :value="5" eager>
           <complete-step :has-remaining="hasRemainingTracks"></complete-step>
-        </v-stepper-content>
-      </v-stepper-items>
+        </v-stepper-window-item>
+      </v-stepper-window>
     </v-stepper>
     <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
   </div>
 </template>
 <style>
+/* Finished steps stay fully opaque, as in Vuetify 2; Vuetify 3 fades every unselected step. */
+.v-stepper-item--complete {
+  opacity: 1;
+}
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble from '@/models/Scrobble';
 import Scrobblify from '@/scrobblify';
@@ -107,7 +122,7 @@ interface ProgressSnapshot {
   dailyCount: number;
 }
 
-export default Vue.extend({
+export default defineComponent({
   components: {
     'authenticate-step': AuthenticateStepVue,
     'upload-step': UploadStepVue,

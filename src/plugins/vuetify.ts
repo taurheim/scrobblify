@@ -1,21 +1,21 @@
-import Vue from 'vue';
-import Vuetify from 'vuetify/lib';
-import 'vuetify/dist/vuetify.min.css';
+// Vuetify's documented stylesheet entry; its package `exports` map it to CSS.
+// eslint-disable-next-line import/extensions
+import 'vuetify/styles';
+import { createVuetify } from 'vuetify';
 
-Vue.use(Vuetify, {
-});
-
-export default new Vuetify({
+export default createVuetify({
   theme: {
     themes: {
       light: {
-        primary: '#ED1C24',
-        secondary: '#424242',
-        accent: '#82B1FF',
-        error: '#FF5252',
-        info: '#2196F3',
-        success: '#4CAF50',
-        warning: '#FFC107',
+        colors: {
+          primary: '#ED1C24',
+          secondary: '#424242',
+          accent: '#82B1FF',
+          error: '#FF5252',
+          info: '#2196F3',
+          success: '#4CAF50',
+          warning: '#FFC107',
+        },
       },
     },
   },

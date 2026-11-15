@@ -1,3 +1,4 @@
+const { VuetifyPlugin } = require('webpack-plugin-vuetify');
 const { execSync } = require('child_process');
 
 // Baked into the bundle (Vue CLI inlines any VUE_APP_* var set at config load)
@@ -23,4 +24,8 @@ module.exports = {
   transpileDependencies: [
     'vuetify',
   ],
+  configureWebpack: {
+    // Imports only the Vuetify components (and their CSS) the templates use.
+    plugins: [new VuetifyPlugin({ autoImport: true })],
+  },
 };

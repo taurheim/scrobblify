@@ -1,12 +1,21 @@
-import Vue from 'vue';
-import Vuex from 'vuex';
+import { createStore } from 'vuex';
 import LastFm from '@/api/LastFm';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble from '@/models/Scrobble';
 
-Vue.use(Vuex);
+export interface RootState {
+  lfmApi: LastFm;
+  validScrobbles: SpotifyListen[];
+  selectedScrobbles: Scrobble[];
+  tracksScrobbled: number;
+  tracksFailed: number;
+  resumedScrobbleCount: number;
+  originalTotalTracks: number;
+  reTagCursorSec: number;
+  scrobbleRunActive: boolean;
+}
 
-export default new Vuex.Store({
+export default createStore<RootState>({
   state: {
     // Yeah it's a singleton, come at me bro
     lfmApi: new LastFm('2bf354b70b4a9a8a4420b2c48333d23e', '440dad9dd54b0e2081b272513401e8df'),
@@ -32,28 +41,28 @@ export default new Vuex.Store({
     scrobbleRunActive: false,
   },
   mutations: {
-    setValidScrobbles(state: any, tracks: SpotifyListen[]) {
-      Vue.set(state, 'validScrobbles', tracks);
+    setValidScrobbles(state, tracks: SpotifyListen[]) {
+      state.validScrobbles = tracks;
     },
-    setSelectedScrobbles(state: any, tracks: Scrobble[]) {
-      Vue.set(state, 'selectedScrobbles', tracks);
+    setSelectedScrobbles(state, tracks: Scrobble[]) {
+      state.selectedScrobbles = tracks;
     },
-    setResumedScrobbleCount(state: any, count: number) {
+    setResumedScrobbleCount(state, count: number) {
       state.resumedScrobbleCount = count;
     },
-    setOriginalTotalTracks(state: any, count: number) {
+    setOriginalTotalTracks(state, count: number) {
       state.originalTotalTracks = count;
     },
-    setReTagCursorSec(state: any, seconds: number) {
+    setReTagCursorSec(state, seconds: number) {
       state.reTagCursorSec = seconds;
     },
-    setScrobbleRunActive(state: any, active: boolean) {
+    setScrobbleRunActive(state, active: boolean) {
       state.scrobbleRunActive = active;
     },
-    trackScrobbled(state: any) {
+    trackScrobbled(state) {
       state.tracksScrobbled += 1;
     },
-    trackFailed(state: any) {
+    trackFailed(state) {
       state.tracksFailed += 1;
     },
   },

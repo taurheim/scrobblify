@@ -15,24 +15,24 @@
           {{ track.track }} - {{ track.artist }} @ {{ track.timestamp.toString() }}<br>
         </span>
       </div>
-      <v-btn class="primary" @click="scrobble">Scrobble</v-btn>
+      <v-btn color="primary" @click="scrobble">Scrobble</v-btn>
     </div>
 
     <!-- Scrobbling view (active, not paused) -->
     <div v-else-if="!paused && !completed">
       <p>Scrobbling... <b>{{ currentTrackName }}</b></p>
-      <v-progress-linear v-model="progress" class="mb-4"></v-progress-linear>
+      <v-progress-linear :model-value="progress" class="mb-4"></v-progress-linear>
 
       <!--
         Preventive pacing is normal operation, not an interruption: it stays put
         for the whole throttled stretch rather than flipping the view into the
         paused panel once per track.
       -->
-      <v-alert v-if="pacing" type="info" dense text class="mb-4">
+      <v-alert v-if="pacing" type="info" density="compact" variant="tonal" class="mb-4">
         {{ pacingNotice }}
       </v-alert>
 
-      <v-card class="pa-3 mb-4" outlined>
+      <v-card class="pa-3 mb-4" variant="outlined">
         <div class="overall-progress">
           Overall: {{ totalSucceeded }} of {{ originalTotalTracks }} scrobbled
         </div>
@@ -44,7 +44,7 @@
         <div>Last 24h: {{ dailyCount }} / {{ dailyLimit }}</div>
       </v-card>
 
-      <v-btn outlined @click="manualPause">Pause &amp; Save</v-btn>
+      <v-btn variant="outlined" @click="manualPause">Pause &amp; Save</v-btn>
     </div>
 
     <!-- Paused view -->
@@ -53,7 +53,7 @@
         {{ pauseReason }}
       </v-alert>
 
-      <v-card class="pa-4 mb-4 text-center" outlined>
+      <v-card class="pa-4 mb-4 text-center" variant="outlined">
         <div v-if="countdown > 0" class="text-h5 mb-2">
           Auto-resuming in {{ formattedCountdown }}
         </div>
@@ -68,7 +68,7 @@
           {{ totalSucceeded }} of {{ originalTotalTracks }} completed so far
         </div>
 
-        <v-btn class="primary mr-2" @click="saveAndExit">Save Progress &amp; Leave</v-btn>
+        <v-btn color="primary" class="mr-2" @click="saveAndExit">Save Progress &amp; Leave</v-btn>
         <!--
           Anything terminal needs a way back in. Without this a manual pause was
           a dead end: a disabled button waiting on an auto-resume that the loop
@@ -78,10 +78,10 @@
         <v-btn v-if="sessionInvalid" color="primary" :href="authorizeUrl">
           Sign in to Last.fm again
         </v-btn>
-        <v-btn v-else-if="canResume" outlined @click="scrobble">
+        <v-btn v-else-if="canResume" variant="outlined" @click="scrobble">
           {{ manuallyPaused ? 'Resume Now' : 'Try Again Now' }}
         </v-btn>
-        <v-btn v-else outlined disabled>Wait Here</v-btn>
+        <v-btn v-else variant="outlined" disabled>Wait Here</v-btn>
       </v-card>
     </div>
 
@@ -98,14 +98,14 @@
     <!-- Failed tracks section -->
     <v-expansion-panels v-if="failedTracks.length > 0" class="mt-4">
       <v-expansion-panel>
-        <v-expansion-panel-header>
+        <v-expansion-panel-title>
           {{ failedTracks.length }} failed track(s)
-        </v-expansion-panel-header>
-        <v-expansion-panel-content>
+        </v-expansion-panel-title>
+        <v-expansion-panel-text>
           <div v-for="(item, i) in failedTracks" :key="i" class="mb-1">
             <strong>{{ item.track.toString() }}</strong> — {{ item.error }}
           </div>
-        </v-expansion-panel-content>
+        </v-expansion-panel-text>
       </v-expansion-panel>
     </v-expansion-panels>
 
@@ -122,7 +122,7 @@
 }
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import Scrobble from '@/models/Scrobble';
 import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
@@ -219,8 +219,9 @@ function formatDuration(ms: number): string {
   return `${hours} hour${hours === 1 ? '' : 's'}`;
 }
 
-export default Vue.extend({
+export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
+  emits: ['complete', 'auto-save', 'save-and-exit', 'checkpoint'],
   data() {
     return {
       scrobbling: false,
@@ -355,7 +356,7 @@ export default Vue.extend({
   created() {
     this.syncRateLimitCounters();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.$store.commit('setScrobbleRunActive', false);
     if (this.countdownTimer) {
       clearInterval(this.countdownTimer);
@@ -365,7 +366,7 @@ export default Vue.extend({
   methods: {
     /**
      * The rolling-window rate-limit tracker, created lazily and cached
-     * off-reactivity (`_`-prefixed keys are skipped by Vue 2's observer). It is
+     * off-reactivity (assigned straight onto the instance, outside data()). It is
      * keyed by Last.fm username, which is not reliably known until the user
      * actually reaches this step.
      */

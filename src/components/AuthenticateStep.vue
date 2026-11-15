@@ -30,13 +30,14 @@
 
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError, identifyUser } from '@/services/Analytics';
 
-export default Vue.extend({
+export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
+  emits: ['complete'],
   data() {
     return {
       checkingAuth: false,
@@ -87,10 +88,10 @@ export default Vue.extend({
       if (hadToken) {
         const query = { ...this.$route.query };
         delete query.token;
-        this.$router.replace({ query }).catch((err: any) => {
-          if (err && err.name !== 'NavigationDuplicated') {
-            trackError('auth.strip_token_url', err);
-          }
+        // Vue Router 4 resolves (rather than rejects) aborted or duplicated
+        // navigations, so anything caught here is a genuine error.
+        this.$router.replace({ query }).catch((err: unknown) => {
+          trackError('auth.strip_token_url', err);
         });
       }
     }

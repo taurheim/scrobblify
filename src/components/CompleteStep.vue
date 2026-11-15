@@ -37,10 +37,9 @@
 }
 </style>
 <script lang="ts">
-import Vue from 'vue';
-import LastFm from '@/api/LastFm';
+import { defineComponent } from 'vue';
 
-export default Vue.extend({
+export default defineComponent({
   props: {
     hasRemaining: {
       type: Boolean,
@@ -49,7 +48,7 @@ export default Vue.extend({
   },
   computed: {
     userName(): string {
-      return this.$store.state.lfmApi.userName;
+      return this.$store.state.lfmApi.getUserName() || '';
     },
     lastwaveUrl(): string {
       const url = 'https://savas.ca/lastwave';

@@ -92,7 +92,7 @@ function normalizeErrorForTracking(error: Error): { trackedError: Error; rawMess
 /*
   Coerces an arbitrary thrown value into an Error. `String(value)` throws for
   Symbols and for objects with a throwing toString/Symbol.toPrimitive, and the
-  global handlers (window.onerror, unhandledrejection, Vue.config.errorHandler)
+  global handlers (window.onerror, unhandledrejection, app.config.errorHandler)
   pass through whatever a third party threw — so this coercion has to be
   survivable in its own right.
 */

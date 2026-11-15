@@ -5,9 +5,9 @@
         <template v-for="log in logs">
           {{ log }}</template>
       </pre>
-      <v-progress-linear v-if="!readyToScrobble" v-model="progress">
+      <v-progress-linear v-if="!readyToScrobble" :model-value="progress">
       </v-progress-linear>
-      <v-btn class="primary" @click="finishStep" v-if="readyToScrobble">Choose which tracks to scrobble</v-btn>
+      <v-btn color="primary" @click="finishStep" v-if="readyToScrobble">Choose which tracks to scrobble</v-btn>
     </div>
     <div v-else>
       <h2>Upload your Spotify Extended Streaming History ZIP file:</h2>
@@ -31,7 +31,7 @@
           style="display: none"
           @change="onFileSelected"
         >
-        <v-icon large class="mb-2">mdi-cloud-upload</v-icon>
+        <v-icon size="large" class="mb-2">mdi-cloud-upload</v-icon>
         <div v-if="selectedFileName">
           <strong>{{ selectedFileName }}</strong>
           <div v-if="detecting" class="zip-summary">Checking what's inside…</div>
@@ -44,7 +44,7 @@
           </div>
         </div>
       </div>
-      <v-alert v-if="embeddedProgress" type="info" text dense class="mt-2">
+      <v-alert v-if="embeddedProgress" type="info" variant="tonal" density="compact" class="mt-2">
         This ZIP also contains a Scrobblify progress file.
         <a role="button" tabindex="0" @click="resumeEmbeddedProgress" @keydown.enter="resumeEmbeddedProgress">
           Resume from it instead
@@ -104,7 +104,7 @@
 }
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import JSZip from 'jszip';
 import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
@@ -151,8 +151,9 @@ function classifyZip(zip: JSZip): ZipContents {
   };
 }
 
-export default Vue.extend({
+export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
+  emits: ['complete', 'import-progress'],
   data() {
     return {
       followLfmRulesLabel: 'Validate track lengths (filters out tracks shorter than 30s, '

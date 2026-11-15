@@ -1,42 +1,48 @@
 <template>
-  <div id="app">
-    <v-app>
-      <div id="nav">
-        <div id="logo">
-          <img src="./assets/logo.png" alt=""> scrobblify
-        </div>
-        <router-link to="/">Home</router-link> |
-        <router-link to="/scrobble">Scrobble</router-link> |
-        <router-link to="/about">About</router-link>
+  <v-app>
+    <div id="nav">
+      <div id="logo">
+        <img src="./assets/logo.png" alt=""> scrobblify
       </div>
-      <v-alert
-        v-if="showUpdateBanner"
-        id="update-available"
-        type="info"
-        text
-        dense
-        class="mx-auto mb-4"
-        max-width="720"
-      >
-        <div class="d-flex align-center flex-wrap">
-          <span class="mr-4">
-            A newer version of Scrobblify is available. Reload to get the latest
-            fixes &mdash; your saved progress is kept.
-          </span>
-          <v-btn small color="primary" @click="reloadForUpdate">Reload</v-btn>
-        </div>
-      </v-alert>
-      <router-view/>
-      <footer id="site-footer">
-        <span :title="buildLabel" :data-build-check="buildCheck">Scrobblify</span> &middot; built by
-        <a href="https://savas.ca">Niko Savas</a>
-      </footer>
-    </v-app>
-  </div>
+      <router-link to="/">Home</router-link> |
+      <router-link to="/scrobble">Scrobble</router-link> |
+      <router-link to="/about">About</router-link>
+    </div>
+    <v-alert
+      v-if="showUpdateBanner"
+      id="update-available"
+      type="info"
+      variant="tonal"
+      density="compact"
+      class="mx-auto mb-4"
+      max-width="720"
+    >
+      <div class="d-flex align-center flex-wrap">
+        <span class="mr-4">
+          A newer version of Scrobblify is available. Reload to get the latest
+          fixes &mdash; your saved progress is kept.
+        </span>
+        <v-btn size="small" color="primary" @click="reloadForUpdate">Reload</v-btn>
+      </div>
+    </v-alert>
+    <router-view/>
+    <footer id="site-footer">
+      <span :title="buildLabel" :data-build-check="buildCheck">Scrobblify</span> &middot; built by
+      <a href="https://savas.ca">Niko Savas</a>
+    </footer>
+  </v-app>
 </template>
 
 <style>
-#app {
+/*
+  Targets the v-app element itself, as `#app` did under Vuetify 2 (whose v-app
+  carried id="app"). On the mount point instead, Vuetify 3's own
+  `.v-application` colour would override the text colour below. Dialogs are
+  included because Vuetify 3 renders them in `.v-overlay-container`, outside
+  the app, where under Vuetify 2 they sat inside it and inherited all of this.
+*/
+#app > .v-application,
+.v-overlay-container {
   font-family: 'Avenir', Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -56,6 +62,25 @@
   font-weight: bold;
 }
 
+/*
+  Vuetify 2 gave every page these app-level defaults; Vuetify 3's reset zeroes
+  all margins and padding and leaves links unstyled.
+*/
+.v-application a,
+.v-overlay-container a {
+  color: rgb(var(--v-theme-primary));
+}
+
+.v-application p,
+.v-overlay-container p {
+  margin-bottom: 16px;
+}
+
+.v-application ul,
+.v-application ol {
+  padding-left: 24px;
+}
+
 #site-footer {
   margin-top: 40px;
   padding-bottom: 16px;
@@ -69,7 +94,7 @@
 }
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { BUILD_NUMBER, GIT_SHA } from './buildInfo';
 import { DeployedBuild, fetchDeployedBuild, isStaleBuild } from './services/BuildCheck';
 import { trackEvent } from './services/Analytics';
@@ -82,7 +107,7 @@ const MIN_RECHECK_GAP_MS = 5 * 60 * 1000;
 // distinguishable in analytics from a user who never reloaded.
 const RELOADED_FOR_KEY = 'scrobblify_reloaded_for_build';
 
-export default Vue.extend({
+export default defineComponent({
   data() {
     return {
       // pending | current | stale | unknown (no readable version.json)
@@ -106,7 +131,7 @@ export default Vue.extend({
     this.buildCheckTimer = window.setInterval(this.checkBuild, RECHECK_INTERVAL_MS);
     document.addEventListener('visibilitychange', this.onVisibilityChange);
   },
-  beforeDestroy() {
+  beforeUnmount() {
     if (this.buildCheckTimer !== null) {
       window.clearInterval(this.buildCheckTimer);
     }
