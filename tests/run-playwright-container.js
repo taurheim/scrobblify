@@ -26,6 +26,11 @@ function dockerArgs(version, playwrightArgs, repositoryPath) {
     '--ipc=host',
     '-e',
     'CI=true',
+    // Forward build identity because linked worktree git metadata is unavailable in Linux.
+    '-e',
+    'GITHUB_SHA',
+    '-e',
+    'GITHUB_RUN_NUMBER',
     '-v',
     `${repositoryPath}:/work`,
     '-w',
