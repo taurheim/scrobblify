@@ -306,7 +306,10 @@ npm run test:e2e:container
 npm run test:e2e:container -- --config=playwright.unreachable-worker.config.ts
 ```
 
-Expected: the standard browser suite and all 10 unreachable-worker tests pass.
+Expected: attempt both local Docker suites. If a Linux Docker engine is
+available, the standard browser suite and all 10 unreachable-worker tests pass.
+If the Linux engine is unavailable, record that limitation and use PR #85's
+required E2E check as the browser-suite acceptance gate after integration.
 
 - [ ] **Step 4: Inspect the final diff**
 
@@ -320,14 +323,17 @@ git status --short
 Expected: no whitespace errors and only the intended CI helper, workflow, and
 Dependabot changes.
 
-- [ ] **Step 5: Push and verify GitHub CI**
+- [ ] **Step 5: Hand off integration and verify GitHub CI**
 
-Run:
+In the parent worktree, merge the completed child branch and push the feature
+branch:
 
 ```powershell
+git merge fix/playwright-ci-container
 git push origin feat/background-scrobbling
 gh pr checks 85 --repo taurheim/scrobblify --watch
 ```
 
-Expected: Lint, Build, and E2E Tests all complete successfully; E2E no longer
-runs `playwright install --with-deps`.
+Expected: the parent owns the merge and push to `feat/background-scrobbling`.
+PR #85's required E2E check passes and is the acceptance gate when local Docker
+suites could not run; E2E no longer runs `playwright install --with-deps`.

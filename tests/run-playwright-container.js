@@ -1,7 +1,14 @@
 const { spawnSync } = require('child_process');
-const {
-  version: installedPlaywrightVersion,
-} = require('@playwright/test/package.json');
+
+function defaultLoadPackage() {
+  // Load at execution time so tests and callers can replace package resolution.
+  // eslint-disable-next-line global-require
+  return require('@playwright/test/package.json');
+}
+
+function defaultLogError(message) {
+  console.error(message);
+}
 
 function imageForVersion(version) {
   if (!/^\d+\.\d+\.\d+$/.test(version)) {
@@ -31,25 +38,32 @@ function dockerArgs(version, playwrightArgs, repositoryPath) {
   ];
 }
 
-function main() {
-  const result = spawnSync(
+function run(playwrightArgs, options = {}) {
+  const {
+    spawn = spawnSync,
+    loadPackage = defaultLoadPackage,
+    workspace = process.cwd(),
+    logError = defaultLogError,
+  } = options;
+  const { version } = loadPackage('@playwright/test/package.json');
+  const result = spawn(
     'docker',
-    dockerArgs(installedPlaywrightVersion, process.argv.slice(2), process.cwd()),
+    dockerArgs(version, playwrightArgs, workspace),
     { stdio: 'inherit' },
   );
 
   if (result.error) {
-    console.error(`Failed to start Docker: ${result.error.message}`);
+    logError(`Failed to start Docker: ${result.error.message}`);
     return 1;
   }
 
   if (result.signal) {
-    console.error(`Docker terminated by signal ${result.signal}.`);
+    logError(`Docker terminated by signal ${result.signal}.`);
     return 1;
   }
 
   if (result.status === null) {
-    console.error('Docker exited without reporting a status.');
+    logError('Docker exited without reporting a status.');
     return 1;
   }
 
@@ -59,8 +73,9 @@ function main() {
 module.exports = {
   dockerArgs,
   imageForVersion,
+  run,
 };
 
 if (require.main === module) {
-  process.exitCode = main();
+  process.exitCode = run(process.argv.slice(2));
 }
