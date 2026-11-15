@@ -54,6 +54,43 @@ const testData2 = [
   },
 ];
 
+/**
+ * A fixture big enough to qualify for the background handoff.
+ *
+ * The offer is gated on 2,700 remaining tracks (`MIN_TRACKS_FOR_BACKGROUND`,
+ * matched in ScrobbleStep.vue and worker/src/api.ts), so the small fixture
+ * above can never reach it. Dates run backwards from a year ago, well outside
+ * Last.fm's acceptance window, which is what makes the queue re-tagged — the
+ * state a real import of this size is in.
+ *
+ * Not committed: it is derived, and `npm run dev:mock -- --background`
+ * regenerates it when missing.
+ */
+async function generateLargeFixture(count, outPath) {
+  const zip = new JSZip();
+  const startMs = Date.now() - 365 * 24 * 60 * 60 * 1000;
+  const perFile = 1000;
+
+  for (let start = 0; start < count; start += perFile) {
+    const entries = [];
+    for (let i = start; i < Math.min(start + perFile, count); i += 1) {
+      entries.push({
+        ts: new Date(startMs + i * 210000).toISOString(),
+        master_metadata_track_name: `Mock Track ${i + 1}`,
+        master_metadata_album_artist_name: `Mock Artist ${(i % 40) + 1}`,
+        master_metadata_album_album_name: `Mock Album ${(i % 12) + 1}`,
+        ms_played: 210000,
+      });
+    }
+    const n = Math.floor(start / perFile);
+    zip.file(`Spotify Extended Streaming History/Streaming_History_Audio_Large_${n}.json`, JSON.stringify(entries));
+  }
+
+  const content = await zip.generateAsync({ type: 'nodebuffer' });
+  fs.writeFileSync(outPath, content);
+  return { path: outPath, bytes: content.length, count };
+}
+
 async function generateFixture() {
   const zip = new JSZip();
   // Prepend a UTF-8 BOM (\uFEFF) to the first file. Some real Spotify exports
@@ -70,4 +107,17 @@ async function generateFixture() {
   console.log(`Created fixture: ${outPath} (${content.length} bytes)`);
 }
 
-generateFixture();
+module.exports = { generateFixture, generateLargeFixture };
+
+// Only when run directly, so `require`ing the large generator from dev-mock.js
+// does not silently rewrite the committed fixture the test suite depends on.
+if (require.main === module) {
+  const large = process.argv.includes('--large');
+  if (large) {
+    const count = Number(process.argv[process.argv.indexOf('--large') + 1]) || 3000;
+    generateLargeFixture(count, path.join(__dirname, 'test-spotify-data-large.zip'))
+      .then((r) => console.log(`Created fixture: ${r.path} (${r.bytes} bytes, ${r.count} tracks)`));
+  } else {
+    generateFixture();
+  }
+}
