@@ -104,8 +104,11 @@ queries.
 
 Selects due jobs, scrobbles a batch for each, commits progress.
 
-**Storage:** D1 for job rows, cursors, and encrypted session keys. R2 for
-track-list blobs.
+**Storage:** D1 for job rows, cursors, and encrypted session keys. Track-list blobs in a second D1 database
+(`BLOB_DB`). They were in R2 until deployment; R2 bills past its free tier with no
+spending cap, where every D1 Free-plan limit is a refusal. Chunks are capped at
+1 MB (D1's row limit is 2 MB) and jobs at 8 MB, so 50 slots fit in one 500 MB
+database.
 
 ### Why Cloudflare, and when to leave
 
@@ -126,16 +129,73 @@ it is easy to "fix" into being wrong.
 | Constraint | Value |
 | --- | --- |
 | Cron ticks/day | 1,440 (1/min) |
-| Subrequests per invocation (free) | 50, **including D1 and R2 binding calls** |
+| Subrequests per invocation (free) | 50, **including D1 binding calls** |
 | Free-tier CPU per invocation | 10ms (wall time awaiting `fetch` does not count) |
+| D1 rows written/day (free) | **100,000**, including index write amplification |
+| D1 rows read/day (free) | 5,000,000 |
 | Scrobbles per Last.fm request | 50 |
 
-With batching, the binding constraints become Last.fm's own limits and the D1
-write budget rather than subrequest count. The real ceiling must therefore be
-derived from a proper model — requests, scrobbles, D1 writes, R2 reads, CPU, and
-retries costed separately, at five-minute peaks rather than daily averages —
-before a concurrency cap is chosen. **The previously stated "~24 concurrent
-users" was computed without batching and is withdrawn.**
+### Measured: the feasibility spike
+
+Run 2026-07-26 against local D1 and R2 (`worker/src/spike.ts`). Workers coarsen
+`performance.now()` to ~1ms, so a single pass cannot resolve this work at all —
+the first attempt reported a misleading "6ms per tick". These are amortised over
+thousands of iterations:
+
+| Operation | Cost |
+| --- | --- |
+| Build + MD5-sign a 50-track batch | **0.25 ms** |
+| Parse a 50-scrobble response | 0.03 ms |
+| Decompress a 1,000-track chunk | 0.14 ms |
+| JSON-parse a 1,000-track chunk | 0.30 ms |
+| **Total CPU per 50-track batch** | **≈0.30 ms** |
+
+**CPU is not the constraint.** At 0.3ms per batch, a tick could sign and process
+~33 batches before approaching the 10ms limit. The earlier concern was
+unfounded — but only measurably so, and note that **Last.fm signs with MD5,
+which WebCrypto does not implement**. There is no platform primitive to fall
+back on; the hash is pure JS on the CPU budget, and it is the single largest
+compute cost in a tick. Any move to per-track signing would multiply it by 50.
+
+**Subrequests bind first.** A job costs ~5 per tick (blob chunk read, CAS acquire,
+mapping insert, the Last.fm call, one batched commit), plus one shared
+job-selection query. That allows **~9 jobs per tick**.
+
+### The correctness fix and the D1 budget are in direct tension
+
+Storing one row per scrobble — the obvious way to satisfy the per-entry outcome
+requirement above — costs 50 inserts plus 50 updates per batch, before index
+amplification. At 54 batches per user per day that is ~16,000 row writes per
+user, and the 100,000/day budget is exhausted by **six users**.
+
+Packing the per-entry timestamps and outcomes into JSON columns on a single
+per-batch row costs ~3 row writes per batch, or ~160 per user per day. Same
+correctness, ~50× cheaper.
+
+**Decision: one row per batch, with per-entry timestamps and outcomes stored as
+packed arrays.** Per-entry granularity is a correctness requirement; per-entry
+*rows* are not.
+
+### Resulting capacity
+
+| Constraint | Implied concurrent jobs |
+| --- | --- |
+| Subrequests (~5/job/tick) | ~240 |
+| D1 writes (packed representation) | ~370 |
+| D1 writes (row-per-scrobble) | ~6 — rejected |
+| CPU | Not binding |
+| Last.fm 5 req/sec per IP | Not binding (~0.15 req/sec at 240 jobs) |
+
+Each user needs 54 job-ticks to consume a 2,700 daily allowance, against ~12,900
+job-ticks available per day.
+
+**Initial cap: 50 concurrent jobs**, roughly a quarter of the measured ceiling.
+The headroom absorbs retries, reconciliation reads, audit writes, and status
+polling, none of which are in the measured path. Raise it on evidence, not
+optimism.
+
+The free tier is therefore viable — which was genuinely uncertain before
+measuring, and is only true because of the packing decision above.
 
 Two constraints that do *not* relax:
 
@@ -185,8 +245,8 @@ The worker must be movable to a plain VM without a rewrite:
 - Plain `fetch` and WebCrypto only in the scrobbling core. Both exist in Workers
   and Node 18+. No `node:` imports, no Workers-only APIs.
 - Portable SQL only, so D1's SQLite can be swapped for Postgres.
-- R2 access behind a minimal get/put-by-key interface, so it can become S3 or
-  the filesystem.
+- Blob access behind a minimal get/put-by-key interface (`BlobStore`), so it
+  can become R2, S3 or the filesystem.
 - **No Durable Objects for scheduling.** This is the principal lock-in trap.
   Scheduling stays "SELECT due jobs → process batch → commit", which runs
   identically under Workers Cron, a systemd timer, or pg_cron.
@@ -277,17 +337,66 @@ live background job.
    nonces, expire on a timer, deleting any captured credential. A user who closes
    the tab mid-flow must not leave a permanent write credential behind.
 
-### The shared secret stays public
+### Two API applications, split by trust
 
-`store.ts:12` hardcodes both the Last.fm API key and shared secret in the client
-bundle. Routing *all* authentication through the worker would make the secret
-genuinely secret, but it would put Cloudflare on the critical path for the
-majority of users who never use background mode.
+**Decided: the worker gets its own Last.fm API application**, separate from the
+one in the client bundle.
 
-This design keeps client-side auth as the default, so **the shared secret remains
-public**. This is the existing accepted risk and is not made worse. The API key is
-public regardless. (See error 26 under Scheduler for the case in favour of a
-separate server-only API application.)
+| | Application | Secret | Callback |
+| --- | --- | --- | --- |
+| Browser | existing (`2bf354b7…`) | public, in the bundle | `https://savas.ca/scrobblify/scrobble` |
+| Worker | **new, server-only** | **genuinely secret** (Worker secret) | `https://api.savas.ca/scrobblify/auth/callback` |
+
+`AuthenticateStep.vue:38-39` hardcodes the client's API key, and `store.ts` its
+shared secret, because a browser cannot keep a secret. That stays true and is
+unchanged — client-side auth remains the default path so Cloudflare is not on the
+critical path for users who never opt in.
+
+What the split buys:
+
+- **Error 26 stops being a shared fate.** The client key is public and therefore
+  abusable by anyone into a suspension. Previously that would have killed every
+  background job; now it only affects the browser path, and vice versa.
+- The worker's shared secret is never published, so its signatures cannot be
+  forged. This is the first genuinely secret credential in the system.
+- Revocation and rate-limit accounting are separable between the two paths.
+
+The cost is honest and small: users opting into background mode see a second
+Last.fm authorisation screen naming a different application. Since the whole
+handoff already requires a second round-trip (below), this adds a consent prompt
+rather than a redirect.
+
+#### Callback URL mechanics
+
+Last.fm's web auth flow (§2.1, §3) has three details that matter here:
+
+- A `cb` parameter may differ from the application's registered callback, so the
+  registered URL is a **default, not a restriction**. Last.fm does not appear to
+  constrain `cb` to the registered origin — which means an attacker can route
+  users through our API key to a callback they control. The single-use signed
+  state and the `auth.getSession` username check are what actually defend the
+  handoff; they are not belt-and-braces.
+- Last.fm appends the token to the callback, **correctly handling a callback that
+  already carries a query string**. The per-handoff signed state can therefore
+  live in `cb`'s query string.
+- **`cb` must be URL-encoded.** `AuthenticateStep.vue:54` interpolates it raw,
+  which is safe only while the callback has no query string. Adding `?state=…`
+  unencoded would let the `&` bind to Last.fm's own URL and the state would
+  silently disappear.
+
+`api.savas.ca` requires a Workers custom domain. DNS is already on Cloudflare
+nameservers, so this is a route, not a nameserver change.
+
+### The client's shared secret stays public
+
+`store.ts:12` hardcodes both the client's Last.fm API key and its shared secret in
+the bundle, because a browser cannot hold a secret. That remains true and is not
+made worse by this design — client-side auth stays the default so Cloudflare is
+not on the critical path for users who never opt in.
+
+What changes is the blast radius: with a separate server-only application (above),
+a compromise or suspension of the public client credentials no longer reaches the
+background jobs.
 
 ### Sessions and identity
 
@@ -352,7 +461,8 @@ do not control:
   D1 alongside the ciphertext.
 - **Delete it the instant** the job completes, fails permanently, is cancelled,
   or reaches its TTL of 60 days.
-- Delete the R2 blob at the same time. Retain summary statistics and the failed-
+- Delete the blob too: cancel deletes it inline, and an hourly cron sweeps the
+  chunks of every completed, failed or cancelled job. Retain summary statistics and the failed-
   track list the completion page promises — nothing else. (An earlier draft said
   "summary statistics only", which contradicted that promise.)
 - **Expose no generic Last.fm proxy.** The worker may only scrobble tracks
@@ -387,6 +497,54 @@ at 2,700/day does not warrant more.
 Completed job rows are retained (without the session key) for 30 days so a
 returning user sees "done — 94,203 scrobbled, 112 failed" with a downloadable
 failure list, rather than "no job found".
+
+### Stalled jobs: dormant, then cancelled, then purged
+
+A parked job (`paused`, `needs_reauth`, `needs_attention`) waits on a person,
+and some people never come back. Without a limit it would hold a Last.fm key
+and one of the 50 places for ever. The hourly housekeeping cron
+(`worker/src/housekeeping.ts`) enforces three deadlines:
+
+| After | What happens | Reversible? |
+| --- | --- | --- |
+| 14 days parked | `dormant`: key and `live_username` deleted, place freed, tracks kept | Yes: reconnect, if a place is free |
+| 30 more days dormant | `cancelled`; its chunks are swept within the hour | No |
+| 30 days after any job ends | its `failures` rows are deleted | No |
+
+- **The clock is a column, not `updated_at`.** Migration 005 adds a trigger
+  that sets `inactivity_deadline` when a job *enters* a parked or dormant state.
+  It is left behind when the job moves on, which is harmless: housekeeping only
+  reads it on jobs that are parked, and re-entering one resets it. `updated_at` moves every time the sweep drains
+  a lease, so a job parked for a month could look fresh. The migration also
+  backfills jobs already parked when it runs.
+- **Dormant is not terminal.** It holds the queue, so `/import/:id` still
+  answers `known: true` and a stale browser copy stays blocked. `/job/live`
+  answers `false`, because nothing can send. Take-back and cancel both work
+  from it. Resume does not; the job has no key.
+- **Reconnecting is the only way back.** The sign-in callback re-attaches the
+  credential and returns the job to `paused`, but only if a place is free,
+  checked inside the same `UPDATE`. A `needs_reauth` job never gave its place
+  up, so it is exempt. `GET /job` reports `reconnectAvailable` for keyless jobs
+  so the client can say "full" rather than offer a button that does nothing.
+- **The job row is never purged.** Its `import_id` is what keeps `/import/:id`
+  answering `known: true`; deleting it would let a browser that kept its copy
+  replay the whole queue. It holds no key and no tracks.
+- **Batches go with the chunks**, when a job ends. They hold the seconds the
+  worker assigned, which only matter while the job can still send or export.
+- **Accepted:** a `needs_attention` job that stalled through our own fault
+  goes dormant on the same clock. Take-back still returns the queue.
+- **Storage bound, weakened.** A dormant job keeps its chunks without holding a
+  place, so "50 places × 8 MB" no longer bounds the blob database. If it fills,
+  new uploads are refused and the browser keeps scrobbling locally. That is a
+  refusal, not a bill.
+
+Every housekeeping pass stays under the Free plan's 50 D1 queries per
+invocation: dormancy and expiry are one `UPDATE … RETURNING` plus one audit
+insert each, and the blob sweep handles at most 8 jobs.
+
+**D1 counts trigger writes in `meta.changes`.** A one-row state change reports
+2 once the trigger fires. Compare `changes` only with zero and use `RETURNING`
+to count rows. Verified with Miniflare.
 
 ## Scheduler
 
@@ -447,12 +605,15 @@ so the failures are not even a suffix.
 A single `cursor` integer cannot represent that, and advancing it past a mixed
 batch silently drops tracks.
 
-**Therefore:** persist a per-entry outcome (an outcome bitmap or a status column
-keyed by index) for every in-flight batch. The cursor advances only across a
-**contiguous prefix** of entries that are terminal — accepted or permanently
-failed. Unknown and code-5 entries stay behind and are retried or reconciled
-individually. Progress counts and the audit log are derived from the per-entry
-outcomes, not from the cursor.
+**Therefore:** persist a per-entry outcome for every in-flight batch. The cursor
+advances only across a **contiguous prefix** of entries that are terminal —
+accepted or permanently failed. Unknown and code-5 entries stay behind and are
+retried or reconciled individually. Progress counts and the audit log are derived
+from the per-entry outcomes, not from the cursor.
+
+Per-entry granularity, **not** per-entry rows: the timestamps and outcomes are
+packed into JSON columns on one row per batch. The measured spike shows a
+row-per-scrobble schema exhausts D1's free write budget at six concurrent users.
 
 ### Error handling
 
@@ -471,11 +632,12 @@ Error 9 is not exclusive to long-running jobs — the client persists session ke
 in `localStorage` indefinitely and can hit revocation too — but the worker must
 handle it without a user present to re-authenticate.
 
-Error 26 is a single point of failure worth stating plainly: the API key is
-shared with the public client bundle, so anyone can abuse it and get it
-suspended, killing every background job at once. A **separate, server-only
-Last.fm API application** would isolate that risk, at the cost of an honest
-second authorisation prompt.
+Error 26 is now contained rather than fatal. The worker uses its **own,
+server-only API application** (see Authentication), so the public client key —
+which anyone can abuse into a suspension — is no longer shared fate with the
+background jobs. A suspension of the worker's key still halts every job at once,
+but that key is never published, so the only way to earn it is our own
+misbehaviour.
 
 ### "Wait until tomorrow" is an assumption, not a fact
 
@@ -597,7 +759,7 @@ a single API call, not a paginated crawl of the user's history.
 
 ### Safe-deploy mechanics
 
-- **Immutable job payload — but bytes are not behaviour.** The R2 chunks are
+- **Immutable job payload — but bytes are not behaviour.** The blob chunks are
   written once at job creation and never mutated. That prevents the *data* from
   changing; it does **not** prevent new code from parsing, normalising, ordering,
   or timestamping the same bytes differently. Immutability alone is not a
@@ -651,11 +813,11 @@ Because this is a beta that may be withdrawn:
   both code paths already exist (`StateManager.exportToFile` /
   `importFromFile`), so this costs almost nothing and guarantees progress is
   never stranded server-side.
-- **Concurrency cap.** Background mode admits a bounded number of concurrent jobs.
-  **The initial number cannot be chosen yet** — the earlier "20, below the ~24
-  ceiling" was derived from the withdrawn capacity model and is void. It must come
-  out of the feasibility spike (see Open questions). When full, the UI offers the
-  normal client-side flow and reports that background mode is at capacity.
+- **Concurrency cap.** Background mode admits a bounded number of concurrent
+  jobs, **initially 50** — roughly a quarter of the ~240 ceiling the feasibility
+  spike measured, leaving headroom for retries, reconciliation reads, audit
+  writes and status polling. When full, the UI offers the normal client-side flow
+  and reports that background mode is at capacity.
 
   Define explicitly *which states consume a slot*. A job that is `needs_reauth`,
   `needs_attention`, or paused must not squat a scarce slot for 60 days: attach an
@@ -725,7 +887,7 @@ clients.
 The export escape hatch must emit exactly the `ScrobbleState` shape
 `importFromFile` accepts, so a user can always return to the client-side flow.
 Ordering matters on cancellation: **generate and deliver the export before
-deleting the R2 blob**, or the data needed to build it is already gone.
+deleting the blob**, or the data needed to build it is already gone.
 
 ### Conflict rules
 
@@ -739,6 +901,26 @@ deleting the R2 blob**, or the data needed to build it is already gone.
 
 - Opt-in only, offered at any of the four entry points above when the remaining
   selection exceeds 2,700 tracks.
+- **Invite-only via `?beta=1`.** Even with `VUE_APP_BACKGROUND_API` set, the
+  offer is hidden unless the browser has visited a URL with `?beta=1`. The
+  opt-in is sticky (`scrobblify.background.beta` in localStorage) because the
+  query string does not survive the handoff: `stripQuery` drops it on return
+  and the Last.fm callback never carried it. `?beta=0` clears it, and an
+  opted-in browser shows a banner with a switch-off link.
+- **The gate covers the offer only, never recovery.** `isBackgroundEnabled`
+  (configured *and* opted in) guards `probeBackgroundAvailability` and
+  `preflight`. The live-job authority check, finishing a handoff on return,
+  and rendering an existing job use `isBackgroundConfigured` alone, so a browser
+  that has lost its storage — and with it the opt-in — still learns it has a
+  job running and is blocked from scrobbling underneath it.
+- **An unanswered authority check falls through for non-beta browsers.** A
+  `live: true` answer blocks everyone, but when the worker cannot be reached a
+  browser that has not opted in and holds no local handover evidence waits
+  3s and scrobbles normally. Opted-in browsers, and any browser with an
+  ownership, unresolved or stale-snapshot record, a pending handoff or a known
+  job, stay blocked. Otherwise a worker outage would stop every user of the
+  site. Accepted gap: lost localStorage plus a leftover handed-over queue in
+  IndexedDB plus an unreachable worker.
 - Labelled clearly as beta in the UI.
 - The opt-in must state plainly: the selected track list is uploaded to
   Scrobblify's server; a Last.fm credential is stored until the import finishes;
@@ -783,26 +965,18 @@ New error contexts: `background.handoff`, `background.upload`,
 
 ## Open questions for implementation
 
-**Blocking — these change the design:**
+**Blocking — none remaining.** All three are now decided:
 
-- **A feasibility spike is a design gate, not a follow-up.** Withdrawing the false
-  ~24-user number was necessary but is not sufficient; "Cloudflare stops being the
-  binding constraint" is currently an assertion, and the 10ms CPU limit was filed
-  as non-blocking despite a tick doing HMAC signing, gzip decompression, JSON
-  parsing, response processing, and reconciliation. **No concurrency cap may be
-  chosen until this is measured.** The spike must state, for one 50-track batch:
-  the exact D1 statements and rows written (including index write amplification),
-  R2 operations, subrequest count, and measured CPU — comparing a
-  **one-mapping-row-per-batch** representation against **fifty**. If the free tier
-  cannot carry even a handful of jobs, that is an argument for starting on Oracle,
-  and it is much cheaper to learn now than after the auth flow is built.
-- **Should Scrobblify move to its own origin?** LastWave shares
-  `https://savas.ca`, and no cookie, token, or CORS configuration can isolate two
-  applications on one origin. Either accept a shared trust boundary explicitly or
-  move. Affects existing site structure, so it is the user's call.
-- **A separate, server-only Last.fm API application?** The public API key can be
-  abused by anyone into an error-26 suspension that kills every background job.
-  Isolating it costs an extra, honestly-explained authorisation prompt.
+- ~~**Free-tier feasibility.**~~ Measured 2026-07-26 (`worker/src/spike.ts`). CPU
+  is not the constraint (0.30 ms per 50-track batch against a 10 ms limit);
+  subrequests bind at ~240 concurrent jobs; D1 writes are affordable only with
+  packed per-batch rows. Initial cap 50. See Architecture.
+- ~~**Should Scrobblify move to its own origin?**~~ **Accepted the shared trust
+  boundary** for the beta, explicitly and documented. No third-party scripts on
+  `savas.ca`. Revisit if the feature graduates.
+- ~~**A separate, server-only Last.fm API application?**~~ **Yes.** Callback
+  `https://api.savas.ca/scrobblify/auth/callback`. The browser keeps the existing
+  key and callback unchanged. See Authentication.
 
 **Non-blocking:**
 

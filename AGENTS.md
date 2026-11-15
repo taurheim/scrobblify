@@ -144,14 +144,41 @@ nothing at all.
 - `scrobble_stopped` — terminal; the run is over until the user comes back.
   Reasons: `daily_limit`, `not_stored`, `lastfm_daily_limit`, `rate_limit_exhausted`,
   `repeated_rejections`, `repeated_failures`, `session_invalid`,
-  `not_authenticated`, `manual`,
-  `save_and_exit`. Only `manual` and `save_and_exit` are user actions. Every
-  one carries `auto_saved`, which is the difference between an interruption and
-  lost work — all of them now save, so `auto_saved: false` in the data means the
-  save itself failed and is worth investigating. `save_and_exit` exists since
-  2026-09-27 and only fires when "Save Progress & Leave" is clicked during a
-  *transient* countdown (after a terminal stop the loop has already returned and
-  reported).
+  `not_authenticated`, `manual`, `save_and_exit`, and
+  the backdating guards `retag_blocked`, `retag_no_second`,
+  `retag_second_refused`, `retag_identity_unavailable`,
+  `retag_journal_unavailable`. Only `manual` and `save_and_exit` are user
+  actions. Every one carries `auto_saved`, which is the difference between an
+  interruption and lost work. `save_and_exit` exists since 2026-09-27 and only
+  fires when "Save Progress & Leave" is clicked during a *transient* countdown
+  (after a terminal stop the loop has already returned and reported).
+
+`auto_saved: true` means the progress write to IndexedDB **resolved** before the
+event was emitted — every stop path awaits its save first, and a failed write
+sets it `false`. So `false` means the save itself failed and is worth
+investigating. **Events from before this was fixed (2026-09) set it before the
+write started, so in older data it only means "a save was attempted"**: a
+failed save still reported `true`, and nothing distinguished the two.
+
+The two storage stops (`retag_identity_unavailable`, `retag_journal_unavailable`)
+also carry `storage_failure`, saying *why* this browser couldn't store data:
+
+| Value | Meaning |
+| --- | --- |
+| `QuotaExceededError`, `SecurityError`, … | the `DOMException` name the write threw. `SecurityError` is storage blocked outright (private browsing, strict cookie settings); `QuotaExceededError` is full or zero-quota storage |
+| `not_persisted` | the journal write didn't throw but read back as something else — private modes have done this |
+| `invalid_record` | the journal refused the record itself (e.g. an empty import id) |
+| `no_random_source` | no `crypto.getRandomValues`, so no import identity could be minted |
+| `no_persist_channel` | the scrobble step had no awaitable save to confirm the identity with |
+| `unknown` | something without a `.name` was thrown |
+
+These stops only affect **backdated** ("older than 2 weeks") plays; an import
+of recent listens never touches the journal. Both leave the whole queue in
+place. When the save also fails, the paused panel says so (`.save-failed`)
+instead of claiming progress is saved, and "Save Progress & Leave" still
+downloads the progress file. It no longer skips the download when the browser
+save fails. `session_saved.saved_in_browser` records which happened; `false`
+means the user left with only the file.
 
 All terminal paths go through the `trackStopped()` helper rather than emitting
 inline, so a new one cannot silently skip the event.
@@ -296,6 +323,11 @@ threw — so coercion goes through `toError()`, which guards `String(value)`
 guard loses the report *and* throws a fresh error out of a `catch` block or a
 global handler, which is exactly where it does the most damage.
 
+Outside production builds, `trackEvent` also logs each event to the console as
+`[scrobblify:event] <name> <json>`. Nothing is captured from localhost, so this
+is how Playwright asserts on telemetry (see `captureEvents` in the "Browser
+storage unavailable" tests). Production bundles don't include it.
+
 ## Scrobble timestamps
 
 Last.fm keys a scrobble on **(user, artist, track, timestamp)** and silently
@@ -371,12 +403,20 @@ the source of truth:
   user's own scrobbler, which would otherwise lose the rest of that day's real
   plays). For today it stops as `daily_limit` and says when midnight UTC is in
   local time; a play keeping its real date on a past full day is recorded as
-  failed, since that day never resets. The count is re-read at every
-  checkpoint. `RateLimitTracker` no longer has a daily limit; its
-  `dailyCount` is telemetry only.
+  failed, since that day never resets. Re-tagged seconds never go back past
+  today's UTC midnight, so a run stays on the one day it checked; just after
+  midnight the cursor can overtake the clock by a few seconds and waits it out
+  (up to `RETAG_CLOCK_WAIT_MAX_SECONDS`). A *reserved* range after a background
+  take-back can reach into past days: full ones are skipped, and running out
+  falls back to the normal window. A pinned second always goes through
+  unchecked. The count is re-read at every checkpoint. `RateLimitTracker` no
+  longer has a daily limit; its `dailyCount` is telemetry only.
 - **Verify.** An accepted play goes into `pending`, not the count. At every
-  checkpoint, before every stop and at the end, pending plays are read back
-  (one `user.getrecenttracks` range per UTC day) and matched on **timestamp
+  checkpoint, at the start of every run (including resumes) and at the end,
+  pending plays are read back. Not before most stops: the stop is already on
+  screen, and a "Try Again" during a slow read would hit the loop's re-entry
+  guard and do nothing. `daily_limit` is the exception, verified before its stop
+  is shown. Reads are one `user.getrecenttracks` range per UTC day, matched on **timestamp
   alone**: Last.fm may autocorrect artist/track names, so a name match would
   call a stored play lost and re-send it as a duplicate.
 - **Lost only on a full day.** A pending play missing from the library is
@@ -393,10 +433,15 @@ the source of truth:
   private profile) they stay pending, the run carries on, and the Complete step
   reports them as "sent, couldn't confirm" rather than counting them.
 
-The Playwright mock (`tests/lastfmMock.js`) models this: its library is
-stateful, enforces the cap per UTC day and fills itself from any
-`track.scrobble` response that says accepted, including ones a test answers
-with its own route.
+The Last.fm mock (`tests/lastfmMock.js`) models this, for Playwright and
+`dev:mock` alike: its library is stateful, enforces the cap per UTC day and
+fills itself (`recordScrobble`) from any `track.scrobble` response that says
+accepted, including ones a test answers with its own route.
+
+**The background worker does not.** `worker/` still paces to 2,700 a day and
+counts accepted replies, so a background job past 750 a day loses plays exactly
+the way #106 did. Pending browser plays handed over in a handoff are also never
+verified.
 
 ## Import robustness
 
@@ -472,6 +517,135 @@ Two Last.fm quirks the validation path has to absorb:
 Timestamps sent to Last.fm are always integer seconds — `from`/`to` window ends
 round outwards so a duplicate-check window can only widen, never miss.
 
+## Running locally with mocks
+
+`npm run dev:mock` starts a dev server on **port 8090 by default** (or `$PORT`
+when set) whose Last.fm is served by mock middleware in `vue.config.js`.
+`npm run dev:mock:bg` adds a fake
+background worker, and prints a URL carrying `?beta=1` because the handoff
+offer is behind that opt-in (see "Background scrobbling beta gate" below).
+Open the printed URL in **any** browser — the mocking lives
+in the server, so every tab and every device on the LAN is covered. The app
+shows a hazard-striped **MOCK MODE** banner; if it isn't there, you aren't
+mocked.
+
+This used to work very differently, and the difference is the point. `dev:mock`
+drove a headed Playwright window and installed `page.route()` on that single
+page. Exactly one tab was mocked. Opening the same dev server in your ordinary
+browser reached the *real* Last.fm and scrobbled to whatever account that
+profile held — while the script's console banner said "nothing is really
+scrobbled". Anything that reintroduces per-page interception reintroduces that.
+
+Three build-time seams make it work, each `process.env.VUE_APP_* || <real
+default>` so a production bundle is unchanged:
+
+| Var | Points at | Default |
+| --- | --- | --- |
+| `VUE_APP_LASTFM_API_BASE` | `/mock/lastfm` | `https://ws.audioscrobbler.com/2.0/` |
+| `VUE_APP_LASTFM_AUTH_BASE` | `/mock/lastfm/auth` | `https://www.last.fm/api/auth/` |
+| `VUE_APP_BACKGROUND_API` | `/mock/worker` | unset (feature hidden) |
+
+The values are **relative on purpose**; an absolute origin would bake in
+localhost and break the moment you opened the server from a phone. The banner
+keys off `VUE_APP_LASTFM_API_BASE` rather than a separate flag, so there is no
+way to be mocked without being told. `vue.config.js` throws if a *production*
+build is attempted with any of them set.
+
+`/mock/lastfm/auth` hands back a random single-use token and redirects to
+`<publicPath>#/scrobble?token=…` rather than pre-seeding localStorage, so the
+authenticate step runs for real: the app exchanges the token against the mocked
+`auth.getSession` exactly as it would in production. The token must be fresh per
+click, because `LastFm.init` records the token it has begun exchanging in
+sessionStorage and refuses to resubmit it.
+
+**dev:mock never reuses a server and defaults to 8090 rather than 8080.** Both
+halves matter.
+`VUE_APP_*` is inlined by webpack at compile time, so adopting a server started
+without the mock env would mock nothing while announcing the opposite. And
+`playwright.config.ts` sets `reuseExistingServer` on 8080, so a mock server left
+there would be silently adopted by the next `npx playwright test` — whose specs
+intercept `ws.audioscrobbler.com`, a URL the mocked app no longer calls.
+
+The canned responses live in transport-free cores — `handleLastFm()` in
+`tests/lastfmMock.js` and `createMockWorker().handle()` in
+`tests/backgroundMock.js` — consumed by both the dev middleware and the
+Playwright suite. Keep it that way: two copies of "what Last.fm returns" is how
+the tests and the interactive run start quietly disagreeing. `interceptLastFm`
+remains a thin `page.route` wrapper so the suite's 20+ call sites are unaffected.
+
+Only `vue.config.js` (Node, build time) requires from `tests/`. Nothing under
+`src/` imports a mock.
+
+Two traps already paid for:
+
+- Mock middlewares are wrapped in `guard()`. They are async, so an uncaught
+  throw becomes an unhandled rejection and kills the whole `vue-cli-service
+  serve` process — losing the compile and the watch because one request had
+  malformed JSON.
+- `createMockWorker` reads `appOrigin` with an explicit `=== undefined` check,
+  not `||`. An empty string is a deliberate *relative* origin; `||` treated it
+  as unset and handed back `localhost:8080`, pointing the handoff at the
+  Playwright port.
+
+## Background scrobbling beta gate
+
+The handoff offer is invite-only: visit any page with `?beta=1` to opt a
+browser in, `?beta=0` to opt out. An opted-in browser shows an info banner
+with a switch-off link. It is independent of `VUE_APP_BACKGROUND_API`, which
+only says whether the build *can* reach a worker.
+
+Two functions in `src/services/BackgroundScrobbling.ts`, and the split is
+load-bearing:
+
+- `isBackgroundEnabled()` — configured **and** opted in. Guards the *offer*
+  only: `probeBackgroundAvailability` and `preflight`.
+- `isBackgroundConfigured()` — configured. Guards every *recovery* path: the
+  live-job authority check, finishing a handoff on return from Last.fm, and
+  rendering an existing job.
+
+**Never gate a recovery path on the opt-in.** A browser that clears its
+storage loses the opt-in but can still have a job running on the server, and
+it is precisely the browser `enforceServerAuthority` exists to block from
+scrobbling the same queue underneath it.
+
+**But an unanswered check only blocks a browser with a reason to worry.** The
+check runs for everyone and a `live: true` answer blocks everyone. When there
+is *no* answer (worker down, not yet deployed, timed out), a browser that has
+not opted in and holds no local handover evidence waits
+`FALLTHROUGH_TIMEOUT_MS` (3s) and then scrobbles normally — see
+`mayScrobbleWithoutAuthority`. Evidence means an ownership record, an
+unresolved-ownership or stale-snapshot record, a pending handoff, a known job,
+or `sawServerOwnership`. **Not** the handoff lineage: every backdating user
+has one, because the re-tag cursor lives there. Without this rule
+`.env.production` compiling in the worker URL was enough to stop every user of
+the site from scrobbling whenever the worker could not be reached.
+
+The accepted gap: a browser that lost its localStorage but kept a leftover
+handed-over queue in IndexedDB, while the worker is unreachable. A successful
+handover clears the saved queue, so this needs a stale copy as well.
+
+**An imported progress file is a queue from somewhere else**, so the local
+evidence above says nothing about it. `importProgressFile` asks
+`/scrobblify/import/:id` about the *file's* `importId` before restoring it
+(`importedQueueMaySend`): `known: true` refuses the file, because the worker
+was handed that queue and the file is a copy from before. An unanswered check
+follows the same fall-through rule. A file with no id cannot be checked. That
+is safe only for files that were never handed over, and it is the one gap
+here: a file exported before `beginHandoff` minted its id.
+
+`npx playwright test -c playwright.unreachable-worker.config.ts` covers this
+against a build whose worker URL cannot resolve; the default config ignores
+`tests/unreachable-worker/` because its build has no worker URL at all. CI
+runs both. It uses port 8471, because other local worktrees commonly occupy
+the 809x range.
+
+The opt-in is sticky (localStorage) rather than read from the URL, because
+the query string does not survive the flow: `stripQuery` discards all of it on
+a handoff return, and the Last.fm callback never carried it. A per-load flag
+would switch itself off exactly when a handoff came back. The parameter is
+read from the query string *and* the hash (dev runs the router in hash mode)
+and deliberately not stripped — see `consumeBetaParam`.
+
 ## Linting
 
 `npm run lint` auto-fixes; `npm run lint:check` (`--no-fix`) is what CI runs, so
@@ -505,9 +679,9 @@ npx playwright test   # or: npm run serve / npm run dev:mock
 
 Set `PORT` in the **same command** that starts the server or runs the tests —
 agent shells don't keep environment variables between calls, and a run that
-loses it falls back to 8080 without complaint. Reuse the same port for the rest
-of the session so later runs find your server instead of starting another, and
-stop any server you started when you're done.
+loses it falls back to 8080 (or 8090 for `dev:mock`) without complaint. Reuse
+the same port for the rest of the session so later runs find your server instead
+of starting another, and stop any server you started when you're done.
 
 `vue-cli-service` quietly moves to the next free port if the one requested is
 taken, so read the URL it prints rather than assuming.

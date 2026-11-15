@@ -17,5 +17,17 @@ export interface MockLibrary {
   countOnDay(uts: number): number;
 }
 
+export interface MockResponse {
+  status: number;
+  contentType: string;
+  body: string;
+}
+
 export function interceptLastFm(page: Page, options?: { dailyCap?: number }): Promise<MockLibrary>;
 export function mockLastFmAuth(page: Page): Promise<void>;
+export function handleLastFm(params: URLSearchParams, library: MockLibrary): MockResponse;
+export function createLibrary(dailyCap?: number): MockLibrary;
+export function recordScrobble(library: MockLibrary, params: URLSearchParams, body: unknown): void;
+export function lastFmAuthRedirect(basePath?: string): string;
+export const MOCK_USER: string;
+export const MOCK_SESSION_KEY: string;
