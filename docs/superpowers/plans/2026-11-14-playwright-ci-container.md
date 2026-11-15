@@ -228,7 +228,7 @@ git commit -m "Isolate E2E from GitHub runner upgrades" -m "Co-authored-by: Copi
 **Files:**
 - Create: `.github/dependabot.yml`
 
-- [ ] **Step 1: Add weekly npm updates**
+- [ ] **Step 1: Add weekly Playwright updates**
 
 Create `.github/dependabot.yml`:
 
@@ -239,6 +239,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    allow:
+      - dependency-name: "@playwright/test"
     groups:
       playwright:
         patterns:
@@ -254,8 +256,8 @@ Get-Content .github\dependabot.yml
 git diff --check
 ```
 
-Expected: valid indentation, npm updates rooted at `/`, weekly schedule, and no
-whitespace errors.
+Expected: valid indentation, npm updates rooted at `/`, restricted to
+`@playwright/test`, weekly schedule, and no whitespace errors.
 
 - [ ] **Step 3: Commit dependency automation**
 

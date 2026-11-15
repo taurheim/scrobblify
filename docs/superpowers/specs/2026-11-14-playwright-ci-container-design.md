@@ -35,10 +35,10 @@ repository script so their setup cannot drift.
 
 ## Dependency Updates
 
-Add weekly Dependabot npm updates. Updating `@playwright/test` updates the lock
-file through the ordinary dependency PR. Because the container tag is derived
-at runtime from the installed package, there is no second Playwright version to
-update manually.
+Add weekly Dependabot updates for `@playwright/test`. Updating it updates the
+lock file through the ordinary dependency PR. Because the container tag is
+derived at runtime from the installed package, there is no second Playwright
+version to update manually.
 
 The image uses Playwright's `noble` image family. This is independent of the
 GitHub host release. A future Playwright release that no longer publishes that
