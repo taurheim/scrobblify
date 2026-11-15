@@ -22,6 +22,7 @@ import {
 } from '../../src/shared/lastfm/protocol';
 
 const API_BASE_URL = 'https://ws.audioscrobbler.com/2.0/';
+const WORKER_ERROR_OPTIONS = { includeRequestDetails: false } as const;
 
 /**
  * Bounds a hung Last.fm request. Without this a stalled connection can hold a
@@ -109,18 +110,31 @@ export class LastFmClient {
           'non-json',
           'Last.fm returned a non-JSON response',
           requestParams,
+          WORKER_ERROR_OPTIONS,
         ),
       );
     }
 
     if (body && typeof body.error === 'number') {
       throw new Error(
-        buildLastFmErrorMessage(response.status, body.error, body.message || '', requestParams),
+        buildLastFmErrorMessage(
+          response.status,
+          body.error,
+          body.message || '',
+          requestParams,
+          WORKER_ERROR_OPTIONS,
+        ),
       );
     }
     if (!response.ok) {
       throw new Error(
-        buildLastFmErrorMessage(response.status, 'http', response.statusText, requestParams),
+        buildLastFmErrorMessage(
+          response.status,
+          'http',
+          response.statusText,
+          requestParams,
+          WORKER_ERROR_OPTIONS,
+        ),
       );
     }
     return body;

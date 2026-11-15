@@ -1050,6 +1050,67 @@ test.describe('Session Resume', () => {
     await expect(page.locator('.overall-progress')).toContainText('3 of 5');
   });
 
+  test('legacy browser-only progress resumes while the background service is unavailable', async ({
+    page,
+  }, testInfo) => {
+    test.skip(
+      testInfo.config.metadata.backgroundAuthority !== true,
+      'Runs with playwright.authority.config.ts so background authority is compiled in.',
+    );
+
+    let authorityChecks = 0;
+    await page.route('http://background.invalid/**', async (route: Route) => {
+      if (new URL(route.request().url()).pathname === '/scrobblify/job/live') {
+        authorityChecks++;
+      }
+      await route.abort('connectionfailed');
+    });
+
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    // No importId or local ownership markers: this predates background
+    // handoff support and could never have been uploaded to the worker.
+    await seedSavedState(page, buildState());
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    expect(authorityChecks).toBe(0);
+  });
+
+  test('identified saved progress stays fail-closed while the background service is unavailable', async ({
+    page,
+  }, testInfo) => {
+    test.skip(
+      testInfo.config.metadata.backgroundAuthority !== true,
+      'Runs with playwright.authority.config.ts so background authority is compiled in.',
+    );
+
+    let authorityChecks = 0;
+    await page.route('http://background.invalid/**', async (route: Route) => {
+      if (new URL(route.request().url()).pathname === '/scrobblify/job/live') {
+        authorityChecks++;
+      }
+      await route.abort('connectionfailed');
+    });
+
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState({
+      importId: 'identified-queue-1234567890',
+    }));
+    await page.reload();
+
+    await expect(page.getByText("Can't reach the background service.")).toBeVisible({
+      timeout: 5000,
+    });
+    await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeHidden();
+    expect(authorityChecks).toBeGreaterThan(0);
+  });
+
   test('preventive pacing keeps scrobbling, it does not pause per track', async ({ page }) => {
     // Regression: `msUntilBurstSafe()` frees exactly one slot at a time, so once
     // the rolling window is full *every* remaining track waits a fraction of a

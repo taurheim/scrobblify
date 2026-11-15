@@ -11,6 +11,7 @@ import { LastFmClient } from './lastfm';
 import { handleRequest, ApiEnv } from './api';
 import { runTick } from './scheduler';
 import { reapExpiredHandoffs } from './handoff';
+import { PostHogAnalytics } from './analytics';
 
 export interface Env {
   DB: D1Database;
@@ -23,6 +24,9 @@ export interface Env {
   CREDENTIAL_SECRET: string;
   CALLBACK_URL: string;
   APP_URL: string;
+  /** Public PostHog ingestion token; never use a personal API key here. */
+  POSTHOG_TOKEN: string;
+  POSTHOG_HOST: string;
 }
 
 /**
@@ -130,6 +134,11 @@ export default {
       return;
     }
     const api = buildEnv(env);
+    const analytics = new PostHogAnalytics({
+      token: env.POSTHOG_TOKEN,
+      host: env.POSTHOG_HOST,
+      waitUntil: (promise) => { ctx.waitUntil(promise); },
+    });
     const nowSec = api.now();
     ctx.waitUntil((async () => {
       // Reaping first: an abandoned handoff holds both a concurrency slot and
@@ -137,7 +146,13 @@ export default {
       // created it.
       const reaped = await reapExpiredHandoffs(api.sql, nowSec);
       const report = await runTick(
-        { sql: api.sql, blobs: api.blobs, lastfm: api.lastfm, credentialSecret: api.credentialSecret },
+        {
+          sql: api.sql,
+          blobs: api.blobs,
+          lastfm: api.lastfm,
+          credentialSecret: api.credentialSecret,
+          analytics,
+        },
         nowSec,
       );
       console.log('tick', JSON.stringify({ reaped, ...report }));

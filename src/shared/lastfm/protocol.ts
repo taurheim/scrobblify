@@ -275,10 +275,15 @@ export function buildLastFmErrorMessage(
   errorCode: number | string,
   errorMessage: string,
   params: {[key: string]: string},
+  options: { includeRequestDetails?: boolean } = {},
 ): string {
-  const safeParams = sanitizeRequestParams(params);
   const statusPart = httpStatus ? ` (HTTP ${httpStatus})` : '';
-  return `Last.fm API error ${errorCode}${statusPart}: ${errorMessage}. Request: ${JSON.stringify(safeParams)}`;
+  const summary = `Last.fm API error ${errorCode}${statusPart}`;
+  if (options.includeRequestDetails === false) {
+    return summary;
+  }
+  const safeParams = sanitizeRequestParams(params);
+  return `${summary}: ${errorMessage}. Request: ${JSON.stringify(safeParams)}`;
 }
 
 export function isLastFmApiError(error: unknown): boolean {

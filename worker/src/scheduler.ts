@@ -58,6 +58,7 @@ import {
   type ScrobbleOutcome,
 } from '../../src/shared/lastfm/protocol';
 import { ALGORITHM_VERSION } from './handoff';
+import { WorkerAnalytics } from './analytics';
 
 /**
  * How long a tick may hold a job.
@@ -104,6 +105,7 @@ export interface SchedulerEnv {
   lastfm: LastFmClient;
   /** Worker secret used to decrypt stored session keys. Never stored in D1. */
   credentialSecret: string;
+  analytics?: WorkerAnalytics;
 }
 
 export interface TickReport {
@@ -125,6 +127,56 @@ interface EntryOutcome {
   /** Last.fm ignore code, when there was one. */
   c?: number;
   t: number;
+}
+
+interface RunLineage {
+  previouslyScrobbled: number;
+  isResumed: boolean;
+}
+
+function progressProperties(
+  job: JobRow,
+  lineage: RunLineage,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    execution: 'background',
+    job_id: job.id,
+    scrobbled_tracks: job.cursor,
+    total_tracks: job.total_tracks,
+    succeeded_tracks: job.scrobbled_count,
+    failed_tracks: job.failed_count,
+    is_resumed: lineage.isResumed,
+    previously_scrobbled: lineage.previouslyScrobbled,
+    original_total_tracks: job.total_tracks,
+    total_succeeded: job.scrobbled_count,
+    completion_pct: job.total_tracks
+      ? Math.round((1000 * job.scrobbled_count) / job.total_tracks) / 10
+      : 0,
+    ...extra,
+  };
+}
+
+async function capture(
+  env: SchedulerEnv,
+  job: JobRow,
+  event: string,
+  lineage: RunLineage,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  if (!env.analytics) {
+    return;
+  }
+  try {
+    const delivery = env.analytics.capture(
+      event,
+      job.username,
+      progressProperties(job, lineage, extra),
+    );
+    void delivery.catch(() => {});
+  } catch {
+    // Custom adapters get the same best-effort boundary as the HTTP adapter.
+  }
 }
 
 async function audit(
@@ -548,6 +600,7 @@ async function sendBatch(
   tracks: JobTrack[],
   startIndex: number,
   nowSec: number,
+  lineage: RunLineage,
 ): Promise<BatchResult> {
   const job = lease.job;
   const assignment = assignTimestamps(
@@ -648,6 +701,9 @@ async function sendBatch(
       return { sent: 0, accepted: 0, failed: 0, global: { kind: 'halt', reason: message } };
     }
     if (isRateLimitError(error)) {
+      await capture(env, job, 'scrobble_rate_limited', lineage, {
+        reason: 'lastfm_ip_rate_limit',
+      });
       // Error 29 is an *IP* throttle, shared by every job on this worker.
       // Backing off one job would leave the others hammering the same limit.
       return { sent: 0, accepted: 0, failed: 0, global: { kind: 'breaker', reason: message } };
@@ -663,6 +719,11 @@ async function sendBatch(
     // A network error consumed nothing, but the batch stays in `sending`: we
     // cannot tell a request that never arrived from a response that never came
     // back, and only reconciliation can.
+    if (isNetworkError(error)) {
+      await capture(env, job, 'scrobble_network_error', lineage, {
+        attempted_count: assigned.length,
+      });
+    }
     return { sent: 0, accepted: 0, failed: 0, stop: { state: 'retry', reason: message } };
   }
 
@@ -715,6 +776,22 @@ async function sendBatch(
     })),
   });
 
+  const ignoredCodes = outcomes.reduce<Record<string, number>>((counts, outcome) => {
+    if (outcome.s === 'accepted') {
+      return counts;
+    }
+    const key = outcome.c === undefined ? 'unknown' : String(outcome.c);
+    counts[key] = (counts[key] ?? 0) + 1;
+    return counts;
+  }, {});
+  const ignoredCount = outcomes.length - outcomes.filter((o) => o.s === 'accepted').length;
+  if (ignoredCount > 0) {
+    await capture(env, job, 'scrobble_ignored', lineage, {
+      ignored_count: ignoredCount,
+      ignored_codes: ignoredCodes,
+    });
+  }
+
   // A timestamp Last.fm calls too old or too new is our bug, not the user's
   // data, and it is never terminal — so if a whole batch comes back that way
   // the job would otherwise re-send it forever. Park it for a human instead.
@@ -757,6 +834,10 @@ async function sendBatch(
   }
 
   if (capped) {
+    await capture(env, job, 'scrobble_rate_limited', lineage, {
+      reason: 'lastfm_daily_limit',
+      ignored_count: outcomes.filter((o) => o.s === 'capped').length,
+    });
     return {
       sent: assigned.length,
       accepted,
@@ -797,6 +878,10 @@ async function runJob(
   }
 
   const empty: JobOutcome = { batchesSent: 0, scrobbled: 0, failed: 0 };
+  const lineage: RunLineage = {
+    previouslyScrobbled: lease.job.scrobbled_count,
+    isResumed: lease.job.cursor > 0,
+  };
 
   // A job pinned to semantics this worker no longer implements must be refused,
   // not reinterpreted. Bytes being immutable does not make behaviour immutable.
@@ -918,6 +1003,7 @@ async function runJob(
       );
       return empty;
     }
+
     // Past the grace period and still unknown: the lookup itself is failing.
     // Back off and, after enough attempts, ask a human — rather than guessing.
     await failJobAttempt(
@@ -928,6 +1014,13 @@ async function runJob(
     );
     return empty;
   }
+
+  await capture(
+    env,
+    lease.job,
+    lineage.isResumed ? 'scrobble_resumed' : 'scrobble_started',
+    lineage,
+  );
 
   let batchesSent = 0;
   let scrobbled = 0;
@@ -973,7 +1066,15 @@ async function runJob(
 
     const cursorBefore = lease.job.cursor;
     // eslint-disable-next-line no-await-in-loop
-    const result = await sendBatch(env, lease, sessionKey, slice, lease.job.cursor, nowSec);
+    const result = await sendBatch(
+      env,
+      lease,
+      sessionKey,
+      slice,
+      lease.job.cursor,
+      nowSec,
+      lineage,
+    );
     batchesSent += result.sent > 0 ? 1 : 0;
     scrobbled += result.accepted;
     failed += result.failed;
@@ -1062,6 +1163,21 @@ async function runJob(
       // eslint-disable-next-line no-await-in-loop
       await fencedJobUpdate(env.sql, lease, 'probing = 0, state_reason = NULL, updated_at = ?', [nowSec]);
       lease.job.probing = 0;
+      await capture(
+        env,
+        lease.job,
+        'scrobble_rate_limit_cooldown_complete',
+        lineage,
+        {
+          reason: 'lastfm_daily_limit',
+          cooldown_seconds: lease.job.daily_window_start
+            ? nowSec - lease.job.daily_window_start
+            : null,
+        },
+      );
+      await capture(env, lease.job, 'scrobble_rate_limit_recovered', lineage, {
+        reason: 'lastfm_daily_limit',
+      });
     }
 
     // Renewal uses wall time, not the tick's frozen `nowSec`. Every batch
@@ -1087,6 +1203,7 @@ async function runJob(
       scrobbled: lease.job.scrobbled_count,
       failed: lease.job.failed_count,
     }, nowSec);
+    await capture(env, lease.job, 'scrobble_completed', lineage);
   } else {
     await releaseJob(env.sql, lease, nowSec, nowSec + INTER_BATCH_DELAY_SECONDS);
   }

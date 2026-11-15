@@ -21,6 +21,9 @@ bucket_name = "scrobblify"
 [vars]
 CALLBACK_URL = "https://api.savas.ca/scrobblify/auth/callback"
 APP_URL = "https://savas.ca/scrobble"
+# Public client-side ingestion token, not a personal PostHog API key.
+POSTHOG_TOKEN = "phc_nhGFP4vdzuGrL5B7VGoeGRKcAtnPMvEsumoWhWTkp4a5"
+POSTHOG_HOST = "https://us.i.posthog.com"
 
 # Secrets are set with `wrangler secret put` and are never committed:
 #   LASTFM_API_KEY        the worker's own server-only Last.fm application

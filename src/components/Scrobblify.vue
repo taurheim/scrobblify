@@ -642,6 +642,7 @@ export default Vue.extend({
       */
       let username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
       let savedImportId = (this.$store.state.importId as string) || '';
+      let savedQueueIsLegacyLocalOnly = false;
       try {
         const saved = await this.stateManager.loadState();
         if (saved) {
@@ -654,7 +655,8 @@ export default Vue.extend({
             record on disk is the queue that would actually be resumed — and
             resuming is the action being gated.
           */
-          savedImportId = saved.importId || savedImportId;
+          savedImportId = saved.importId || '';
+          savedQueueIsLegacyLocalOnly = !savedImportId;
         }
       } catch (e) {
         // Unreadable state. There is nothing to resume either, so the
@@ -671,6 +673,26 @@ export default Vue.extend({
       // can establish a freeze while the request is in flight.
       const observed = background.queueOwner();
       this.handedOverProgress = null;
+      /*
+        A handoff mints and persists an import id before uploading anything.
+        Therefore a saved queue without one cannot have reached the worker.
+        Use that local proof before asking the worker so an outage cannot
+        strand old browser-only progress.
+
+        The exception stays deliberately narrow: any ownership evidence still
+        requires server reconciliation, even when the saved format is old.
+      */
+      const hasBackgroundOwnershipEvidence = !!observed
+        || !!background.getOwnershipUnresolved()
+        || !!background.getPendingHandoff()
+        || !!background.staleSnapshotRecord()
+        || !!this.backgroundJob
+        || this.sawServerOwnership;
+      if (savedQueueIsLegacyLocalOnly && !hasBackgroundOwnershipEvidence) {
+        this.authorityPending = false;
+        this.authorityUnknown = false;
+        return;
+      }
       const live = await background.liveJobForUsername(username);
       this.authorityPending = false;
 

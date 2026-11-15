@@ -28,6 +28,12 @@ CREDENTIAL_SECRET=
 # as above.
 SIGNING_KEY=
 
+# --- PostHog analytics -------------------------------------------------------
+# POSTHOG_TOKEN is a public project ingestion token, not a personal API key.
+# These override the non-secret production values in wrangler.toml locally.
+POSTHOG_TOKEN=phc_nhGFP4vdzuGrL5B7VGoeGRKcAtnPMvEsumoWhWTkp4a5
+POSTHOG_HOST=https://us.i.posthog.com
+
 # --- The feasibility spike only ---------------------------------------------
 # `src/spike.ts` predates the real worker and reads two differently named
 # variables for the same two keys. It is not deployed and nothing else uses

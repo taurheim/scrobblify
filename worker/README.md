@@ -39,7 +39,8 @@ npx wrangler d1 execute scrobblify --remote --file schema/002_synthetic_floor.sq
 npx wrangler d1 execute scrobblify --remote --file schema/003_export_claim.sql
 npx wrangler d1 execute scrobblify --remote --file schema/004_import_id.sql
 
-# 4. Secrets (see below).
+# 4. Secrets (see below). PostHog uses the non-secret ingestion variables
+#    already declared in wrangler.toml.
 # 5. Deploy, then point api.savas.ca at the worker via a Cloudflare route.
 npx wrangler deploy
 
@@ -135,6 +136,20 @@ keys; it is not deployed, so ignore those unless you are running the spike.
 argument, which keeps it out of shell history. It also writes to the *deployed*
 environment only — setting a secret locally does not set it in production, or
 vice versa.
+
+## PostHog telemetry
+
+Scheduled background scrobbling sends best-effort lifecycle and aggregate
+progress events through PostHog's HTTP capture endpoint. `POSTHOG_TOKEN` and
+`POSTHOG_HOST` are explicit `[vars]` in `wrangler.toml`; the token is the same
+public project ingestion token used by the browser, **not** a personal API key
+or secret. Every event is tagged `app=scrobblify`, uses the Last.fm username as
+`distinct_id`, and contains aggregate counts only. Analytics delivery failures
+are ignored and cannot change scheduler state or retries.
+
+For local development, `.dev.vars.example` repeats those two non-secret values
+so they can be changed without editing deployment configuration. Do not replace
+`POSTHOG_TOKEN` with a personal API key.
 
 ### Generating the two random keys
 

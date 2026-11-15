@@ -28,6 +28,7 @@ import {
   drainJobOnDemand,
 } from '../src/scheduler';
 import { BatchScrobbleResult, ScrobbleEntry } from '../../src/shared/lastfm/protocol';
+import { WorkerAnalytics } from '../src/analytics';
 
 const NOW = 1_800_000_000;
 const SECRET = 'test-credential-secret-0123456789';
@@ -77,6 +78,34 @@ class MemoryBlobs implements BlobStore {
 interface SentBatch {
   entries: ScrobbleEntry[];
   sessionKey: string;
+}
+
+interface CapturedEvent {
+  event: string;
+  distinctId: string;
+  properties: Record<string, unknown>;
+}
+
+class FakeAnalytics implements WorkerAnalytics {
+  public events: CapturedEvent[] = [];
+
+  public throwOnCapture = false;
+
+  public hangOnCapture = false;
+
+  async capture(
+    event: string,
+    distinctId: string,
+    properties: Record<string, unknown>,
+  ): Promise<void> {
+    if (this.throwOnCapture) {
+      throw new Error('analytics fake failed');
+    }
+    if (this.hangOnCapture) {
+      await new Promise<void>(() => {});
+    }
+    this.events.push({ event, distinctId, properties });
+  }
 }
 
 /**
@@ -179,6 +208,7 @@ interface Harness {
   env: SchedulerEnv;
   sql: Sql;
   fake: FakeLastFm;
+  analytics: FakeAnalytics;
   jobId: string;
   job(): Promise<any>;
 }
@@ -196,6 +226,7 @@ async function harness(options: {
   const sql = freshSql();
   const blobs = new MemoryBlobs();
   const fake = new FakeLastFm(options.script ?? []);
+  const analytics = new FakeAnalytics();
   const jobId = randomId();
 
   const cred = await encryptCredential('sk-abc', SECRET, jobId);
@@ -238,12 +269,13 @@ async function harness(options: {
   }
 
   const env: SchedulerEnv = {
-    sql, blobs, lastfm: fake as any, credentialSecret: SECRET,
+    sql, blobs, lastfm: fake as any, credentialSecret: SECRET, analytics,
   };
   return {
     env,
     sql,
     fake,
+    analytics,
     jobId,
     job: async () => sql.first<JobRow>('SELECT * FROM jobs WHERE id = ?', [jobId]),
   };
@@ -272,6 +304,69 @@ async function main() {
     check('no timestamp is in the future', stamps.every((t) => t < NOW));
     const batches = await h.sql.all<any>('SELECT * FROM batches WHERE job_id = ?', [h.jobId]);
     check('every batch settled', batches.every((b) => b.state === 'settled'), batches.length);
+    const started = h.analytics.events.find((event) => event.event === 'scrobble_started');
+    check('a new background job emits the established start event', !!started, h.analytics.events);
+    check('worker lifecycle uses the Last.fm username as distinct_id',
+      started?.distinctId === 'listener', started);
+    check('worker lifecycle identifies background execution without listening details',
+      started?.properties.execution === 'background'
+      && started.properties.job_id === h.jobId
+      && JSON.stringify(started.properties).includes('Artist') === false,
+      started);
+    const completed = h.analytics.events.find((event) => event.event === 'scrobble_completed');
+    check('completion is emitted after the persistent job reaches its end', !!completed,
+      h.analytics.events);
+    check('completion reports lineage-stable progress',
+      completed?.properties.original_total_tracks === 120
+      && completed.properties.total_succeeded === 120
+      && completed.properties.completion_pct === 100
+      && completed.properties.is_resumed === false
+      && completed.properties.previously_scrobbled === 0
+      && completed.properties.scrobbled_tracks === 120
+      && completed.properties.failed_tracks === 0,
+      completed);
+  }
+
+  console.log('\n-- analytics failures do not alter scheduler results --');
+  {
+    const h = await harness({ total: 50 });
+    h.analytics.throwOnCapture = true;
+    const report = await runTick(h.env, NOW);
+    const job = await h.job();
+    check('the job still completes', job.state === 'completed', job.state);
+    check('all accepted tracks are still counted', report.scrobbled === 50, report);
+  }
+
+  console.log('\n-- stalled analytics delivery does not stall scrobbling --');
+  {
+    const h = await harness({ total: 50 });
+    h.analytics.hangOnCapture = true;
+    const completed = await Promise.race([
+      runTick(h.env, NOW).then(() => true),
+      new Promise<boolean>((resolve) => { setTimeout(() => resolve(false), 50); }),
+    ]);
+    check('the scheduler does not await analytics delivery', completed);
+    const job = await h.job();
+    check('the job still reaches its persistent terminal state', job.state === 'completed', job.state);
+  }
+
+  console.log('\n-- a continued persistent job emits resumed progress --');
+  {
+    const h = await harness({
+      total: 100,
+      job: { cursor: 40, scrobbled_count: 35, failed_count: 5 },
+    });
+    await runTick(h.env, NOW);
+    const resumed = h.analytics.events.find((event) => event.event === 'scrobble_resumed');
+    check('an already-advanced job emits resumed rather than started', !!resumed,
+      h.analytics.events);
+    check('resumed progress uses the original persistent denominator',
+      resumed?.properties.original_total_tracks === 100
+      && resumed.properties.previously_scrobbled === 35
+      && resumed.properties.total_succeeded === 35
+      && resumed.properties.completion_pct === 35
+      && resumed.properties.is_resumed === true,
+      resumed);
   }
 
   console.log('\n-- the mapping is durable before the send --');
@@ -311,6 +406,15 @@ async function main() {
     check('the tick stopped sending for that job', h.fake.sent.length === 1, h.fake.sent.length);
     check('the reason is surfaced', /daily/i.test(job.state_reason || ''), job.state_reason);
     check('report counts only what was accepted', report.scrobbled === 20, report);
+    const ignored = h.analytics.events.find((event) => event.event === 'scrobble_ignored');
+    check('ignored telemetry contains aggregate counts and code only',
+      ignored?.properties.ignored_count === 30
+      && JSON.stringify(ignored.properties).includes('Artist') === false
+      && JSON.stringify(ignored.properties).includes('Track') === false,
+      ignored);
+    const limited = h.analytics.events.find((event) => event.event === 'scrobble_rate_limited');
+    check('the Last.fm daily cap is truthfully reported as a background rate limit',
+      limited?.properties.reason === 'lastfm_daily_limit', limited);
 
     // The point of recording this is to answer whether the cap resets on a
     // clock or a rolling window — which decides whether the blind 24h wait is
@@ -338,6 +442,10 @@ async function main() {
     const job = await h.job();
     check('a successful probe clears the flag', job.probing === 0);
     check('and clears the stale reason', job.state_reason === null);
+    check('a successful probe reports cooldown completion',
+      h.analytics.events.some((event) => event.event === 'scrobble_rate_limit_cooldown_complete'));
+    check('a successful probe reports recovery',
+      h.analytics.events.some((event) => event.event === 'scrobble_rate_limit_recovered'));
 
     // Paired with `daily_cap_hit`, this bounds the real reset interval: the
     // cap lifted somewhere between the previous failed probe and here.
@@ -480,6 +588,12 @@ async function main() {
     const audits = await h.sql.all<any>("SELECT * FROM audit WHERE event = 'breaker_tripped'");
     check('the active job count is recorded, since that is the unknown',
       audits.length === 1 && JSON.parse(audits[0].detail).activeJobs === 1, audits[0]);
+    const limited = h.analytics.events.find((event) => event.event === 'scrobble_rate_limited');
+    check('the shared Last.fm IP throttle emits the established rate-limit event',
+      limited?.properties.reason === 'lastfm_ip_rate_limit', limited);
+    check('a circuit-breaker cooldown is not mislabeled as browser retry exhaustion',
+      !h.analytics.events.some((event) => event.event === 'scrobble_rate_limit_gave_up'),
+      h.analytics.events);
 
     const second = await runTick(h.env, NOW);
     check('the next tick does nothing while the breaker is open',
@@ -514,6 +628,13 @@ async function main() {
     const batch = await h.sql.first<any>('SELECT * FROM batches WHERE job_id = ?', [h.jobId]);
     check('the batch stays in flight, because we cannot tell what happened',
       batch.state === 'sending', batch.state);
+    const network = h.analytics.events.find((event) => event.event === 'scrobble_network_error');
+    check('the transient transport failure emits the established network event',
+      network?.properties.attempted_count === 50, network);
+    check('network telemetry contains aggregate context only',
+      JSON.stringify(network?.properties).includes('Artist') === false
+      && JSON.stringify(network?.properties).includes('Track') === false,
+      network);
   }
 
   console.log('\n-- repeated failure parks the job --');
