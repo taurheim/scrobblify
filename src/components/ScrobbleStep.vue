@@ -180,13 +180,15 @@ import {
 import { canCompress } from '@/services/BackgroundScrobbling';
 import * as background from '@/services/BackgroundScrobbling';
 import StateManager from '@/services/StateManager';
+import { formatDuration } from '@/services/ScrobbleEstimate';
 
 /**
- * Below this, finishing in the browser takes about a day and the extra moving
- * parts of a handoff are not worth it. Must match the worker's
- * `MIN_TRACKS_FOR_BACKGROUND`, which rejects a smaller preflight outright.
+ * One day's worth of scrobbles: below this, finishing in the browser takes
+ * about a day and the extra moving parts of a handoff are not worth it. Must
+ * match the worker's `MIN_TRACKS_FOR_BACKGROUND`, which rejects a smaller
+ * preflight outright.
  */
-const MIN_TRACKS_FOR_BACKGROUND = 2700;
+const MIN_TRACKS_FOR_BACKGROUND = LASTFM_DAILY_CAP;
 
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
@@ -323,19 +325,6 @@ const IGNORE_CODE_DAILY_LIMIT = 5;
 */
 const IGNORE_CODE_TIMESTAMP_TOO_OLD = 3;
 const IGNORE_CODE_TIMESTAMP_TOO_NEW = 4;
-
-function formatDuration(ms: number): string {
-  const totalMinutes = Math.round(ms / MS_PER_MINUTE);
-  if (totalMinutes < 1) {
-    const seconds = Math.max(1, Math.ceil(ms / MS_PER_SECOND));
-    return `${seconds} second${seconds === 1 ? '' : 's'}`;
-  }
-  if (totalMinutes < 60) {
-    return `${totalMinutes} minute${totalMinutes === 1 ? '' : 's'}`;
-  }
-  const hours = Math.round(totalMinutes / 60);
-  return `${hours} hour${hours === 1 ? '' : 's'}`;
-}
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog },

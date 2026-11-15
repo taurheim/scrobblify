@@ -107,6 +107,18 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `stale_build_detected` / `stale_build_reload_clicked` are outside the funnel
 (see "Old builds keep running" above).
 
+Since 2026-11-15 `tracks_selected` fires when the user confirms the "Scrobble N
+tracks?" dialog, not on the select step's button. That dialog estimates the
+run time (`src/services/ScrobbleEstimate.ts`): re-tagged plays get today's
+import budget (read from the library, as the loop does), then 700 per UTC day;
+see "Last.fm's daily cap". Cancelling it emits nothing.
+
+Before that, a fresh import that re-tags more than one day's budget (700
+plays) hits a blocking `LargeHistoryGate` on "Choose which tracks to scrobble":
+wrong dates, days of returning, no bulk undo, and a "Use ListenBrainz instead"
+link to ListenBrainz's own Spotify importer, which keeps the real dates. Only
+"I understand, continue" proceeds. Resumes and progress files skip it.
+
 `upload_no_matching_files` carries `detected`: `progress_file` (a Scrobblify
 progress file was zipped up and is imported instead), `account_data` (Spotify's
 default "Account data" export, `StreamingHistory_music_*.json`, rather than the

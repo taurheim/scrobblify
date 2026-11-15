@@ -12,7 +12,7 @@ import {
   encryptCredential, sha256Hex, randomId, signPayload, signHandoffState,
 } from '../src/crypto';
 import { issueSession, SESSION_TTL_SECONDS } from '../src/session';
-import { ALGORITHM_VERSION } from '../src/handoff';
+import { ALGORITHM_VERSION, TRACKS_PER_DAY } from '../src/handoff';
 import { handleRequest, ApiEnv, MIN_TRACKS_FOR_BACKGROUND, collapseToRanges } from '../src/api';
 import { assignTimestamps } from '../src/timestamps';
 
@@ -581,12 +581,12 @@ async function main() {
     check('progress is reported', body.job.scrobbled === 8900, body.job);
     check('failures are reported', body.job.failed === 100);
     check('remaining is reported', body.job.remaining === 81000, body.job.remaining);
-    // Without a date, a user watching a 30-day job concludes it is broken and
-    // re-imports, which is the duplicate source this feature exists to remove.
+    // Without a date, a user watching a months-long job concludes it is broken
+    // and re-imports, which is the duplicate source this feature exists to remove.
     check('an estimated completion date is given',
       body.job.estimatedCompletionSec > NOW, body.job.estimatedCompletionSec);
-    check('the estimate is roughly 30 days out',
-      Math.abs((body.job.estimatedCompletionSec - NOW) / 86400 - 30) < 1,
+    check('the estimate is the remaining tracks at the daily rate',
+      Math.abs((body.job.estimatedCompletionSec - NOW) / 86400 - 81000 / TRACKS_PER_DAY) < 1,
       (body.job.estimatedCompletionSec - NOW) / 86400);
     check('no credential material is exposed',
       !JSON.stringify(body).includes('session_key')

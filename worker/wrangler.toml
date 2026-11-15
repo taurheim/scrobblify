@@ -15,7 +15,7 @@ routes = [{ pattern = "api.savas.ca", custom_domain = true }]
 "blueimp-md5" = "./node_modules/blueimp-md5"
 
 # One tick every 5 minutes. Deliberately not more often: a job advances at
-# roughly 2,700 scrobbles/day whatever we do, so a faster cron only spends the
+# roughly 750 scrobbles/day whatever we do, so a faster cron only spends the
 # shared free-tier invocation budget and pushes harder on Last.fm's per-IP
 # limit without finishing anything sooner.
 [triggers]

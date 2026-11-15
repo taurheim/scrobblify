@@ -1,7 +1,7 @@
 # Scrobblify background worker
 
 Cloudflare Worker that finishes large Last.fm imports unattended, so users with
-more than ~2,700 tracks don't have to keep returning to the tab.
+more than ~750 tracks don't have to keep returning to the tab.
 
 Design: [`docs/superpowers/specs/2026-07-26-background-scrobbling-design.md`](../docs/superpowers/specs/2026-07-26-background-scrobbling-design.md)
 
@@ -195,7 +195,7 @@ full blob database refuses new uploads and costs nothing.
 The worker and the SPA can be deployed in either order. The SPA ships through
 the normal CD on merge to master. Nobody is offered the feature without opting
 in: open `https://savas.ca/scrobblify/?beta=1` (sticky; `?beta=0` turns it
-off), start an import with at least 2,700 tracks left, and press
+off), start an import with at least 750 tracks left, and press
 Pause & Save to see the offer. `npx wrangler tail` streams the worker's logs.
 
 ## Secrets

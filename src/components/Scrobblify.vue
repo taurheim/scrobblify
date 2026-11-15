@@ -234,6 +234,7 @@ import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
 import RateLimitTracker from '@/services/RateLimitTracker';
+import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import BackgroundOffer from '@/components/BackgroundOffer.vue';
 import * as background from '@/services/BackgroundScrobbling';
@@ -687,7 +688,7 @@ export default Vue.extend({
     canOfferBackground(remaining: number): boolean {
       return this.backgroundAvailable
         && !this.backgroundJob
-        && remaining >= 2700;
+        && remaining >= LASTFM_DAILY_CAP;
     },
 
     /**
