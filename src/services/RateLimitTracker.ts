@@ -5,7 +5,7 @@ const MS_PER_MINUTE = 60 * MS_PER_SECOND;
 const MS_PER_HOUR = 60 * MS_PER_MINUTE;
 
 /*
-  Last.fm enforces its scrobble limits as a *rolling window* on the account, not
+  Last.fm enforces its *rate* limit as a rolling window on the account, not
   as a fixed count that resets when our page reloads. The previous
   implementation counted scrobbles in a plain in-memory integer that started at
   zero on every mount, so a user who came back after being throttled immediately
@@ -30,11 +30,11 @@ export const DEFAULT_BURST_LIMIT = 500;
 // being caution and starts being a broken app.
 export const MIN_BURST_LIMIT = 50;
 
-// Last.fm's daily ceiling. Unlike the burst limit this one is well established,
-// so it is not adapted — but it is now measured over a rolling 24 hours rather
-// than a calendar day, which is both what Last.fm enforces and what removes the
-// need for any day-rollover bookkeeping.
-export const DAILY_LIMIT = 2700;
+// The daily ceiling is *not* enforced here. Last.fm caps what it stores per UTC
+// calendar day of the scrobble timestamp, not per rolling 24h of sending, and
+// it counts the user's own listening too, which this tracker cannot see. See
+// DailyCap.ts. `dailyCount` below is only kept for telemetry and for the legacy
+// count fields in saved progress.
 
 // When we do get rate limited, the number of sends we managed inside the burst
 // window is direct evidence of where the real ceiling sits. Back off to a
@@ -73,10 +73,6 @@ export default class RateLimitTracker {
     return this.burstLimitValue;
   }
 
-  public get dailyLimit(): number {
-    return DAILY_LIMIT;
-  }
-
   public get burstCount(): number {
     return this.countSince(Date.now() - BURST_WINDOW_MS);
   }
@@ -93,12 +89,16 @@ export default class RateLimitTracker {
     return this.msUntilWindowHasRoom(BURST_WINDOW_MS, this.burstLimitValue);
   }
 
-  /**
-   * How long the caller must wait before a send would fit inside the 24 hour
-   * window. Zero means "safe to send now".
-   */
-  public msUntilDailySafe(): number {
-    return this.msUntilWindowHasRoom(DAILY_WINDOW_MS, DAILY_LIMIT);
+  /** Sends recorded at or after `cutoffMs`. */
+  public countSince(cutoffMs: number): number {
+    let count = 0;
+    for (let i = this.sends.length - 1; i >= 0; i--) {
+      if (this.sends[i] < cutoffMs) {
+        break;
+      }
+      count++;
+    }
+    return count;
   }
 
   public recordSend(timestamp: number = Date.now()): void {
@@ -209,17 +209,6 @@ export default class RateLimitTracker {
     } catch (e) {
       // Storage unavailable (private mode, quota, disabled) — not fatal.
     }
-  }
-
-  private countSince(cutoff: number): number {
-    let count = 0;
-    for (let i = this.sends.length - 1; i >= 0; i--) {
-      if (this.sends[i] < cutoff) {
-        break;
-      }
-      count++;
-    }
-    return count;
   }
 
   private msUntilWindowHasRoom(windowMs: number, limit: number): number {

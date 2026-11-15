@@ -81,7 +81,7 @@
 <script lang="ts">
 import Vue from 'vue';
 import SpotifyListen from '@/models/SpotifyListen';
-import Scrobble from '@/models/Scrobble';
+import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 import Scrobblify from '@/scrobblify';
 
 // Steps
@@ -101,6 +101,7 @@ interface ProgressSnapshot {
   scrobbledTracks: number;
   originalTotalTracks: number;
   originalSucceededCount: number;
+  pendingVerification: PendingScrobble[];
   sendTimestamps: number[];
   lastReTagTimestampSec: number;
   burstCount: number;
@@ -263,6 +264,7 @@ export default Vue.extend({
 
       this.restoreRateLimitWindow(state, api.getUserName() || state.userName || null);
       this.$store.commit('setReTagCursorSec', state.lastReTagTimestampSec || 0);
+      this.$store.commit('setPendingVerification', StateManager.deserializePending(state.pendingVerification));
 
       // Restore remaining (not yet completed) tracks to store
       const allScrobbles = StateManager.deserializeScrobbles(state.tracks);
@@ -352,6 +354,7 @@ export default Vue.extend({
         tracks: StateManager.serializeScrobbles(tracks),
         originalTotalTracks: info.originalTotalTracks || tracks.length,
         originalSucceededCount: info.originalSucceededCount,
+        pendingVerification: StateManager.serializePending(info.pendingVerification || []),
         sendTimestamps: info.sendTimestamps || [],
         lastReTagTimestampSec: info.lastReTagTimestampSec || 0,
         burstCount: info.burstCount,

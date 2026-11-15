@@ -31,9 +31,9 @@
     No need to unzip or open any files! Just drag and drop the ZIP file directly into the
     <router-link to="/scrobble">Scrobble</router-link> page and Scrobblify will handle the rest.<br>
     <b>5. Sit back and let it run!</b><br>
-    Scrobblify will start submitting your listening history to last.fm. Note that last.fm has undocumented rate limits
-    (~2,800 scrobbles per day, ~1,000 per burst), so if you have a large history it may take a while.
-    Don't worry — Scrobblify handles this automatically by pausing and resuming when rate limits are hit.
+    Scrobblify will start submitting your listening history to last.fm. Note that last.fm keeps at most 750 scrobbles
+    per day (midnight to midnight UTC, your own listening included), so a large history takes several days.
+    Scrobblify stops a little short of that each day and only counts scrobbles it can see in your Last.fm library.
     You can also <strong>save your progress</strong> and come back later if you need to close the page.
     Your progress will be waiting for you when you return!
 

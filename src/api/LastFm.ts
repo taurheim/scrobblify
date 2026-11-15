@@ -257,6 +257,31 @@ export default class LastFm {
     return allScrobbles;
   }
 
+  /**
+   * How many scrobbles Last.fm has actually *stored* for this user with
+   * timestamps in [fromSec, toSec]. A `track.scrobble` reply cannot answer
+   * that: Last.fm reports plays over its daily cap as accepted and then keeps
+   * none of them, so reading the library back is the only source of truth.
+   */
+  public async countStoredScrobbles(fromSec: number, toSec: number): Promise<number> {
+    if (this.userName === null) {
+      throw new Error('Couldn\'t find username');
+    }
+    const response = await this.makeRequest('GET', {
+      method: 'user.getrecenttracks',
+      user: this.userName,
+      from: String(Math.floor(fromSec)),
+      to: String(Math.ceil(toSec)),
+      limit: '1',
+    });
+    const attr = response && response.recenttracks && response.recenttracks['@attr'];
+    const total = parseInt(attr && attr.total, 10);
+    if (!Number.isFinite(total)) {
+      throw new Error('Last.fm did not report a scrobble count');
+    }
+    return total;
+  }
+
   public async getTrackTimeMs(trackName: string, trackArtist: string): Promise<number> {
     // TODO this could be better done with musicbrainz/spotify api instead?
     // That way we wouldn't rely on last.fm's track length data

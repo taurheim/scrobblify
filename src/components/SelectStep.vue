@@ -513,6 +513,7 @@ export default Vue.extend({
       // import that all later resume progress is measured against.
       this.$store.commit('setOriginalTotalTracks', scrobbles.length);
       this.$store.commit('setResumedScrobbleCount', 0);
+      this.$store.commit('setPendingVerification', []);
       trackEvent('tracks_selected', {
         selected_count: selected.length,
         total_count: this.totalTrackCount,

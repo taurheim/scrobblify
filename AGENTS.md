@@ -20,6 +20,19 @@ workflow, journey invariants, and validated HogQL for each check.
 
 Verify with `copilot mcp get posthog`.
 
+No key at all: the server supports OAuth, which clients that implement it
+refresh by themselves. In omp, add a user-level entry with **no**
+`Authorization` header to `~/.omp/agent/mcp.json` (an explicit header, even the
+unresolved `${POSTHOG_MCP_TOKEN}` one in `.mcp.json`, turns OAuth off for that
+entry; the user-level entry shadows the project one by name):
+
+```json
+{ "mcpServers": { "posthog": { "type": "http", "url": "https://mcp.posthog.com/mcp" } } }
+```
+
+Then run `/mcp reauth posthog` once. The credential lives in omp's auth storage
+and applies to every worktree.
+
 ### Project layout
 
 The PostHog project is **shared with LastWave**. Every scrobblify event is tagged
@@ -113,7 +126,11 @@ Rate limiting has its own events: `scrobble_rate_limited`,
 was auto-saved), and `scrobble_burst_limit_lowered` / `scrobble_burst_limit_raised`
 from the adaptive limit in `RateLimitTracker`. Network failures emit
 `scrobble_network_error`. `scrobble_ignored` fires when Last.fm accepts the
-request but discards the play (see below).
+request but discards the play (see below). `scrobble_not_stored` (`not_stored`,
+`re_tagged_not_stored`, `checked`) fires when plays Last.fm answered as
+accepted are missing from the user's library on a day at the cap, and
+`scrobble_verify_failed` (once per run, `message`) when the library couldn't be
+read back at all — see "Last.fm's daily cap".
 
 **`scrobble_paused` and `scrobble_stopped` are deliberately separate events**, so
 "how often does a run end early, and why" is answerable without knowing which
@@ -125,7 +142,7 @@ nothing at all.
   `burst_limit`, `rate_limit`, `network_error`. This is Last.fm throttling, not
   a bug: treat it as normal operation rather than signal.
 - `scrobble_stopped` — terminal; the run is over until the user comes back.
-  Reasons: `daily_limit`, `lastfm_daily_limit`, `rate_limit_exhausted`,
+  Reasons: `daily_limit`, `not_stored`, `lastfm_daily_limit`, `rate_limit_exhausted`,
   `repeated_rejections`, `repeated_failures`, `session_invalid`,
   `not_authenticated`, `manual`,
   `save_and_exit`. Only `manual` and `save_and_exit` are user actions. Every
@@ -252,10 +269,18 @@ Every scrobble event carries resume-stable fields instead — use these:
 `previously_scrobbled`. Note these only exist on events emitted after the
 telemetry fix, so older events cannot be compared against them.
 
-`total_succeeded` is still an **upper bound**: Last.fm silently discards a
-scrobble duplicating an existing (artist, track, timestamp) while reporting it
-as accepted, so re-scrobbling history a user already has inflates the count with
-no way to detect it from the API.
+**`total_succeeded` counts only plays read back from the user's library**, from
+the daily-cap fix (2026-11) on. Before it, it counted every `accepted` reply,
+and since Last.fm's cap dropped to 750 on 2026-06-24 that overstates heavy
+users by up to ~1,950 per day each: **`total_succeeded` and `completion_pct`
+from 2026-06-24 until the fix are inflated** wherever a user sent more than ~750
+in a UTC day. Events now also carry `unconfirmed_tracks` (sent, not yet read
+back) and `not_stored_tracks` (accepted, then missing on a full day).
+
+Even now it is an **upper bound** for real-dated plays: Last.fm silently
+discards a scrobble duplicating an existing (artist, track, timestamp) while
+reporting it as accepted, and the read-back matches on timestamp, so the
+existing play confirms the duplicate.
 
 ### Adding instrumentation
 
@@ -290,8 +315,12 @@ timestamps are **allocated at send time**, not at parse time, from a cursor in
 `ScrobbleStep`:
 
 ```
-reTagCursorSec = min(nowSec, max(reTagCursorSec + 1, nowSec - RETAG_BACKFILL_SECONDS))
+reTagCursorSec = max(reTagCursorSec + 1, nowSec - RETAG_BACKFILL_SECONDS, todayUtcMidnightSec)
 ```
+
+If that is ahead of the clock (a run just after UTC midnight), the loop waits
+for the clock rather than send a future timestamp (ignore code 4). The midnight
+floor keeps a whole run on the one UTC day whose cap it checked; see below.
 
 This matters because absolute timestamps baked in at parse time expire: a queue
 saved today and resumed three weeks later would be rejected wholesale with
@@ -316,6 +345,58 @@ Two consequences worth knowing before touching this code:
   fact and would silently drop import rows. Their true dates survive on
   `originalListenDate`, but checking those would mean fetching the user's whole
   Last.fm history back to the start of the export.
+
+## Last.fm's daily cap
+
+Last.fm stores at most **750 scrobbles per UTC calendar day of the scrobble's
+timestamp** (`LASTFM_DAILY_CAP` in `src/services/DailyCap.ts`), the user's own
+listening included. Everything past it is answered exactly like a stored play —
+`accepted=1, ignored=0`, no `ignoredMessage` — and thrown away. Undocumented;
+measured in 2026-11 by comparing PostHog against `user.getrecenttracks` for ~40
+heavy user-days: every one stored exactly 750, and one run whose re-tagged
+timestamps straddled UTC midnight stored 750 on each side (so it is keyed on the
+timestamp's day, not on send time or a rolling 24h). Last.fm announced a lower
+cap on 2026-06-24 without a number. Before the fix the app paced to 2,700 per
+rolling 24h and counted every accepted reply, so heavy users were told ~2,700 a
+day were scrobbled while ~750 were kept (#106: "10k scrobbled", ~4k on Last.fm).
+Those losses are not recoverable from saved progress, which recorded the
+dropped plays as done.
+
+Because the reply can't be trusted, `ScrobbleStep` treats Last.fm's library as
+the source of truth:
+
+- **Budget.** Before sending a play, it reads how many scrobbles that UTC day
+  already holds (`LastFm.countStoredScrobbles`, `limit=1`, reads `@attr.total`)
+  and stops at `LASTFM_DAILY_CAP - OWN_LISTENING_HEADROOM` (50, left for the
+  user's own scrobbler, which would otherwise lose the rest of that day's real
+  plays). For today it stops as `daily_limit` and says when midnight UTC is in
+  local time; a play keeping its real date on a past full day is recorded as
+  failed, since that day never resets. The count is re-read at every
+  checkpoint. `RateLimitTracker` no longer has a daily limit; its
+  `dailyCount` is telemetry only.
+- **Verify.** An accepted play goes into `pending`, not the count. At every
+  checkpoint, before every stop and at the end, pending plays are read back
+  (one `user.getrecenttracks` range per UTC day) and matched on **timestamp
+  alone**: Last.fm may autocorrect artist/track names, so a name match would
+  call a stored play lost and re-send it as a duplicate.
+- **Lost only on a full day.** A pending play missing from the library is
+  re-checked after 5s, and then only counted as lost if its day now holds
+  ≥ 750. Otherwise it may just be listing lag, and re-sending a re-tagged play
+  (with a fresh second) that *was* stored would duplicate it, so it stays
+  pending. Lost re-tagged plays are appended to the queue (`requeueScrobble`;
+  everything before them stays index-addressed, so save/resume is unchanged);
+  lost real-dated plays are failed. A loss on today stops the run as
+  `not_stored`.
+- **Persisted.** Pending plays are saved as `pendingVerification` (with the
+  timestamp they were *sent* with) inside the completed range, so a resume
+  re-checks them instead of re-sending. If the library can't be read (network,
+  private profile) they stay pending, the run carries on, and the Complete step
+  reports them as "sent, couldn't confirm" rather than counting them.
+
+The Playwright mock (`tests/lastfmMock.js`) models this: its library is
+stateful, enforces the cap per UTC day and fills itself from any
+`track.scrobble` response that says accepted, including ones a test answers
+with its own route.
 
 ## Import robustness
 
