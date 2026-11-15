@@ -1,8 +1,21 @@
 <template>
   <div class="scrobblify">
     <div v-if="currentStep > 1">
-      Currently authenticated as: {{ this.$store.state.lfmApi.userName }}. <a @click="clearToken">Not you?</a>
+      Currently authenticated as: {{ this.$store.state.lfmApi.userName }}.
+      <a role="button" tabindex="0" @click="clearToken" @keydown.enter="clearToken">Not you?</a>
     </div>
+    <!--
+      Resuming needs a session key to scrobble with. Without one, every track
+      used to fail in a burst and be saved as done, so the resume is held here
+      instead, with the saved progress left untouched.
+    -->
+    <v-alert v-if="resumeSignInMessage" type="warning" prominent class="mb-4">
+      <div><strong>{{ resumeSignInMessage }}</strong></div>
+      <div class="mt-1">Your saved progress is kept, and nothing has been scrobbled yet.</div>
+      <div class="mt-2">
+        <v-btn color="primary" :href="authorizeUrl">Sign in to Last.fm</v-btn>
+      </div>
+    </v-alert>
     <v-alert v-if="hasResumableState && currentStep <= 2" type="info" prominent class="mb-4">
       <div>
         <strong>Resume previous session?</strong>
@@ -17,6 +30,7 @@
         ref="importFileInput"
         type="file"
         accept=".json"
+        aria-label="Import saved session file"
         style="display: none"
         @change="onImportFile"
       >
@@ -35,10 +49,13 @@
       </v-stepper-header>
       <v-stepper-items>
         <v-stepper-content step="1">
-          <authenticate-step v-on:complete="currentStep = 2"></authenticate-step>
+          <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
         </v-stepper-content>
         <v-stepper-content step="2">
-          <upload-step v-on:complete="currentStep = 3"></upload-step>
+          <upload-step
+            v-on:complete="currentStep = 3"
+            v-on:import-progress="importProgressFile"
+          ></upload-step>
         </v-stepper-content>
         <v-stepper-content step="3">
           <select-step v-on:complete="currentStep = 4"></select-step>
@@ -47,6 +64,8 @@
           <scrobble-step
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
+            v-on:auto-save="onAutoSave"
+            v-on:checkpoint="onCheckpoint"
           ></scrobble-step>
         </v-stepper-content>
         <v-stepper-content step="5">
@@ -73,8 +92,20 @@ import LastFm from '@/api/LastFm';
 import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
+import NotAProgressFileError from '@/services/NotAProgressFileError';
+import RateLimitTracker from '@/services/RateLimitTracker';
 import ErrorDialog from '@/components/ErrorDialog.vue';
+import { trackEvent, trackError, resetUser } from '@/services/Analytics';
 
+interface ProgressSnapshot {
+  scrobbledTracks: number;
+  originalTotalTracks: number;
+  originalSucceededCount: number;
+  sendTimestamps: number[];
+  lastReTagTimestampSec: number;
+  burstCount: number;
+  dailyCount: number;
+}
 
 export default Vue.extend({
   components: {
@@ -94,27 +125,78 @@ export default Vue.extend({
       showError: false,
       errorMessage: '',
       errorDetails: '',
+      resumeSignInMessage: '',
     };
   },
+  computed: {
+    authorizeUrl(): string {
+      return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
+    },
+  },
   async mounted() {
+    trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
     try {
       this.hasResumableState = await this.stateManager.hasSavedState();
     } catch (e) {
       // IndexedDB not available — not critical, just skip resume
     }
   },
+  watch: {
+    currentStep(step: number) {
+      trackEvent('step_viewed', { step, step_name: this.stepName(step) });
+    },
+  },
   methods: {
+    stepName(step: number): string {
+      return ['', 'authenticate', 'upload', 'select', 'scrobble', 'complete'][step] || String(step);
+    },
+    /**
+     * AuthenticateStep confirms an existing session and then emits `complete`
+     * on a 2 second delay (so the "Checking for authentication..." spinner is
+     * readable). The user can act inside that window — most importantly they can
+     * hit "Resume", which jumps straight to the scrobble step. Advancing
+     * unconditionally would then yank them back to the upload step a moment
+     * later, losing the resumed session. Only ever move *forward* off step 1.
+     */
+    onAuthenticated() {
+      // Signed in now, so a resume held back for want of a key can go ahead.
+      this.resumeSignInMessage = '';
+      if (this.currentStep === 1) {
+        this.currentStep = 2;
+      }
+    },
+    /**
+     * `state.totalTracks` is only the tracks left to do, so on its own it makes
+     * a resumed import look smaller each time. Always report the original size
+     * and the cumulative progress alongside it.
+     */
+    resumeProps(state: ScrobbleState, source: string) {
+      const originalTotal = state.originalTotalTracks || state.totalTracks;
+      const succeeded = state.originalSucceededCount ?? state.completedIndices.length;
+      return {
+        source,
+        total_tracks: state.totalTracks,
+        original_total_tracks: originalTotal,
+        total_succeeded: succeeded,
+        completion_pct: originalTotal
+          ? Math.round((1000 * succeeded) / originalTotal) / 10
+          : 0,
+      };
+    },
     clearToken() {
       const api = this.$store.state.lfmApi as LastFm;
       this.currentStep = 1;
       api.clearUser();
+      resetUser();
+      trackEvent('user_logged_out');
     },
     async resumeFromSaved() {
       try {
         const state = await this.stateManager.loadState();
         if (!state) { return; }
-        this.restoreFromState(state);
+        this.restoreFromState(state, 'saved');
       } catch (e) {
+        trackError('scrobblify.resumeFromSaved', e);
         this.errorMessage = 'Failed to load your saved progress.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
@@ -126,22 +208,61 @@ export default Vue.extend({
     async onImportFile(event: Event) {
       const input = event.target as HTMLInputElement;
       if (!input.files || input.files.length === 0) { return; }
+      const file = input.files[0];
+      input.value = '';
+      await this.importProgressFile(file, 'file');
+    },
+    /**
+     * Also reachable from the upload step, because the resume banner (and its
+     * "Import from file" button) only appears when this browser already has
+     * saved state — which a new device or browser never does.
+     */
+    async importProgressFile(file: File, source: string) {
       try {
-        const state = await this.stateManager.importFromFile(input.files[0]);
-        this.restoreFromState(state);
+        const state = await this.stateManager.importFromFile(file);
+        this.restoreFromState(state, source);
       } catch (e) {
+        if (e instanceof NotAProgressFileError) {
+          // The user picked the wrong file; that's not an app error. Recorded
+          // alongside the ZIP-level equivalent so both show up in one place.
+          trackEvent('upload_no_matching_files', { detected: e.detected, file_type: 'json', source });
+          this.errorMessage = e.message;
+          this.errorDetails = '';
+          this.showError = true;
+          return;
+        }
+        trackError('scrobblify.onImportFile', e);
         this.errorMessage = 'The selected file is not a valid Scrobblify progress file.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
       }
     },
-    restoreFromState(state: ScrobbleState) {
+    restoreFromState(state: ScrobbleState, source: string) {
       const api = this.$store.state.lfmApi as LastFm;
-      if (api.getUserName() && api.getUserName() !== state.userName) {
+      // A session key can be missing while the username is still stored:
+      // `clearSessionKey()` keeps it after Last.fm rejects a key. Resuming then
+      // sent every track unsigned, and the failures were saved as completed.
+      // Nothing is written here, so the saved state survives the sign-in
+      // redirect and the banner offers it again afterwards.
+      if (!api.isAuthenticated()) {
+        trackEvent('session_resume_blocked', { source, reason: 'not_authenticated' });
+        // Only the saved-state resume survives the redirect; a file has to be
+        // chosen again.
+        this.resumeSignInMessage = source === 'saved'
+          ? 'Sign in to Last.fm first, then choose Resume.'
+          : 'Sign in to Last.fm first, then import your progress file again.';
+        this.currentStep = 1;
+        return;
+      }
+      trackEvent('session_resumed', this.resumeProps(state, source));
+      if (state.userName && api.getUserName() && api.getUserName() !== state.userName) {
         this.errorMessage = `This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`;
         this.showError = true;
         return;
       }
+
+      this.restoreRateLimitWindow(state, api.getUserName() || state.userName || null);
+      this.$store.commit('setReTagCursorSec', state.lastReTagTimestampSec || 0);
 
       // Restore remaining (not yet completed) tracks to store
       const allScrobbles = StateManager.deserializeScrobbles(state.tracks);
@@ -150,28 +271,72 @@ export default Vue.extend({
       const remaining = allScrobbles.filter((_, i) => !completedSet.has(i) && !failedSet.has(i));
 
       this.$store.commit('setSelectedScrobbles', remaining);
+      // The scrobble step only ever sees the remaining tracks, so it needs to be
+      // told separately that this is a resume — otherwise `scrobble_resumed`
+      // can never fire and the resume funnel is invisible. `originalTotalTracks`
+      // likewise has to be carried forward, since `remaining.length` shrinks on
+      // every resume and would otherwise make completion look better each time.
+      this.$store.commit('setResumedScrobbleCount', state.originalSucceededCount ?? completedSet.size);
+      this.$store.commit('setOriginalTotalTracks', state.originalTotalTracks || state.totalTracks);
       this.hasResumableState = false;
+      this.resumeSignInMessage = '';
       // Skip to scrobble step (step 4)
       this.currentStep = 4;
     },
+
+    /**
+     * Rate-limit budget is a property of the Last.fm *account*, not of a page
+     * load, so a restored session must restore it too. Files written before
+     * this existed only carry counts, which are converted to a (pessimistic)
+     * rolling window.
+     */
+    restoreRateLimitWindow(state: ScrobbleState, userName: string | null) {
+      try {
+        const tracker = new RateLimitTracker(userName);
+        if (Array.isArray(state.sendTimestamps) && state.sendTimestamps.length > 0) {
+          tracker.setSendTimestamps(state.sendTimestamps);
+        } else if (state.burstCount || state.dailyCount) {
+          const savedAtMs = state.savedAt ? new Date(state.savedAt).getTime() : Date.now();
+          tracker.seedFromLegacyCounts(state.burstCount, state.dailyCount, savedAtMs);
+        }
+      } catch (e) {
+        // A missing/corrupt rate-limit record must never block a restore; the
+        // tracker simply starts from an empty window.
+      }
+    },
     async clearSavedState() {
       try {
-        await this.stateManager.clearState();
+        await this.persist(() => this.stateManager.clearState());
       } catch (e) {
         // Not critical — continue anyway
       }
       this.hasResumableState = false;
     },
+    /**
+     * Run a write to the saved session after every write queued before it.
+     * Checkpoints make writes frequent, and each opens its own IndexedDB
+     * connection, so without this a checkpoint issued just before completion
+     * could land *after* the completion's clear and resurrect a finished
+     * import as a resumable one.
+     */
+    persist(write: () => Promise<void>): Promise<void> {
+      const self = this as any;
+      const previous: Promise<void> = self._persistQueue || Promise.resolve();
+      const next = previous.catch(() => undefined).then(write);
+      self._persistQueue = next;
+      return next;
+    },
     async onScrobbleComplete() {
       try {
-        await this.stateManager.clearState();
+        await this.persist(() => this.stateManager.clearState());
       } catch (e) {
         // Not critical — continue anyway
       }
+      this.$store.commit('setResumedScrobbleCount', 0);
       this.hasRemainingTracks = false;
       this.currentStep = 5;
     },
-    async onSaveAndExit(info: { scrobbledTracks: number, burstCount: number, dailyCount: number }) {
+    buildState(info: ProgressSnapshot): ScrobbleState {
       const tracks = this.$store.state.selectedScrobbles as Scrobble[];
       const completedIndices: number[] = [];
       const failedIndices: number[] = [];
@@ -179,22 +344,78 @@ export default Vue.extend({
         completedIndices.push(i);
       }
 
-      const state: ScrobbleState = {
+      return {
         userName: (this.$store.state.lfmApi as LastFm).getUserName() || '',
         totalTracks: tracks.length,
         completedIndices,
         failedIndices,
         tracks: StateManager.serializeScrobbles(tracks),
+        originalTotalTracks: info.originalTotalTracks || tracks.length,
+        originalSucceededCount: info.originalSucceededCount,
+        sendTimestamps: info.sendTimestamps || [],
+        lastReTagTimestampSec: info.lastReTagTimestampSec || 0,
         burstCount: info.burstCount,
         dailyCount: info.dailyCount,
         dailyCountDate: new Date().toISOString().split('T')[0],
         savedAt: new Date().toISOString(),
       };
+    },
+    saveProps(info: ProgressSnapshot, automatic: boolean) {
+      const originalTotal = info.originalTotalTracks
+        || (this.$store.state.selectedScrobbles as Scrobble[]).length;
+      return {
+        automatic,
+        scrobbled_tracks: info.scrobbledTracks,
+        total_tracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
+        original_total_tracks: originalTotal,
+        total_succeeded: info.originalSucceededCount,
+        completion_pct: originalTotal
+          ? Math.round((1000 * info.originalSucceededCount) / originalTotal) / 10
+          : 0,
+      };
+    },
+    /**
+     * Silent save used when the scrobble step gives up (rate limited or daily
+     * limit reached). No file download and no navigation: the user stays on the
+     * explanation and can simply close the tab and come back.
+     */
+    async onAutoSave(info: ProgressSnapshot) {
+      try {
+        const state = this.buildState(info);
+        await this.persist(() => this.stateManager.saveState(state));
+        trackEvent('session_saved', this.saveProps(info, true));
+      } catch (e) {
+        trackError('scrobblify.onAutoSave', e);
+      }
+    },
+    /**
+     * Periodic mid-run save, so closing the tab costs at most a few tracks
+     * instead of everything since the last stop. Deliberately silent: it runs
+     * every few dozen tracks, so it reports neither `session_saved` nor more
+     * than one error per page load.
+     */
+    async onCheckpoint(info: ProgressSnapshot) {
+      try {
+        // Built before the first await, so it captures the queue as it is now.
+        const state = this.buildState(info);
+        await this.persist(() => this.stateManager.saveState(state));
+      } catch (e) {
+        const self = this as any;
+        if (!self._checkpointErrorReported) {
+          self._checkpointErrorReported = true;
+          trackError('scrobblify.onCheckpoint', e);
+        }
+      }
+    },
+    async onSaveAndExit(info: ProgressSnapshot) {
+      const state = this.buildState(info);
 
       try {
-        await this.stateManager.saveState(state);
+        await this.persist(() => this.stateManager.saveState(state));
         this.stateManager.exportToFile(state);
+        trackEvent('session_saved', this.saveProps(info, false));
       } catch (e) {
+        trackError('scrobblify.onSaveAndExit', e);
         this.errorMessage = 'Failed to save your scrobbling progress. You can try the "Save Progress" button again.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
@@ -206,4 +427,3 @@ export default Vue.extend({
   },
 });
 </script>
-

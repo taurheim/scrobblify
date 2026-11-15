@@ -1,10 +1,17 @@
 import Scrobble from '@/models/Scrobble';
+import NotAProgressFileError from '@/services/NotAProgressFileError';
 
 export interface SerializedScrobble {
   track: string;
   artist: string;
   album: string;
   timestamp: number;
+  /**
+   * Absent in files written before re-tagged plays were given per-play
+   * timestamps. deserializeScrobbles() infers it for those — see
+   * hasCollapsedTimestamps().
+   */
+  reTagged?: boolean;
 }
 
 export interface ScrobbleState {
@@ -13,29 +20,141 @@ export interface ScrobbleState {
   completedIndices: number[];
   failedIndices: number[];
   tracks: SerializedScrobble[];
+  /**
+   * Size of the user's *original* selection. `totalTracks` shrinks on every
+   * resume (only the remaining tracks are re-saved), so it cannot be used as a
+   * completion denominator. This one is carried forward untouched.
+   */
+  originalTotalTracks: number;
+  /**
+   * Cumulative count of tracks successfully scrobbled across every session of
+   * this import, not just the most recent one.
+   */
+  originalSucceededCount: number;
+  /**
+   * Timestamps (ms) of recent successful scrobbles — the rolling window used by
+   * RateLimitTracker. This is the authoritative rate-limit record.
+   */
+  sendTimestamps: number[];
+  /**
+   * High-water mark of the send-time timestamp allocator for re-tagged plays.
+   * Optional: absent from files written before it existed, in which case the
+   * allocator simply starts from the current clock.
+   */
+  lastReTagTimestampSec?: number;
+  /**
+   * Legacy count-based rate-limit fields. Kept so progress files written by
+   * older versions still import, and so files written by this version remain
+   * readable by them. RateLimitTracker.seedFromLegacyCounts() converts these
+   * into a rolling window when sendTimestamps is absent.
+   */
   burstCount: number;
   dailyCount: number;
   dailyCountDate: string;
   savedAt: string;
 }
 
+export const ACCOUNT_DATA_MESSAGE = 'This is Spotify\'s "Account data" export, which doesn\'t contain the detailed history Scrobblify needs. '
+  + 'On Spotify\'s privacy page, request "Extended streaming history" instead — it arrives as a separate download '
+  + 'containing Streaming_History_Audio_*.json files.';
+
 const DB_NAME = 'scrobblify';
 const STORE_NAME = 'scrobbleState';
 const STATE_KEY = 'current';
 
 export default class StateManager {
-
   static serializeScrobbles(scrobbles: Scrobble[]): SerializedScrobble[] {
     return scrobbles.map((s) => ({
       track: s.track,
       artist: s.artist,
       album: s.album,
       timestamp: s.timestamp.getTime(),
+      reTagged: s.reTagged,
     }));
   }
 
+  /**
+   * Older versions stamped every re-tagged play with the same Date object, so a
+   * saved queue from one of those is recognisable by essentially *all* of its
+   * timestamps being identical — real listening history never looks like that.
+   *
+   * Without this, someone mid-import from an older build would resume into a
+   * queue that Last.fm collapses into a single scrobble, and (once the saved
+   * date ages past 14 days) rejects outright.
+   *
+   * The thresholds are deliberately strict. A saved file holds only the
+   * *remaining* queue, so a near-finished import can be down to a handful of
+   * tracks, and Spotify exports do contain occasional genuinely-identical
+   * second-precision timestamps. A loose test would re-stamp those real listen
+   * dates — corrupting good data to rescue bad. The bug being migrated produced
+   * identical timestamps for 100% of entries, so demanding 90% costs nothing.
+   */
+  static hasCollapsedTimestamps(data: SerializedScrobble[]): boolean {
+    const MIN_SAMPLE = 20;
+    const MIN_SHARE = 0.9;
+    if (data.length < MIN_SAMPLE) {
+      return false;
+    }
+    const counts = new Map<number, number>();
+    let mostCommon = 0;
+    for (const d of data) {
+      const next = (counts.get(d.timestamp) || 0) + 1;
+      counts.set(d.timestamp, next);
+      if (next > mostCommon) {
+        mostCommon = next;
+      }
+    }
+    return mostCommon >= data.length * MIN_SHARE;
+  }
+
   static deserializeScrobbles(data: SerializedScrobble[]): Scrobble[] {
-    return data.map((d) => new Scrobble(d.track, d.artist, new Date(d.timestamp), d.album));
+    const inferReTagged = data.some((d) => d.reTagged === undefined)
+      && StateManager.hasCollapsedTimestamps(data);
+    return data.map((d) => new Scrobble(
+      d.track,
+      d.artist,
+      new Date(d.timestamp),
+      d.album,
+      d.reTagged ?? inferReTagged,
+    ));
+  }
+
+  /**
+   * Both import entry points take any `.json`, and the ones users most often
+   * pick by mistake are Spotify's own history files — dragged out of an opened
+   * ZIP, or from the "Account data" export. Those are arrays of plays, which
+   * used to fail the required-field check below as 'missing required field
+   * "totalTracks"'. Recognised by content, not name, so a renamed file is
+   * still caught.
+   */
+  static assertIsProgressFile(data: unknown): void {
+    if (Array.isArray(data)) {
+      const first = data.find((d) => d && typeof d === 'object') || {};
+      if ('ts' in first || 'master_metadata_track_name' in first) {
+        throw new NotAProgressFileError(
+          'extended_history',
+          'This is one of the history files from your Spotify export, not a Scrobblify progress file. '
+            + 'Upload the whole .zip Spotify sent you instead — there\'s no need to extract it.',
+        );
+      }
+      if ('endTime' in first || 'trackName' in first) {
+        throw new NotAProgressFileError('account_data', ACCOUNT_DATA_MESSAGE);
+      }
+    }
+    // Any other JSON object — Spotify's own YourLibrary.json, Userdata.json,
+    // Playlist1.json, or an unrelated download — has none of the counters only
+    // Scrobblify writes. (`tracks` alone proves nothing: YourLibrary.json has
+    // one.) A file with some of them but not all is a damaged progress file
+    // and is left to the required-field check to report.
+    const signature = ['totalTracks', 'completedIndices', 'failedIndices'];
+    if (!data || typeof data !== 'object' || Array.isArray(data)
+      || !signature.some((field) => field in data)) {
+      throw new NotAProgressFileError(
+        'unknown',
+        'This file is not a Scrobblify progress file. Progress files are named like '
+          + '"scrobblify-progress-2026-01-31.json".',
+      );
+    }
   }
 
   public async saveState(state: ScrobbleState): Promise<void> {
@@ -99,10 +218,14 @@ export default class StateManager {
       reader.readAsText(file);
     });
     const data = JSON.parse(text);
+    StateManager.assertIsProgressFile(data);
 
+    // Only the fields needed to actually restore scrobbles are required.
+    // Everything else is optional metadata that is defaulted below, so an
+    // older or partial progress file (e.g. one without "userName") can still
+    // be imported successfully.
     const requiredFields: Array<keyof ScrobbleState> = [
-      'userName', 'totalTracks', 'completedIndices', 'failedIndices',
-      'tracks', 'burstCount', 'dailyCount', 'dailyCountDate', 'savedAt',
+      'totalTracks', 'completedIndices', 'failedIndices', 'tracks',
     ];
 
     for (const field of requiredFields) {
@@ -111,7 +234,23 @@ export default class StateManager {
       }
     }
 
-    return data as ScrobbleState;
+    return {
+      userName: '',
+      sendTimestamps: [],
+      lastReTagTimestampSec: 0,
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+      ...data,
+      // Files written before these existed have no lineage information, so the
+      // best available approximation is this file's own totals. Applied after
+      // the spread so a genuinely absent field is filled rather than kept as
+      // undefined.
+      originalTotalTracks: data.originalTotalTracks || data.totalTracks,
+      originalSucceededCount: data.originalSucceededCount
+        ?? (Array.isArray(data.completedIndices) ? data.completedIndices.length : 0),
+    } as ScrobbleState;
   }
 
   private openDB(): Promise<IDBDatabase> {
