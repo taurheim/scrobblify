@@ -26,6 +26,10 @@ export default new Vuex.Store({
     // High-water mark of the re-tagged-play timestamp allocator, carried across
     // a resume so a later run cannot reuse seconds an earlier one already sent.
     reTagCursorSec: 0,
+    // True while the scrobble loop is sending (or waiting to resume by itself).
+    // Reloading then would drop everything since the last checkpoint, so the
+    // "new version available" banner stays hidden until the run stops.
+    scrobbleRunActive: false,
   },
   mutations: {
     setValidScrobbles(state: any, tracks: SpotifyListen[]) {
@@ -42,6 +46,9 @@ export default new Vuex.Store({
     },
     setReTagCursorSec(state: any, seconds: number) {
       state.reTagCursorSec = seconds;
+    },
+    setScrobbleRunActive(state: any, active: boolean) {
+      state.scrobbleRunActive = active;
     },
     trackScrobbled(state: any) {
       state.tracksScrobbled += 1;
