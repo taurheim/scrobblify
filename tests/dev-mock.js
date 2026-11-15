@@ -25,8 +25,8 @@
 //     remaining tracks and the committed fixture has five. Upload it by hand;
 //     the path is printed below.
 //
-// The server always starts fresh on its own port, never 8080, and never reuses
-// one it finds. Both halves of that matter:
+// The server always starts fresh on its own port (8090 by default, or $PORT),
+// and never reuses one it finds. Both halves of that matter:
 //
 //   * VUE_APP_* is inlined by webpack at compile time, so a server started
 //     without the mock env has already baked the real Last.fm URL into the
@@ -36,7 +36,6 @@
 //     left running there would be silently adopted by the next
 //     `npx playwright test`, whose specs intercept ws.audioscrobbler.com — a
 //     URL the mocked app no longer calls.
-
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -45,7 +44,7 @@ const { MIN_TRACKS } = require('./backgroundMock');
 const { generateLargeFixture } = require('./fixtures/generate-fixture');
 const { mockEnv } = require('./mockPaths');
 
-const PORT = 8090;
+const PORT = Number(process.env.PORT) || 8090;
 const BASE_URL = `http://localhost:${PORT}`;
 // Must be the publicPath (see vue.config.js): webpack only serves the app
 // there, and `/` is not reliable for a non-browser probe.

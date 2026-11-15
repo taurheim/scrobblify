@@ -1,4 +1,5 @@
 import posthog from 'posthog-js';
+import { BUILD_NUMBER, GIT_SHA } from '../buildInfo';
 
 /*
   Lightweight wrapper around PostHog. Its purpose is to give visibility into
@@ -36,7 +37,7 @@ export function initAnalytics(): void {
       capture_pageview: false,
       persistence: 'localStorage+cookie',
     });
-    posthog.register({ app: APP_NAME });
+    posthog.register({ app: APP_NAME, build_sha: GIT_SHA, build_number: BUILD_NUMBER });
     initialized = true;
   } catch (e) {
     // Analytics is best-effort; never let it break the app.

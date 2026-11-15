@@ -6,6 +6,10 @@ This app reports usage and errors to PostHog from the browser. The PostHog MCP
 server is configured in `.mcp.json` at the repo root, so any MCP-aware agent
 picks it up automatically.
 
+To go looking for bugs rather than chase a known one, use the
+`hunting-posthog-bugs` skill (`.github/skills/hunting-posthog-bugs/`): a
+workflow, journey invariants, and validated HogQL for each check.
+
 ### Setup (once per machine)
 
 `.mcp.json` reads the token from an environment variable — **never commit a key**.
@@ -30,6 +34,37 @@ silently. Absence of events is not evidence that a code path did not run.
 Users are identified by their Last.fm username (`lastfm_username`), so a bug
 report from a named user can be traced to their session.
 
+Every event also carries `build_sha` (7-char commit) and `build_number` (the CI
+run number), so you can tell which deploy an error came from — e.g. whether it
+predates a fix. Events from before 2026-09-27 have neither. Values come from
+`src/buildInfo.ts`, injected by `vue.config.js` from `GITHUB_SHA` /
+`GITHUB_RUN_NUMBER` (locally: `git rev-parse` / `local`). The same values show
+on the site as a hover tooltip on "Scrobblify" in the footer, and the deployed
+`/scrobblify/version.json` (written by the CI build job) has the full SHA and
+build time.
+
+**Old builds keep running long after a deploy.** Until 2026-10-03 `index.html`
+was served with no `Cache-Control`, so browsers cached it heuristically, and the
+FTP deploy never deletes old hashed chunks, so a stale copy still boots. About
+5–7% of fresh page loads ran a superseded build for days after each deploy (one
+user was on code two months old), and those users kept hitting already-fixed
+bugs. **Before calling a fix ineffective, check `build_sha`**: an occurrence on
+a build older than the fix is this, not a regression. Two mitigations:
+
+- `public/.htaccess` sets `Cache-Control: no-cache` on `index.html` and
+  `version.json` (Vue CLI copies dotfiles from `public/`). Verify after a
+  deploy with `curl -I https://savas.ca/scrobblify/`.
+- The app fetches `version.json` (`src/services/BuildCheck.ts`) on load, every
+  30 minutes and when a backgrounded tab returns, and if its `sha` differs from
+  `build_sha` shows a "newer version — Reload" banner. It is hidden while a run
+  is actively scrobbling (`scrobbleRunActive` in the store), because a reload
+  then drops everything since the last checkpoint. It emits
+  `stale_build_detected` (`latest_sha`, `latest_run`, `reloaded_for_latest` —
+  true means a reload came back stale anyway, i.e. something is still caching
+  `index.html`) and `stale_build_reload_clicked`. Tabs on builds from before
+  this shipped can't detect themselves, so they still show up as old
+  `build_sha`s until they reload.
+
 ### Errors
 
 Errors arrive two ways: a filterable `scrobblify_error` event (properties:
@@ -41,7 +76,7 @@ Errors arrive two ways: a filterable `scrobblify_error` event (properties:
 | Upload / parsing | `upload.loadZip`, `upload.extractFile`, `upload.parseJson`, `upload.removeInvalidListens`, `upload.filterDuplicates` |
 | Auth | `auth.init`, `auth.strip_token_url` |
 | Scrobbling | `scrobble.repeatedFailures` |
-| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit` |
+| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load) |
 | Uncaught | `vue.errorHandler`, `window.onerror`, `unhandledrejection` |
 
 Last.fm failures are normalized to `Last.fm API error <code> (HTTP <status>)`
@@ -55,13 +90,22 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `upload_parse_started` / `upload_parse_completed` / `upload_no_matching_files` →
 `tracks_selected` → `scrobble_started` / `scrobble_resumed` / `scrobble_paused` /
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
-`session_resumed`, and `user_logged_out`.
+`session_resumed`, `session_resume_blocked`, and `user_logged_out`.
+`stale_build_detected` / `stale_build_reload_clicked` are outside the funnel
+(see "Old builds keep running" above).
 
 `upload_no_matching_files` carries `detected`: `progress_file` (a Scrobblify
 progress file was zipped up and is imported instead), `account_data` (Spotify's
 default "Account data" export, `StreamingHistory_music_*.json`, rather than the
 extended one) or `unknown`. Before 2026-09-27 it carried no properties.
-`session_resumed.source` is `saved`, `file`, or `zip`.
+A loose `.json` that turns out not to be a progress file (see "Import
+robustness") emits it too, with `file_type: 'json'`, a `source` and `detected`
+of `extended_history`, `account_data` or `unknown` — not a
+`scrobblify.onImportFile` error.
+`session_resumed.source` is `saved`, `file`, or `zip`. `session_resume_blocked`
+(same `source`, plus `reason: not_authenticated`) fires instead of
+`session_resumed` when a resume is attempted with no session key; it exists
+since 2026-09-27.
 
 Rate limiting has its own events: `scrobble_rate_limited`,
 `scrobble_rate_limit_cooldown_complete`, `scrobble_rate_limit_recovered`,
@@ -82,12 +126,15 @@ nothing at all.
   a bug: treat it as normal operation rather than signal.
 - `scrobble_stopped` — terminal; the run is over until the user comes back.
   Reasons: `daily_limit`, `lastfm_daily_limit`, `rate_limit_exhausted`,
-  `repeated_rejections`, `repeated_failures`, `session_invalid`, `manual`, and
+  `repeated_rejections`, `repeated_failures`, `session_invalid`,
+  `not_authenticated`, `manual`, `save_and_exit`, and
   the backdating guards `retag_blocked`, `retag_no_second`,
   `retag_second_refused`, `retag_identity_unavailable`,
-  `retag_journal_unavailable`. Only `manual` is a user action. Every one
-  carries `auto_saved`, which is the difference between an interruption and
-  lost work.
+  `retag_journal_unavailable`. Only `manual` and `save_and_exit` are user
+  actions. Every one carries `auto_saved`, which is the difference between an
+  interruption and lost work. `save_and_exit` exists since 2026-09-27 and only
+  fires when "Save Progress & Leave" is clicked during a *transient* countdown
+  (after a terminal stop the loop has already returned and reported).
 
 `auto_saved: true` means the progress write to IndexedDB **resolved** before the
 event was emitted — every stop path awaits its save first, and a failed write
@@ -120,8 +167,8 @@ All terminal paths go through the `trackStopped()` helper rather than emitting
 inline, so a new one cannot silently skip the event.
 
 Every terminal path must also leave the user a way back in. The paused panel's
-resume button is gated on the `canResume` computed (`stopped || manuallyPaused`),
-not on `stopped` alone: a manual pause is terminal but is *not* an error, so it
+resume button is gated on the `canResume` computed (`stopped || manuallyPaused
+|| leaving`), not on `stopped` alone: a manual pause is terminal but is *not* an error, so it
 sets `manuallyPaused` and gets `info` styling via `pauseAlertType` instead of a
 red `error` banner. Setting only `paused` renders a **disabled** "Wait Here"
 button waiting on an auto-resume the loop has already returned from — a dead end
@@ -140,6 +187,25 @@ failed identically: the top `scrobble.repeatedFailures` cause, with one user
 stuck for 8 days. Error 9 no longer reaches `scrobble.repeatedFailures`, so that
 context's volume drops from this fix on.
 
+**A cleared key must never be resumed past.** `clearSessionKey()` keeps the
+username, and the resume used to check only that, so "Save Progress & Leave" →
+sign-in step → **Resume** jumped to the scrobble step with no key. Every send
+threw `Not authenticated.` in ~100ms, it stopped as `repeated_failures`, and the
+nine tracks those failures consumed were saved as completed and never sent
+(seen in production right after the error-9 fix shipped, with no `auth_success`
+in between). Two guards now, since 2026-09-27:
+
+- `restoreFromState()` (saved-state and file resumes) refuses when
+  `!api.isAuthenticated()`: it stays on the sign-in step, writes nothing, and
+  shows a "Sign in to Last.fm first" prompt with a sign-in button. The saved
+  state survives the Last.fm redirect, so the banner comes back after it. It
+  emits `session_resume_blocked`, not `session_resumed`.
+- `scrobblePlay` throws a typed `NotAuthenticatedError`
+  (`LastFm.isNotAuthenticatedError`) when there is no key, and the loop treats
+  it like error 9 — first occurrence, track unconsumed, saved, sign-in link —
+  but stops as `not_authenticated`. That reason should stay at zero; any
+  occurrence means some other route into the loop skips signing in.
+
 `init()` exchanges a callback `?token=` **even when a key is already stored**.
 It used to skip the exchange whenever one was, which silently discarded the
 fresh token and kept the dead key — re-authorizing could never help (visible in
@@ -154,6 +220,24 @@ which runs *between* tracks. Saving on the click would snapshot a
 `scrobbledTracks` that omits the in-flight track, so the resume would re-send it
 — and for a re-tagged play that means a freshly allocated timestamp and a
 phantom duplicate scrobble.
+
+**Progress is checkpointed mid-run**, silently (no `session_saved`): every
+`CHECKPOINT_EVERY_TRACKS` (25) tracks, between tracks, and at the start of every
+countdown wait. Before 2026-09-27 a save only happened on a terminal stop or a
+save button, so closing the tab mid-run lost everything since. Separately, "Save
+Progress & Leave" during a transient countdown saved and navigated away but did
+**not** stop the loop — it carried on scrobbling unseen behind the Complete step
+once the countdown ended. Both made the next resume replay already-sent tracks:
+42% of resuming users had a resume with *lower* `completion_pct` than their
+previous event, replaying a median of ~340 tracks (143k in total over 60 days).
+**Session-over-session drops in `completion_pct` before 2026-09-27 are this bug**,
+and those replays also inflate `total_succeeded` and burn daily budget.
+`saveAndExit()` now sets `leaving` and cancels the countdown so the loop returns.
+
+All writes to the saved session go through `persist()` in `Scrobblify.vue`,
+which serializes them. Each save opens its own IndexedDB connection, so without
+the queue a checkpoint issued just before completion could land after the
+completion's clear and resurrect a finished import as resumable.
 
 `burst_limit` is **preventive pacing, not a stoppage**, and it is emitted once
 per *stretch* of throttled sends — paired with a `scrobble_pacing_ended` event
@@ -294,7 +378,21 @@ saved state in IndexedDB, so on a new PC or browser it never appears. The drop
 zone therefore takes both `.zip` and `.json` and **classifies the file the
 moment it's chosen** (`classifyZip`, by entry names only), not on "Find tracks":
 
-- `.json` → imported as a progress file.
+- `.json` → imported as a progress file — *unless its content is a Spotify
+  history file* (`StateManager.assertIsProgressFile`, which also guards the
+  banner's "Import from file"). Users drag a `Streaming_History_Audio_*.json`
+  out of an opened ZIP, or pick one from the "Account data" export, and those
+  used to fail as `Invalid state file: missing required field "totalTracks"`,
+  reported under `scrobblify.onImportFile`. They now get a
+  `NotAProgressFileError` whose message tells them what to upload instead, so
+  **`totalTracks` errors before 2026-09-27 are mostly this wrong-file mistake,
+  not corrupted progress files.** Any other JSON *object* (Spotify's
+  `YourLibrary.json`, `Userdata.json`, …) is refused the same way, as
+  `detected: unknown`. A file only counts as a progress file if it has at least
+  one of the Scrobblify-only counters `totalTracks` / `completedIndices` /
+  `failedIndices`, and `tracks` alone doesn't count, because `YourLibrary.json`
+  has one. So a `missing required field` error now means a genuinely damaged
+  progress file.
 - ZIP with `Streaming_History_Audio_*` → ready; if it *also* holds a
   `scrobblify-progress*.json`, a "Resume from it instead" link is offered but
   not forced.
@@ -327,8 +425,9 @@ round outwards so a duplicate-check window can only widen, never miss.
 
 ## Running locally with mocks
 
-`npm run dev:mock` starts a dev server on **port 8090** whose Last.fm is served
-by mock middleware in `vue.config.js`. `npm run dev:mock:bg` adds a fake
+`npm run dev:mock` starts a dev server on **port 8090 by default** (or `$PORT`
+when set) whose Last.fm is served by mock middleware in `vue.config.js`.
+`npm run dev:mock:bg` adds a fake
 background worker, and prints a URL carrying `?beta=1` because the handoff
 offer is behind that opt-in (see "Background scrobbling beta gate" below).
 Open the printed URL in **any** browser — the mocking lives
@@ -365,7 +464,8 @@ authenticate step runs for real: the app exchanges the token against the mocked
 click, because `LastFm.init` records the token it has begun exchanging in
 sessionStorage and refuses to resubmit it.
 
-**dev:mock never reuses a server and never uses port 8080.** Both halves matter.
+**dev:mock never reuses a server and defaults to 8090 rather than 8080.** Both
+halves matter.
 `VUE_APP_*` is inlined by webpack at compile time, so adopting a server started
 without the mock env would mock nothing while announcing the opposite. And
 `playwright.config.ts` sets `reuseExistingServer` on 8080, so a mock server left
@@ -467,26 +567,51 @@ and tank performance on big histories.
 
 Warnings (mostly `no-explicit-any`) do not fail the build; only errors do.
 
+## Local servers and ports
+
+Several worktrees of this repo are often checked out and running at once, so
+**never start a local server on the default port 8080**. Pick a free port for
+your worktree and pass it through the `PORT` environment variable, which
+everything here honours — `vue-cli-service serve` (so `npm run serve`),
+`playwright.config.ts` (both the server it starts and `baseURL`), and
+`npm run dev:mock`:
+
+```powershell
+$port = Get-Random -Minimum 8100 -Maximum 9000
+while (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { $port++ }
+$env:PORT = $port
+npx playwright test   # or: npm run serve / npm run dev:mock
+```
+
+Set `PORT` in the **same command** that starts the server or runs the tests —
+agent shells don't keep environment variables between calls, and a run that
+loses it falls back to 8080 (or 8090 for `dev:mock`) without complaint. Reuse
+the same port for the rest of the session so later runs find your server instead
+of starting another, and stop any server you started when you're done.
+
+`vue-cli-service` quietly moves to the next free port if the one requested is
+taken, so read the URL it prints rather than assuming.
+
 ## Running the tests
 
 Playwright is the only test framework here — there are no unit tests. Analytics
 is disabled on `localhost`, so **a test can never observe a PostHog event**;
 assert on the UI instead.
 
-`playwright.config.ts` sets `reuseExistingServer: true` on port 8080. If a
-`vue-cli-service serve` is already running there **from another checkout or
-worktree, Playwright will happily test that checkout's code instead of yours**
-and say nothing. This has already produced three "verified" results that were
-really the other tree's build. Before trusting a local run — especially one
-verifying a fix — confirm what owns the port:
+`playwright.config.ts` sets `reuseExistingServer: true` on `$PORT` (default
+8080). If a `vue-cli-service serve` is already running there **from another
+checkout or worktree, Playwright will happily test that checkout's code instead
+of yours** and say nothing. This has already produced three "verified" results
+that were really the other tree's build — the main reason for the per-worktree
+port above. Before trusting a local run — especially one verifying a fix —
+confirm what owns the port:
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "ProcessId = $((Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess)" |
+Get-CimInstance Win32_Process -Filter "ProcessId = $((Get-NetTCPConnection -LocalPort $env:PORT -State Listen).OwningProcess)" |
   Select-Object -ExpandProperty CommandLine
 ```
 
-or run against a scratch config on its own port with `reuseExistingServer:
-false`. CI is unaffected, since it starts from nothing.
+CI is unaffected, since it starts from nothing and uses the default.
 
 Verify a regression test actually catches its bug with
 `git stash push -- <source file>`, re-run, `git stash pop`. A test that passes

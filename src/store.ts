@@ -98,6 +98,10 @@ export default new Vuex.Store({
       furthest-progress comparison between their saves meaningful.
     */
     importId: '',
+    // True while the scrobble loop is sending (or waiting to resume by itself).
+    // Reloading then would drop everything since the last checkpoint, so the
+    // "new version available" banner stays hidden until the run stops.
+    scrobbleRunActive: false,
   },
   mutations: {
     setValidScrobbles(state: any, tracks: SpotifyListen[]) {
@@ -135,6 +139,9 @@ export default new Vuex.Store({
     },
     setImportId(state: any, id: string) {
       state.importId = id;
+    },
+    setScrobbleRunActive(state: any, active: boolean) {
+      state.scrobbleRunActive = active;
     },
     trackScrobbled(state: any) {
       state.tracksScrobbled += 1;

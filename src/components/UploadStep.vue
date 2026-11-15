@@ -110,6 +110,7 @@ import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError } from '@/services/Analytics';
+import { ACCOUNT_DATA_MESSAGE } from '@/services/StateManager';
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -299,9 +300,7 @@ export default Vue.extend({
           (progressError as Error)?.message || String(progressError),
         );
       } else if (contents.isAccountData) {
-        this.showUploadError('This ZIP is Spotify\'s "Account data" export, which doesn\'t contain the detailed history Scrobblify needs. '
-          + 'On Spotify\'s privacy page, request "Extended streaming history" instead — it arrives as a separate download '
-          + 'containing Streaming_History_Audio_*.json files.');
+        this.showUploadError(ACCOUNT_DATA_MESSAGE);
       } else {
         this.showUploadError('No Streaming_History_Audio_*.json files found in the ZIP. Make sure you uploaded the correct Spotify Extended Streaming History export.');
       }

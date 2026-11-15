@@ -5,6 +5,7 @@ import Scrobble from '@/models/Scrobble';
 // in this class — if the two ever disagree, one of them silently corrupts a
 // user's history.
 import * as protocol from '@/shared/lastfm/protocol';
+import NotAuthenticatedError from '@/api/NotAuthenticatedError';
 
 const LFM_AUTH_CALLBACK = 'https://savas.ca/scrobblify/scrobble';
 // Overridable so `npm run dev:mock` can send the authorise link to the dev
@@ -390,7 +391,7 @@ export default class LastFm {
   // https://www.last.fm/api/show/track.scrobble
   public async scrobblePlay(play: Scrobble, timestampSecOverride?: number): Promise<ScrobbleResult> {
     if (!this.userAuthKey) {
-      throw new Error('Not authenticated.');
+      throw new NotAuthenticatedError();
     }
     const timestampSec = timestampSecOverride !== undefined
       ? timestampSecOverride
@@ -548,6 +549,19 @@ export default class LastFm {
     return protocol.isInvalidSessionKeyError(error);
   }
 
+  // No session key at all, so nothing was sent. Like error 9 the only way
+  // forward is signing in, and the track is not at fault.
+  public static isNotAuthenticatedError(error: unknown): boolean {
+    return error instanceof NotAuthenticatedError;
+  }
+
+  // A failed `fetch` (offline, DNS failure, connection reset, CORS, ad-blocker,
+  // etc.) rejects with a TypeError rather than an HTTP response. These are
+  // transient connectivity problems, not a problem with a specific track, so
+  // callers should pause and retry rather than treat the track as failed.
+  // The message differs per browser: "Failed to fetch" (Chrome/Edge),
+  // "NetworkError when attempting to fetch resource." (Firefox),
+  // "Load failed" (Safari).
   public static isNetworkError(error: unknown): boolean {
     return protocol.isNetworkError(error);
   }
