@@ -45,7 +45,8 @@ jobs:
 
   e2e-tests:
     name: E2E Tests
-    runs-on: ubuntu-latest
+    # Pinned: Playwright 1.59 cannot install browsers on ubuntu-latest (26.04).
+    runs-on: ubuntu-24.04
     needs: build
     steps:
       - uses: actions/checkout@v4
