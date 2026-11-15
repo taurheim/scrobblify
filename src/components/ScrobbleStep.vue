@@ -36,12 +36,15 @@
         <div class="overall-progress">
           Overall: {{ totalSucceeded }} of {{ originalTotalTracks }} scrobbled
         </div>
+        <div v-if="pending.length > 0">
+          {{ pending.length }} more sent, being checked on Last.fm
+        </div>
         <div>
           This session: {{ scrobbledTracks }} of {{ tracksToScrobble.length }}
           ({{ failedTracks.length }} failed)
         </div>
         <div>Recent: {{ burstCount }} / {{ burstLimit }} in the last 10 minutes</div>
-        <div>Last 24h: {{ dailyCount }} / {{ dailyLimit }}</div>
+        <div v-if="storedToday !== null">Today on Last.fm (UTC): {{ storedToday }} / {{ dailyCap }}</div>
       </v-card>
 
       <v-btn outlined @click="manualPause">Pause &amp; Save</v-btn>
@@ -90,6 +93,9 @@
         </v-alert>
         <div class="mb-3 overall-progress">
           {{ totalSucceeded }} of {{ originalTotalTracks }} completed so far
+          <span v-if="pending.length > 0" class="font-weight-regular">
+            ({{ pending.length }} more sent, checked on Last.fm when you resume)
+          </span>
         </div>
 
         <v-btn class="primary mr-2" @click="saveAndExit">Save Progress &amp; Leave</v-btn>
@@ -116,6 +122,15 @@
         <span class="overall-progress">
           {{ totalSucceeded }} of {{ originalTotalTracks }} tracks scrobbled.
         </span>
+      </v-alert>
+      <!--
+        Only plays read back from the user's library are counted. When the
+        library can't be read (network, private profile), say so rather than
+        quietly counting what Last.fm merely accepted.
+      -->
+      <v-alert v-if="pending.length > 0" type="warning" text class="mt-2">
+        {{ pending.length }} more were sent, but Scrobblify couldn't read your Last.fm library to
+        confirm them, so they aren't counted above.
       </v-alert>
     </div>
 
@@ -150,11 +165,18 @@
 </style>
 <script lang="ts">
 import Vue from 'vue';
-import Scrobble from '@/models/Scrobble';
+import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError } from '@/services/Analytics';
-import RateLimitTracker, { DAILY_LIMIT } from '@/services/RateLimitTracker';
+import RateLimitTracker from '@/services/RateLimitTracker';
+import {
+  LASTFM_DAILY_CAP,
+  OWN_LISTENING_HEADROOM,
+  importBudget,
+  nextUtcDayStartSec,
+  utcDayStartSec,
+} from '@/services/DailyCap';
 import { canCompress } from '@/services/BackgroundScrobbling';
 import * as background from '@/services/BackgroundScrobbling';
 import StateManager from '@/services/StateManager';
@@ -248,16 +270,33 @@ const SEND_LOCK_RETRY_MS = 5 * MS_PER_SECOND;
 // since that is exactly where users walk away.
 const CHECKPOINT_EVERY_TRACKS = 25;
 
+// Plays are confirmed by reading the user's library back, because Last.fm
+// answers plays over its daily cap as accepted and keeps none of them (see
+// DailyCap.ts). A play missing from the first read is re-checked once after this
+// long before it is called lost, in case Last.fm lists it a moment late.
+const VERIFY_RECHECK_MS = 5 * MS_PER_SECOND;
+
+// Unconfirmed plays are read back one UTC day at a time, over just the span
+// they cover that day, rather than in one range spanning all of them: plays
+// dated in the last 14 days keep their real timestamps, and a single range from
+// those to today's re-tagged ones could cover a fortnight of the user's
+// library. A day holds at most LASTFM_DAILY_CAP plays, so each range fits in
+// one page.
+
 // Re-tagged plays (see Scrobble.reTagged) are stamped at send time, starting
 // this far back and stepping forward one second per scrobble. Last.fm rejects
-// timestamps in the future and anything older than 14 days, so the cursor is
-// always clamped into (now - 6h, now].
+// timestamps in the future and anything older than 14 days.
 //
-// Six hours of runway is far more than the pacing needs — the burst limit keeps
-// sustained throughput below one scrobble per second — but it keeps every
-// scrobble comfortably inside the window no matter how long the import runs or
-// how many times it is resumed.
+// Outside a reserved range the cursor also never goes back past today's UTC
+// midnight. Last.fm's daily cap is per UTC day of the *timestamp*, so this keeps
+// a whole run inside the one day whose budget it checked.
 const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
+
+// Just after UTC midnight the floor above leaves less room than there are
+// sends, so the cursor can overtake the clock by a few seconds. A gap this
+// small is waited out; a larger one means the clock moved backwards, and the
+// run stops instead (see `retag_no_second`).
+const RETAG_CLOCK_WAIT_MAX_SECONDS = 60;
 
 /**
  * Outer bound on how far back a re-tagged scrobble may be placed, matching the
@@ -362,8 +401,17 @@ export default Vue.extend({
       // Tracks *processed* this session (successes + permanent failures). Also
       // the loop index / resume point, so it must count both.
       scrobbledTracks: 0,
-      // Tracks Last.fm actually accepted this session.
-      succeededTracks: 0,
+      // Plays read back from the user's Last.fm library this session. Only
+      // these count as scrobbled: an `accepted` reply is not proof of storage.
+      confirmedTracks: 0,
+      // Plays Last.fm accepted and then did not keep.
+      droppedTracks: 0,
+      // Sent and accepted, not yet seen in the library.
+      pending: [] as PendingScrobble[],
+      // Scrobbles Last.fm holds per UTC day (keyed by the day's start, in unix
+      // seconds), counting this run's sends since the last read.
+      dayStored: {} as Record<number, number>,
+      verifyErrorReported: false,
       // High-water mark of the send-time timestamp allocator for re-tagged
       // plays. Persisted so a resume cannot reuse an earlier run's seconds.
       reTagCursorSec: 0,
@@ -446,7 +494,7 @@ export default Vue.extend({
       burstCount: 0,
       dailyCount: 0,
       burstLimit: 0,
-      dailyLimit: DAILY_LIMIT,
+      dailyCap: LASTFM_DAILY_CAP,
       rateLimitPauseCount: 0,
       firstRateLimitAtMs: null as number | null,
       failedTracks: [] as Array<{ track: Scrobble; error: string }>,
@@ -534,7 +582,11 @@ export default Vue.extend({
     },
     /** Successful scrobbles across every session of this import. */
     totalSucceeded(): number {
-      return this.previouslyScrobbled + this.succeededTracks;
+      return this.previouslyScrobbled + this.confirmedTracks;
+    },
+    storedToday(): number | null {
+      const today = utcDayStartSec(Math.floor(Date.now() / MS_PER_SECOND));
+      return today in this.dayStored ? this.dayStored[today] : null;
     },
     progress(): number {
       return (100 * this.scrobbledTracks) / this.tracksToScrobble.length;
@@ -714,8 +766,10 @@ export default Vue.extend({
       return {
         scrobbled_tracks: this.scrobbledTracks,
         total_tracks: this.tracksToScrobble.length,
-        succeeded_tracks: this.succeededTracks,
+        succeeded_tracks: this.confirmedTracks,
         failed_tracks: this.failedTracks.length,
+        unconfirmed_tracks: this.pending.length,
+        not_stored_tracks: this.droppedTracks,
         is_resumed: this.isResumed,
         previously_scrobbled: this.previouslyScrobbled,
         original_total_tracks: this.originalTotalTracks,
@@ -725,6 +779,209 @@ export default Vue.extend({
           : 0,
         ...extra,
       };
+    },
+
+    /**
+     * Scrobbles Last.fm holds for the UTC day starting at `daySec`, read once per
+     * day and then kept current by `recordStored` and checkpoint refreshes.
+     */
+    async storedOn(api: LastFm, tracker: RateLimitTracker, daySec: number): Promise<number> {
+      if (!(daySec in this.dayStored)) {
+        await this.refreshStored(api, tracker, daySec);
+      }
+      return this.dayStored[daySec];
+    },
+
+    async refreshStored(api: LastFm, tracker: RateLimitTracker, daySec: number) {
+      let stored: number;
+      try {
+        stored = await api.countStoredScrobbles(daySec, nextUtcDayStartSec(daySec) - 1);
+      } catch (e) {
+        // The library can't be read (network, private profile). Fall back to
+        // what this browser itself sent that day, which misses the user's own
+        // listening but is the best floor available.
+        stored = Math.max(
+          this.dayStored[daySec] || 0,
+          tracker.countSince(daySec * MS_PER_SECOND),
+        );
+      }
+      this.dayStored = { ...this.dayStored, [daySec]: stored };
+    },
+
+    recordStored(daySec: number) {
+      this.dayStored = { ...this.dayStored, [daySec]: (this.dayStored[daySec] || 0) + 1 };
+    },
+
+    /**
+     * The plays in `items` that are not in the user's library at the timestamp
+     * they were sent with.
+     *
+     * Matched on timestamp alone. Last.fm can rewrite the artist or track name
+     * it stores (autocorrection), so a name match would call a stored play lost
+     * and re-send it as a duplicate. A re-tagged play owns its second; the only
+     * way to be fooled is the user's own play landing on that exact second.
+     */
+    async unconfirmed(api: LastFm, items: PendingScrobble[]): Promise<PendingScrobble[]> {
+      const spans = new Map<number, { from: number; to: number }>();
+      for (const { timestampSec } of items) {
+        const day = utcDayStartSec(timestampSec);
+        const span = spans.get(day);
+        if (span) {
+          span.from = Math.min(span.from, timestampSec);
+          span.to = Math.max(span.to, timestampSec);
+        } else {
+          spans.set(day, { from: timestampSec, to: timestampSec });
+        }
+      }
+      const stored = new Map<number, number>();
+      for (const { from, to } of Array.from(spans.values())) {
+        // Widened by a second each side: Last.fm doesn't document whether
+        // `from`/`to` are inclusive.
+        const plays = await api.getAllScrobblesInRange(
+          new Date((from - 1) * MS_PER_SECOND),
+          new Date((to + 1) * MS_PER_SECOND),
+        );
+        for (const play of plays) {
+          const sec = Math.floor(play.timestamp.getTime() / MS_PER_SECOND);
+          stored.set(sec, (stored.get(sec) || 0) + 1);
+        }
+      }
+      return items.filter((p) => {
+        const count = stored.get(p.timestampSec) || 0;
+        if (count > 0) {
+          stored.set(p.timestampSec, count - 1);
+          return false;
+        }
+        return true;
+      });
+    },
+
+    /**
+     * Read every unconfirmed play back from the user's library. Found ones count
+     * as scrobbled. Lost re-tagged ones go back on the end of the queue — they
+     * were never stored, so re-sending (with a fresh timestamp) cannot duplicate
+     * them. A lost play with its real date can never fit into that day again,
+     * so it is recorded as failed.
+     *
+     * If the library can't be read, everything stays unconfirmed and is checked
+     * again at the next opportunity, including after a resume.
+     *
+     * Returns true when a lost play was dated today or later: the day's cap is
+     * full, and the run must stop rather than keep sending into it.
+     */
+    async verifyPending(api: LastFm): Promise<boolean> {
+      if (this.pending.length === 0) {
+        return false;
+      }
+      const batch = this.pending.slice();
+      let missing: PendingScrobble[];
+      try {
+        missing = await this.unconfirmed(api, batch);
+        if (missing.length > 0) {
+          await this.sleep(VERIFY_RECHECK_MS);
+          missing = await this.unconfirmed(api, missing);
+        }
+      } catch (e) {
+        if (!this.verifyErrorReported) {
+          this.verifyErrorReported = true;
+          trackEvent('scrobble_verify_failed', this.progressProps({
+            message: (e instanceof Error && e.message) || String(e),
+          }));
+        }
+        return false;
+      }
+
+      const confirmed = batch.length - missing.length;
+      this.confirmedTracks += confirmed;
+      this.$store.commit('trackScrobbled', confirmed);
+
+      // Missing from the library is only proof of loss when that day is at
+      // Last.fm's cap. Otherwise the listing may simply be lagging, and
+      // re-sending a re-tagged play (with a fresh timestamp) that was in fact
+      // stored would create a duplicate. Those stay unconfirmed and are read
+      // again at the next check.
+      const missingDays = Array.from(new Set(missing.map((p) => utcDayStartSec(p.timestampSec))));
+      const tracker = this.rateLimitTracker();
+      for (const daySec of missingDays) {
+        await this.refreshStored(api, tracker, daySec);
+      }
+      const lost = missing.filter((p) => this.dayStored[utcDayStartSec(p.timestampSec)] >= LASTFM_DAILY_CAP);
+      const lagging = missing.filter((p) => !lost.includes(p));
+      // The loop is awaiting this, so nothing was added to `pending` meanwhile.
+      this.pending.splice(0, batch.length, ...lagging);
+      if (lost.length === 0) {
+        return false;
+      }
+
+      const todaySec = utcDayStartSec(Math.floor(Date.now() / MS_PER_SECOND));
+      let todayFull = false;
+      let reTagged = 0;
+      for (const play of lost) {
+        if (utcDayStartSec(play.timestampSec) >= todaySec) {
+          todayFull = true;
+        }
+        if (play.scrobble.reTagged) {
+          reTagged += 1;
+          this.$store.commit('requeueScrobble', play.scrobble);
+        } else {
+          this.$store.commit('trackFailed');
+          this.failedTracks.push({
+            track: play.scrobble,
+            error: `Last.fm accepted this play but did not keep it: it already holds its maximum of ${LASTFM_DAILY_CAP} scrobbles for that day.`,
+          });
+        }
+      }
+      this.droppedTracks += lost.length;
+      trackEvent('scrobble_not_stored', this.progressProps({
+        not_stored: lost.length,
+        re_tagged_not_stored: reTagged,
+        checked: batch.length,
+      }));
+      return todayFull;
+    },
+
+    dailyCapMessage(): string {
+      const nowMs = Date.now();
+      const resetMs = nextUtcDayStartSec(Math.floor(nowMs / MS_PER_SECOND)) * MS_PER_SECOND;
+      const resetAt = new Date(resetMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      return `Last.fm keeps at most ${LASTFM_DAILY_CAP} scrobbles a day, your own listening included,`
+        + ` and silently throws away the rest. Scrobblify stops ${OWN_LISTENING_HEADROOM} short so your own`
+        + ' plays today still count. The day resets at midnight UTC: come back after'
+        + ` ${resetAt} (in ${formatDuration(resetMs - nowMs)}) to continue where you left off.`;
+    },
+
+    /**
+     * The import has used up its share of today's cap.
+     *
+     * What was sent is confirmed *before* the stop is shown, unlike other
+     * stops (see `autoSave`): this is where a day's work ends, so the count the
+     * user is left looking at should be the confirmed one, and no "Try Again"
+     * exists yet to race the read.
+     */
+    async stopDailyLimit(tracker: RateLimitTracker, todaySec: number) {
+      this.endPacing();
+      await this.verifyPending(this.$store.state.lfmApi as LastFm);
+      this.pauseReason = this.dailyCapMessage();
+      this.stopped = true;
+      this.paused = true;
+      await this.autoSave();
+      this.trackStopped('daily_limit', {
+        stored_today: this.dayStored[todaySec],
+        daily_count: tracker.dailyCount,
+        wait_ms: nextUtcDayStartSec(todaySec) * MS_PER_SECOND - Date.now(),
+      });
+    },
+
+    /** Last.fm stopped keeping today's plays before our budget said it would. */
+    async stopNotStored() {
+      this.endPacing();
+      this.pauseReason = `Last.fm stopped keeping today's scrobbles, so ${this.droppedTracks} it accepted`
+        + ' didn\'t make it into your library. They are not counted, and the ones re-dated to today'
+        + ` are back in the queue. ${this.dailyCapMessage()}`;
+      this.stopped = true;
+      this.paused = true;
+      await this.autoSave();
+      this.trackStopped('not_stored');
     },
 
     async scrobble() {
@@ -969,6 +1226,9 @@ export default Vue.extend({
       // A manual retry after giving up starts a fresh backoff ladder.
       this.rateLimitPauseCount = 0;
       this.firstRateLimitAtMs = null;
+      // Re-read from Last.fm on every entry: the user may have listened, or a
+      // new UTC day may have started, since the last run.
+      this.dayStored = {};
       this.syncRateLimitCounters();
 
       const api = this.$store.state.lfmApi as LastFm;
@@ -1005,6 +1265,13 @@ export default Vue.extend({
       */
       const savedPendingSec = (this.$store.state.pendingReTagSec as number) || 0;
       const headTrack = tracks[this.scrobbledTracks];
+      // Plays a resumed session sent but never got to confirm. They sit inside
+      // the completed range, so they are checked here rather than re-sent.
+      const restored = this.$store.state.pendingVerification as PendingScrobble[];
+      if (restored.length > 0) {
+        this.pending.push(...restored);
+        this.$store.commit('setPendingVerification', []);
+      }
       /*
         A queue that will need substitute seconds needs a durable identity
         first, because that is what every journalled second is bound to. Done
@@ -1013,9 +1280,11 @@ export default Vue.extend({
 
         Only when the remainder actually contains a re-tagged play — an import
         of recent listens never touches any of this, and should not be stopped
-        by storage it does not use.
+        by storage it does not use. A pending play counts: one found lost is
+        re-queued.
       */
-      const needsReTagSeconds = tracks.slice(this.scrobbledTracks).some((t) => t.reTagged);
+      const needsReTagSeconds = tracks.slice(this.scrobbledTracks).some((t) => t.reTagged)
+        || this.pending.some((p) => p.scrobble.reTagged);
       /*
         Carried into the component field before anything persists, because the
         identity write below snapshots that field and would otherwise write a
@@ -1097,11 +1366,29 @@ export default Vue.extend({
         }));
       }
 
+      if (await this.verifyPending(api)) {
+        await this.stopNotStored();
+        return;
+      }
+
       /*
         `i` is incremented conditionally at the end so a rate-limited track can
-        be retried.
+        be retried. `tracks` can grow while this runs: plays Last.fm did not
+        keep are re-queued at the end.
       */
-      for (let i = this.scrobbledTracks; i < tracks.length;) {
+      for (let i = this.scrobbledTracks; ;) {
+        if (i >= tracks.length) {
+          // Nothing is finished until it is confirmed, and confirming can
+          // re-queue plays.
+          if (await this.verifyPending(api)) {
+            await this.stopNotStored();
+            return;
+          }
+          if (i >= tracks.length) {
+            break;
+          }
+        }
+
         // A handoff outranks everything. Checked separately from `paused`
         // because `pauseWithCountdown` clears that flag when its timer expires,
         // so a halt landing during a backoff would otherwise be undone.
@@ -1213,23 +1500,6 @@ export default Vue.extend({
           return;
         }
 
-        // Daily ceiling: a rolling 24h window, so it frees up gradually rather
-        // than all at once at midnight. There is nothing useful to wait for in
-        // the tab, so save and stop.
-        const dailyWaitMs = tracker.msUntilDailySafe();
-        if (dailyWaitMs > 0) {
-          this.pauseReason = `You've reached Last.fm's daily limit of about ${DAILY_LIMIT} scrobbles. Come back in ${formatDuration(dailyWaitMs)} to continue where you left off.`;
-          this.stopped = true;
-          this.paused = true;
-          // eslint-disable-next-line no-await-in-loop
-          await this.autoSave();
-          this.trackStopped('daily_limit', {
-            daily_count: tracker.dailyCount,
-            wait_ms: dailyWaitMs,
-          });
-          return;
-        }
-
         const track = tracks[i];
         this.currentTrackName = track.toString();
 
@@ -1282,7 +1552,8 @@ export default Vue.extend({
         }
 
         if (track.reTagged && pendingReTagTimestampSec === undefined) {
-          const nowSec = Math.floor(Date.now() / MS_PER_SECOND);
+          let nowSec = Math.floor(Date.now() / MS_PER_SECOND);
+          const todaySec = utcDayStartSec(nowSec);
           /*
             Normally the walk starts six hours back and climbs towards the
             present. After a background job hands work back it starts in a
@@ -1297,14 +1568,47 @@ export default Vue.extend({
             where it is certain.
           */
           const reserved = this.reservedReTagRange();
-          const withinReservation = reserved !== null && reTagCursorSec + 1 < reserved.ceilingSec;
-          const earliestSec = withinReservation
-            ? (reserved as { floorSec: number }).floorSec
-            : nowSec - RETAG_BACKFILL_SECONDS;
+          let withinReservation = reserved !== null && reTagCursorSec + 1 < reserved.ceilingSec;
+          let candidateSec = withinReservation
+            ? Math.max(reTagCursorSec + 1, (reserved as { floorSec: number }).floorSec)
+            : 0;
+          /*
+            Last.fm's daily cap is per UTC day of the timestamp, and a reserved
+            range can reach back into earlier days. Those never reset, so a full
+            one is skipped rather than waited for, and running out of reserved
+            days falls back to the normal window like running out of seconds.
+          */
+          while (withinReservation && utcDayStartSec(candidateSec) < todaySec
+            && importBudget(await this.storedOn(api, tracker, utcDayStartSec(candidateSec))) <= 0) {
+            candidateSec = nextUtcDayStartSec(candidateSec);
+            withinReservation = candidateSec < (reserved as { ceilingSec: number }).ceilingSec;
+          }
+          if (!withinReservation) {
+            candidateSec = Math.max(reTagCursorSec + 1, nowSec - RETAG_BACKFILL_SECONDS, todaySec);
+          }
+          if (utcDayStartSec(candidateSec) >= todaySec
+            && importBudget(await this.storedOn(api, tracker, todaySec)) <= 0) {
+            // Nothing useful to wait for in the tab: the day resets at midnight UTC.
+            await this.stopDailyLimit(tracker, todaySec);
+            return;
+          }
+          const aheadSec = candidateSec - nowSec;
+          if (!withinReservation && aheadSec > 0 && aheadSec <= RETAG_CLOCK_WAIT_MAX_SECONDS) {
+            await this.sleep(aheadSec * MS_PER_SECOND);
+            if (this.handoffHalted) {
+              this.endPacing();
+              await this.persistForHalt();
+              return;
+            }
+            if (this.leaving) {
+              this.stopForLeave(i);
+              return;
+            }
+            nowSec = Math.floor(Date.now() / MS_PER_SECOND);
+          }
           const latestSec = withinReservation
             ? Math.min(nowSec, (reserved as { ceilingSec: number }).ceilingSec)
             : nowSec;
-          const candidateSec = Math.max(reTagCursorSec + 1, earliestSec);
           if (candidateSec > latestSec) {
             /*
               There is no second left above the cursor and below the ceiling.
@@ -1377,6 +1681,31 @@ export default Vue.extend({
             return;
           }
           pendingSecondUnspent = true;
+        }
+
+        const sendTimestampSec = pendingReTagTimestampSec !== undefined
+          ? pendingReTagTimestampSec
+          : Math.floor(track.timestamp.getTime() / MS_PER_SECOND);
+        if (pendingReTagTimestampSec === undefined) {
+          // A play keeping its real date counts against the cap of the day it
+          // was heard. Re-tagged ones were checked when their second was
+          // chosen, and a pinned second always goes through (see above).
+          const daySec = utcDayStartSec(sendTimestampSec);
+          if (importBudget(await this.storedOn(api, tracker, daySec)) <= 0) {
+            if (daySec >= utcDayStartSec(Math.floor(Date.now() / MS_PER_SECOND))) {
+              await this.stopDailyLimit(tracker, daySec);
+              return;
+            }
+            // That day never resets, so sending would only be thrown away.
+            this.$store.commit('trackFailed');
+            this.failedTracks.push({
+              track,
+              error: `Not sent: Last.fm already holds its maximum of ${LASTFM_DAILY_CAP} scrobbles for that day.`,
+            });
+            this.scrobbledTracks += 1;
+            i++;
+            continue;
+          }
         }
 
         try {
@@ -1525,8 +1854,9 @@ export default Vue.extend({
               consecutiveFailures++;
             }
           } else {
-            this.$store.commit('trackScrobbled');
-            this.succeededTracks += 1;
+            // Accepted is not stored: it counts once it is read back.
+            this.pending.push({ scrobble: track, timestampSec: sendTimestampSec });
+            this.recordStored(utcDayStartSec(sendTimestampSec));
             consecutiveFailures = 0;
           }
 
@@ -1736,6 +2066,13 @@ export default Vue.extend({
           // Not on the last track, whose completion clears the save anyway.
           this.tracksSinceCheckpoint += 1;
           if (this.tracksSinceCheckpoint >= CHECKPOINT_EVERY_TRACKS && i + 1 < tracks.length) {
+            // Confirm what has been sent so far, then re-read today's total:
+            // the user's own listening counts against the same cap.
+            if (await this.verifyPending(api)) {
+              await this.stopNotStored();
+              return;
+            }
+            await this.refreshStored(api, tracker, utcDayStartSec(Math.floor(Date.now() / MS_PER_SECOND)));
             this.checkpoint();
           }
           if (recoveredFromRateLimit) {
@@ -1753,6 +2090,9 @@ export default Vue.extend({
 
       this.endPacing();
       this.completed = true;
+      // Anything still unconfirmed here could not be read back; the complete
+      // step says so instead of counting it.
+      this.$store.commit('setPendingVerification', this.pending.slice());
       trackEvent('scrobble_completed', this.progressProps());
       this.$emit('complete');
     },
@@ -1926,6 +2266,12 @@ export default Vue.extend({
     /**
      * Persist progress without downloading a file or navigating away, so the
      * user can close the tab and resume later. Used when we stop retrying.
+     *
+     * Deliberately does not read unconfirmed plays back first. The stop is
+     * already on screen, and the user may press "Try Again" — which the
+     * re-entry guard ignores while this loop is still running — or close the
+     * tab before a slower save lands. They are saved as `pendingVerification`
+     * and checked when the run is next entered.
      */
     async autoSave() {
       const snapshot = this.progressSnapshot();
@@ -2067,6 +2413,7 @@ export default Vue.extend({
         scrobbledTracks: this.scrobbledTracks,
         originalTotalTracks: this.originalTotalTracks,
         originalSucceededCount: this.totalSucceeded,
+        pendingVerification: this.pending.slice(),
         sendTimestamps: tracker.getSendTimestamps(),
         lastReTagTimestampSec: this.reTagCursorSec,
         pendingReTagTimestampSec: this.pendingReTagSec || undefined,

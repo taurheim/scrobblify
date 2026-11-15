@@ -515,6 +515,7 @@ export default Vue.extend({
       // import that all later resume progress is measured against.
       this.$store.commit('setOriginalTotalTracks', scrobbles.length);
       this.$store.commit('setResumedScrobbleCount', 0);
+      this.$store.commit('setPendingVerification', []);
       /*
         Named failures *are* reset, unlike the re-tag lineage below. They
         describe tracks the user chose in a previous import; carrying them into
