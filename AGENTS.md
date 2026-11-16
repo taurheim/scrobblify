@@ -117,7 +117,19 @@ Before that, a fresh import that re-tags more than one day's budget (700
 plays) hits a blocking `LargeHistoryGate` on "Choose which tracks to scrobble":
 wrong dates, days of returning, no bulk undo, and a "Use ListenBrainz instead"
 link to ListenBrainz's own Spotify importer, which keeps the real dates. Only
-"I understand, continue" proceeds. Resumes and progress files skip it.
+"I understand, continue" proceeds. Resumes and progress files skip it. When the
+background offer could take what is left after the first day
+(`backgroundCanFinish`, fed by `backgroundTrackLimit` from the capacity probe),
+the gate and the confirmation say the server can finish it instead of "come
+back each day".
+
+Gate telemetry, since 2026-11-16: `large_history_gate_shown` and
+`large_history_gate_accepted` carry `re_tagged_count`, `estimated_days` and
+`background_available`. `listenbrainz_clicked` carries `source`: `gate_button`
+(which also closes the gate), `gate_text` (the inline link) or `home` (the Home
+page; no other properties). A click only means the link was opened, not that
+the user imported anything there. Shown minus accepted is not "went to
+ListenBrainz": closing the tab looks the same.
 
 `upload_no_matching_files` carries `detected`: `progress_file` (a Scrobblify
 progress file was zipped up and is imported instead), `account_data` (Spotify's

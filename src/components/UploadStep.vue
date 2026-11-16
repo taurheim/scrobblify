@@ -75,6 +75,7 @@
     <large-history-gate
       v-model="showLargeHistoryGate"
       :re-tagged-count="reTaggedCount"
+      :background-track-limit="backgroundTrackLimit"
       @accept="finishStep"
       @decline="showLargeHistoryGate = false"
     ></large-history-gate>
@@ -161,6 +162,10 @@ function classifyZip(zip: JSZip): ZipContents {
 
 export default Vue.extend({
   components: { 'error-dialog': ErrorDialog, 'large-history-gate': LargeHistoryGate },
+  props: {
+    /** Largest queue the background offer would take, or 0 when it is off. */
+    backgroundTrackLimit: { type: Number, default: 0 },
+  },
   data() {
     return {
       followLfmRulesLabel: 'Validate track lengths (filters out tracks shorter than 30s, '

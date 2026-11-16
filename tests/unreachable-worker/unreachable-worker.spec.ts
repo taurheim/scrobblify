@@ -2,6 +2,7 @@ import {
   test, expect, Page, Route,
 } from '@playwright/test';
 import path from 'path';
+import JSZip from 'jszip';
 import { interceptLastFm, mockLastFmAuth } from '../lastfmMock';
 
 /*
@@ -282,5 +283,49 @@ test.describe('Offering background scrobbling', () => {
     await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile());
 
     await expect(page.locator(OFFER)).toBeVisible({ timeout: 15000 });
+  });
+
+  // 1,600 plays from a year ago: after the first day's 700, 900 are left,
+  // which is enough for the offer on the stop screen.
+  async function openLargeHistoryGate(page: Page) {
+    const startMs = Date.now() - 365 * 24 * 60 * 60 * 1000;
+    const zip = new JSZip();
+    zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024.json', JSON.stringify(
+      Array.from({ length: 1600 }, (_, i) => ({
+        ts: new Date(startMs + i * 60000).toISOString(),
+        master_metadata_track_name: `Track ${i}`,
+        master_metadata_album_artist_name: 'Queen',
+        master_metadata_album_album_name: 'An Album',
+        ms_played: 300000,
+      })),
+    ));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data.zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await page.locator('button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    const gate = page.locator('.large-history-gate');
+    await expect(gate).toBeVisible();
+    return gate;
+  }
+
+  test('a large import the server could finish is not told to come back every day', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    const gate = await openLargeHistoryGate(page);
+
+    await expect(gate).toContainText('Finish this in the background');
+    await expect(gate).not.toContainText("You'll need to come back each day");
+  });
+
+  test('without the beta flag the same import is told it has to come back', async ({ page }) => {
+    await openUploadStep(page, WILLING_WORKER);
+    const gate = await openLargeHistoryGate(page);
+
+    await expect(gate).toContainText("You'll need to come back each day");
+    await expect(gate).not.toContainText('Finish this in the background');
   });
 });

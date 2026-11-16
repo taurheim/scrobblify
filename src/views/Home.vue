@@ -45,7 +45,12 @@
     delete scrobbles in bulk, so this is hard to undo.
     <br><br>
     If most of your history is older than two weeks, consider
-    <a href="https://listenbrainz.org/settings/import/" target="_blank" rel="noopener noreferrer">ListenBrainz</a>
+    <a
+      href="https://listenbrainz.org/settings/import/"
+      target="_blank"
+      rel="noopener noreferrer"
+      @click="listenBrainzClicked"
+    >ListenBrainz</a>
     instead. It imports the same Spotify ZIP directly, in one go, and keeps every play on the day you actually
     listened to it. Scrobblify is the better fit for recent plays, or if you specifically want your history on
     Last.fm and don't mind the dates. Once your accounts are connected, all future plays keep their real dates
@@ -66,6 +71,13 @@
 </style>
 <script lang="ts">
 import Vue from 'vue';
+import { trackEvent } from '@/services/Analytics';
 
-export default Vue.extend({});
+export default Vue.extend({
+  methods: {
+    listenBrainzClicked() {
+      trackEvent('listenbrainz_clicked', { source: 'home' });
+    },
+  },
+});
 </script>
