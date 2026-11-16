@@ -1,5 +1,5 @@
 import { BURST_WINDOW_MS } from '@/services/RateLimitTracker';
-import { LASTFM_DAILY_CAP, importBudget, nextUtcDayStartSec } from '@/services/DailyCap';
+import { LASTFM_DAILY_CAP, importBudget, nextUtcDayStartSec } from '@/shared/lastfm/dailyCap';
 
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;

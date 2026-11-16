@@ -9,7 +9,7 @@
       <v-card-text class="pt-4">
         <p>
           You have <strong>{{ remaining.toLocaleString() }}</strong> tracks left.
-          Last.fm only accepts about {{ dailyLimit.toLocaleString() }} scrobbles a day from one account, so
+          Last.fm keeps at most {{ dailyCap.toLocaleString() }} scrobbles a day from one account, so
           finishing here means coming back over the next
           <strong>{{ daysRemaining }}</strong>.
         </p>
@@ -82,13 +82,15 @@
 
 <script lang="ts">
 import Vue from 'vue';
-import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
+import { LASTFM_DAILY_CAP, importBudget } from '@/shared/lastfm/dailyCap';
 
 /*
-  Last.fm's per-day cap, which is also the per-day constant `describeJob` in
-  worker/src/api.ts divides by, so this dialog promises the same date as the
-  status card the user lands on immediately afterwards.
+  The rate the worker actually paces at, and the same figure `describeJob` in
+  worker/src/api.ts divides by: Last.fm's daily cap less the headroom left for
+  the user's own listening. Quoting anything else makes this dialog promise a
+  different date from the status card the user lands on immediately afterwards.
 */
+const DAILY_LIMIT = importBudget(0);
 
 export default Vue.extend({
   name: 'BackgroundOffer',
@@ -99,16 +101,16 @@ export default Vue.extend({
     allReTagged: { type: Boolean, default: false },
     busy: { type: Boolean, default: false },
   },
+  data() {
+    return { dailyCap: LASTFM_DAILY_CAP };
+  },
   computed: {
     visible: {
       get(): boolean { return this.value; },
       set(val: boolean) { this.$emit('input', val); },
     },
-    dailyLimit(): number {
-      return LASTFM_DAILY_CAP;
-    },
     daysRemaining(): string {
-      const days = Math.ceil(this.remaining / LASTFM_DAILY_CAP);
+      const days = Math.ceil(this.remaining / DAILY_LIMIT);
       return days === 1 ? '1 day' : `${days} days`;
     },
     mailtoLink(): string {

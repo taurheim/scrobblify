@@ -588,6 +588,11 @@ async function main() {
     check('the estimate is the remaining tracks at the daily rate',
       Math.abs((body.job.estimatedCompletionSec - NOW) / 86400 - 81000 / TRACKS_PER_DAY) < 1,
       (body.job.estimatedCompletionSec - NOW) / 86400);
+    // The scheduler runs every five minutes, so the card says when the next
+    // send is due rather than leaving the count frozen with no explanation.
+    check('an active job says when it next sends: the next tick',
+      body.job.nextRunAt > NOW && body.job.nextRunAt - NOW <= 300 && body.job.nextRunAt % 300 === 0,
+      body.job.nextRunAt);
     check('no credential material is exposed',
       !JSON.stringify(body).includes('session_key')
       && (body.job as any).session_key_ct === undefined, Object.keys(body.job));
@@ -610,6 +615,7 @@ async function main() {
     check('a returning user sees the result, not nothing', body.job !== null, body);
     check('with the totals', body.job.scrobbled === 94203, body.job);
     check('marked completed', body.job.state === 'completed');
+    check('a finished job has no next send', body.job.nextRunAt === null, body.job.nextRunAt);
   }
 
   console.log('\n-- controls --');

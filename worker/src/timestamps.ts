@@ -192,6 +192,14 @@ export function isPinReplaceable(pinnedSec: number, nowSec: number): boolean {
  * this job (0 for a fresh job). Synthetic timestamps march *downwards* from
  * there, because upwards is the future and the future is ignore code 4.
  *
+ * `dayFloorSec`, when given, is the lowest second a synthetic timestamp may
+ * take: the scheduler passes today's UTC midnight, so every re-tagged play in
+ * a run lands on the one day whose Last.fm cap it checked (see
+ * `shared/lastfm/dailyCap.ts`). A floor recorded on an earlier day is not
+ * continued from; the band restarts below the present. When the band reaches
+ * `dayFloorSec`, assignment stops and only the tracks before that point are
+ * returned — the caller sends that prefix and waits for the next day.
+ *
  * Guarantees the caller depends on:
  *  - every timestamp in the returned batch is unique
  *  - every timestamp is inside Last.fm's window and not in the future, with
@@ -202,19 +210,28 @@ export function isPinReplaceable(pinnedSec: number, nowSec: number): boolean {
  *    reason to stall the job
  *  - a preserved original is never overwritten by a synthetic value, and a
  *    synthetic value never collides with a preserved one in the same batch
+ *  - no synthetic timestamp is below `dayFloorSec`
  */
 export function assignTimestamps(
   tracks: TrackForSend[],
   nowSec: number,
   syntheticFloor: number,
+  dayFloorSec = Number.NEGATIVE_INFINITY,
 ): AssignmentResult {
   const ceiling = nowSec - PRESENT_MARGIN_SECONDS;
   const hardFloor = nowSec - SYNTHETIC_FLOOR_LIMIT_SECONDS;
 
-  // Wrap when the recorded floor is unusable: either unset (new job) or so old
-  // that continuing downwards would fall out of the window. Because `nowSec`
-  // advances as the job runs, wrapping lands well clear of anything in flight.
-  let next = syntheticFloor > hardFloor && syntheticFloor <= ceiling
+  // Wrap when the recorded floor is unusable: unset (new job), so old that
+  // continuing downwards would fall out of the window, or left on an earlier
+  // UTC day than `dayFloorSec`. Because `nowSec` advances as the job runs,
+  // wrapping lands well clear of anything in flight.
+  //
+  // `syntheticFloor` is one below the last second handed out, so a band that
+  // used today's midnight itself records `dayFloorSec - 1`. That is today's
+  // band, exhausted, not yesterday's: only below it is the band an old one.
+  let next = syntheticFloor > hardFloor
+    && syntheticFloor <= ceiling
+    && syntheticFloor >= dayFloorSec - 1
     ? syntheticFloor - 1
     : ceiling;
 
@@ -269,6 +286,10 @@ export function assignTimestamps(
       while (taken.has(next) || next > ceiling) {
         next -= 1;
       }
+      if (next < dayFloorSec) {
+        // Today's band is used up. Everything from here waits for tomorrow.
+        break;
+      }
       ts = next;
       taken.add(ts);
       next -= 1;
@@ -288,10 +309,30 @@ export function assignTimestamps(
 
   return {
     assigned,
-    // `next` is already one below the last value handed out.
-    syntheticFloor: Math.min(next, ceiling - 1),
+    syntheticFloor: floorAfter(assigned, syntheticFloor),
     preservedCount,
   };
+}
+
+/**
+ * The synthetic floor to record once `assigned` has been sent: one below the
+ * lowest synthetic second in it, or `previousFloor` when it used none.
+ *
+ * Computed from what is actually sent rather than from the allocator's
+ * position, so a caller that sends only a prefix of an assignment records only
+ * the seconds that prefix spent. Leaving the floor alone when nothing synthetic
+ * was sent matters at a day boundary: lowering it anyway would walk a band that
+ * ended at midnight into the previous day, where it reads as an old band and
+ * wraps back onto seconds already used today.
+ */
+export function floorAfter(assigned: AssignedTrack[], previousFloor: number): number {
+  let lowest = Number.POSITIVE_INFINITY;
+  assigned.forEach((a) => {
+    if (!a.preservedOriginal && a.timestampSec < lowest) {
+      lowest = a.timestampSec;
+    }
+  });
+  return Number.isFinite(lowest) ? lowest - 1 : previousFloor;
 }
 
 /**

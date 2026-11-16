@@ -219,4 +219,36 @@ export class LastFmClient {
         timestampSec: Number(t.date.uts),
       }));
   }
+
+  /**
+   * How many scrobbles Last.fm has *stored* for this user with timestamps in
+   * [fromSec, toSec]. A `track.scrobble` reply cannot answer that: plays over
+   * the daily cap are reported as accepted and then discarded (see
+   * `shared/lastfm/dailyCap.ts`). Same request as the SPA's
+   * `countStoredScrobbles`, so both read the day the same way.
+   */
+  public async countScrobbles(
+    username: string,
+    fromSec: number,
+    toSec: number,
+    sessionKey: string,
+  ): Promise<number> {
+    const body = await this.request(
+      {
+        method: 'user.getRecentTracks',
+        user: username,
+        from: String(Math.floor(fromSec)),
+        to: String(Math.ceil(toSec)),
+        limit: '1',
+        sk: sessionKey,
+      },
+      true,
+    );
+    const attr = body && body.recenttracks && body.recenttracks['@attr'];
+    const total = parseInt(attr && attr.total, 10);
+    if (!Number.isFinite(total)) {
+      throw new Error('Last.fm did not report a scrobble count');
+    }
+    return total;
+  }
 }

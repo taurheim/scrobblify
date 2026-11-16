@@ -43,6 +43,7 @@ import { LastFmClient } from './lastfm';
 import { decryptCredential, randomId } from './crypto';
 import {
   assignTimestamps,
+  floorAfter,
   reconciliationWindow,
   normalizeForMatch,
   AssignedTrack,
@@ -57,6 +58,12 @@ import {
   isNetworkError,
   type ScrobbleOutcome,
 } from '../../src/shared/lastfm/protocol';
+import {
+  LASTFM_DAILY_CAP,
+  importBudget,
+  nextUtcDayStartSec,
+  utcDayStartSec,
+} from '../../src/shared/lastfm/dailyCap';
 import { ALGORITHM_VERSION } from './handoff';
 import { WorkerAnalytics } from './analytics';
 
@@ -98,6 +105,49 @@ export const PROBE_BATCH_SIZE = 5;
 
 /** Spacing between batches of the same job, to stay clear of the IP throttle. */
 export const INTER_BATCH_DELAY_SECONDS = 60;
+
+/**
+ * Seconds between scheduler ticks. Must match the `*\/5 * * * *` cron in
+ * wrangler.toml: the job card tells the user when their job next sends from it.
+ */
+export const TICK_INTERVAL_SECONDS = 300;
+
+/**
+ * When a job will next send: now if a tick holds its lease, otherwise the first
+ * cron boundary at or after it becomes eligible. With more due jobs than
+ * `MAX_JOBS_PER_TICK` it can slip a tick, so this is an "around", not a promise.
+ */
+export function nextRunAt(
+  job: Pick<JobRow, 'next_eligible_at' | 'locked_until'>,
+  nowSec: number,
+): number {
+  if (job.locked_until > nowSec) {
+    return nowSec;
+  }
+  const earliest = Math.max(nowSec + 1, job.next_eligible_at);
+  return Math.ceil(earliest / TICK_INTERVAL_SECONDS) * TICK_INTERVAL_SECONDS;
+}
+
+/**
+ * How long after UTC midnight a job held back by the daily cap resumes.
+ *
+ * Re-tagged seconds march down from the present and never below today's UTC
+ * midnight, so a job resumed at 00:01 would have about a minute of seconds to
+ * spend and stop again for want of room rather than budget. Twenty minutes
+ * leaves room for a whole day's budget (`importBudget(0)`) below the present
+ * margin.
+ */
+export const DAY_RESUME_OFFSET_SECONDS = 20 * 60;
+
+/** Shown on the job card while a job waits for the next UTC day. */
+export const DAY_FULL_REASON = `Last.fm keeps at most ${LASTFM_DAILY_CAP} scrobbles a day and today's are used up. `
+  + 'Scrobbling continues after midnight UTC.';
+
+/** Shown while a job waits for today's resume point just after midnight UTC. */
+export const DAY_START_REASON = 'Scrobbling resumes a few minutes after midnight UTC.';
+
+/** Recorded on a play whose real date falls on a day Last.fm already holds in full. */
+export const DAY_FULL_FAILURE = `Last.fm already holds its daily limit of ${LASTFM_DAILY_CAP} scrobbles for the day this was played`;
 
 export interface SchedulerEnv {
   sql: Sql;
@@ -530,6 +580,8 @@ async function commitBatch(
   lease: JobLease,
   nowSec: number,
   c: BatchCommit,
+  /** Statements that must commit in the same transaction, ahead of the commit. */
+  prelude: { query: string; params?: unknown[] }[] = [],
 ): Promise<void> {
   const newCursor = c.startIndex + c.advance;
   const statements: { query: string; params?: unknown[] }[] = [
@@ -570,7 +622,7 @@ async function commitBatch(
     });
   }
 
-  await fencedBatch(env.sql, lease, nowSec, statements);
+  await fencedBatch(env.sql, lease, nowSec, [...prelude, ...statements]);
 
   if (c.advance > 0 && newCursor > lease.job.cursor) {
     lease.job.cursor = newCursor;
@@ -585,9 +637,189 @@ interface BatchResult {
   accepted: number;
   failed: number;
   /** Set when the job must stop for a reason of its own. */
-  stop?: { state: string; reason: string; nextEligibleAt?: number };
+  stop?: { state: string; reason: string; nextEligibleAt?: number; storedThatDay?: number };
   /** Set when every job must stop. */
   global?: { kind: 'breaker' | 'halt'; reason: string };
+}
+
+/**
+ * Scrobbles on one UTC day: what Last.fm has stored, read once per run, plus
+ * what this run has sent there since, so later batches in the same tick see
+ * their predecessors without asking again.
+ */
+async function usedOnDay(
+  env: SchedulerEnv,
+  job: JobRow,
+  sessionKey: string,
+  daySec: number,
+  dayUsage: Map<number, number>,
+): Promise<number> {
+  const known = dayUsage.get(daySec);
+  if (known !== undefined) {
+    return known;
+  }
+  const stored = await env.lastfm.countScrobbles(
+    job.username,
+    daySec,
+    nextUtcDayStartSec(daySec) - 1,
+    sessionKey,
+  );
+  dayUsage.set(daySec, stored);
+  return stored;
+}
+
+type CapPlan =
+  | { kind: 'send'; count: number }
+  | { kind: 'fail'; count: number }
+  | { kind: 'wait'; storedToday: number };
+
+/**
+ * Decides how much of an assigned batch Last.fm's daily cap lets through.
+ *
+ * Last.fm stores at most `LASTFM_DAILY_CAP` scrobbles per UTC day of the
+ * scrobble's timestamp and answers the rest exactly like stored plays before
+ * discarding them, so the reply cannot be trusted and the budget has to come
+ * from the library itself (see `shared/lastfm/dailyCap.ts`). Outcomes are
+ * positional, so a batch is cut into contiguous runs:
+ *
+ *  - a leading run of real-dated plays whose day is already full is failed
+ *    without being sent: that day never gets room again;
+ *  - otherwise the longest prefix that fits every day it touches is sent;
+ *  - a batch whose first play is re-tagged onto a full today, or that has no
+ *    second left today at all, waits for the next UTC day.
+ *
+ * A repeat (a pinned retry, or a second this job already spent) goes through
+ * unchecked, as it does in the browser: the identical tuple is a no-op if the
+ * original landed, and any other second would duplicate it. It is still
+ * counted, because this time it may be stored.
+ */
+async function planAgainstDailyCap(
+  env: SchedulerEnv,
+  job: JobRow,
+  sessionKey: string,
+  candidates: AssignedTrack[],
+  repeats: boolean[],
+  dayUsage: Map<number, number>,
+  nowSec: number,
+): Promise<CapPlan> {
+  let failing = 0;
+  while (failing < candidates.length
+    && !repeats[failing]
+    && candidates[failing].preservedOriginal) {
+    const daySec = utcDayStartSec(candidates[failing].timestampSec);
+    // eslint-disable-next-line no-await-in-loop
+    if (importBudget(await usedOnDay(env, job, sessionKey, daySec, dayUsage)) > 0) {
+      break;
+    }
+    failing += 1;
+  }
+  if (failing > 0) {
+    return { kind: 'fail', count: failing };
+  }
+
+  let fits = 0;
+  while (fits < candidates.length) {
+    const daySec = utcDayStartSec(candidates[fits].timestampSec);
+    // eslint-disable-next-line no-await-in-loop
+    const used = await usedOnDay(env, job, sessionKey, daySec, dayUsage);
+    if (!repeats[fits] && importBudget(used) <= 0) {
+      break;
+    }
+    dayUsage.set(daySec, used + 1);
+    fits += 1;
+  }
+  if (fits > 0) {
+    return { kind: 'send', count: fits };
+  }
+  return {
+    kind: 'wait',
+    storedToday: await usedOnDay(env, job, sessionKey, utcDayStartSec(nowSec), dayUsage),
+  };
+}
+
+/**
+ * Maps a failed library read to the same outcome a failed send would have.
+ * Nothing was sent, so there is no batch to leave in `sending`.
+ */
+async function lookupFailure(
+  env: SchedulerEnv,
+  job: JobRow,
+  lineage: RunLineage,
+  error: unknown,
+): Promise<BatchResult> {
+  const message = error instanceof Error ? error.message : String(error);
+  if (isSuspendedApiKeyError(error)) {
+    return { sent: 0, accepted: 0, failed: 0, global: { kind: 'halt', reason: message } };
+  }
+  if (isRateLimitError(error)) {
+    await capture(env, job, 'scrobble_rate_limited', lineage, {
+      reason: 'lastfm_ip_rate_limit',
+    });
+    return { sent: 0, accepted: 0, failed: 0, global: { kind: 'breaker', reason: message } };
+  }
+  if (isInvalidSessionKeyError(error)) {
+    return {
+      sent: 0,
+      accepted: 0,
+      failed: 0,
+      stop: { state: 'needs_reauth', reason: 'Last.fm session key was revoked' },
+    };
+  }
+  // Never send blind: without the day's count the play may be discarded.
+  return {
+    sent: 0,
+    accepted: 0,
+    failed: 0,
+    stop: { state: 'retry', reason: `Couldn't read the day's scrobble count: ${message}` },
+  };
+}
+
+/**
+ * Records real-dated plays whose day Last.fm already holds in full as failed,
+ * without sending them, and moves the cursor past them.
+ *
+ * The batch row is inserted and settled in one transaction, so a crash cannot
+ * leave it in `sending` for reconciliation to chase. Its insert carries the
+ * fence like every other write a tick makes.
+ */
+async function failUnsendable(
+  env: SchedulerEnv,
+  lease: JobLease,
+  nowSec: number,
+  entries: AssignedTrack[],
+  tracks: JobTrack[],
+  startIndex: number,
+): Promise<BatchResult> {
+  const batchId = randomId();
+  const outcomes: EntryOutcome[] = entries.map((a) => ({ i: a.index, s: 'failed', t: a.timestampSec }));
+  await commitBatch(env, lease, nowSec, {
+    batchId,
+    batchState: 'settled',
+    outcomes,
+    acceptedInBatch: 0,
+    ignoredInBatch: outcomes.length,
+    startIndex,
+    advance: outcomes.length,
+    accepted: 0,
+    failed: outcomes.length,
+    failureRows: entries.map((a, i) => ({ index: a.index, track: tracks[i], reason: DAY_FULL_FAILURE })),
+  }, [{
+    query: `INSERT INTO batches
+              (id, job_id, generation, start_index, entry_count, state, assigned_timestamps, created_at)
+            SELECT ?, ?, ?, ?, ?, 'sending', ?, ?
+             WHERE EXISTS (
+               SELECT 1 FROM jobs
+                WHERE id = ? AND generation = ?
+                  AND state NOT IN ('completed', 'failed', 'cancelled')
+             )`,
+    params: [batchId, lease.job.id, lease.generation, startIndex, entries.length,
+      JSON.stringify(entries), nowSec, lease.job.id, lease.generation],
+  }]);
+  await audit(env.sql, lease.job.id, lease.generation, 'day_full_failed', {
+    count: entries.length,
+    days: Array.from(new Set(entries.map((a) => utcDayStartSec(a.timestampSec)))),
+  }, nowSec);
+  return { sent: 0, accepted: 0, failed: entries.length };
 }
 
 /**
@@ -601,6 +833,7 @@ async function sendBatch(
   startIndex: number,
   nowSec: number,
   lineage: RunLineage,
+  dayUsage: Map<number, number>,
 ): Promise<BatchResult> {
   const job = lease.job;
   const assignment = assignTimestamps(
@@ -615,6 +848,8 @@ async function sendBatch(
     })),
     nowSec,
     job.synthetic_floor ?? 0,
+    // Re-tagged plays stay on today, the one day whose cap is checked for them.
+    utcDayStartSec(nowSec),
   );
 
   // Rebase the in-batch indices onto the job's blob so outcomes survive
@@ -648,13 +883,51 @@ async function sendBatch(
   const reused = (await unresolvedSeconds(
     env.sql, job.id, nowSec, REPEATABLE_WINDOW_SECONDS,
   )).repeatable;
-  const assigned = rebased.map((a) => {
+  const repeats: boolean[] = [];
+  const candidates = rebased.map((a) => {
     const prior = reused.get(a.index);
     if (prior === undefined || prior.artist !== a.artist || prior.track !== a.track) {
+      repeats.push(a.pinnedRetry === true);
       return a;
     }
+    repeats.push(true);
     return { ...a, timestampSec: prior.sec };
   });
+
+  let plan: CapPlan;
+  try {
+    plan = await planAgainstDailyCap(env, job, sessionKey, candidates, repeats, dayUsage, nowSec);
+  } catch (error) {
+    return lookupFailure(env, job, lineage, error);
+  }
+  if (plan.kind === 'wait') {
+    /*
+      Usually today's budget is spent and the job resumes tomorrow. Just after
+      midnight there can be budget but no seconds yet below the present margin;
+      then it waits for today's resume point instead of losing the day.
+    */
+    const todaySec = utcDayStartSec(nowSec);
+    const laterToday = importBudget(plan.storedToday) > 0
+      && nowSec < todaySec + DAY_RESUME_OFFSET_SECONDS;
+    return {
+      sent: 0,
+      accepted: 0,
+      failed: 0,
+      stop: {
+        state: 'day_full',
+        reason: laterToday ? DAY_START_REASON : DAY_FULL_REASON,
+        nextEligibleAt: (laterToday ? todaySec : nextUtcDayStartSec(nowSec)) + DAY_RESUME_OFFSET_SECONDS,
+        storedThatDay: plan.storedToday,
+      },
+    };
+  }
+  if (plan.kind === 'fail') {
+    return failUnsendable(env, lease, nowSec, candidates.slice(0, plan.count), tracks, startIndex);
+  }
+
+  const assigned = candidates.slice(0, plan.count);
+  // Only the seconds actually sent are spent; the rest of today's band stays free.
+  const syntheticFloor = floorAfter(assignment.assigned.slice(0, plan.count), job.synthetic_floor ?? 0);
   const batchId = randomId();
 
   // Step 1: the mapping is durable *before* the send, and in the same
@@ -673,10 +946,10 @@ async function sendBatch(
       query: `UPDATE jobs SET synthetic_floor = ?, updated_at = ?
                WHERE id = ? AND generation = ?
                  AND state NOT IN ('completed', 'failed', 'cancelled')`,
-      params: [assignment.syntheticFloor, nowSec, job.id, lease.generation],
+      params: [syntheticFloor, nowSec, job.id, lease.generation],
     },
   ]);
-  lease.job.synthetic_floor = assignment.syntheticFloor;
+  lease.job.synthetic_floor = syntheticFloor;
 
   // Step 2: send.
   let result;
@@ -1027,6 +1300,8 @@ async function runJob(
   let failed = 0;
   const budget = lease.job.probing ? 1 : MAX_BATCHES_PER_JOB_PER_TICK;
   const batchSize = lease.job.probing ? PROBE_BATCH_SIZE : MAX_SCROBBLES_PER_BATCH;
+  // Per UTC day, what Last.fm holds plus what this run has sent there.
+  const dayUsage = new Map<number, number>();
 
   for (let n = 0; n < budget; n += 1) {
     if (lease.job.cursor >= lease.job.total_tracks) {
@@ -1074,6 +1349,7 @@ async function runJob(
       lease.job.cursor,
       nowSec,
       lineage,
+      dayUsage,
     );
     batchesSent += result.sent > 0 ? 1 : 0;
     scrobbled += result.accepted;
@@ -1126,6 +1402,25 @@ async function runJob(
            probing = 1, consecutive_failures = 0, daily_window_start = ?, updated_at = ?`,
           [nowSec, nextEligibleAt ?? nowSec + DAILY_CAP_BACKOFF_SECONDS, reason, nowSec, nowSec],
         );
+      } else if (state === 'day_full') {
+        // eslint-disable-next-line no-await-in-loop
+        await audit(env.sql, lease.job.id, lease.generation, 'daily_budget_reached', {
+          storedToday: result.stop.storedThatDay ?? null,
+          resumesAt: nextEligibleAt ?? null,
+        }, nowSec);
+        // eslint-disable-next-line no-await-in-loop
+        await capture(env, lease.job, 'scrobble_rate_limited', lineage, {
+          reason: 'daily_budget',
+          stored_today: result.stop.storedThatDay ?? null,
+        });
+        // eslint-disable-next-line no-await-in-loop
+        await fencedJobUpdate(
+          env.sql,
+          lease,
+          `locked_until = 0, last_run_at = ?, next_eligible_at = ?, state_reason = ?,
+           consecutive_failures = 0, updated_at = ?`,
+          [nowSec, nextEligibleAt ?? nowSec + DAILY_CAP_BACKOFF_SECONDS, reason, nowSec],
+        );
       } else {
         // eslint-disable-next-line no-await-in-loop
         await failJobAttempt(env.sql, lease, reason, nowSec);
@@ -1146,6 +1441,14 @@ async function runJob(
         nowSec,
       );
       return { batchesSent, scrobbled, failed };
+    }
+
+    // Sending again means the wait for a new UTC day is over; stop saying so.
+    if (result.sent > 0
+      && (lease.job.state_reason === DAY_FULL_REASON || lease.job.state_reason === DAY_START_REASON)) {
+      // eslint-disable-next-line no-await-in-loop
+      await fencedJobUpdate(env.sql, lease, 'state_reason = NULL, updated_at = ?', [nowSec]);
+      lease.job.state_reason = null;
     }
 
     // A successful send clears the probe flag: the cap has demonstrably lifted.

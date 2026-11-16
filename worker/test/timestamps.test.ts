@@ -234,6 +234,32 @@ function main() {
   }
   check('162k synthetic timestamps all stay valid at a fixed now', ok);
 
+  console.log('\n-- the day floor --');
+  // Pretend the UTC day began 150 seconds ago: the present margin leaves 31
+  // seconds of it, from the floor up to the ceiling inclusive.
+  const dayStart = NOW - 150;
+  const rDay = assignTimestamps(tracks(new Array(50).fill(shared)), NOW, 0, dayStart);
+  check('no synthetic second goes below the day floor',
+    rDay.assigned.every((a) => a.timestampSec >= dayStart), rDay.assigned.map((a) => a.timestampSec));
+  check('only the tracks that fit are assigned, in order',
+    rDay.assigned.length === 31 && rDay.assigned.every((a, i) => a.index === i), rDay.assigned.length);
+  const rSpent = assignTimestamps(tracks(new Array(5).fill(shared)), NOW, rDay.syntheticFloor, dayStart);
+  // Wrapping here would restart at the ceiling, onto seconds rDay just used.
+  check('a band used down to the floor is exhausted, not wrapped',
+    rSpent.assigned.length === 0, rSpent.assigned);
+  check('and an empty assignment leaves the floor where it was',
+    rSpent.syntheticFloor === rDay.syntheticFloor, rSpent.syntheticFloor);
+  const rNewDay = assignTimestamps(tracks(new Array(5).fill(shared)), NOW, dayStart - 5000, dayStart);
+  check('a band left on an earlier day restarts below the present',
+    rNewDay.assigned[0].timestampSec === NOW - PRESENT_MARGIN_SECONDS, rNewDay.assigned[0]);
+  const rMixed = assignTimestamps(tracks([NOW - 2 * 86400, shared, shared]), NOW, 0, NOW - 121);
+  check('a real date before the day floor is still kept',
+    rMixed.assigned[0].timestampSec === NOW - 2 * 86400 && rMixed.assigned[0].preservedOriginal,
+    rMixed.assigned[0]);
+  check('while the re-tagged plays get what is left of today',
+    rMixed.assigned.length === 3 && rMixed.assigned.slice(1).every((a) => a.timestampSec >= NOW - 121),
+    rMixed.assigned);
+
   console.log('\n-- reconciliation window --');
   check('no timestamps, no window', reconciliationWindow([]) === null);
   const w = reconciliationWindow([100, 50, 75])!;
