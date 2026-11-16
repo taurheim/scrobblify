@@ -29,8 +29,7 @@ const DEFAULT_APP_ORIGIN = 'http://localhost:8080';
 // Must match `MIN_TRACKS_FOR_BACKGROUND` in worker/src/api.ts and
 // ScrobbleStep.vue: below it the client never offers the handoff and the
 // worker rejects the preflight outright.
-const MIN_TRACKS = 2700;
-const MAX_TRACKS = 2700 * 60;
+const MIN_TRACKS = 750;
 const CHUNK_TRACKS = 1000;
 
 // The rate the *real* worker paces at (`importBudget(0)` in
@@ -41,6 +40,8 @@ const CHUNK_TRACKS = 1000;
 // "Should finish within a day" — the status card would contradict the offer
 // dialog the user had just read.
 const WORKER_TRACKS_PER_DAY = 700;
+// `MAX_TRACKS_PER_JOB` in worker/src/handoff.ts: 60 days at the worker's pace.
+const MAX_TRACKS = WORKER_TRACKS_PER_DAY * 60;
 
 const CORS = {
   // Safe as a wildcard: the session travels in an Authorization header, not a

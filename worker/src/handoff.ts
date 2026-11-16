@@ -31,6 +31,7 @@ import {
   signHandoffState,
   verifyHandoffState,
 } from './crypto';
+import { importBudget } from '../../src/shared/lastfm/dailyCap';
 
 /** How long a user has to complete the Last.fm round trip and upload. */
 export const HANDOFF_TTL_SECONDS = 60 * 60;
@@ -87,12 +88,19 @@ export type PreflightResult =
   | { ok: false; reason: 'at_capacity' | 'already_live' | 'too_large' | 'paused' };
 
 /**
- * At roughly 2,700 scrobbles/day, a job that cannot finish inside the
- * credential's 60-day life is guaranteed to be abandoned half-done. Refusing it
- * up front is kinder than accepting it — and this assumes no outages, no global
- * pauses and no daily-limit backoff, so it is already optimistic.
+ * Scrobbles per day a job advances at: Last.fm's daily per-account limit less
+ * the headroom left for the user's own listening, which is all the scheduler
+ * sends into a day (see `shared/lastfm/dailyCap.ts`).
  */
-export const MAX_TRACKS_PER_JOB = 2700 * 60;
+export const TRACKS_PER_DAY = importBudget(0);
+
+/**
+ * At roughly TRACKS_PER_DAY, a job that cannot finish inside the credential's
+ * 60-day life is guaranteed to be abandoned half-done. Refusing it up front is
+ * kinder than accepting it — and this assumes no outages, no global pauses and
+ * no daily-limit backoff, so it is already optimistic.
+ */
+export const MAX_TRACKS_PER_JOB = TRACKS_PER_DAY * 60;
 
 /**
  * Step 0: commit what we expect *before* redirecting.

@@ -21,7 +21,7 @@
 //     every handoff screen stays hidden;
 //   * serves tests/backgroundMock.js, a fake worker, so no wrangler / D1 / R2
 //     or deployment is involved;
-//   * generates a 3,000-track history, because the offer is gated on 2,700
+//   * generates a 1,050-track history, because the offer is gated on 750
 //     remaining tracks and the committed fixture has five. Upload it by hand;
 //     the path is printed below.
 //

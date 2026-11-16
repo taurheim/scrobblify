@@ -22,6 +22,7 @@ import {
   reapExpiredHandoffs,
   HandoffRow,
   MAX_TRACKS_PER_JOB,
+  TRACKS_PER_DAY,
   CREDENTIAL_TTL_SECONDS,
 } from './handoff';
 import { issueSession, authenticate } from './session';
@@ -29,10 +30,15 @@ import { drainJobOnDemand, nextRunAt } from './scheduler';
 import {
   normalizeUsername, randomId, signHandoffState, verifyHandoffState, encryptCredential,
 } from './crypto';
-import { importBudget } from '../../src/shared/lastfm/dailyCap';
+import { LASTFM_DAILY_CAP } from '../../src/shared/lastfm/dailyCap';
 
-/** Remaining tracks below which background mode is not worth the trade-offs. */
-export const MIN_TRACKS_FOR_BACKGROUND = 2700;
+/**
+ * Remaining tracks below which background mode is not worth the trade-offs:
+ * about one day's worth, which the browser can finish by itself. Last.fm's cap
+ * rather than `TRACKS_PER_DAY` because it must match `MIN_TRACKS_FOR_BACKGROUND`
+ * in ScrobbleStep.vue, which uses the cap.
+ */
+export const MIN_TRACKS_FOR_BACKGROUND = LASTFM_DAILY_CAP;
 
 /**
  * Lifetime of a re-authentication state. Short: it exists only to survive one
@@ -318,9 +324,7 @@ const PARKED_STATES: JobRow['state'][] = ['paused', 'needs_reauth', 'needs_atten
  */
 function describeJob(job: JobRow, nowSec: number) {
   const remaining = Math.max(0, job.total_tracks - job.cursor);
-  // The scheduler's pace: a whole day's budget, with nothing else on the day.
-  const perDay = importBudget(0);
-  const daysLeft = remaining / perDay;
+  const daysLeft = remaining / TRACKS_PER_DAY;
   return {
     id: job.id,
     state: job.state,

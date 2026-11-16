@@ -57,7 +57,7 @@ const testData2 = [
 /**
  * A fixture big enough to qualify for the background handoff.
  *
- * The offer is gated on 2,700 remaining tracks (`MIN_TRACKS_FOR_BACKGROUND`,
+ * The offer is gated on 750 remaining tracks (`MIN_TRACKS_FOR_BACKGROUND`,
  * matched in ScrobbleStep.vue and worker/src/api.ts), so the small fixture
  * above can never reach it. Dates run backwards from a year ago, well outside
  * Last.fm's acceptance window, which is what makes the queue re-tagged — the

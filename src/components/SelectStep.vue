@@ -125,7 +125,8 @@
         </span>
         <v-btn
           color="primary"
-          @click="scrobbleSelectedTracks"
+          @click="openConfirm"
+          :loading="confirmLoading"
           :disabled="selectedCount === 0"
         >
           <v-icon left>mdi-music-note</v-icon>
@@ -133,6 +134,14 @@
         </v-btn>
       </v-card-text>
     </v-card>
+
+    <scrobble-confirm-dialog
+      v-if="confirmEstimate"
+      v-model="confirmOpen"
+      :track-count="selectedCount"
+      :estimate="confirmEstimate"
+      @confirm="scrobbleSelectedTracks"
+    ></scrobble-confirm-dialog>
   </div>
 </template>
 <style scoped>
@@ -153,11 +162,16 @@
 </style>
 <script lang="ts">
 import Vue from 'vue';
+import LastFm from '@/api/LastFm';
 import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
+import ScrobbleConfirmDialog from '@/components/ScrobbleConfirmDialog.vue';
 import { trackEvent } from '@/services/Analytics';
 import StateManager from '@/services/StateManager';
 import * as background from '@/services/BackgroundScrobbling';
+import RateLimitTracker from '@/services/RateLimitTracker';
+import { utcDayStartSec } from '@/shared/lastfm/dailyCap';
+import { ScrobbleEstimate, estimateScrobbleTime } from '@/services/ScrobbleEstimate';
 
 const workerCode = `
   let count = 0;
@@ -208,6 +222,7 @@ function createSearchWorker(): Worker | null {
 }
 
 export default Vue.extend({
+  components: { 'scrobble-confirm-dialog': ScrobbleConfirmDialog },
   beforeCreate() {
     // Non-reactive storage for large arrays
     (this as any)._tracks = [] as any[];
@@ -227,6 +242,10 @@ export default Vue.extend({
       selectedCount: 0,
       totalTrackCount: 0,
       filteredCount: 0,
+      // Snapshot taken when the confirmation opens; the selection cannot change under the dialog
+      confirmOpen: false,
+      confirmLoading: false,
+      confirmEstimate: null as ScrobbleEstimate | null,
       // Version counter to trigger computed re-evaluation
       trackVersion: 0,
       filterVersion: 0,
@@ -498,6 +517,43 @@ export default Vue.extend({
       }
       this.selectedCount = selIds.size;
       this.filterVersion++;
+    },
+    /*
+      Re-tagged plays all land on today's UTC day, so how much of today's cap
+      the user's library already holds decides how many go out now. Read the
+      same way the scrobble loop reads it, including its fallback when the
+      library can't be read: what this browser itself sent today.
+    */
+    async openConfirm() {
+      const selIds = (this as any)._selectedIds as Set<number>;
+      const tracks = (this as any)._tracks as any[];
+      let reTagged = 0;
+      for (const t of tracks) {
+        if (t.reTagged && selIds.has(t.id)) { reTagged += 1; }
+      }
+      const api = this.$store.state.lfmApi as LastFm;
+      const tracker = new RateLimitTracker(api.getUserName());
+      const nowMs = Date.now();
+      const todaySec = utcDayStartSec(Math.floor(nowMs / 1000));
+      let storedToday = 0;
+      if (reTagged > 0) {
+        this.confirmLoading = true;
+        try {
+          storedToday = await api.countStoredScrobbles(todaySec, todaySec + 86399);
+        } catch (e) {
+          storedToday = tracker.countSince(todaySec * 1000);
+        } finally {
+          this.confirmLoading = false;
+        }
+      }
+      this.confirmEstimate = estimateScrobbleTime({
+        trackCount: selIds.size,
+        reTaggedCount: reTagged,
+        storedToday,
+        burstLimit: tracker.burstLimit,
+        nowMs,
+      });
+      this.confirmOpen = true;
     },
     scrobbleSelectedTracks() {
       const selIds = (this as any)._selectedIds as Set<number>;
