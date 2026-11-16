@@ -1,17 +1,17 @@
 <template>
   <div class="select-step">
     <h3>Choose which tracks to scrobble</h3>
-    <p v-if="dataMinDate && dataMaxDate" class="text-caption text-grey mb-4">
+    <p v-if="dataMinDate && dataMaxDate" class="text-body-small text-grey mb-4">
       Your data spans {{ dataMinDate }} to {{ dataMaxDate }}
     </p>
 
     <!-- Filter panel -->
     <v-card variant="outlined" class="mb-4 filter-panel">
       <v-card-text class="pb-2 pt-3">
-        <div class="text-overline text-grey-darken-1 mb-2">
+        <div class="text-label-medium text-uppercase text-grey-darken-1 mb-2">
           <v-icon size="small" class="mr-1">mdi-filter-outline</v-icon>Filter tracks
         </div>
-        <v-row align="center" dense>
+        <v-row class="align-center" density="compact">
           <v-col cols="12" sm="4">
             <v-text-field
               :model-value="search"
@@ -63,7 +63,7 @@
         <!-- Matching info + bulk-add action -->
         <v-divider class="mt-3 mb-2"></v-divider>
         <div class="d-flex align-center justify-space-between flex-wrap">
-          <span class="text-body-2 text-grey-darken-2">
+          <span class="text-body-medium text-grey-darken-2">
             Showing <strong>{{ filteredCount }}</strong> matching tracks
           </span>
           <v-btn
@@ -121,7 +121,7 @@
     <!-- Bottom action bar -->
     <v-card variant="outlined" class="mt-4 scrobble-action-bar">
       <v-card-text class="d-flex align-center justify-space-between py-3">
-        <span class="text-body-1">
+        <span class="text-body-large">
           <v-icon size="small" class="mr-1" :color="selectedCount > 0 ? 'success' : 'grey'">
             {{ selectedCount > 0 ? 'mdi-check-circle' : 'mdi-circle-outline' }}
           </v-icon>

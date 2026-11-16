@@ -4,7 +4,13 @@ import 'vuetify/styles';
 import { createVuetify } from 'vuetify';
 
 export default createVuetify({
+  // Vuetify 4 buttons are sentence case; keep the uppercase labels of 2 and 3.
+  defaults: {
+    VBtn: { class: 'text-uppercase' },
+  },
   theme: {
+    // Vuetify 4 follows the OS by default, and only the light theme is styled.
+    defaultTheme: 'light',
     themes: {
       light: {
         colors: {

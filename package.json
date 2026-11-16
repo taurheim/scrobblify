@@ -20,7 +20,7 @@
     "string-similarity": "^4.0.1",
     "vue": "^3.5.45",
     "vue-router": "^4.6.5",
-    "vuetify": "^3.13.7",
+    "vuetify": "^4.3.3",
     "vuex": "^4.1.0"
   },
   "devDependencies": {
