@@ -51,6 +51,12 @@ export interface JobStatus {
   failed: number;
   remaining: number;
   waitingUntil: number | null;
+  /**
+   * When an active job next sends: the scheduler runs every five minutes, or
+   * now if a run has it. Null when not active, and absent from workers that
+   * predate it.
+   */
+  nextRunAt?: number | null;
   estimatedCompletionSec: number;
   createdAt: number;
   completedAt: number | null;

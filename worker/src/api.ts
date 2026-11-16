@@ -25,10 +25,11 @@ import {
   CREDENTIAL_TTL_SECONDS,
 } from './handoff';
 import { issueSession, authenticate } from './session';
-import { drainJobOnDemand } from './scheduler';
+import { drainJobOnDemand, nextRunAt } from './scheduler';
 import {
   normalizeUsername, randomId, signHandoffState, verifyHandoffState, encryptCredential,
 } from './crypto';
+import { importBudget } from '../../src/shared/lastfm/dailyCap';
 
 /** Remaining tracks below which background mode is not worth the trade-offs. */
 export const MIN_TRACKS_FOR_BACKGROUND = 2700;
@@ -317,7 +318,8 @@ const PARKED_STATES: JobRow['state'][] = ['paused', 'needs_reauth', 'needs_atten
  */
 function describeJob(job: JobRow, nowSec: number) {
   const remaining = Math.max(0, job.total_tracks - job.cursor);
-  const perDay = 2700;
+  // The scheduler's pace: a whole day's budget, with nothing else on the day.
+  const perDay = importBudget(0);
   const daysLeft = remaining / perDay;
   return {
     id: job.id,
@@ -328,6 +330,9 @@ function describeJob(job: JobRow, nowSec: number) {
     failed: job.failed_count,
     remaining,
     waitingUntil: job.next_eligible_at > nowSec ? job.next_eligible_at : null,
+    // Shown on the job card so a user can see the next send coming, since
+    // the scheduler only runs every few minutes.
+    nextRunAt: job.state === 'active' ? nextRunAt(job, nowSec) : null,
     estimatedCompletionSec: job.state === 'completed'
       ? job.completed_at
       : nowSec + Math.ceil(daysLeft * 86400),

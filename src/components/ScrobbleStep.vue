@@ -176,7 +176,7 @@ import {
   importBudget,
   nextUtcDayStartSec,
   utcDayStartSec,
-} from '@/services/DailyCap';
+} from '@/shared/lastfm/dailyCap';
 import { canCompress } from '@/services/BackgroundScrobbling';
 import * as background from '@/services/BackgroundScrobbling';
 import StateManager from '@/services/StateManager';
@@ -272,7 +272,7 @@ const CHECKPOINT_EVERY_TRACKS = 25;
 
 // Plays are confirmed by reading the user's library back, because Last.fm
 // answers plays over its daily cap as accepted and keeps none of them (see
-// DailyCap.ts). A play missing from the first read is re-checked once after this
+// shared/lastfm/dailyCap.ts). A play missing from the first read is re-checked once after this
 // long before it is called lost, in case Last.fm lists it a moment late.
 const VERIFY_RECHECK_MS = 5 * MS_PER_SECOND;
 

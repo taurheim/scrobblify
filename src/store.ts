@@ -13,7 +13,7 @@ export default new Vuex.Store({
     validScrobbles: [],
     selectedScrobbles: [],
     // Plays confirmed as stored in the user's Last.fm library, and plays given
-    // up on. A play Last.fm merely *accepted* is in neither: see DailyCap.ts.
+    // up on. A play Last.fm merely *accepted* is in neither: see shared/lastfm/dailyCap.ts.
     tracksScrobbled: 0,
     tracksFailed: 0,
     // Sent but not yet confirmed. Carries a restored session's unchecked plays

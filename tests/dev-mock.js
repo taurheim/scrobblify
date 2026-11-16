@@ -123,7 +123,7 @@ function banner() {
     console.log(`  Upload this by hand:  ${LARGE_FIXTURE}`);
     console.log('  Then select every track, press Scrobble, then "Pause & Save".');
     console.log('  The handoff offer lives on the paused screen — that is by design.');
-    console.log('  The simulated job runs at ~40 tracks/sec so the status card moves.');
+    console.log('  The simulated job sends a batch every 20s so the status card moves.');
   }
   console.log('');
   console.log('  Press Ctrl+C to stop.');

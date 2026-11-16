@@ -572,7 +572,8 @@ async function main() {
     const sql = freshSql();
     const blobs = new MemoryBlobs();
     const env = makeEnv(sql, blobs);
-    const id = await seedJob(sql, blobs, 'listener', { total: 90000, cursor: 9000 });
+    // 21,000 left at the worker's 700 a day: 30 days.
+    const id = await seedJob(sql, blobs, 'listener', { total: 30000, cursor: 9000 });
     await sql.run('UPDATE jobs SET scrobbled_count = 8900, failed_count = 100 WHERE id = ?', [id]);
     const body: any = await (await handleRequest(env, req('/scrobblify/job', {
       token: await issueSession('listener', SIGNING, NOW),
@@ -580,7 +581,7 @@ async function main() {
 
     check('progress is reported', body.job.scrobbled === 8900, body.job);
     check('failures are reported', body.job.failed === 100);
-    check('remaining is reported', body.job.remaining === 81000, body.job.remaining);
+    check('remaining is reported', body.job.remaining === 21000, body.job.remaining);
     // Without a date, a user watching a 30-day job concludes it is broken and
     // re-imports, which is the duplicate source this feature exists to remove.
     check('an estimated completion date is given',
@@ -588,6 +589,11 @@ async function main() {
     check('the estimate is roughly 30 days out',
       Math.abs((body.job.estimatedCompletionSec - NOW) / 86400 - 30) < 1,
       (body.job.estimatedCompletionSec - NOW) / 86400);
+    // The scheduler runs every five minutes, so the card says when the next
+    // send is due rather than leaving the count frozen with no explanation.
+    check('an active job says when it next sends: the next tick',
+      body.job.nextRunAt > NOW && body.job.nextRunAt - NOW <= 300 && body.job.nextRunAt % 300 === 0,
+      body.job.nextRunAt);
     check('no credential material is exposed',
       !JSON.stringify(body).includes('session_key')
       && (body.job as any).session_key_ct === undefined, Object.keys(body.job));
@@ -610,6 +616,7 @@ async function main() {
     check('a returning user sees the result, not nothing', body.job !== null, body);
     check('with the totals', body.job.scrobbled === 94203, body.job);
     check('marked completed', body.job.state === 'completed');
+    check('a finished job has no next send', body.job.nextRunAt === null, body.job.nextRunAt);
   }
 
   console.log('\n-- controls --');

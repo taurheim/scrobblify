@@ -33,12 +33,14 @@ const MIN_TRACKS = 2700;
 const MAX_TRACKS = 2700 * 60;
 const CHUNK_TRACKS = 1000;
 
-// The rate the *real* worker paces at, and the only thing the completion
-// estimate may be derived from. The simulation deliberately runs ~86,400x
-// faster than this so the progress bar visibly moves, but reusing that speed
-// for the ETA made a 28-day job report "Should finish within a day" — the
-// status card would contradict the offer dialog the user had just read.
-const WORKER_TRACKS_PER_DAY = 2700;
+// The rate the *real* worker paces at (`importBudget(0)` in
+// src/shared/lastfm/dailyCap.ts: Last.fm's 750 a day less 50 for the user's own
+// listening), and the only thing the completion estimate may be derived from.
+// The simulation deliberately runs far faster than this so the progress bar
+// visibly moves, but reusing that speed for the ETA made a 28-day job report
+// "Should finish within a day" — the status card would contradict the offer
+// dialog the user had just read.
+const WORKER_TRACKS_PER_DAY = 700;
 
 const CORS = {
   // Safe as a wildcard: the session travels in an Authorization header, not a
@@ -163,11 +165,14 @@ function shimHtml(session, handoffId) {
  * The world lives in this closure rather than being passed around, so no
  * handler mutates something it was handed.
  *
- * `rate` is the only knob that matters in practice. The real worker manages
- * about 2,700 scrobbles a day; at that speed nothing visibly moves, so this
- * defaults to a few dozen a second and the status card animates. It drives
- * the progress bar only — the completion estimate uses the real rate, so the
- * card's ETA still matches the one the offer dialog quoted.
+ * `rate` and `tickSeconds` are the knobs that matter in practice. The real
+ * worker sends in steps, once per five-minute tick, at most a day's budget (see
+ * `WORKER_TRACKS_PER_DAY`); at that speed nothing visibly moves. The mock keeps
+ * the steps but shortens them: every `tickSeconds` (default 20) it sends
+ * `rate * tickSeconds` tracks, so the card's "next batch" countdown and its
+ * auto-refresh can be watched. It drives the progress bar only — the completion
+ * estimate uses the real rate, so the card's ETA still matches the one the
+ * offer dialog quoted.
  */
 function createMockWorker(options = {}) {
   const apiOrigin = options.apiOrigin || DEFAULT_API_ORIGIN;
@@ -180,6 +185,7 @@ function createMockWorker(options = {}) {
 
   const world = {
     rate: options.rate || 40,
+    tickSeconds: options.tickSeconds || 20,
     capacityAvailable: options.capacityAvailable !== false,
     handoffs: new Map(),
     imports: new Map(),
@@ -187,24 +193,25 @@ function createMockWorker(options = {}) {
   };
 
   /**
-   * Advances the simulated job to `nowMs`.
+   * Advances the simulated job to `nowMs`, one tick at a time.
    *
    * Called at the top of every request rather than on a timer: the client only
    * ever observes the job through these endpoints, so there is nothing a timer
    * could do that a read cannot — and no interval to leak when the page shuts.
+   * `lastTickMs` is the last tick the job has had; it resets when the job
+   * (re)activates, like a real job becoming due.
    */
   function advance(nowMs) {
     const { job } = world;
-    if (!job || job.state !== 'active') {
-      return;
-    }
-    const elapsedSec = (nowMs - job.lastTickMs) / 1000;
-    job.lastTickMs = nowMs;
-    job.scrobbled = Math.min(job.totalTracks, job.scrobbled + elapsedSec * world.rate);
-    if (job.scrobbled >= job.totalTracks) {
-      job.scrobbled = job.totalTracks;
-      job.state = 'completed';
-      job.completedAtMs = nowMs;
+    const tickMs = world.tickSeconds * 1000;
+    while (job && job.state === 'active' && nowMs - job.lastTickMs >= tickMs) {
+      job.lastTickMs += tickMs;
+      job.scrobbled = Math.min(job.totalTracks, job.scrobbled + world.rate * world.tickSeconds);
+      if (job.scrobbled >= job.totalTracks) {
+        job.scrobbled = job.totalTracks;
+        job.state = 'completed';
+        job.completedAtMs = job.lastTickMs;
+      }
     }
   }
 
@@ -243,6 +250,9 @@ function createMockWorker(options = {}) {
       failed: job.failed,
       remaining,
       waitingUntil: job.waitingUntil,
+      nextRunAt: job.state === 'active'
+        ? Math.ceil((job.lastTickMs + world.tickSeconds * 1000) / 1000)
+        : null,
       // Anchored to the job's creation and its *original* size, not to
       // `remaining`. The simulation drains the queue about 86,400x faster than
       // the real worker, so anything derived from live progress collapses to

@@ -9,7 +9,7 @@
       <v-card-text class="pt-4">
         <p>
           You have <strong>{{ remaining.toLocaleString() }}</strong> tracks left.
-          Last.fm only accepts about 2,700 scrobbles a day from one account, so
+          Last.fm keeps at most {{ dailyCap.toLocaleString() }} scrobbles a day from one account, so
           finishing here means coming back over the next
           <strong>{{ daysRemaining }}</strong>.
         </p>
@@ -82,14 +82,15 @@
 
 <script lang="ts">
 import Vue from 'vue';
+import { LASTFM_DAILY_CAP, importBudget } from '@/shared/lastfm/dailyCap';
 
 /*
-  The rate the worker actually paces at, and the same constant `describeJob`
-  in worker/src/api.ts divides by. Last.fm's own ceiling is nearer 2,800, but
-  quoting that here made this dialog promise a date one day earlier than the
-  status card the user lands on immediately afterwards.
+  The rate the worker actually paces at, and the same figure `describeJob` in
+  worker/src/api.ts divides by: Last.fm's daily cap less the headroom left for
+  the user's own listening. Quoting anything else makes this dialog promise a
+  different date from the status card the user lands on immediately afterwards.
 */
-const DAILY_LIMIT = 2700;
+const DAILY_LIMIT = importBudget(0);
 
 export default Vue.extend({
   name: 'BackgroundOffer',
@@ -99,6 +100,9 @@ export default Vue.extend({
     /** True when every remaining track already had its date rewritten. */
     allReTagged: { type: Boolean, default: false },
     busy: { type: Boolean, default: false },
+  },
+  data() {
+    return { dailyCap: LASTFM_DAILY_CAP };
   },
   computed: {
     visible: {

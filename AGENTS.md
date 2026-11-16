@@ -381,7 +381,7 @@ Two consequences worth knowing before touching this code:
 ## Last.fm's daily cap
 
 Last.fm stores at most **750 scrobbles per UTC calendar day of the scrobble's
-timestamp** (`LASTFM_DAILY_CAP` in `src/services/DailyCap.ts`), the user's own
+timestamp** (`LASTFM_DAILY_CAP` in `src/shared/lastfm/dailyCap.ts`, shared with the worker), the user's own
 listening included. Everything past it is answered exactly like a stored play —
 `accepted=1, ignored=0`, no `ignoredMessage` — and thrown away. Undocumented;
 measured in 2026-11 by comparing PostHog against `user.getrecenttracks` for ~40
@@ -438,10 +438,24 @@ The Last.fm mock (`tests/lastfmMock.js`) models this, for Playwright and
 fills itself (`recordScrobble`) from any `track.scrobble` response that says
 accepted, including ones a test answers with its own route.
 
-**The background worker does not.** `worker/` still paces to 2,700 a day and
-counts accepted replies, so a background job past 750 a day loses plays exactly
-the way #106 did. Pending browser plays handed over in a handoff are also never
-verified.
+**The background worker budgets the same way, but does not verify.** Before
+each batch the scheduler reads the day's count (`LastFmClient.countScrobbles`,
+once per UTC day per run, then advanced by what it sends) and sends only what
+fits under `importBudget`. Re-tagged seconds stay on today (`assignTimestamps`'
+`dayFloorSec`); once today is full the job waits until
+`DAY_RESUME_OFFSET_SECONDS` (20 min) past the next UTC midnight, with
+`DAY_FULL_REASON` on the job card. The offset exists because the worker's
+allocator marches *down* from the present and never below midnight, so at
+00:01 it would have a minute of seconds to spend. A real-dated play on a full
+day is failed without being sent (`DAY_FULL_FAILURE`); repeats (pinned retries,
+reused seconds) go through unchecked; a count that can't be read sends nothing
+and counts as a failed attempt. Estimates (`describeJob`, `BackgroundOffer`)
+use `importBudget(0)`, 700 a day. What it still lacks is the read-back:
+`scrobbled_count` counts accepted replies, so the user's own scrobbler landing
+between the count and the send can still tip a day over, and pending browser
+plays handed over in a handoff are never verified. **Jobs before 2026-11-15
+paced to 2,700 a day: everything past ~750 on a day was lost and counted as
+scrobbled.**
 
 ## Import robustness
 
@@ -645,6 +659,25 @@ a handoff return, and the Last.fm callback never carried it. A per-load flag
 would switch itself off exactly when a handoff came back. The parameter is
 read from the query string *and* the hash (dev runs the router in hash mode)
 and deliberately not stripped — see `consumeBetaParam`.
+
+### The job card refreshes itself
+
+The scheduler only runs every five minutes (`TICK_INTERVAL_SECONDS`, which must
+match the cron in `worker/wrangler.toml`), so a count that sits still looks like
+a stall. `/scrobblify/job` therefore carries `nextRunAt` for active jobs: the
+next cron boundary at or after `next_eligible_at`, or now while a tick holds the
+lease. The card shows it ("Next batch around 4:25 PM (in 3 minutes)", then
+"Sending a batch now") with "Last checked", and re-fetches the job
+`JOB_POLL_AFTER_RUN_SECONDS` (45s) after each `nextRunAt`, clamped to 15s–10min.
+It only polls while the job is `active` and the tab is visible, and checks at
+once when the tab is shown again, so expect one `/scrobblify/job` request per open
+tab per tick. A failed check keeps the last card rather than clearing it: a
+null `backgroundJob` would bring back the Resume prompt for a queue the server
+still holds. A poll that resolves after a pause, resume or take-back is
+discarded.
+
+`dev:mock:bg` ticks every 20s (`tickSeconds` in `createMockWorker`) in steps
+like the real worker, so the countdown and refresh can be watched.
 
 ## Linting
 
