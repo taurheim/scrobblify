@@ -5,6 +5,12 @@
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width,initial-scale=1.0">
     <link rel="icon" href="<%= BASE_URL %>favicon.ico">
+    <!--
+      Cascade layer order. It must come before any stylesheet: the first
+      declaration of a layer fixes its place, and the bundled CSS would otherwise
+      put App.vue's `app-base` after Vuetify's utilities.
+    -->
+    <style>@layer vuetify-core, vuetify-components, vuetify-overrides, app-base, vuetify-utilities, vuetify-final;</style>
     <link href="https://fonts.googleapis.com/css?family=Roboto:100:300,400,500,700,900|Material+Icons" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/@mdi/font@5.x/css/materialdesignicons.min.css" rel="stylesheet">
     <title>scrobblify</title>

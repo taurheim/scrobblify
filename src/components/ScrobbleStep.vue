@@ -70,7 +70,7 @@
           Don't want to keep coming back?
           <v-chip size="x-small" color="deep-purple" variant="flat" class="ml-1">Beta</v-chip>
         </div>
-        <div class="mb-3 text-body-2">
+        <div class="mb-3 text-body-medium">
           Scrobblify's server can finish the remaining
           {{ tracksRemaining.toLocaleString() }} tracks for you. Close the tab
           and it keeps going.
@@ -81,13 +81,13 @@
       </v-alert>
 
       <v-card class="pa-4 mb-4 text-center" variant="outlined">
-        <div v-if="countdown > 0" class="text-h5 mb-2">
+        <div v-if="countdown > 0" class="text-headline-small mb-2">
           Auto-resuming in {{ formattedCountdown }}
         </div>
-        <div v-if="countdown > 0" class="mb-2 text-body-2">
+        <div v-if="countdown > 0" class="mb-2 text-body-medium">
           You can save progress and leave now, then resume later at any time.
         </div>
-        <div v-if="canResume && autoSaved" class="mb-2 text-body-2">
+        <div v-if="canResume && autoSaved" class="mb-2 text-body-medium">
           Your progress has been saved automatically — just come back to this page later
           and choose "Resume"<template v-if="canOfferBackground">, or use "Finish this in the
           background" above and you won't need to</template>.

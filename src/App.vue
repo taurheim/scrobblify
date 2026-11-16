@@ -38,20 +38,53 @@
 
 <style>
 /*
-  Targets the v-app element itself, as `#app` did under Vuetify 2 (whose v-app
-  carried id="app"). On the mount point instead, Vuetify 3's own
-  `.v-application` colour would override the text colour below. Dialogs are
-  included because Vuetify 3 renders them in `.v-overlay-container`, outside
-  the app, where under Vuetify 2 they sat inside it and inherited all of this.
+  App-wide defaults sit in the `app-base` layer, which public/index.html orders
+  below Vuetify's utilities. Vuetify 4's utilities (`mb-0`, `pl-4`, …) are
+  layered and no longer `!important`, so unlayered rules here would beat them.
 */
-#app > .v-application,
-.v-overlay-container {
-  font-family: 'Avenir', Helvetica, Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-align: center;
-  color: #2c3e50;
+@layer app-base {
+  /*
+    Targets the v-app element itself, as `#app` did under Vuetify 2 (whose v-app
+    carried id="app"). Dialogs are included because Vuetify renders them in
+    `.v-overlay-container`, outside the app, where under Vuetify 2 they sat
+    inside it and inherited all of this.
+  */
+  #app > .v-application,
+  .v-overlay-container {
+    font-family: 'Avenir', Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-align: center;
+    color: #2c3e50;
+  }
+
+  /* Vuetify 2 gave every page these defaults; Vuetify 3 and 4 leave links unstyled. */
+  .v-application a,
+  .v-overlay-container a {
+    color: rgb(var(--v-theme-primary));
+  }
+
+  .v-application p,
+  .v-overlay-container p {
+    margin-bottom: 16px;
+  }
+
+  .v-application ul,
+  .v-application ol,
+  .v-overlay-container ul,
+  .v-overlay-container ol {
+    padding-left: 24px;
+  }
 }
+
+/* Vuetify 4 dropped the global reset that every page here was laid out against. */
+@layer vuetify-core.reset {
+  * {
+    padding: 0;
+    margin: 0;
+  }
+}
+
 #nav {
   padding: 30px;
 }
@@ -63,27 +96,6 @@
 
 #nav a {
   font-weight: bold;
-}
-
-/*
-  Vuetify 2 gave every page these app-level defaults; Vuetify 3's reset zeroes
-  all margins and padding and leaves links unstyled.
-*/
-.v-application a,
-.v-overlay-container a {
-  color: rgb(var(--v-theme-primary));
-}
-
-.v-application p,
-.v-overlay-container p {
-  margin-bottom: 16px;
-}
-
-.v-application ul,
-.v-application ol,
-.v-overlay-container ul,
-.v-overlay-container ol {
-  padding-left: 24px;
 }
 
 /* Sticky rather than fixed: the point is to be impossible to miss, but not to

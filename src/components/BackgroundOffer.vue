@@ -64,7 +64,7 @@
           stop the import and take your progress back at any point.
         </v-alert>
 
-        <p class="mt-3 mb-0 text-body-2 text-grey-darken-1">
+        <p class="mt-3 mb-0 text-body-medium text-grey-darken-1">
           &ldquo;Not now&rdquo; leaves this tab scrobbling as before.
         </p>
       </v-card-text>

@@ -66,19 +66,19 @@
           >, {{ backgroundJob.failed.toLocaleString() }} rejected by Last.fm</span>.
           <span v-if="jobEta">{{ jobEta }}</span>
         </div>
-        <div v-if="jobNextRun" class="mt-1 text-body-2">
+        <div v-if="jobNextRun" class="mt-1 text-body-medium">
           {{ jobNextRun }}<span v-if="jobCheckedAt"> Last checked {{ jobCheckedAt }}.</span>
         </div>
         <div
           v-if="backgroundJob.reason && backgroundJob.state !== 'dormant'"
-          class="mt-1 text-body-2"
+          class="mt-1 text-body-medium"
         >{{ backgroundJob.reason }}</div>
         <!--
           A parked job that nobody touches goes dormant after 14 days: its
           Last.fm key is deleted and its place freed. It is cancelled if it is
           still dormant 30 days after that. Both dates come from the server.
         -->
-        <div v-if="backgroundJob.state === 'dormant'" class="mt-1 text-body-2">
+        <div v-if="backgroundJob.state === 'dormant'" class="mt-1 text-body-medium">
           Nothing happened with this import for 14 days, so Scrobblify deleted
           its Last.fm access and gave its place to someone else. Your remaining
           tracks are kept<span v-if="inactivityDate"> until {{ inactivityDate }}</span>.
@@ -89,7 +89,7 @@
             until a place opens up.
           </span>
         </div>
-        <div v-else-if="inactivityDate" class="mt-1 text-body-2">
+        <div v-else-if="inactivityDate" class="mt-1 text-body-medium">
           If it's still waiting on {{ inactivityDate }}, Scrobblify will delete
           its Last.fm access and put it on hold.
         </div>

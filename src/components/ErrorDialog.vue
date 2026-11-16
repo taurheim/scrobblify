@@ -14,7 +14,7 @@
         </p>
         <v-expansion-panels v-if="details" flat class="mt-2">
           <v-expansion-panel>
-            <v-expansion-panel-title class="pa-0 text-caption">
+            <v-expansion-panel-title class="pa-0 text-body-small">
               Technical details
             </v-expansion-panel-title>
             <v-expansion-panel-text>
