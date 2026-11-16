@@ -6,161 +6,171 @@
     </div>
 
     <!--
-      Sticky opt-in, so it needs to be visible and reversible: a flag the user
-      cannot see is one they cannot report a bug against or switch off. Hidden
-      once a job exists, where the job banner is the more useful thing to read.
+      One banner at a time, chosen by `banner`. A `backgroundNotice` that is
+      not itself the banner rides along as the banner's first line rather than
+      stacking a second one on top.
     -->
     <v-alert
-      v-if="betaOptedIn && !backgroundJob"
-      type="info"
-      text
-      dense
+      v-if="banner"
+      :type="bannerType"
+      :prominent="banner === 'job' || banner === 'signIn' || banner === 'resume'"
+      :text="banner === 'beta'"
+      :dense="banner === 'beta'"
       class="mb-4"
     >
-      Background scrobbling (beta) is switched on for this browser.
-      <a :href="betaOffHref">Switch it off</a>.
-    </v-alert>
+      <div v-if="showBackgroundNotice" :class="{ 'mb-3': banner !== 'notice' }">
+        {{ backgroundNotice }}
+        <div v-if="showReauth" class="mt-3">
+          <v-btn color="primary" :loading="reauthBusy" @click="reauthenticate">
+            {{ reauthLabel }}
+          </v-btn>
+        </div>
+      </div>
 
-    <!--
-      A live server-side job outranks everything else on this page. If it is
-      running and the user also has local progress, offering "Resume" would
-      invite them to scrobble the same tracks the server is scrobbling, so the
-      job banner replaces the resume prompt rather than sitting beside it.
-    -->
-    <v-alert v-if="backgroundJob" :type="jobAlertType" prominent class="mb-4">
-      <div>
-        <strong>{{ jobHeadline }}</strong>
-        <v-chip x-small color="deep-purple" text-color="white" class="ml-2">Beta</v-chip>
-      </div>
-      <div class="mt-1">
-        {{ backgroundJob.scrobbled.toLocaleString() }} of
-        {{ backgroundJob.totalTracks.toLocaleString() }} scrobbled<span
-          v-if="backgroundJob.failed > 0"
-        >, {{ backgroundJob.failed.toLocaleString() }} rejected by Last.fm</span>.
-        <span v-if="jobEta">{{ jobEta }}</span>
-      </div>
-      <div
-        v-if="backgroundJob.reason && backgroundJob.state !== 'dormant'"
-        class="mt-1 text-body-2"
-      >{{ backgroundJob.reason }}</div>
-      <!--
-        A parked job that nobody touches goes dormant after 14 days: its
-        Last.fm key is deleted and its place freed. It is cancelled if it is
-        still dormant 30 days after that. Both dates come from the server.
-      -->
-      <div v-if="backgroundJob.state === 'dormant'" class="mt-1 text-body-2">
-        Nothing happened with this import for 14 days, so Scrobblify deleted
-        its Last.fm access and gave its place to someone else. Your remaining
-        tracks are kept<span v-if="inactivityDate"> until {{ inactivityDate }}</span>.
-        Reconnect Last.fm to carry on, or take your progress back and finish in
-        this browser.
-        <span v-if="backgroundJob.reconnectAvailable === false">
-          The background service is full right now, so reconnecting won't work
-          until a place opens up.
-        </span>
-      </div>
-      <div v-else-if="inactivityDate" class="mt-1 text-body-2">
-        If it's still waiting on {{ inactivityDate }}, Scrobblify will delete
-        its Last.fm access and put it on hold.
-      </div>
-      <div class="mt-2">
-        <v-btn
-          v-if="backgroundJob.state === 'active'"
-          outlined
-          class="mr-2"
-          :loading="backgroundBusy"
-          @click="pauseBackgroundJob"
-        >Pause</v-btn>
-        <v-btn
-          v-else-if="backgroundJob.state === 'paused'"
-          color="primary"
-          class="mr-2"
-          :loading="backgroundBusy"
-          @click="resumeBackgroundJob"
-        >Resume on the server</v-btn>
+      <template v-if="banner === 'outage'">
         <!--
-          The only way a job parked for re-auth can ever send again: the
-          sign-in callback re-attaches the credential it proves. Without the
-          button the headline told the user to reconnect and gave them nothing
-          to reconnect with, leaving take-back (which abandons any batch still
-          in flight) as their only exit.
+          The choice is not offered over a local ownership record: that browser
+          handed its queue over, so the worker is known to have it, not merely
+          possibly.
         -->
-        <v-btn
-          v-else-if="backgroundJob.state === 'needs_reauth' || backgroundJob.state === 'dormant'"
-          color="primary"
-          class="mr-2"
-          :loading="reauthBusy"
-          :disabled="backgroundJob.reconnectAvailable === false"
-          @click="reauthenticate"
-        >Reconnect Last.fm</v-btn>
-        <v-btn outlined class="mr-2" :loading="backgroundBusy" @click="takeBackProgress">
-          Take my progress back
-        </v-btn>
-        <v-btn text @click="refreshBackgroundJob">Refresh</v-btn>
-      </div>
+        <div v-if="!ownershipBlocked">
+          We can't reach the background scrobble worker. You can continue in
+          browser but you might get double scrobbles if the worker is also
+          scrobbling. Please check in again in a couple hours. If you keep seeing
+          this message, email me at <a href="mailto:niko@savas.ca">niko@savas.ca</a>
+        </div>
+        <div v-else>
+          We can't reach the background scrobble worker. Please check in again in
+          a couple hours. If you keep seeing this message, email me at
+          <a href="mailto:niko@savas.ca">niko@savas.ca</a>
+        </div>
+        <div class="mt-3">
+          <v-btn color="primary" :loading="authorityPending" @click="retryAuthority">
+            Try again
+          </v-btn>
+          <v-btn v-if="!ownershipBlocked" text class="ml-2" @click="continueWithoutAuthority">
+            Continue in this browser anyway
+          </v-btn>
+        </div>
+      </template>
+
+      <template v-else-if="banner === 'job'">
+        <div>
+          <strong>{{ jobHeadline }}</strong>
+          <v-chip x-small color="deep-purple" text-color="white" class="ml-2">Beta</v-chip>
+        </div>
+        <div class="mt-1">
+          {{ backgroundJob.scrobbled.toLocaleString() }} of
+          {{ backgroundJob.totalTracks.toLocaleString() }} scrobbled<span
+            v-if="backgroundJob.failed > 0"
+          >, {{ backgroundJob.failed.toLocaleString() }} rejected by Last.fm</span>.
+          <span v-if="jobEta">{{ jobEta }}</span>
+        </div>
+        <div
+          v-if="backgroundJob.reason && backgroundJob.state !== 'dormant'"
+          class="mt-1 text-body-2"
+        >{{ backgroundJob.reason }}</div>
+        <!--
+          A parked job that nobody touches goes dormant after 14 days: its
+          Last.fm key is deleted and its place freed. It is cancelled if it is
+          still dormant 30 days after that. Both dates come from the server.
+        -->
+        <div v-if="backgroundJob.state === 'dormant'" class="mt-1 text-body-2">
+          Nothing happened with this import for 14 days, so Scrobblify deleted
+          its Last.fm access and gave its place to someone else. Your remaining
+          tracks are kept<span v-if="inactivityDate"> until {{ inactivityDate }}</span>.
+          Reconnect Last.fm to carry on, or take your progress back and finish in
+          this browser.
+          <span v-if="backgroundJob.reconnectAvailable === false">
+            The background service is full right now, so reconnecting won't work
+            until a place opens up.
+          </span>
+        </div>
+        <div v-else-if="inactivityDate" class="mt-1 text-body-2">
+          If it's still waiting on {{ inactivityDate }}, Scrobblify will delete
+          its Last.fm access and put it on hold.
+        </div>
+        <div class="mt-2">
+          <v-btn
+            v-if="backgroundJob.state === 'active'"
+            outlined
+            class="mr-2"
+            :loading="backgroundBusy"
+            @click="pauseBackgroundJob"
+          >Pause</v-btn>
+          <v-btn
+            v-else-if="backgroundJob.state === 'paused'"
+            color="primary"
+            class="mr-2"
+            :loading="backgroundBusy"
+            @click="resumeBackgroundJob"
+          >Resume on the server</v-btn>
+          <!--
+            The only way a job parked for re-auth can ever send again: the
+            sign-in callback re-attaches the credential it proves. Without the
+            button the headline told the user to reconnect and gave them nothing
+            to reconnect with, leaving take-back (which abandons any batch still
+            in flight) as their only exit.
+          -->
+          <v-btn
+            v-else-if="backgroundJob.state === 'needs_reauth' || backgroundJob.state === 'dormant'"
+            color="primary"
+            class="mr-2"
+            :loading="reauthBusy"
+            :disabled="backgroundJob.reconnectAvailable === false"
+            @click="reauthenticate"
+          >Reconnect Last.fm</v-btn>
+          <v-btn outlined class="mr-2" :loading="backgroundBusy" @click="takeBackProgress">
+            Take my progress back
+          </v-btn>
+          <v-btn text @click="refreshBackgroundJob">Refresh</v-btn>
+        </div>
+      </template>
+
+      <!--
+        Resuming needs a session key to scrobble with. Without one, every track
+        used to fail in a burst and be saved as done, so the resume is held here
+        instead, with the saved progress left untouched.
+      -->
+      <template v-else-if="banner === 'signIn'">
+        <div><strong>{{ resumeSignInMessage }}</strong></div>
+        <div class="mt-1">Your saved progress is kept, and nothing has been scrobbled yet.</div>
+        <div class="mt-2">
+          <v-btn color="primary" :href="authorizeUrl">Sign in to Last.fm</v-btn>
+        </div>
+      </template>
+
+      <template v-else-if="banner === 'resume'">
+        <div>
+          <strong>Resume previous session?</strong>
+          You have saved progress from a previous scrobbling session.
+        </div>
+        <div class="mt-2">
+          <v-btn color="primary" class="mr-2" @click="resumeFromSaved">Resume</v-btn>
+          <v-btn outlined @click="importStateFile">Import from file</v-btn>
+          <v-btn text color="error" @click="clearSavedState">Discard</v-btn>
+        </div>
+        <input
+          ref="importFileInput"
+          type="file"
+          accept=".json"
+          aria-label="Import saved session file"
+          style="display: none"
+          @change="onImportFile"
+        >
+      </template>
+
+      <!--
+        Sticky opt-in, so it needs to be visible and reversible: a flag the user
+        cannot see is one they cannot report a bug against or switch off. Last
+        in line, so it only shows when nothing more useful does.
+      -->
+      <template v-else-if="banner === 'beta'">
+        Background scrobbling (beta) is switched on for this browser.
+        <a :href="betaOffHref">Switch it off</a>.
+      </template>
     </v-alert>
 
-    <v-alert v-if="backgroundNotice" type="warning" class="mb-4">
-      {{ backgroundNotice }}
-      <div v-if="showReauth" class="mt-3">
-        <v-btn color="primary" :loading="reauthBusy" @click="reauthenticate">
-          Sign in to the background service
-        </v-btn>
-      </div>
-    </v-alert>
-
-    <v-alert v-if="authorityUnknown" type="warning" class="mb-4">
-      <div>
-        <strong>Can't reach the background service.</strong>
-        Scrobbling is held back until it can confirm that an import isn't
-        already running on the server for your account — sending the same
-        tracks twice can't be undone.
-      </div>
-      <div class="mt-3">
-        <v-btn color="primary" :loading="authorityPending" @click="retryAuthority">
-          Try again
-        </v-btn>
-      </div>
-    </v-alert>
-
-    <!--
-      Resuming needs a session key to scrobble with. Without one, every track
-      used to fail in a burst and be saved as done, so the resume is held here
-      instead, with the saved progress left untouched.
-    -->
-    <v-alert v-if="resumeSignInMessage" type="warning" prominent class="mb-4">
-      <div><strong>{{ resumeSignInMessage }}</strong></div>
-      <div class="mt-1">Your saved progress is kept, and nothing has been scrobbled yet.</div>
-      <div class="mt-2">
-        <v-btn color="primary" :href="authorizeUrl">Sign in to Last.fm</v-btn>
-      </div>
-    </v-alert>
-
-    <v-alert
-      v-if="hasResumableState && currentStep <= 2 && !backgroundJob && !ownershipBlocked
-        && !authorityPending && !authorityUnknown"
-      type="info"
-      prominent
-      class="mb-4"
-    >
-      <div>
-        <strong>Resume previous session?</strong>
-        You have saved progress from a previous scrobbling session.
-      </div>
-      <div class="mt-2">
-        <v-btn color="primary" class="mr-2" @click="resumeFromSaved">Resume</v-btn>
-        <v-btn outlined @click="importStateFile">Import from file</v-btn>
-        <v-btn text color="error" @click="clearSavedState">Discard</v-btn>
-      </div>
-      <input
-        ref="importFileInput"
-        type="file"
-        accept=".json"
-        aria-label="Import saved session file"
-        style="display: none"
-        @change="onImportFile"
-      >
-    </v-alert>
     <v-stepper v-model="currentStep">
       <v-stepper-header>
         <v-stepper-step :complete="currentStep > 1" step="1">Authenticate with last.fm</v-stepper-step>
@@ -191,6 +201,7 @@
             ref="scrobbleStep"
             :background-available="backgroundAvailable"
             :sending-blocked="sendingBlocked"
+            :worker-unreachable="authorityUnknown"
             :persist-progress="onAutoSave"
             :persist-progress-if-ahead="onAutoSaveIfAhead"
             v-on:complete="onScrobbleComplete"
@@ -252,6 +263,15 @@ import { trackEvent, trackError, resetUser } from '@/services/Analytics';
  * not recorded, so an over-estimate is the safe direction.
  */
 const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
+
+/** Shown when the bearer token for the worker has expired, wherever that is detected. */
+const SESSION_EXPIRED_NOTICE = 'You need to refresh your connection to the scrobble worker.';
+const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sign in. Please try again in a few minutes.';
+/**
+ * Hidden while the worker can't be reached: refreshing the connection needs
+ * the worker, so the unreachable banner is the only one worth showing.
+ */
+const NEEDS_WORKER_NOTICES = [SESSION_EXPIRED_NOTICE, REAUTH_UNREACHABLE_NOTICE];
 
 interface ProgressSnapshot {
   scrobbledTracks: number;
@@ -345,6 +365,12 @@ export default Vue.extend({
        */
       authorityUnknown: false,
       /**
+       * The user chose to scrobble here without the server's answer, accepting
+       * possible duplicates. For this page load only, so every visit asks
+       * again; and never over a local ownership record.
+       */
+      authorityOverridden: false,
+      /**
        * Progress reported by the server for a queue it was handed, used only
        * to make the block message concrete. Null when unknown.
        */
@@ -358,6 +384,12 @@ export default Vue.extend({
        */
       showReauth: false,
       reauthBusy: false,
+      /**
+       * Labels the sign-in button "Fix now" for an expired connection. A flag
+       * rather than a comparison with the notice, because a failed attempt
+       * replaces the notice and the button must keep its label.
+       */
+      reauthFixNow: false,
       resumeSignInMessage: '',
     };
   },
@@ -603,6 +635,55 @@ export default Vue.extend({
     sendingBlocked(): boolean {
       return this.ownershipBlocked || this.authorityPending || this.authorityUnknown;
     },
+    /**
+     * The one banner shown above the stepper, most important first.
+     *
+     *   outage — the worker can't be asked, and that blocks everything else.
+     *   job    — a server-side job outranks local progress: offering Resume
+     *            beside it would invite sending the tracks it is sending.
+     *   signIn — a resume was held back for want of a Last.fm session.
+     *   resume — saved progress; never while anything might own the queue.
+     *   notice — `backgroundNotice` on its own. Below the resume prompt
+     *            because a notice that leaves Resume available is a "nothing
+     *            happened" report (a handoff that didn't go through), and the
+     *            prompt is what the user acts on; it shows as its first line.
+     *   beta   — the opt-in reminder, only when nothing else needs saying.
+     */
+    banner(): 'outage' | 'job' | 'signIn' | 'resume' | 'notice' | 'beta' | null {
+      if (this.authorityUnknown) { return 'outage'; }
+      if (this.backgroundJob) { return 'job'; }
+      if (this.resumeSignInMessage) { return 'signIn'; }
+      if (this.hasResumableState && this.currentStep <= 2 && !this.ownershipBlocked
+        && !this.authorityPending) {
+        return 'resume';
+      }
+      if (this.showBackgroundNotice) { return 'notice'; }
+      if (this.betaOptedIn) { return 'beta'; }
+      return null;
+    },
+    bannerType(): string {
+      switch (this.banner) {
+        case 'job': return this.jobAlertType;
+        case 'resume':
+        case 'beta': return 'info';
+        default: return 'warning';
+      }
+    },
+    /**
+     * Whether `backgroundNotice` is shown at all, as the banner or inside it.
+     * Not while the worker can't be reached if acting on it needs the worker:
+     * the outage banner already says what is wrong.
+     */
+    showBackgroundNotice(): boolean {
+      if (!this.backgroundNotice) { return false; }
+      return !(NEEDS_WORKER_NOTICES.includes(this.backgroundNotice)
+        && (this.authorityUnknown || this.authorityPending));
+    },
+    reauthLabel(): string {
+      return this.reauthFixNow
+        ? 'Fix now'
+        : 'Sign in to the background service';
+    },
     jobAlertType(): string {
       if (!this.backgroundJob) { return 'info'; }
       if (this.backgroundJob.state === 'completed') { return 'success'; }
@@ -796,6 +877,7 @@ export default Vue.extend({
         await this.refreshBackgroundJob();
         if (!this.backgroundJob) {
           this.showReauth = true;
+          this.reauthFixNow = false;
           this.backgroundNotice = 'Your import is still running on the server, so scrobbling from this browser is switched off to stop the same tracks being sent twice. Sign in to check on it or bring it back here.';
         }
         trackEvent('background_authority_check', { result: 'live', signed_in: String(!!this.backgroundJob) });
@@ -874,12 +956,14 @@ export default Vue.extend({
      * Whether an *unanswered* authority check may fall through to ordinary
      * scrobbling.
      *
-     * Only in a browser that has not opted in to the beta and holds no local
-     * trace of a handover. The check still runs for everyone and a `live` answer
-     * still blocks everyone; only the no-answer case differs. Without this, a
-     * worker outage — or a worker not yet deployed — stops every user of the
-     * site from scrobbling, including all the ones who have never seen the
-     * offer.
+     * Never over a local ownership record: that queue is known to have left.
+     * Otherwise, when the user has chosen to carry on anyway
+     * (`continueWithoutAuthority`), or in a browser that has not opted in to
+     * the beta and holds no local trace of a handover. The check still runs
+     * for everyone and a `live` answer still blocks everyone; only the
+     * no-answer case differs. Without this, a worker outage — or a worker not
+     * yet deployed — stops every user of the site from scrobbling, including
+     * all the ones who have never seen the offer.
      *
      * The accepted cost: a browser that lost its localStorage (and with it the
      * opt-in and every ownership record) while keeping a handed-over queue in
@@ -890,15 +974,25 @@ export default Vue.extend({
     mayScrobbleWithoutAuthority(
       observed: ReturnType<typeof background.queueOwner> = background.queueOwner(),
     ): boolean {
-      if (background.isBetaOptedIn()) {
+      if (observed) {
         return false;
       }
-      return !observed
-        && !background.getOwnershipUnresolved()
-        && !background.getPendingHandoff()
-        && !background.staleSnapshotRecord()
-        && !this.backgroundJob
-        && !this.sawServerOwnership;
+      if (this.authorityOverridden) {
+        return true;
+      }
+      return !background.isBetaOptedIn() && !this.hasHandoverEvidence(observed);
+    },
+
+    /** Any local trace that a queue of this browser's may have been handed over. */
+    hasHandoverEvidence(
+      observed: ReturnType<typeof background.queueOwner> = background.queueOwner(),
+    ): boolean {
+      return !!observed
+        || !!background.getOwnershipUnresolved()
+        || !!background.getPendingHandoff()
+        || !!background.staleSnapshotRecord()
+        || !!this.backgroundJob
+        || this.sawServerOwnership;
     },
 
     /** The authority check could not be answered, or threw. Never throws. */
@@ -975,6 +1069,7 @@ export default Vue.extend({
       await this.refreshBackgroundJob();
       if (!this.backgroundJob) {
         this.showReauth = true;
+        this.reauthFixNow = false;
         const p = this.handedOverProgress;
         const detail = p ? ` It has scrobbled ${p.scrobbled} of ${p.total} tracks.` : '';
         this.backgroundNotice = `This import was handed over to the background service, so scrobbling it from this browser is switched off — the tracks it already sent would be sent again and silently discarded.${detail} Sign in to check on it or bring it back here.`;
@@ -1107,11 +1202,47 @@ export default Vue.extend({
 
     /**
      * Retries the authority question after it could not be answered.
+     *
+     * `authorityUnknown` stays up while the retry is in flight. Every outcome
+     * of `enforceServerAuthority` sets it, and dropping it here made the
+     * unreachable banner vanish, and the scrobble step fall back to "Checking…",
+     * for every retry of a sustained outage.
      */
     async retryAuthority(): Promise<void> {
       this.authorityPending = true;
-      this.authorityUnknown = false;
       await this.enforceServerAuthority();
+    },
+
+    /**
+     * "Continue in this browser anyway": the user scrobbles here while the
+     * server cannot be asked, accepting that tracks it already sent may be
+     * sent twice. A worker outage otherwise blocks an opted-in browser, or one
+     * with a trace of a handover, for as long as it lasts.
+     *
+     * Lifts only the no-answer gate. A `live: true` answer from a later check
+     * still blocks, and a local ownership record is never overridden.
+     */
+    async continueWithoutAuthority(): Promise<void> {
+      const observed = background.queueOwner();
+      if (observed || this.ownershipBlocked) {
+        return;
+      }
+      trackEvent('background_authority_overridden', {
+        opted_in: String(background.isBetaOptedIn()),
+        handover_evidence: String(this.hasHandoverEvidence(observed)),
+      });
+      this.authorityOverridden = true;
+      if (this.authorityRetryTimer) {
+        window.clearTimeout(this.authorityRetryTimer);
+        this.authorityRetryTimer = null;
+      }
+      this.authorityPending = false;
+      this.authorityUnknown = false;
+      try {
+        await this.exposeSavedStateUnlessStale('authority_overridden');
+      } catch (e) {
+        // Resume stays hidden; scrobbling a fresh import is still allowed.
+      }
     },
 
     /**
@@ -1208,7 +1339,8 @@ export default Vue.extend({
         // an expected end state rather than an error. It needs an action, not
         // an apology.
         this.showReauth = true;
-        this.backgroundNotice = 'Your link to the background service has expired, so this browser can\'t check whether your import finished. Sign in again to unlock scrobbling here.';
+        this.reauthFixNow = true;
+        this.backgroundNotice = SESSION_EXPIRED_NOTICE;
       }
     },
 
@@ -1290,8 +1422,9 @@ export default Vue.extend({
       this.hasResumableState = false;
       this.ownershipBlocked = true;
       this.showReauth = background.isSessionExpired();
+      this.reauthFixNow = this.showReauth;
       this.backgroundNotice = background.isSessionExpired()
-        ? 'Your link to the background service has expired, so this browser can\'t check whether it finished your import. Sign in again to unlock scrobbling here.'
+        ? SESSION_EXPIRED_NOTICE
         : 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
       trackEvent('background_ownership_unresolved', { session_expired: background.isSessionExpired() });
     },
@@ -1314,7 +1447,7 @@ export default Vue.extend({
       const url = await background.startReauth(username);
       if (!url) {
         this.reauthBusy = false;
-        this.backgroundNotice = 'Couldn\'t reach the background service to sign in. Please try again in a few minutes.';
+        this.backgroundNotice = REAUTH_UNREACHABLE_NOTICE;
         return;
       }
       window.location.href = url;
