@@ -906,7 +906,7 @@ deleting the blob**, or the data needed to build it is already gone.
   opt-in is sticky (`scrobblify.background.beta` in localStorage) because the
   query string does not survive the handoff: `stripQuery` drops it on return
   and the Last.fm callback never carried it. `?beta=0` clears it, and an
-  opted-in browser shows a banner with a switch-off link.
+  opted-in browser shows a banner with a switch-off link when no other banner is showing.
 - **The gate covers the offer only, never recovery.** `isBackgroundEnabled`
   (configured *and* opted in) guards `probeBackgroundAvailability` and
   `preflight`. The live-job authority check, finishing a handoff on return,
@@ -921,6 +921,10 @@ deleting the blob**, or the data needed to build it is already gone.
   job, stay blocked. Otherwise a worker outage would stop every user of the
   site. Accepted gap: lost localStorage plus a leftover handed-over queue in
   IndexedDB plus an unreachable worker.
+- **A blocked browser may carry on at its own risk.** The unreachable banner
+  offers "Continue in this browser anyway", warning that tracks the server already sent
+  may be scrobbled twice. Per page load, lifts only the no-answer gate, and is
+  never offered over a local ownership record.
 - Labelled clearly as beta in the UI.
 - The opt-in must state plainly: the selected track list is uploaded to
   Scrobblify's server; a Last.fm credential is stored until the import finishes;

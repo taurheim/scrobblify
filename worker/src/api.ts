@@ -22,6 +22,7 @@ import {
   reapExpiredHandoffs,
   HandoffRow,
   MAX_TRACKS_PER_JOB,
+  TRACKS_PER_DAY,
   CREDENTIAL_TTL_SECONDS,
 } from './handoff';
 import { issueSession, authenticate } from './session';
@@ -30,8 +31,11 @@ import {
   normalizeUsername, randomId, signHandoffState, verifyHandoffState, encryptCredential,
 } from './crypto';
 
-/** Remaining tracks below which background mode is not worth the trade-offs. */
-export const MIN_TRACKS_FOR_BACKGROUND = 2700;
+/**
+ * Remaining tracks below which background mode is not worth the trade-offs:
+ * one day's worth, which the browser can finish by itself.
+ */
+export const MIN_TRACKS_FOR_BACKGROUND = TRACKS_PER_DAY;
 
 /**
  * Lifetime of a re-authentication state. Short: it exists only to survive one
@@ -317,8 +321,7 @@ const PARKED_STATES: JobRow['state'][] = ['paused', 'needs_reauth', 'needs_atten
  */
 function describeJob(job: JobRow, nowSec: number) {
   const remaining = Math.max(0, job.total_tracks - job.cursor);
-  const perDay = 2700;
-  const daysLeft = remaining / perDay;
+  const daysLeft = remaining / TRACKS_PER_DAY;
   return {
     id: job.id,
     state: job.state,

@@ -6,7 +6,9 @@ import JSZip from 'jszip';
 import LastFm from '../src/api/LastFm';
 import Scrobble from '../src/models/Scrobble';
 // Shared Last.fm mock, also used by the `npm run dev:mock` interactive script.
-import { interceptLastFm, mockLastFmAuth } from './lastfmMock';
+import {
+  interceptLastFm, mockLastFmAuth, MockLibrary,
+} from './lastfmMock';
 
 const FIXTURE_ZIP = path.resolve(__dirname, 'fixtures', 'test-spotify-data.zip');
 
@@ -24,8 +26,8 @@ test.beforeEach(async ({ context }) => {
 });
 
 // Navigate past auth (step 1 -> step 2) with mocked auth
-async function goToUploadStep(page: Page) {
-  await interceptLastFm(page);
+async function goToUploadStep(page: Page): Promise<MockLibrary> {
+  const library = await interceptLastFm(page);
   // Navigate first to establish origin for localStorage
   await page.goto('/#/scrobble');
   await mockLastFmAuth(page);
@@ -33,6 +35,14 @@ async function goToUploadStep(page: Page) {
   await page.reload();
   // Auth step should auto-complete since we're "authenticated"
   await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+  return library;
+}
+
+// The scrobble button opens a confirmation with a time estimate; starting
+// needs the dialog's own button.
+async function scrobbleSelection(page: Page) {
+  await page.locator('button:has-text("selected tracks")').click();
+  await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
 }
 
 test.describe('Home Page', () => {
@@ -276,11 +286,83 @@ test.describe('Select Step - Track Selection', () => {
     await expect(page.locator('button:has-text("Add 0 matching")')).toBeVisible({ timeout: 5000 });
   });
 
-  test('add matching + scrobble advances to scrobble step', async ({ page }) => {
+  test('scrobbling asks for confirmation with a time estimate first', async ({ page }) => {
     await goToSelectStep(page);
     await page.locator('button:has-text("matching")').click();
     await page.locator('button:has-text("selected tracks")').click();
-    // Should advance to step 4 - the scrobble step
+
+    const dialog = page.locator('.scrobble-confirm');
+    await expect(dialog).toContainText('Scrobble 5 tracks?');
+    await expect(dialog).toContainText('This should take about 5 seconds');
+
+    // Cancelling leaves the selection alone and stays on this step.
+    await dialog.locator('button:has-text("Cancel")').click();
+    await expect(dialog).toBeHidden();
+    await expect(page.locator('h3:has-text("Choose which tracks to scrobble")')).toBeVisible();
+
+    await scrobbleSelection(page);
+    await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+  });
+
+  test('a large backdated import must be acknowledged first, and is told how long it takes', async ({ page }) => {
+    const library = await goToUploadStep(page);
+    // Last.fm already holds 650 plays for today, leaving 50 of the import's 700.
+    const lastSecondToday = Math.floor(Date.now() / 86400000) * 86400 + 86399;
+    for (let n = 0; n < 650; n++) {
+      library.add({
+        track: `Own ${n}`, artist: 'Own', album: '', uts: lastSecondToday,
+      });
+    }
+
+    // One more than a day's budget, all a year old so every play is re-tagged.
+    const count = 701;
+    const startMs = Date.now() - 365 * 24 * 60 * 60 * 1000;
+    const zip = new JSZip();
+    zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024.json', JSON.stringify(
+      Array.from({ length: count }, (_, i) => ({
+        ts: new Date(startMs + i * 60000).toISOString(),
+        master_metadata_track_name: `Track ${i}`,
+        master_metadata_album_artist_name: 'Queen',
+        master_metadata_album_album_name: 'An Album',
+        ms_played: 300000,
+      })),
+    ));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data.zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+
+    // Choosing tracks is blocked until the user has read what a large backdated import means.
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
+    const gate = page.locator('.large-history-gate');
+    await expect(gate).toContainText('701 of your plays are more than 2 weeks old');
+    await expect(gate).toContainText('Scrobbling will take about 2 days');
+
+    // Declining opens ListenBrainz's importer and leaves the user where they were.
+    await page.context().route('https://listenbrainz.org/**', (route) => route.fulfill({ status: 200, body: '' }));
+    const popup = page.waitForEvent('popup');
+    await gate.locator('a:has-text("Use ListenBrainz instead")').click();
+    expect((await popup).url()).toBe('https://listenbrainz.org/settings/import/');
+    await expect(gate).toBeHidden();
+    // The stepper keeps every step in the DOM, so "still here" means hidden, not absent.
+    await expect(page.locator('h3:has-text("Choose which tracks to scrobble")')).toBeHidden();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible();
+
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
+    await gate.locator('button:has-text("I understand, continue")').click();
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
+
+    const dialog = page.locator('.scrobble-confirm');
+    // 50 today, then the other 651 at 700 a day: two days, not one.
+    await expect(dialog).toContainText('will take 2 days');
+    await expect(dialog).toContainText('About 50 go today');
+
+    await dialog.locator('button:has-text("Start scrobbling")').click();
     await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   });
 });
@@ -299,7 +381,7 @@ test.describe('Scrobble Step', () => {
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
 
     await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   }
@@ -362,7 +444,7 @@ test.describe('Scrobble Step', () => {
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -429,7 +511,7 @@ test.describe('Scrobble Step', () => {
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -496,7 +578,7 @@ test.describe('Scrobble Step', () => {
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -1608,7 +1690,7 @@ test.describe('Session Resume', () => {
     await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
     await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
     await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
 
@@ -1740,6 +1822,108 @@ test.describe('Session Resume', () => {
     await page.reload();
     await page.waitForTimeout(2000);
     await expect(page.locator('text=Resume previous session?')).toBeHidden();
+  });
+
+  // Re-tagged plays (the path ~78% of imports take), so they all land on
+  // today's UTC day.
+  function reTaggedState(count: number) {
+    const tracks = Array.from({ length: count }, (_, n) => ({
+      track: `Track ${n + 1}`,
+      artist: `Artist ${n + 1}`,
+      album: '',
+      timestamp: Date.UTC(2024, 0, n + 1),
+      reTagged: true,
+    }));
+    return buildState({
+      totalTracks: count,
+      completedIndices: [],
+      tracks,
+      originalTotalTracks: count,
+      originalSucceededCount: 0,
+    });
+  }
+
+  // The user's own listening today, on a second no re-tagged play can use.
+  function fillToday(library: MockLibrary, plays: number) {
+    const lastSecondToday = Math.floor(Date.now() / 86400000) * 86400 + 86399;
+    for (let n = 0; n < plays; n++) {
+      library.add({
+        track: `Own ${n}`, artist: 'Own', album: '', uts: lastSecondToday,
+      });
+    }
+  }
+
+  test('plays Last.fm accepted but did not keep are not counted, and stay queued', async ({ page }) => {
+    // Regression for #106: Last.fm stores at most 750 scrobbles per UTC day and
+    // answers the rest as accepted. Every accepted reply was counted as
+    // scrobbled and saved as done, so a week of "10k scrobbled" left ~4k in the
+    // user's library and the rest could never be resumed.
+    test.setTimeout(60000);
+    const library = await interceptLastFm(page);
+    const scrobbled: string[] = [];
+    page.on('request', (request) => {
+      if (new URLSearchParams(request.postData() || '').get('method') === 'track.scrobble') {
+        scrobbled.push(new URLSearchParams(request.postData() || '').get('track[0]') || '');
+      }
+    });
+    // Room for 10 when the run starts; then the user's own scrobbler fills the
+    // day while it is running, so everything the import sends is dropped.
+    fillToday(library, 690);
+    let filled = false;
+    page.on('response', (response) => {
+      const url = new URL(response.url());
+      if (!filled && url.searchParams.get('method') === 'user.getrecenttracks'
+        && url.searchParams.get('limit') === '1') {
+        filled = true;
+        fillToday(library, 60);
+      }
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, reTaggedState(10));
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator('text=Last.fm stopped keeping today\'s scrobbles')).toBeVisible({ timeout: 30000 });
+    expect(scrobbled).toHaveLength(10);
+    expect(library.plays.filter((p) => p.artist !== 'Own')).toHaveLength(0);
+    // Nothing reached the library, so nothing is reported as scrobbled...
+    await expect(page.locator('.overall-progress')).toContainText('0 of 10');
+    // ...and every dropped play is still owed a send on the next resume.
+    await expect.poll(async () => (await readSavedState(page))?.tracks.length, { timeout: 10000 }).toBe(20);
+    const saved = await readSavedState(page);
+    expect(saved?.completedIndices).toHaveLength(10);
+    expect(saved?.originalSucceededCount).toBe(0);
+  });
+
+  test('stops at Last.fm\'s daily cap instead of sending plays it will throw away', async ({ page }) => {
+    test.setTimeout(60000);
+    const library = await interceptLastFm(page);
+    const scrobbled: string[] = [];
+    page.on('request', (request) => {
+      if (new URLSearchParams(request.postData() || '').get('method') === 'track.scrobble') {
+        scrobbled.push(new URLSearchParams(request.postData() || '').get('track[0]') || '');
+      }
+    });
+    // 695 already today: 5 more fit under the cap with 50 left for the user.
+    fillToday(library, 695);
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, reTaggedState(10));
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator('text=Last.fm keeps at most 750 scrobbles a day')).toBeVisible({ timeout: 30000 });
+    expect(scrobbled).toEqual(['Track 1', 'Track 2', 'Track 3', 'Track 4', 'Track 5']);
+    await expect(page.locator('.overall-progress')).toContainText('5 of 10');
   });
 });
 
@@ -1907,7 +2091,7 @@ test.describe('Complete Step', () => {
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -1995,7 +2179,7 @@ test.describe('URL Encoding', () => {
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -2045,6 +2229,9 @@ test.describe('Re-tagged old plays', () => {
   ) {
     const timestamps: number[] = [];
     let scrobbleAttempts = 0;
+    // Everything but track.scrobble falls through to the stateful mock, so the
+    // app can read back what an accepted reply stored.
+    await interceptLastFm(page);
     await page.route('https://ws.audioscrobbler.com/**', async (route) => {
       const postData = route.request().postData() || '';
       const allParams = new URLSearchParams(
@@ -2068,24 +2255,8 @@ test.describe('Re-tagged old plays', () => {
           contentType: 'application/json',
           body: JSON.stringify(outcome),
         });
-      } else if (apiMethod === 'track.getInfo') {
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({ track: { duration: '240000' } }),
-        });
-      } else if (apiMethod === 'user.getrecenttracks') {
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({ recenttracks: { track: [] } }),
-        });
       } else {
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({ session: { name: 'testuser', key: 'fake-session-key' } }),
-        });
+        await route.fallback();
       }
     });
 
@@ -2102,7 +2273,7 @@ test.describe('Re-tagged old plays', () => {
     await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
 
     await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -2959,7 +3130,7 @@ test.describe('Stale build detection', () => {
     await page.locator('button:has-text("Find tracks")').click();
     await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
 
     await expect(page.locator('text=Scrobbling...')).toBeVisible({ timeout: 10000 });
@@ -3040,7 +3211,7 @@ test.describe('Browser storage unavailable', () => {
     await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
     await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     await page.locator('button:has-text("matching")').click();
-    await page.locator('button:has-text("selected tracks")').click();
+    await scrobbleSelection(page);
     await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   }
 

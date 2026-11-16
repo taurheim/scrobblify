@@ -1,7 +1,7 @@
 import { createStore } from 'vuex';
 import LastFm from '@/api/LastFm';
 import SpotifyListen from '@/models/SpotifyListen';
-import Scrobble from '@/models/Scrobble';
+import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 
 export interface CarriedFailure {
   artist: string;
@@ -16,6 +16,7 @@ export interface RootState {
   selectedScrobbles: Scrobble[];
   tracksScrobbled: number;
   tracksFailed: number;
+  pendingVerification: PendingScrobble[];
   resumedScrobbleCount: number;
   carriedFailures: CarriedFailure[];
   carriedFailuresDropped: number;
@@ -35,8 +36,13 @@ export default createStore<RootState>({
     lfmApi: new LastFm('2bf354b70b4a9a8a4420b2c48333d23e', '440dad9dd54b0e2081b272513401e8df'),
     validScrobbles: [],
     selectedScrobbles: [],
+    // Plays confirmed as stored in the user's Last.fm library, and plays given
+    // up on. A play Last.fm merely *accepted* is in neither: see DailyCap.ts.
     tracksScrobbled: 0,
     tracksFailed: 0,
+    // Sent but not yet confirmed. Carries a restored session's unchecked plays
+    // into the scrobble step, and what was still unchecked at completion out.
+    pendingVerification: [],
     // Number of tracks already scrobbled in a previously saved session that is
     // being resumed. `selectedScrobbles` only ever holds the *remaining* tracks,
     // so this is the only way the scrobble step can tell a resume from a fresh
@@ -131,6 +137,15 @@ export default createStore<RootState>({
     setSelectedScrobbles(state, tracks: Scrobble[]) {
       state.selectedScrobbles = tracks;
     },
+    // A play Last.fm accepted but did not keep goes back on the end of the
+    // queue. Everything before it stays index-addressed, so saving and resuming
+    // need no other changes.
+    requeueScrobble(state, scrobble: Scrobble) {
+      state.selectedScrobbles.push(scrobble);
+    },
+    setPendingVerification(state, pending: PendingScrobble[]) {
+      state.pendingVerification = pending;
+    },
     setResumedScrobbleCount(state, count: number) {
       state.resumedScrobbleCount = count;
     },
@@ -164,8 +179,8 @@ export default createStore<RootState>({
     setScrobbleRunActive(state, active: boolean) {
       state.scrobbleRunActive = active;
     },
-    trackScrobbled(state) {
-      state.tracksScrobbled += 1;
+    trackScrobbled(state, count = 1) {
+      state.tracksScrobbled += count;
     },
     trackFailed(state) {
       state.tracksFailed += 1;

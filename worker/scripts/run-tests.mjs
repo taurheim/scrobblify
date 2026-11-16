@@ -43,6 +43,8 @@ for (const test of tests) {
     '--external:node:*',
     `--alias:@=${join(root, '..', 'src')}`,
     `--alias:posthog-js=${join(root, 'test', 'stubs', 'posthog.ts')}`,
+    // Same as [alias] in wrangler.toml: src/shared/ must not need the root install.
+    `--alias:blueimp-md5=${join(root, 'node_modules', 'blueimp-md5')}`,
     `--outfile=${out}`,
   ], { stdio: ['ignore', 'ignore', 'inherit'], shell: process.platform === 'win32' });
 

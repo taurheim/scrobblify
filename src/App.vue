@@ -80,7 +80,9 @@
 }
 
 .v-application ul,
-.v-application ol {
+.v-application ol,
+.v-overlay-container ul,
+.v-overlay-container ol {
   padding-left: 24px;
 }
 

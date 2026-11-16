@@ -2,6 +2,7 @@ import {
   test, expect, Page, Route,
 } from '@playwright/test';
 import path from 'path';
+import JSZip from 'jszip';
 import { interceptLastFm, mockLastFmAuth } from '../lastfmMock';
 
 /*
@@ -10,12 +11,14 @@ import { interceptLastFm, mockLastFmAuth } from '../lastfmMock';
 
   The rule under test: an unanswered authority check blocks scrobbling only for
   a browser that has opted in to the beta or holds some local trace of a
-  handover. Everyone else waits briefly and then scrobbles as normal.
+  handover. Everyone else waits briefly and then scrobbles as normal. A blocked
+  browser can choose to carry on anyway, unless it holds an ownership record.
 */
 
 const FIXTURE_ZIP = path.resolve(__dirname, '..', 'fixtures', 'test-spotify-data.zip');
 const WORKER = 'http://background.invalid/**';
-const UNREACHABLE = "text=Can't reach the background service";
+const UNREACHABLE = "text=We can't reach the background scrobble worker";
+const CONTINUE_ANYWAY = 'button:has-text("Continue in this browser anyway")';
 // Vuetify renders every stepper pane up front, so an unfiltered text match
 // finds the hidden copy of this heading before anything has been sent.
 const FINISHED = 'text=Finished scrobbling >> visible=true';
@@ -87,6 +90,7 @@ async function importAndPressScrobble(page: Page) {
   await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
   await page.locator('button:has-text("matching")').click();
   await page.locator('button:has-text("selected tracks")').click();
+  await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
 
   await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
   await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -99,6 +103,12 @@ async function expectHeldBack(page: Page, scrobbles: string[]) {
   await page.waitForTimeout(3000);
   expect(scrobbles).toEqual([]);
   await expect(page.locator(UNREACHABLE)).toBeVisible();
+  // One banner, ever: not the beta reminder or a sign-in prompt beside it.
+  await expect(page.locator('.scrobblify > .v-alert')).toHaveCount(1);
+  // The banner explains the block; the scrobble step must not claim to be
+  // still checking underneath it.
+  await expect(page.locator('text=Checking whether your import is running')).toHaveCount(0);
+  await expect(page.locator('text=Getting ready')).toHaveCount(0);
 }
 
 test.describe('Background worker unreachable', () => {
@@ -122,11 +132,17 @@ test.describe('Background worker unreachable', () => {
     expect(workerCalls).toContain('/scrobblify/job/live');
   });
 
-  test('an opted-in browser is held back', async ({ page }) => {
+  test('an opted-in browser is held back until it chooses to carry on', async ({ page }) => {
     const { scrobbles } = await openUploadStep(page, 'refuse', {
       'scrobblify.background.beta': '1',
     });
     await expectHeldBack(page, scrobbles);
+
+    await page.locator(CONTINUE_ANYWAY).click();
+    // The attempt held back above picks itself up; no second press needed.
+    await expect(page.locator(FINISHED)).toBeVisible({ timeout: 30000 });
+    expect(scrobbles.length).toBeGreaterThan(0);
+    await expect(page.locator(UNREACHABLE)).toHaveCount(0);
   });
 
   test('a browser holding a handover record is held back even without the opt-in', async ({ page }) => {
@@ -134,6 +150,12 @@ test.describe('Background worker unreachable', () => {
       'scrobblify.background.serverOwns': JSON.stringify({ owner: 'server', id: 'job-1' }),
     });
     await expectHeldBack(page, scrobbles);
+    // The server is known to have this queue, not merely possibly.
+    await expect(page.locator(CONTINUE_ANYWAY)).toHaveCount(0);
+    // Refreshing the worker connection needs the worker, so the unreachable
+    // banner is the only one shown.
+    await expect(page.locator('text=You need to refresh your connection')).toHaveCount(0);
+    await expect(page.locator('button:has-text("Fix now")')).toHaveCount(0);
   });
 });
 
@@ -213,18 +235,19 @@ test.describe('Offering background scrobbling', () => {
     '/scrobblify/job/live': { ok: true, live: false },
     '/scrobblify/import/': { ok: true, known: false, live: false },
     '/scrobblify/capacity': {
-      available: true, used: 0, capacity: 100, minTracks: 2700, maxTracks: 200000, chunkTracks: 5000,
+      available: true, used: 0, capacity: 100, minTracks: 750, maxTracks: 200000, chunkTracks: 5000,
     },
   };
   const OFFER = 'text=Finish this in the background >> visible=true';
 
-  function largeProgressFile() {
+  function largeProgressFile(reTagged = false) {
     const count = 3000;
     const tracks = Array.from({ length: count }, (_, i) => ({
       track: `Track ${i}`,
       artist: `Artist ${i % 50}`,
       album: `Album ${i % 50}`,
       timestamp: Date.UTC(2024, 0, 1) + i * 60000,
+      reTagged,
     }));
     return {
       name: 'scrobblify-progress.json',
@@ -261,5 +284,73 @@ test.describe('Offering background scrobbling', () => {
     await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile());
 
     await expect(page.locator(OFFER)).toBeVisible({ timeout: 15000 });
+  });
+
+  // 1,600 plays from a year ago: after the first day's 700, 900 are left,
+  // which is enough for the offer on the stop screen.
+  async function openLargeHistoryGate(page: Page) {
+    const startMs = Date.now() - 365 * 24 * 60 * 60 * 1000;
+    const zip = new JSZip();
+    zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024.json', JSON.stringify(
+      Array.from({ length: 1600 }, (_, i) => ({
+        ts: new Date(startMs + i * 60000).toISOString(),
+        master_metadata_track_name: `Track ${i}`,
+        master_metadata_album_artist_name: 'Queen',
+        master_metadata_album_album_name: 'An Album',
+        ms_played: 300000,
+      })),
+    ));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data.zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    const gate = page.locator('.large-history-gate');
+    await expect(gate).toBeVisible();
+    return gate;
+  }
+
+  test('a large import the server could finish is not told to come back every day', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    const gate = await openLargeHistoryGate(page);
+
+    await expect(gate).toContainText('Finish this in the background');
+    await expect(gate).not.toContainText("You'll need to come back each day");
+  });
+
+  test('without the beta flag the same import is told it has to come back', async ({ page }) => {
+    await openUploadStep(page, WILLING_WORKER);
+    const gate = await openLargeHistoryGate(page);
+
+    await expect(gate).toContainText("You'll need to come back each day");
+    await expect(gate).not.toContainText('Finish this in the background');
+  });
+
+  test('the daily stop points to the background offer, not only "come back"', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    // Today's UTC day already holds 700 plays, so the first re-tagged send stops for the day.
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(new URL(route.request().url()).search);
+      if (params.get('method') !== 'user.getrecenttracks') {
+        await route.fallback();
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ recenttracks: { '@attr': { total: '700' }, track: [] } }),
+      });
+    });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile(true));
+    await page.locator('button:has-text("Not now") >> visible=true').click({ timeout: 15000 });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator("text=hand the rest to Scrobblify's server below >> visible=true"))
+      .toBeVisible({ timeout: 30000 });
   });
 });

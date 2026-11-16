@@ -8,6 +8,10 @@
 // Playwright or Node HTTP. That split is the point: `dev:mock` and the test
 // suite have to agree about what Last.fm returns, and the surest way to make
 // them agree is to give them one implementation and two thin transports.
+//
+// The library is stateful, because the app reads it back to confirm what was
+// stored. Like the real Last.fm, it keeps at most `dailyCap` scrobbles per UTC
+// day of the scrobble's timestamp and answers the rest as accepted anyway.
 
 /** Username every mocked session authenticates as. */
 const MOCK_USER = 'testuser';
@@ -15,16 +19,96 @@ const MOCK_USER = 'testuser';
 /** Session key handed back by auth.getSession. The real API rejects it. */
 const MOCK_SESSION_KEY = 'fake-session-key';
 
+const DEFAULT_DAILY_CAP = 750;
+const SECONDS_PER_DAY = 24 * 60 * 60;
+
+function createLibrary(dailyCap = DEFAULT_DAILY_CAP) {
+  const plays = [];
+  const countOnDay = (uts) => {
+    const day = Math.floor(uts / SECONDS_PER_DAY);
+    return plays.filter((p) => Math.floor(p.uts / SECONDS_PER_DAY) === day).length;
+  };
+  return {
+    plays,
+    dailyCap,
+    /** Store a play as Last.fm would: silently not at all once its day is full. */
+    add(play) {
+      if (countOnDay(play.uts) < this.dailyCap) {
+        plays.push(play);
+      }
+    },
+    countOnDay,
+  };
+}
+
+/**
+ * Store the play a `track.scrobble` request carried, if its response says
+ * Last.fm accepted it. Keyed on the *response* rather than on who produced it,
+ * so a test that answers track.scrobble with its own route still fills the
+ * library whenever its reply says accepted.
+ *
+ * @param {ReturnType<typeof createLibrary>} library
+ * @param {URLSearchParams} params
+ * @param {unknown} body the parsed JSON response
+ */
+function recordScrobble(library, params, body) {
+  if (params.get('method') !== 'track.scrobble') {
+    return;
+  }
+  const attr = (body && body.scrobbles && body.scrobbles['@attr']) || {};
+  if (Number(attr.accepted) >= 1 && Number(attr.ignored || 0) === 0) {
+    library.add({
+      track: params.get('track[0]') || '',
+      artist: params.get('artist[0]') || '',
+      album: params.get('album[0]') || '',
+      uts: Number(params.get('timestamp[0]')),
+    });
+  }
+}
+
+function recentTracksBody(library, params) {
+  const from = Number(params.get('from') || 0);
+  const to = Number(params.get('to') || Number.MAX_SAFE_INTEGER);
+  const limit = Number(params.get('limit') || 50);
+  const page = Number(params.get('page') || 1);
+  const inRange = library.plays
+    .filter((p) => p.uts >= from && p.uts <= to)
+    .sort((a, b) => b.uts - a.uts);
+  const slice = inRange.slice((page - 1) * limit, page * limit);
+  return {
+    recenttracks: {
+      track: slice.map((p) => ({
+        name: p.track,
+        artist: { '#text': p.artist },
+        album: { '#text': p.album },
+        date: { uts: String(p.uts), '#text': new Date(p.uts * 1000).toUTCString() },
+      })),
+      '@attr': {
+        user: MOCK_USER,
+        page: String(page),
+        perPage: String(limit),
+        total: String(inRange.length),
+        totalPages: String(Math.max(1, Math.ceil(inRange.length / limit))),
+      },
+    },
+  };
+}
+
 /**
  * The canned Last.fm API. Transport-free: hand it the request's merged
- * parameters (query string for GET, form body for POST) and it returns a
- * response description that both `route.fulfill` and a Node `ServerResponse`
- * can serve.
+ * parameters (query string for GET, form body for POST) and the library it
+ * reads back from, and it returns a response description that both
+ * `route.fulfill` and a Node `ServerResponse` can serve.
+ *
+ * It does not store scrobbles itself: the transport passes the response it
+ * served to `recordScrobble`, which is what lets a Playwright test override
+ * track.scrobble and still have accepted plays stored.
  *
  * @param {URLSearchParams} params
+ * @param {ReturnType<typeof createLibrary>} library
  * @returns {{ status: number, contentType: string, body: string }}
  */
-function handleLastFm(params) {
+function handleLastFm(params, library) {
   const apiMethod = params.get('method');
 
   const json = (payload) => ({
@@ -50,7 +134,7 @@ function handleLastFm(params) {
   }
 
   if (apiMethod === 'user.getrecenttracks') {
-    return json({ recenttracks: { track: [] } });
+    return json(recentTracksBody(library, params));
   }
 
   if (apiMethod === 'track.scrobble') {
@@ -87,19 +171,37 @@ function lastFmAuthRedirect(basePath = '/') {
   return `${base}#/scrobble?token=${token}`;
 }
 
-// Intercept all Last.fm API calls and fulfill them with fake data.
-function interceptLastFm(page) {
-  return page.route('https://ws.audioscrobbler.com/**', async (route) => {
-    const request = route.request();
-    const method = request.method();
-    const postData = request.postData() || '';
+function requestParams(request) {
+  return new URLSearchParams(
+    request.method() === 'POST' ? request.postData() || '' : new URL(request.url()).search,
+  );
+}
 
-    const params = new URLSearchParams(
-      method === 'POST' ? postData : new URL(request.url()).search,
-    );
+// Intercept all Last.fm API calls and fulfill them with fake data. Resolves to
+// the mock's library, so a test can inspect what was really "stored" or
+// pre-fill a day.
+async function interceptLastFm(page, { dailyCap = DEFAULT_DAILY_CAP } = {}) {
+  const library = createLibrary(dailyCap);
 
-    await route.fulfill(handleLastFm(params));
+  page.on('response', async (response) => {
+    const request = response.request();
+    if (!request.url().startsWith('https://ws.audioscrobbler.com/') || response.status() !== 200) {
+      return;
+    }
+    let body;
+    try {
+      body = await response.json();
+    } catch (e) {
+      return;
+    }
+    recordScrobble(library, requestParams(request), body);
   });
+
+  await page.route('https://ws.audioscrobbler.com/**', async (route) => {
+    await route.fulfill(handleLastFm(requestParams(route.request()), library));
+  });
+
+  return library;
 }
 
 // Seed localStorage so the app believes it's already authenticated with Last.fm.
@@ -116,6 +218,8 @@ module.exports = {
   interceptLastFm,
   mockLastFmAuth,
   handleLastFm,
+  createLibrary,
+  recordScrobble,
   lastFmAuthRedirect,
   MOCK_USER,
   MOCK_SESSION_KEY,

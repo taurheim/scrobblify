@@ -7,7 +7,7 @@
       </pre>
       <v-progress-linear v-if="!readyToScrobble" :model-value="progress">
       </v-progress-linear>
-      <v-btn color="primary" @click="finishStep" v-if="readyToScrobble">Choose which tracks to scrobble</v-btn>
+      <v-btn color="primary" @click="chooseTracks" v-if="readyToScrobble">Choose which tracks to scrobble</v-btn>
     </div>
     <div v-else>
       <h2>Upload your Spotify Extended Streaming History ZIP file:</h2>
@@ -72,6 +72,13 @@
       </v-btn>
     </div>
     <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
+    <large-history-gate
+      v-model="showLargeHistoryGate"
+      :re-tagged-count="reTaggedCount"
+      :background-track-limit="backgroundTrackLimit"
+      @accept="finishStep"
+      @decline="showLargeHistoryGate = false"
+    ></large-history-gate>
   </div>
 </template>
 <style>
@@ -109,6 +116,8 @@ import JSZip from 'jszip';
 import Scrobblify from '@/scrobblify';
 import SpotifyListen from '@/models/SpotifyListen';
 import ErrorDialog from '@/components/ErrorDialog.vue';
+import LargeHistoryGate from '@/components/LargeHistoryGate.vue';
+import { IMPORT_DAILY_BUDGET } from '@/services/ScrobbleEstimate';
 import { trackEvent, trackError } from '@/services/Analytics';
 import { ACCOUNT_DATA_MESSAGE } from '@/services/StateManager';
 
@@ -152,7 +161,11 @@ function classifyZip(zip: JSZip): ZipContents {
 }
 
 export default defineComponent({
-  components: { 'error-dialog': ErrorDialog },
+  components: { 'error-dialog': ErrorDialog, 'large-history-gate': LargeHistoryGate },
+  props: {
+    /** Largest queue the background offer would take, or 0 when it is off. */
+    backgroundTrackLimit: { type: Number, default: 0 },
+  },
   emits: ['complete', 'import-progress'],
   data() {
     return {
@@ -176,6 +189,8 @@ export default defineComponent({
       showError: false,
       errorMessage: '',
       errorDetails: '',
+      showLargeHistoryGate: false,
+      reTaggedCount: 0,
     };
   },
   computed: {
@@ -184,7 +199,18 @@ export default defineComponent({
     },
   },
   methods: {
+    // Large backdated imports must be acknowledged before any track is picked.
+    chooseTracks() {
+      const listens = this.$store.state.validScrobbles as SpotifyListen[];
+      this.reTaggedCount = listens.filter((l) => l.reTagged).length;
+      if (this.reTaggedCount > IMPORT_DAILY_BUDGET) {
+        this.showLargeHistoryGate = true;
+        return;
+      }
+      this.finishStep();
+    },
     finishStep() {
+      this.showLargeHistoryGate = false;
       this.$emit('complete');
     },
     async smartMoveProgress() {

@@ -31,18 +31,38 @@
     No need to unzip or open any files! Just drag and drop the ZIP file directly into the
     <router-link to="/scrobble">Scrobble</router-link> page and Scrobblify will handle the rest.<br>
     <b>5. Sit back and let it run!</b><br>
-    Scrobblify will start submitting your listening history to last.fm. Note that last.fm has undocumented rate limits
-    (~2,800 scrobbles per day, ~1,000 per burst), so if you have a large history it may take a while.
-    Don't worry — Scrobblify handles this automatically by pausing and resuming when rate limits are hit.
-    You can also <strong>save your progress</strong> and come back later if you need to close the page.
-    Your progress will be waiting for you when you return!
+    Scrobblify will start submitting your listening history to last.fm. Note that last.fm keeps at most 750 scrobbles
+    per day (midnight to midnight UTC, your own listening included), so a large history takes several days.
+    Scrobblify stops a little short of that each day and only counts scrobbles it can see in your Last.fm library.
+    <template v-if="backgroundEnabled">
+      You've switched on the background scrobbling beta, so you don't have to keep coming back: once a day's
+      share is sent, choose <strong>"Finish this in the background"</strong> and Scrobblify's server carries on
+      with the tab closed.
+    </template>
+    <template v-else>
+      You can also <strong>save your progress</strong> and come back later if you need to close the page.
+      Your progress will be waiting for you when you return!
+    </template>
 
-    <h2>Why does scrobblify only backfill the last two weeks?</h2>
-    This is a limitation enforced by last.fm — scrobbles are supposed to be for the past two weeks only.
-    See the community topic <a href="https://getsatisfaction.com/lastfm/topics/scrobbles-more-than-14-days">here</a>.
-    However, Scrobblify gives you the option to <strong>re-tag older listens to today's date</strong>, so you can still
-    import your full history if you'd like. Don't worry, once you've connected your accounts all future plays will be
-    kept forever!
+    <h2>Have a big listening history?</h2>
+    Last.fm only accepts scrobbles from the past two weeks with their real dates. Scrobblify can still import
+    older plays, but only by <strong>giving each one the date it is sent</strong>: plays from months or years
+    ago show up on your profile as if you listened to them over the coming days. And with at most 750 scrobbles
+    a day, a history of tens of thousands of plays takes weeks<template v-if="backgroundEnabled"> (with the
+    background beta, Scrobblify's server does the waiting for you)</template><template v-else> of coming back
+    each day</template>. Last.fm has no way to delete scrobbles in bulk, so this is hard to undo.
+    <br><br>
+    If most of your history is older than two weeks, consider
+    <a
+      href="https://listenbrainz.org/settings/import/"
+      target="_blank"
+      rel="noopener noreferrer"
+      @click="listenBrainzClicked"
+    >ListenBrainz</a>
+    instead. It imports the same Spotify ZIP directly, in one go, and keeps every play on the day you actually
+    listened to it. Scrobblify is the better fit for recent plays, or if you specifically want your history on
+    Last.fm and don't mind the dates. Once your accounts are connected, all future plays keep their real dates
+    either way.
   </div>
 </template>
 <style>
@@ -59,6 +79,18 @@
 </style>
 <script lang="ts">
 import { defineComponent } from 'vue';
+import { trackEvent } from '@/services/Analytics';
+import { isBackgroundEnabled } from '@/services/BackgroundScrobbling';
 
-export default defineComponent({});
+export default defineComponent({
+  data() {
+    // The beta opt-in, not live worker capacity: this page only describes what's possible.
+    return { backgroundEnabled: isBackgroundEnabled() };
+  },
+  methods: {
+    listenBrainzClicked() {
+      trackEvent('listenbrainz_clicked', { source: 'home' });
+    },
+  },
+});
 </script>

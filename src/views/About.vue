@@ -43,18 +43,30 @@
 
     <h2>What about rate limits?</h2>
     <p>
-      Last.fm has undocumented rate limits — roughly ~2,800 scrobbles per day and ~1,000 per burst.
-      If you have a large listening history, you might hit these limits. Don't worry — Scrobblify
-      detects when you've been rate-limited and will automatically pause and resume, so you don't
-      have to babysit the process.
+      Last.fm keeps at most 750 scrobbles per day (midnight to midnight UTC), your own listening
+      included, and quietly throws away anything over that. Scrobblify stops a little short of it
+      each day and only counts scrobbles it can see in your Last.fm library, so a large history
+      takes a while.
+      <template v-if="backgroundEnabled">
+        Since you've switched on the background scrobbling beta, you don't have to come back each
+        day: once a day's share is sent, choose "Finish this in the background" and Scrobblify's
+        server finishes the rest.
+      </template>
+      <template v-else>Save your progress and come back the next day to continue.</template>
     </p>
 
     <h2>What if I have a huge listening history?</h2>
     <p>
       If you have years of Spotify data, importing everything can take a while due to rate limits.
-      Scrobblify includes a <strong>save and resume</strong> feature — you can save your progress
-      at any time, close the page, and pick up right where you left off when you come back.
-      No lost progress!
+      <template v-if="backgroundEnabled">
+        With the background scrobbling beta, Scrobblify's server can do that waiting for you and keep
+        going after you close the page.
+      </template>
+      <template v-else>
+        Scrobblify includes a <strong>save and resume</strong> feature — you can save your progress
+        at any time, close the page, and pick up right where you left off when you come back.
+        No lost progress!
+      </template>
     </p>
   </div>
 </template>
@@ -68,7 +80,12 @@
 </style>
 <script lang="ts">
 import { defineComponent } from 'vue';
+import { isBackgroundEnabled } from '@/services/BackgroundScrobbling';
 
 export default defineComponent({
+  data() {
+    // The beta opt-in, not live worker capacity: this page only describes what's possible.
+    return { backgroundEnabled: isBackgroundEnabled() };
+  },
 });
 </script>
