@@ -1,12 +1,36 @@
-import Vue from 'vue';
-import Vuex from 'vuex';
+import { createStore } from 'vuex';
 import LastFm from '@/api/LastFm';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 
-Vue.use(Vuex);
+export interface CarriedFailure {
+  artist: string;
+  track: string;
+  album?: string;
+  reason: string;
+}
 
-export default new Vuex.Store({
+export interface RootState {
+  lfmApi: LastFm;
+  validScrobbles: SpotifyListen[];
+  selectedScrobbles: Scrobble[];
+  tracksScrobbled: number;
+  tracksFailed: number;
+  pendingVerification: PendingScrobble[];
+  resumedScrobbleCount: number;
+  carriedFailures: CarriedFailure[];
+  carriedFailuresDropped: number;
+  originalTotalTracks: number;
+  reTagCursorSec: number;
+  reTagFloorSec: number;
+  reTagCeilingSec: number;
+  reTagBlockedUntilSec: number;
+  pendingReTagSec: number;
+  importId: string;
+  scrobbleRunActive: boolean;
+}
+
+export default createStore<RootState>({
   state: {
     // Yeah it's a singleton, come at me bro
     lfmApi: new LastFm('2bf354b70b4a9a8a4420b2c48333d23e', '440dad9dd54b0e2081b272513401e8df'),
@@ -18,7 +42,7 @@ export default new Vuex.Store({
     tracksFailed: 0,
     // Sent but not yet confirmed. Carries a restored session's unchecked plays
     // into the scrobble step, and what was still unchecked at completion out.
-    pendingVerification: [] as PendingScrobble[],
+    pendingVerification: [],
     // Number of tracks already scrobbled in a previously saved session that is
     // being resumed. `selectedScrobbles` only ever holds the *remaining* tracks,
     // so this is the only way the scrobble step can tell a resume from a fresh
@@ -33,9 +57,7 @@ export default new Vuex.Store({
       is told a count before take-back and nothing afterwards — and a track
       they cannot name is a track they cannot re-add.
     */
-    carriedFailures: [] as Array<{
-      artist: string; track: string; album?: string; reason: string;
-    }>,
+    carriedFailures: [],
     /*
       How many named failures could not be kept. Shown alongside the list so an
       incomplete list is visibly incomplete: a user reading five names when
@@ -109,58 +131,58 @@ export default new Vuex.Store({
     scrobbleRunActive: false,
   },
   mutations: {
-    setValidScrobbles(state: any, tracks: SpotifyListen[]) {
-      Vue.set(state, 'validScrobbles', tracks);
+    setValidScrobbles(state, tracks: SpotifyListen[]) {
+      state.validScrobbles = tracks;
     },
-    setSelectedScrobbles(state: any, tracks: Scrobble[]) {
-      Vue.set(state, 'selectedScrobbles', tracks);
+    setSelectedScrobbles(state, tracks: Scrobble[]) {
+      state.selectedScrobbles = tracks;
     },
     // A play Last.fm accepted but did not keep goes back on the end of the
     // queue. Everything before it stays index-addressed, so saving and resuming
     // need no other changes.
-    requeueScrobble(state: { selectedScrobbles: Scrobble[] }, scrobble: Scrobble) {
+    requeueScrobble(state, scrobble: Scrobble) {
       state.selectedScrobbles.push(scrobble);
     },
-    setPendingVerification(state: { pendingVerification: PendingScrobble[] }, pending: PendingScrobble[]) {
-      Vue.set(state, 'pendingVerification', pending);
+    setPendingVerification(state, pending: PendingScrobble[]) {
+      state.pendingVerification = pending;
     },
-    setResumedScrobbleCount(state: any, count: number) {
+    setResumedScrobbleCount(state, count: number) {
       state.resumedScrobbleCount = count;
     },
-    setCarriedFailures(state: any, failures: any[]) {
-      Vue.set(state, 'carriedFailures', Array.isArray(failures) ? failures : []);
+    setCarriedFailures(state, failures: CarriedFailure[]) {
+      state.carriedFailures = Array.isArray(failures) ? failures : [];
     },
-    setCarriedFailuresDropped(state: any, dropped: number) {
+    setCarriedFailuresDropped(state, dropped: number) {
       state.carriedFailuresDropped = Number.isFinite(dropped) && dropped > 0
         ? Math.floor(dropped)
         : 0;
     },
-    setOriginalTotalTracks(state: any, count: number) {
+    setOriginalTotalTracks(state, count: number) {
       state.originalTotalTracks = count;
     },
-    setReTagCursorSec(state: any, seconds: number) {
+    setReTagCursorSec(state, seconds: number) {
       state.reTagCursorSec = seconds;
     },
-    setReTagReservedRange(state: any, range: { floorSec: number; ceilingSec: number }) {
+    setReTagReservedRange(state, range: { floorSec: number; ceilingSec: number }) {
       state.reTagFloorSec = range.floorSec;
       state.reTagCeilingSec = range.ceilingSec;
     },
-    setReTagBlocked(state: any, blockedUntilSec: number) {
+    setReTagBlocked(state, blockedUntilSec: number) {
       state.reTagBlockedUntilSec = blockedUntilSec;
     },
-    setPendingReTagSec(state: any, seconds: number) {
+    setPendingReTagSec(state, seconds: number) {
       state.pendingReTagSec = seconds;
     },
-    setImportId(state: any, id: string) {
+    setImportId(state, id: string) {
       state.importId = id;
     },
-    setScrobbleRunActive(state: any, active: boolean) {
+    setScrobbleRunActive(state, active: boolean) {
       state.scrobbleRunActive = active;
     },
-    trackScrobbled(state: { tracksScrobbled: number }, count = 1) {
+    trackScrobbled(state, count = 1) {
       state.tracksScrobbled += count;
     },
-    trackFailed(state: any) {
+    trackFailed(state) {
       state.tracksFailed += 1;
     },
   },

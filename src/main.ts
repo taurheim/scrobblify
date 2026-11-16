@@ -1,4 +1,4 @@
-import Vue from 'vue';
+import { createApp } from 'vue';
 import {
   initAnalytics, registerGlobalErrorHandlers, trackError, trackPageView,
 } from '@/services/Analytics';
@@ -7,13 +7,13 @@ import App from './App.vue';
 import router from './router';
 import store from './store';
 
-Vue.config.productionTip = false;
-
 initAnalytics();
 registerGlobalErrorHandlers();
 
+const app = createApp(App);
+
 // Capture uncaught errors thrown inside Vue components/lifecycle hooks.
-Vue.config.errorHandler = (err, vm, info) => {
+app.config.errorHandler = (err, vm, info) => {
   trackError('vue.errorHandler', err, { info });
   if (process.env.NODE_ENV !== 'production') {
     // eslint-disable-next-line no-console
@@ -26,9 +26,7 @@ router.afterEach((to) => {
   trackPageView(to.fullPath);
 });
 
-new Vue({
-  router,
-  store,
-  vuetify,
-  render: (h) => h(App),
-}).$mount('#app');
+app.use(router);
+app.use(store);
+app.use(vuetify);
+app.mount('#app');

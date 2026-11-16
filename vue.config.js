@@ -1,3 +1,4 @@
+const { VuetifyPlugin } = require('webpack-plugin-vuetify');
 const { execSync } = require('child_process');
 const {
   MOCK_LASTFM_API,
@@ -191,6 +192,10 @@ module.exports = {
   transpileDependencies: [
     'vuetify',
   ],
+  configureWebpack: {
+    // Imports only the Vuetify components (and their CSS) the templates use.
+    plugins: [new VuetifyPlugin({ autoImport: true })],
+  },
   devServer: MOCK_MODE
     ? {
       setupMiddlewares: (middlewares) => {

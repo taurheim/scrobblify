@@ -245,8 +245,8 @@ test.describe('Select Step - Track Selection', () => {
     await page.locator('button:has-text("Find tracks")').click();
 
     // Wait for processing to complete
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
 
     // Should now be on step 3
     await expect(page.locator('h3:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 5000 });
@@ -267,8 +267,8 @@ test.describe('Select Step - Track Selection', () => {
     await fileInput.setInputFiles(FIXTURE_ZIP);
     // Don't check "Scrobble tracks older than 2 weeks" — keep original dates
     await page.locator('button:has-text("Find tracks")').click();
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     await expect(page.locator('h3:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 5000 });
 
     // Without re-tagging, old tracks are filtered out, so we should see 0 tracks
@@ -334,10 +334,10 @@ test.describe('Select Step - Track Selection', () => {
     });
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
 
     // Choosing tracks is blocked until the user has read what a large backdated import means.
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     const gate = page.locator('.large-history-gate');
     await expect(gate).toContainText('701 of your plays are more than 2 weeks old');
     await expect(gate).toContainText('Scrobbling will take about 2 days');
@@ -350,9 +350,9 @@ test.describe('Select Step - Track Selection', () => {
     await expect(gate).toBeHidden();
     // The stepper keeps every step in the DOM, so "still here" means hidden, not absent.
     await expect(page.locator('h3:has-text("Choose which tracks to scrobble")')).toBeHidden();
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible();
 
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     await gate.locator('button:has-text("I understand, continue")').click();
     await page.locator('button:has-text("matching")').click();
     await page.locator('button:has-text("selected tracks")').click();
@@ -376,8 +376,8 @@ test.describe('Scrobble Step', () => {
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
@@ -439,8 +439,8 @@ test.describe('Scrobble Step', () => {
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
@@ -506,8 +506,8 @@ test.describe('Scrobble Step', () => {
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
@@ -573,8 +573,8 @@ test.describe('Scrobble Step', () => {
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
@@ -1211,7 +1211,7 @@ test.describe('Session Resume', () => {
       }])),
     });
 
-    const dialog = page.locator('.v-dialog--active');
+    const dialog = page.locator('.v-dialog.v-overlay--active');
     await expect(dialog).toContainText('Upload the whole .zip', { timeout: 5000 });
     await expect(dialog).not.toContainText('not a valid Scrobblify progress file');
     await expect(dialog).not.toContainText('totalTracks');
@@ -1227,7 +1227,7 @@ test.describe('Session Resume', () => {
       }])),
     });
 
-    const dialog = page.locator('.v-dialog--active');
+    const dialog = page.locator('.v-dialog.v-overlay--active');
     await expect(dialog).toContainText('"Account data" export', { timeout: 5000 });
     await expect(dialog).not.toContainText('totalTracks');
   });
@@ -1249,7 +1249,7 @@ test.describe('Session Resume', () => {
       })),
     });
 
-    const dialog = page.locator('.v-dialog--active');
+    const dialog = page.locator('.v-dialog.v-overlay--active');
     await expect(dialog).toContainText('scrobblify-progress-', { timeout: 5000 });
     await expect(dialog).not.toContainText('not a valid Scrobblify progress file');
     await expect(dialog).not.toContainText('totalTracks');
@@ -1265,7 +1265,7 @@ test.describe('Session Resume', () => {
       buffer: Buffer.from(JSON.stringify(damaged)),
     });
 
-    const dialog = page.locator('.v-dialog--active');
+    const dialog = page.locator('.v-dialog.v-overlay--active');
     await expect(dialog).toContainText('not a valid Scrobblify progress file', { timeout: 5000 });
     await expect(dialog).not.toContainText('Progress files are named like');
   });
@@ -1687,8 +1687,8 @@ test.describe('Session Resume', () => {
     await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     await page.locator('button:has-text("matching")').click();
     await scrobbleSelection(page);
     await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
@@ -2086,8 +2086,8 @@ test.describe('Complete Step', () => {
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
@@ -2174,8 +2174,8 @@ test.describe('URL Encoding', () => {
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
 
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
@@ -2269,8 +2269,8 @@ test.describe('Re-tagged old plays', () => {
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
 
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
     await page.locator('button:has-text("matching")').click();
     await scrobbleSelection(page);
@@ -2524,7 +2524,9 @@ test.describe('Re-tagged old plays', () => {
     */
     expect(timestamps.length).toBeGreaterThan(0);
     expect(new Set(timestamps).size).toBe(timestamps.length);
-    await expect(page.locator('.v-expansion-panel-header')).toContainText(`${timestamps.length} failed track(s)`);
+    // The scrobble step is still mounted but hidden once the stepper advances,
+    // so assert on text content rather than visibility.
+    await expect(page.locator('.v-expansion-panel-title')).toContainText(`${timestamps.length} failed track(s)`);
     await expect(page.locator('.overall-progress')).toContainText(`0 of ${timestamps.length}`);
   });
 
@@ -2600,7 +2602,7 @@ test.describe('Import robustness', () => {
     await expect(page.locator('text=Found 2 plays')).toBeVisible({ timeout: 15000 });
     // ...and the user is told plainly that part of their history is missing.
     await expect(page.locator('text=skipped 1 of 2 file(s)')).toBeVisible({ timeout: 5000 });
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 15000 });
   });
 
   test('a ZIP where every history file is unreadable still reports an error', async ({ page }) => {
@@ -2665,7 +2667,7 @@ test.describe('Import robustness', () => {
     await expect(page.locator('text=Found 2 plays')).toBeVisible({ timeout: 15000 });
     // ...and nothing is reported as damaged, because nothing was.
     await expect(page.locator('text=skipped')).toHaveCount(0);
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 15000 });
   });
 
   test('a repeated track is looked up once, not once per play', async ({ page }) => {
@@ -2785,7 +2787,7 @@ test.describe('Import robustness', () => {
 
     await page.locator('label:has-text("Check for duplicates")').click();
     await page.locator('button:has-text("Find tracks")').click();
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
 
     expect(ranges.length).toBeGreaterThan(0);
     for (const range of ranges) {
@@ -3034,7 +3036,7 @@ test.describe('Invalid session key', () => {
     await page.waitForTimeout(2500);
     // Lose the key behind the resume guard's back.
     await page.evaluate(() => {
-      (document.querySelector('.scrobblify') as any).__vue__.$store.state.lfmApi.clearSessionKey();
+      (document.querySelector('#app') as any).__vue_app__.config.globalProperties.$store.state.lfmApi.clearSessionKey();
     });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
 
@@ -3126,7 +3128,7 @@ test.describe('Stale build detection', () => {
     await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
     await page.locator('button:has-text("matching")').click();
     await scrobbleSelection(page);
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -3206,8 +3208,8 @@ test.describe('Browser storage unavailable', () => {
     await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
-    await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+    await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
     await page.locator('button:has-text("matching")').click();
     await scrobbleSelection(page);
     await expect(page.locator('text=tracks ready to scrobble')).toBeVisible({ timeout: 5000 });

@@ -15,24 +15,24 @@
           {{ track.track }} - {{ track.artist }} @ {{ track.timestamp.toString() }}<br>
         </span>
       </div>
-      <v-btn class="primary" @click="scrobble">Scrobble</v-btn>
+      <v-btn color="primary" @click="scrobble">Scrobble</v-btn>
     </div>
 
     <!-- Scrobbling view (active, not paused) -->
     <div v-else-if="!paused && !completed">
       <p>Scrobbling... <b>{{ currentTrackName }}</b></p>
-      <v-progress-linear v-model="progress" class="mb-4"></v-progress-linear>
+      <v-progress-linear :model-value="progress" class="mb-4"></v-progress-linear>
 
       <!--
         Preventive pacing is normal operation, not an interruption: it stays put
         for the whole throttled stretch rather than flipping the view into the
         paused panel once per track.
       -->
-      <v-alert v-if="pacing" type="info" dense text class="mb-4">
+      <v-alert v-if="pacing" type="info" density="compact" variant="tonal" class="mb-4">
         {{ pacingNotice }}
       </v-alert>
 
-      <v-card class="pa-3 mb-4" outlined>
+      <v-card class="pa-3 mb-4" variant="outlined">
         <div class="overall-progress">
           Overall: {{ totalSucceeded }} of {{ originalTotalTracks }} scrobbled
         </div>
@@ -47,7 +47,7 @@
         <div v-if="storedToday !== null">Today on Last.fm (UTC): {{ storedToday }} / {{ dailyCap }}</div>
       </v-card>
 
-      <v-btn outlined @click="manualPause">Pause &amp; Save</v-btn>
+      <v-btn variant="outlined" @click="manualPause">Pause &amp; Save</v-btn>
     </div>
 
     <!-- Paused view -->
@@ -65,10 +65,10 @@
         large imports are abandoned: the user has been told to come back in a
         day, and most never do.
       -->
-      <v-alert v-if="canOfferBackground" type="info" text class="mb-4">
+      <v-alert v-if="canOfferBackground" type="info" variant="tonal" class="mb-4">
         <div class="font-weight-medium mb-1">
           Don't want to keep coming back?
-          <v-chip x-small color="deep-purple" text-color="white" class="ml-1">Beta</v-chip>
+          <v-chip size="x-small" color="deep-purple" variant="flat" class="ml-1">Beta</v-chip>
         </div>
         <div class="mb-3 text-body-2">
           Scrobblify's server can finish the remaining
@@ -80,7 +80,7 @@
         </v-btn>
       </v-alert>
 
-      <v-card class="pa-4 mb-4 text-center" outlined>
+      <v-card class="pa-4 mb-4 text-center" variant="outlined">
         <div v-if="countdown > 0" class="text-h5 mb-2">
           Auto-resuming in {{ formattedCountdown }}
         </div>
@@ -92,7 +92,13 @@
           and choose "Resume"<template v-if="canOfferBackground">, or use "Finish this in the
           background" above and you won't need to</template>.
         </div>
-        <v-alert v-else-if="saveFailed" type="warning" text dense class="mb-2 text-left save-failed">
+        <v-alert
+          v-else-if="saveFailed"
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mb-2 text-left save-failed"
+        >
           Scrobblify couldn't save your progress in this browser. Press
           "Save Progress &amp; Leave" to download it as a file before you close this page.
         </v-alert>
@@ -103,7 +109,7 @@
           </span>
         </div>
 
-        <v-btn class="primary mr-2" @click="saveAndExit">Save Progress &amp; Leave</v-btn>
+        <v-btn color="primary" class="mr-2" @click="saveAndExit">Save Progress &amp; Leave</v-btn>
         <!--
           Anything terminal needs a way back in. Without this a manual pause was
           a dead end: a disabled button waiting on an auto-resume that the loop
@@ -113,10 +119,10 @@
         <v-btn v-if="sessionInvalid" color="primary" :href="authorizeUrl">
           Sign in to Last.fm again
         </v-btn>
-        <v-btn v-else-if="canResume" outlined :disabled="handoffHalted" @click="scrobble">
+        <v-btn v-else-if="canResume" variant="outlined" :disabled="handoffHalted" @click="scrobble">
           {{ manuallyPaused ? 'Resume Now' : 'Try Again Now' }}
         </v-btn>
-        <v-btn v-else outlined disabled>Wait Here</v-btn>
+        <v-btn v-else variant="outlined" disabled>Wait Here</v-btn>
       </v-card>
     </div>
 
@@ -133,7 +139,7 @@
         library can't be read (network, private profile), say so rather than
         quietly counting what Last.fm merely accepted.
       -->
-      <v-alert v-if="pending.length > 0" type="warning" text class="mt-2">
+      <v-alert v-if="pending.length > 0" type="warning" variant="tonal" class="mt-2">
         {{ pending.length }} more were sent, but Scrobblify couldn't read your Last.fm library to
         confirm them, so they aren't counted above.
       </v-alert>
@@ -142,17 +148,17 @@
     <!-- Failed tracks section -->
     <v-expansion-panels v-if="reportedFailures.length > 0" class="mt-4">
       <v-expansion-panel>
-        <v-expansion-panel-header>
+        <v-expansion-panel-title>
           {{ reportedFailures.length }} failed track(s)
-        </v-expansion-panel-header>
-        <v-expansion-panel-content>
+        </v-expansion-panel-title>
+        <v-expansion-panel-text>
           <div v-for="(item, i) in reportedFailures" :key="i" class="mb-1">
             <strong>{{ item.name }}</strong> — {{ item.error }}
           </div>
           <div v-if="carriedFailuresDropped > 0" class="mt-2">
             …and {{ carriedFailuresDropped }} more that couldn't be listed here.
           </div>
-        </v-expansion-panel-content>
+        </v-expansion-panel-text>
       </v-expansion-panel>
     </v-expansion-panels>
 
@@ -169,7 +175,7 @@
 }
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
@@ -331,7 +337,7 @@ const IGNORE_CODE_DAILY_LIMIT = 5;
 const IGNORE_CODE_TIMESTAMP_TOO_OLD = 3;
 const IGNORE_CODE_TIMESTAMP_TOO_NEW = 4;
 
-export default Vue.extend({
+export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
   props: {
     /**
@@ -396,6 +402,7 @@ export default Vue.extend({
       default: null,
     },
   },
+  emits: ['complete', 'auto-save', 'save-and-exit', 'checkpoint', 'background'],
   data() {
     return {
       scrobbling: false,
@@ -653,7 +660,7 @@ export default Vue.extend({
   created() {
     this.syncRateLimitCounters();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.$store.commit('setScrobbleRunActive', false);
     // Routed through `cancelCountdown` so an unmount mid-countdown also settles
     // the promise the loop is awaiting, rather than leaving it pending forever.
@@ -666,7 +673,7 @@ export default Vue.extend({
   methods: {
     /**
      * The rolling-window rate-limit tracker, created lazily and cached
-     * off-reactivity (`_`-prefixed keys are skipped by Vue 2's observer). It is
+     * off-reactivity (assigned straight onto the instance, outside data()). It is
      * keyed by Last.fm username, which is not reliably known until the user
      * actually reaches this step.
      */
@@ -1082,7 +1089,7 @@ export default Vue.extend({
      *
      * The refusal is not an error state and has no button, because the thing
      * to wait for resolves by itself: the winning tab finishes, or is closed
-     * and the browser releases its lock. Cleared in `beforeDestroy` so a
+     * and the browser releases its lock. Cleared in `beforeUnmount` so a
      * navigating tab does not leave a timer re-entering a dead component.
      */
     scheduleSendLockRetry() {

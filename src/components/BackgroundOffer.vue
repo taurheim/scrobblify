@@ -3,7 +3,7 @@
     <v-card>
       <v-card-title>
         Finish this in the background
-        <v-chip x-small color="deep-purple" text-color="white" class="ml-2">Beta</v-chip>
+        <v-chip size="x-small" color="deep-purple" variant="flat" class="ml-2">Beta</v-chip>
       </v-card-title>
 
       <v-card-text class="pt-4">
@@ -24,7 +24,7 @@
           Timestamp reassignment in particular changes data on their profile
           that they cannot easily put back.
         -->
-        <v-alert type="info" text dense class="mt-4">
+        <v-alert type="info" variant="tonal" density="compact" class="mt-4">
           <div class="font-weight-medium mb-2">What you're agreeing to</div>
           <ul class="pl-4 mb-0">
             <li class="mb-2">
@@ -57,21 +57,21 @@
           </ul>
         </v-alert>
 
-        <v-alert type="warning" text dense class="mt-3">
+        <v-alert type="warning" variant="tonal" density="compact" class="mt-3">
           This feature is new and not well tested yet. If something looks wrong
           (duplicates, missing tracks, odd dates), email
           <a :href="mailtoLink">niko@savas.ca</a> and I'll look into it. You can
           stop the import and take your progress back at any point.
         </v-alert>
 
-        <p class="mt-3 mb-0 text-body-2 grey--text text--darken-1">
+        <p class="mt-3 mb-0 text-body-2 text-grey-darken-1">
           &ldquo;Not now&rdquo; leaves this tab scrobbling as before.
         </p>
       </v-card-text>
 
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn text :disabled="busy" @click="decline">Not now</v-btn>
+        <v-btn variant="text" :disabled="busy" @click="decline">Not now</v-btn>
         <v-btn color="primary" :loading="busy" @click="accept">
           Continue to Last.fm
         </v-btn>
@@ -81,7 +81,7 @@
 </template>
 
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { LASTFM_DAILY_CAP, importBudget } from '@/shared/lastfm/dailyCap';
 
 /*
@@ -92,22 +92,23 @@ import { LASTFM_DAILY_CAP, importBudget } from '@/shared/lastfm/dailyCap';
 */
 const DAILY_LIMIT = importBudget(0);
 
-export default Vue.extend({
+export default defineComponent({
   name: 'BackgroundOffer',
   props: {
-    value: { type: Boolean, default: false },
+    modelValue: { type: Boolean, default: false },
     remaining: { type: Number, required: true },
     /** True when every remaining track already had its date rewritten. */
     allReTagged: { type: Boolean, default: false },
     busy: { type: Boolean, default: false },
   },
+  emits: ['update:modelValue', 'accept', 'decline'],
   data() {
     return { dailyCap: LASTFM_DAILY_CAP };
   },
   computed: {
     visible: {
-      get(): boolean { return this.value; },
-      set(val: boolean) { this.$emit('input', val); },
+      get(): boolean { return this.modelValue; },
+      set(val: boolean) { this.$emit('update:modelValue', val); },
     },
     daysRemaining(): string {
       const days = Math.ceil(this.remaining / DAILY_LIMIT);

@@ -85,8 +85,8 @@ async function importAndPressScrobble(page: Page) {
   await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
   await page.locator('button:has-text("Find tracks")').click();
 
-  await expect(page.locator('button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
-  await page.locator('button:has-text("Choose which tracks to scrobble")').click();
+  await expect(page.locator('.upload-step button:has-text("Choose which tracks to scrobble")')).toBeVisible({ timeout: 30000 });
+  await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
   await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
   await page.locator('button:has-text("matching")').click();
   await page.locator('button:has-text("selected tracks")').click();
@@ -307,7 +307,7 @@ test.describe('Offering background scrobbling', () => {
     });
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
-    await page.locator('button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
     const gate = page.locator('.large-history-gate');
     await expect(gate).toBeVisible();
     return gate;

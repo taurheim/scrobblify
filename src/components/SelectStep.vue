@@ -1,28 +1,28 @@
 <template>
   <div class="select-step">
     <h3>Choose which tracks to scrobble</h3>
-    <p v-if="dataMinDate && dataMaxDate" class="caption grey--text mb-4">
+    <p v-if="dataMinDate && dataMaxDate" class="text-caption text-grey mb-4">
       Your data spans {{ dataMinDate }} to {{ dataMaxDate }}
     </p>
 
     <!-- Filter panel -->
-    <v-card outlined class="mb-4 filter-panel">
+    <v-card variant="outlined" class="mb-4 filter-panel">
       <v-card-text class="pb-2 pt-3">
-        <div class="overline grey--text text--darken-1 mb-2">
-          <v-icon small class="mr-1">mdi-filter-outline</v-icon>Filter tracks
+        <div class="text-overline text-grey-darken-1 mb-2">
+          <v-icon size="small" class="mr-1">mdi-filter-outline</v-icon>Filter tracks
         </div>
         <v-row align="center" dense>
           <v-col cols="12" sm="4">
             <v-text-field
-              :value="search"
-              @input="onSearchInput"
-              append-icon="mdi-magnify"
+              :model-value="search"
+              @update:model-value="onSearchInput"
+              append-inner-icon="mdi-magnify"
               label="Search by track, artist, or album"
               single-line
               hide-details
               clearable
-              outlined
-              dense
+              variant="outlined"
+              density="compact"
             ></v-text-field>
           </v-col>
           <v-col cols="6" sm="3">
@@ -33,8 +33,8 @@
               :min="dataMinDate"
               :max="dataMaxDate"
               hide-details
-              outlined
-              dense
+              variant="outlined"
+              density="compact"
             ></v-text-field>
           </v-col>
           <v-col cols="6" sm="3">
@@ -45,8 +45,8 @@
               :min="dataMinDate"
               :max="dataMaxDate"
               hide-details
-              outlined
-              dense
+              variant="outlined"
+              density="compact"
             ></v-text-field>
           </v-col>
           <v-col cols="12" sm="2" class="d-flex align-center justify-center">
@@ -54,7 +54,7 @@
               v-model="showSelectedOnly"
               label="Selected only"
               hide-details
-              dense
+              density="compact"
               class="mt-0 pt-0"
             ></v-checkbox>
           </v-col>
@@ -63,17 +63,17 @@
         <!-- Matching info + bulk-add action -->
         <v-divider class="mt-3 mb-2"></v-divider>
         <div class="d-flex align-center justify-space-between flex-wrap">
-          <span class="body-2 grey--text text--darken-2">
+          <span class="text-body-2 text-grey-darken-2">
             Showing <strong>{{ filteredCount }}</strong> matching tracks
           </span>
           <v-btn
-            small
+            size="small"
             color="primary"
-            outlined
+            variant="outlined"
             @click="addMatchingTracks"
             :disabled="filteredCount === 0"
           >
-            <v-icon small left>mdi-plus</v-icon>
+            <v-icon size="small" start>mdi-plus</v-icon>
             Add {{ filteredCount }} matching to selection
           </v-btn>
         </div>
@@ -81,30 +81,34 @@
     </v-card>
 
     <!-- Data table (server-side pagination for performance) -->
-    <v-data-table
+    <v-data-table-server
+      v-model:page="tableOptions.page"
+      v-model:items-per-page="tableOptions.itemsPerPage"
       :headers="headers"
       :items="pageItems"
-      :server-items-length="filteredCount"
+      :items-length="filteredCount"
+      :items-per-page-options="[10, 25, 50, 100]"
       show-select
       class="elevation-1"
-      item-key="id"
-      :value="pageSelectedItems"
-      @input="onTableSelectionChange"
-      :options.sync="tableOptions"
-      :footer-props="{ 'items-per-page-options': [10, 25, 50, 100] }"
+      item-value="id"
+      :row-props="rowProps"
     >
+      <!--
+        Both selection cells are replaced, so Vuetify's own selection model is
+        unused: selection lives in `_selectedIds`, which spans every page.
+      -->
       <template v-slot:header.data-table-select>
-        <v-simple-checkbox
-          :value="isPageAllSelected"
+        <v-checkbox-btn
+          :model-value="isPageAllSelected"
           :indeterminate="isPageSomeSelected && !isPageAllSelected"
-          @input="togglePageSelectAll"
-        ></v-simple-checkbox>
+          @update:model-value="togglePageSelectAll"
+        ></v-checkbox-btn>
       </template>
       <template v-slot:item.data-table-select="{ item }">
-        <v-simple-checkbox
-          :value="selectedIds.has(item.id)"
-          @input="toggleTrackSelection(item)"
-        ></v-simple-checkbox>
+        <v-checkbox-btn
+          :model-value="selectedIds.has(item.id)"
+          @update:model-value="toggleTrackSelection(item)"
+        ></v-checkbox-btn>
       </template>
       <template v-slot:item.originalTime="{ item }">
         {{ formatDate(item.originalTime) }}
@@ -112,13 +116,13 @@
       <template v-slot:item.time="{ item }">
         {{ formatDate(item.time) }}
       </template>
-    </v-data-table>
+    </v-data-table-server>
 
     <!-- Bottom action bar -->
-    <v-card outlined class="mt-4 scrobble-action-bar">
+    <v-card variant="outlined" class="mt-4 scrobble-action-bar">
       <v-card-text class="d-flex align-center justify-space-between py-3">
-        <span class="body-1">
-          <v-icon small class="mr-1" :color="selectedCount > 0 ? 'success' : 'grey'">
+        <span class="text-body-1">
+          <v-icon size="small" class="mr-1" :color="selectedCount > 0 ? 'success' : 'grey'">
             {{ selectedCount > 0 ? 'mdi-check-circle' : 'mdi-circle-outline' }}
           </v-icon>
           <strong>{{ selectedCount }}</strong> of {{ totalTrackCount }} tracks selected
@@ -129,7 +133,7 @@
           :loading="confirmLoading"
           :disabled="selectedCount === 0"
         >
-          <v-icon left>mdi-music-note</v-icon>
+          <v-icon start>mdi-music-note</v-icon>
           Scrobble {{ selectedCount }} selected tracks
         </v-btn>
       </v-card-text>
@@ -160,9 +164,13 @@
   background: white !important;
   z-index: 2;
 }
+/* Vuetify 2 shaded selected rows; Vuetify 3 has no selected-row style. */
+.select-step :deep(.selected-row) {
+  background: #f5f5f5;
+}
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import LastFm from '@/api/LastFm';
 import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
@@ -222,12 +230,13 @@ function createSearchWorker(): Worker | null {
   }
 }
 
-export default Vue.extend({
+export default defineComponent({
   components: { 'scrobble-confirm-dialog': ScrobbleConfirmDialog },
   props: {
     /** Largest queue the background offer would take, or 0 when it is off. */
     backgroundTrackLimit: { type: Number, default: 0 },
   },
+  emits: ['complete'],
   beforeCreate() {
     // Non-reactive storage for large arrays
     (this as any)._tracks = [] as any[];
@@ -256,13 +265,13 @@ export default Vue.extend({
       filterVersion: 0,
       // Search version bumped when search results arrive
       searchVersion: 0,
-      tableOptions: { page: 1, itemsPerPage: 25 } as any,
+      tableOptions: { page: 1, itemsPerPage: 25 },
       headers: [
-        { text: 'Track', value: 'track', sortable: false },
-        { text: 'Artist', value: 'artist', sortable: false },
-        { text: 'Album', value: 'album', sortable: false },
-        { text: 'Date Listened', value: 'originalTime', sortable: false },
-        { text: 'Date to scrobble', value: 'time', sortable: false },
+        { title: 'Track', key: 'track', sortable: false },
+        { title: 'Artist', key: 'artist', sortable: false },
+        { title: 'Album', key: 'album', sortable: false },
+        { title: 'Date Listened', key: 'originalTime', sortable: false },
+        { title: 'Date to scrobble', key: 'time', sortable: false },
       ],
     };
   },
@@ -280,7 +289,7 @@ export default Vue.extend({
       };
     }
   },
-  beforeDestroy() {
+  beforeUnmount() {
     if (this.searchWorker) {
       this.searchWorker.terminate();
     }
@@ -361,12 +370,6 @@ export default Vue.extend({
       const start = (page - 1) * itemsPerPage;
       const end = start + itemsPerPage;
       return indices.slice(start, end).map((idx: number) => tracks[idx]);
-    },
-    pageSelectedItems(): any[] {
-      // eslint-disable-next-line no-unused-expressions
-      this.filterVersion;
-      const selIds = (this as any)._selectedIds as Set<number>;
-      return this.pageItems.filter((item: any) => selIds.has(item.id));
     },
     isPageAllSelected(): boolean {
       const items = this.pageItems;
@@ -477,6 +480,9 @@ export default Vue.extend({
     formatDate(timestamp: number): string {
       return new Date(timestamp).toLocaleString();
     },
+    rowProps({ item }: { item: { id: number } }): { class: string } {
+      return { class: this.selectedIds.has(item.id) ? 'selected-row' : '' };
+    },
     toggleTrackSelection(item: any) {
       const selIds = (this as any)._selectedIds as Set<number>;
       if (selIds.has(item.id)) {
@@ -495,20 +501,6 @@ export default Vue.extend({
         } else {
           selIds.delete(item.id);
         }
-      }
-      this.selectedCount = selIds.size;
-      this.filterVersion++;
-    },
-    onTableSelectionChange(selected: any[]) {
-      // Handle Vuetify's built-in selection events
-      const selIds = (this as any)._selectedIds as Set<number>;
-      const pageIds = new Set(this.pageItems.map((item: any) => item.id));
-      // Remove all page items from selection, then add back the ones selected
-      for (const id of pageIds) {
-        selIds.delete(id);
-      }
-      for (const item of selected) {
-        selIds.add(item.id);
       }
       this.selectedCount = selIds.size;
       this.filterVersion++;

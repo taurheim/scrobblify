@@ -1,5 +1,5 @@
 <template>
-  <v-dialog :value="value" max-width="640" persistent scrollable>
+  <v-dialog :model-value="modelValue" max-width="640" persistent scrollable>
     <v-card class="large-history-gate text-left">
       <v-card-title>Before you start scrobbling</v-card-title>
 
@@ -47,7 +47,7 @@
 
       <v-card-actions class="flex-wrap">
         <v-btn
-          text
+          variant="text"
           color="primary"
           href="https://listenbrainz.org/settings/import/"
           target="_blank"
@@ -55,7 +55,7 @@
           @click="listenBrainzClicked('gate_button'); $emit('decline')"
         >
           Use ListenBrainz instead
-          <v-icon right small>mdi-open-in-new</v-icon>
+          <v-icon end size="small">mdi-open-in-new</v-icon>
         </v-btn>
         <v-spacer></v-spacer>
         <v-btn color="primary" @click="accept">I understand, continue</v-btn>
@@ -65,7 +65,7 @@
 </template>
 
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import { IMPORT_DAILY_BUDGET, backgroundCanFinish } from '@/services/ScrobbleEstimate';
 import { trackEvent } from '@/services/Analytics';
@@ -77,15 +77,18 @@ import { trackEvent } from '@/services/Analytics';
   Shown once the ZIP is parsed, because that is the first point the size is
   known, and before any track is picked or sent.
 */
-export default Vue.extend({
+export default defineComponent({
   name: 'LargeHistoryGate',
   props: {
-    value: { type: Boolean, default: false },
+    modelValue: { type: Boolean, default: false },
     /** Plays whose date will be rewritten to when they are sent. */
     reTaggedCount: { type: Number, required: true },
     /** Largest queue the background offer would take, or 0 when it is off. */
     backgroundTrackLimit: { type: Number, default: 0 },
   },
+  // `update:modelValue` is never emitted (the gate is persistent) but is
+  // declared so `v-model` on it does not fall through as a DOM attribute.
+  emits: ['update:modelValue', 'accept', 'decline'],
   data() {
     return { dailyCap: LASTFM_DAILY_CAP, dailyBudget: IMPORT_DAILY_BUDGET };
   },
@@ -109,7 +112,7 @@ export default Vue.extend({
     },
   },
   watch: {
-    value: {
+    modelValue: {
       immediate: true,
       handler(open: boolean) {
         if (open) { trackEvent('large_history_gate_shown', this.eventProps); }

@@ -37,7 +37,7 @@
 
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn text @click="visible = false">Cancel</v-btn>
+        <v-btn variant="text" @click="visible = false">Cancel</v-btn>
         <v-btn color="primary" @click="confirm">Start scrobbling</v-btn>
       </v-card-actions>
     </v-card>
@@ -45,28 +45,29 @@
 </template>
 
 <script lang="ts">
-import Vue, { PropType } from 'vue';
+import { defineComponent, PropType } from 'vue';
 import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import {
   IMPORT_DAILY_BUDGET, ScrobbleEstimate, backgroundCanFinish, formatDuration,
 } from '@/services/ScrobbleEstimate';
 
-export default Vue.extend({
+export default defineComponent({
   name: 'ScrobbleConfirmDialog',
   props: {
-    value: { type: Boolean, default: false },
+    modelValue: { type: Boolean, default: false },
     trackCount: { type: Number, required: true },
     estimate: { type: Object as PropType<ScrobbleEstimate>, required: true },
     /** Largest queue the background offer would take, or 0 when it is off. */
     backgroundTrackLimit: { type: Number, default: 0 },
   },
+  emits: ['update:modelValue', 'confirm'],
   data() {
     return { dailyCap: LASTFM_DAILY_CAP, dailyBudget: IMPORT_DAILY_BUDGET };
   },
   computed: {
     visible: {
-      get(): boolean { return this.value; },
-      set(val: boolean) { this.$emit('input', val); },
+      get(): boolean { return this.modelValue; },
+      set(val: boolean) { this.$emit('update:modelValue', val); },
     },
     // The offer appears on the stop screen, for whatever is left after today.
     canFinishInBackground(): boolean {

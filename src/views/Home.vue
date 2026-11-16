@@ -78,11 +78,11 @@
 }
 </style>
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { trackEvent } from '@/services/Analytics';
 import { isBackgroundEnabled } from '@/services/BackgroundScrobbling';
 
-export default Vue.extend({
+export default defineComponent({
   data() {
     // The beta opt-in, not live worker capacity: this page only describes what's possible.
     return { backgroundEnabled: isBackgroundEnabled() };
