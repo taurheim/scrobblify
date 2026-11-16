@@ -216,7 +216,10 @@
           ></scrobble-step>
         </v-stepper-content>
         <v-stepper-content step="5">
-          <complete-step :has-remaining="hasRemainingTracks"></complete-step>
+          <complete-step
+            :has-remaining="hasRemainingTracks"
+            :background-available="backgroundTrackLimit > 0"
+          ></complete-step>
         </v-stepper-content>
       </v-stepper-items>
     </v-stepper>

@@ -117,11 +117,16 @@ Before that, a fresh import that re-tags more than one day's budget (700
 plays) hits a blocking `LargeHistoryGate` on "Choose which tracks to scrobble":
 wrong dates, days of returning, no bulk undo, and a "Use ListenBrainz instead"
 link to ListenBrainz's own Spotify importer, which keeps the real dates. Only
-"I understand, continue" proceeds. Resumes and progress files skip it. When the
-background offer could take what is left after the first day
-(`backgroundCanFinish`, fed by `backgroundTrackLimit` from the capacity probe),
-the gate and the confirmation say the server can finish it instead of "come
-back each day".
+"I understand, continue" proceeds. Resumes and progress files skip it.
+
+Copy that tells users to "come back each day" has a background variant on every
+surface, so beta users aren't told to return when the server could finish for
+them. The gate and the confirmation use `backgroundCanFinish` (fed by
+`backgroundTrackLimit`, the capacity probe's `maxTracks`, 0 when the offer is
+off). The stop reasons and the paused panel use `canOfferBackground`, since the
+offer sits right under them. The Complete step uses `backgroundTrackLimit > 0`.
+Home and About only know the opt-in (`isBackgroundEnabled()`), not live
+capacity. New copy along those lines needs the same branch.
 
 Gate telemetry, since 2026-11-16: `large_history_gate_shown` and
 `large_history_gate_accepted` carry `re_tagged_count`, `estimated_days` and

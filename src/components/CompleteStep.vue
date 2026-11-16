@@ -10,6 +10,10 @@
       <v-alert type="warning" prominent>
         <strong>Some tracks haven't been scrobbled yet.</strong><br>
         Your progress has been saved automatically. You can come back later to scrobble the remaining tracks.
+        <template v-if="backgroundAvailable">
+          If a day's worth or more is left when you resume, Scrobblify will offer to finish it on its
+          server (beta), so you don't have to keep coming back.
+        </template>
         A backup file has also been downloaded — you can use it to resume on any computer.
         <br><br>
         <strong>Tips:</strong>
@@ -67,6 +71,11 @@ import LastFm from '@/api/LastFm';
 export default Vue.extend({
   props: {
     hasRemaining: {
+      type: Boolean,
+      default: false,
+    },
+    /** The background offer is available to this browser right now. */
+    backgroundAvailable: {
       type: Boolean,
       default: false,
     },

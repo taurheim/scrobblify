@@ -240,13 +240,14 @@ test.describe('Offering background scrobbling', () => {
   };
   const OFFER = 'text=Finish this in the background >> visible=true';
 
-  function largeProgressFile() {
+  function largeProgressFile(reTagged = false) {
     const count = 3000;
     const tracks = Array.from({ length: count }, (_, i) => ({
       track: `Track ${i}`,
       artist: `Artist ${i % 50}`,
       album: `Album ${i % 50}`,
       timestamp: Date.UTC(2024, 0, 1) + i * 60000,
+      reTagged,
     }));
     return {
       name: 'scrobblify-progress.json',
@@ -327,5 +328,29 @@ test.describe('Offering background scrobbling', () => {
 
     await expect(gate).toContainText("You'll need to come back each day");
     await expect(gate).not.toContainText('Finish this in the background');
+  });
+
+  test('the daily stop points to the background offer, not only "come back"', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    // Today's UTC day already holds 700 plays, so the first re-tagged send stops for the day.
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(new URL(route.request().url()).search);
+      if (params.get('method') !== 'user.getrecenttracks') {
+        await route.fallback();
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ recenttracks: { '@attr': { total: '700' }, track: [] } }),
+      });
+    });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile(true));
+    await page.locator('button:has-text("Not now") >> visible=true').click({ timeout: 15000 });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator("text=hand the rest to Scrobblify's server below >> visible=true"))
+      .toBeVisible({ timeout: 30000 });
   });
 });
