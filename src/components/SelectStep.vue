@@ -145,7 +145,9 @@
       :track-count="selectedCount"
       :estimate="confirmEstimate"
       :background-track-limit="backgroundTrackLimit"
+      :saved-progress="savedProgress"
       @confirm="scrobbleSelectedTracks"
+      @resume-saved="resumeSavedProgress"
     ></scrobble-confirm-dialog>
   </div>
 </template>
@@ -170,11 +172,11 @@
 }
 </style>
 <script lang="ts">
-import { defineComponent } from 'vue';
+import { defineComponent, PropType } from 'vue';
 import LastFm from '@/api/LastFm';
 import Scrobble from '@/models/Scrobble';
 import SpotifyListen from '@/models/SpotifyListen';
-import ScrobbleConfirmDialog from '@/components/ScrobbleConfirmDialog.vue';
+import ScrobbleConfirmDialog, { SavedProgressSummary } from '@/components/ScrobbleConfirmDialog.vue';
 import { trackEvent } from '@/services/Analytics';
 import StateManager from '@/services/StateManager';
 import * as background from '@/services/BackgroundScrobbling';
@@ -235,8 +237,10 @@ export default defineComponent({
   props: {
     /** Largest queue the background offer would take, or 0 when it is off. */
     backgroundTrackLimit: { type: Number, default: 0 },
+    /** Progress saved in this browser, which a fresh run would replace. */
+    savedProgress: { type: Object as PropType<SavedProgressSummary | null>, default: null },
   },
-  emits: ['complete'],
+  emits: ['complete', 'resume-saved'],
   beforeCreate() {
     // Non-reactive storage for large arrays
     (this as any)._tracks = [] as any[];
@@ -551,8 +555,25 @@ export default defineComponent({
         nowMs,
       });
       this.confirmOpen = true;
+      if (this.savedProgress) {
+        trackEvent('saved_progress_prompt_shown', this.savedProgressProps());
+      }
+    },
+    savedProgressProps() {
+      return {
+        saved_total_succeeded: this.savedProgress ? this.savedProgress.succeeded : 0,
+        saved_original_total_tracks: this.savedProgress ? this.savedProgress.total : 0,
+        selected_count: this.selectedCount,
+      };
+    },
+    resumeSavedProgress() {
+      trackEvent('saved_progress_choice', { ...this.savedProgressProps(), choice: 'resume' });
+      this.$emit('resume-saved');
     },
     scrobbleSelectedTracks() {
+      if (this.savedProgress) {
+        trackEvent('saved_progress_choice', { ...this.savedProgressProps(), choice: 'start_over' });
+      }
       const selIds = (this as any)._selectedIds as Set<number>;
       const tracks = (this as any)._tracks as any[];
       const selected = tracks.filter((t: any) => selIds.has(t.id));

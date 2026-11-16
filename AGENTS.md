@@ -113,6 +113,20 @@ run time (`src/services/ScrobbleEstimate.ts`): re-tagged plays get today's
 import budget (read from the library, as the loop does), then 700 per UTC day;
 see "Last.fm's daily cap". Cancelling it emits nothing.
 
+**A fresh run never replaces saved progress unasked** (#102). There is one
+saved-progress slot, and a fresh run's first save (checkpoint or stop)
+overwrites it, so re-uploading the export and pressing Scrobble used to throw
+the saved count away and make the next resume re-send it. When this browser has
+saved progress (`hasResumableState`), the confirmation dialog warns with its
+count and offers **Resume saved progress** (primary) or **Start over** instead
+of "Start scrobbling". It emits `saved_progress_prompt_shown` and
+`saved_progress_choice` (`choice`: `resume` / `start_over`), both carrying
+`saved_total_succeeded`, `saved_original_total_tracks` and `selected_count`.
+Shown minus choices is cancels. Since 2026-11-16; earlier `scrobble_started`
+at `total_succeeded = 0` after higher progress for the same
+`original_total_tracks` is this bug. Importing an *older progress file* over
+newer saved progress is a separate path (#124) this does not cover.
+
 Before that, a fresh import that re-tags more than one day's budget (700
 plays) hits a blocking `LargeHistoryGate` on "Choose which tracks to scrobble":
 wrong dates, days of returning, no bulk undo, and a "Use ListenBrainz instead"

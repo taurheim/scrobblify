@@ -4,6 +4,18 @@
       <v-card-title>Scrobble {{ trackCount.toLocaleString() }} tracks?</v-card-title>
 
       <v-card-text class="pt-2">
+        <!--
+          There is one saved-progress slot, and the new run's first save
+          replaces it. The next resume would then start from this run's count
+          and re-send what the saved one already had.
+        -->
+        <v-alert v-if="savedProgress" type="warning" variant="tonal" class="saved-progress-warning mb-4">
+          <strong>You have saved progress<template v-if="savedProgress.total > 0">
+            ({{ savedProgress.succeeded.toLocaleString() }} of
+            {{ savedProgress.total.toLocaleString() }} tracks scrobbled)</template>.</strong>
+          Starting over replaces it, and tracks it already sent may be scrobbled
+          again. Resume it instead to carry on where you left off.
+        </v-alert>
         <p v-if="estimate.todayCount === 0" class="scrobble-estimate">
           This import has already used today's share of Last.fm's daily cap, so scrobbling can
           start after midnight UTC ({{ resetAt }} your time, in {{ startsIn }}). At up to
@@ -38,7 +50,11 @@
       <v-card-actions>
         <v-spacer></v-spacer>
         <v-btn variant="text" @click="visible = false">Cancel</v-btn>
-        <v-btn color="primary" @click="confirm">Start scrobbling</v-btn>
+        <template v-if="savedProgress">
+          <v-btn variant="text" color="error" @click="confirm">Start over</v-btn>
+          <v-btn color="primary" variant="flat" @click="resumeSaved">Resume saved progress</v-btn>
+        </template>
+        <v-btn v-else color="primary" @click="confirm">Start scrobbling</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
@@ -51,6 +67,11 @@ import {
   IMPORT_DAILY_BUDGET, ScrobbleEstimate, backgroundCanFinish, formatDuration,
 } from '@/services/ScrobbleEstimate';
 
+export interface SavedProgressSummary {
+  succeeded: number;
+  total: number;
+}
+
 export default defineComponent({
   name: 'ScrobbleConfirmDialog',
   props: {
@@ -59,8 +80,10 @@ export default defineComponent({
     estimate: { type: Object as PropType<ScrobbleEstimate>, required: true },
     /** Largest queue the background offer would take, or 0 when it is off. */
     backgroundTrackLimit: { type: Number, default: 0 },
+    /** Saved progress the new run would replace; `total` is 0 when it couldn't be read. */
+    savedProgress: { type: Object as PropType<SavedProgressSummary | null>, default: null },
   },
-  emits: ['update:modelValue', 'confirm'],
+  emits: ['update:modelValue', 'confirm', 'resume-saved'],
   data() {
     return { dailyCap: LASTFM_DAILY_CAP, dailyBudget: IMPORT_DAILY_BUDGET };
   },
@@ -91,6 +114,10 @@ export default defineComponent({
     confirm() {
       this.visible = false;
       this.$emit('confirm');
+    },
+    resumeSaved() {
+      this.visible = false;
+      this.$emit('resume-saved');
     },
   },
 });
