@@ -497,7 +497,7 @@ Two traps already paid for:
 
 The handoff offer is invite-only: visit any page with `?beta=1` to opt a
 browser in, `?beta=0` to opt out. An opted-in browser shows an info banner
-with a switch-off link. It is independent of `VUE_APP_BACKGROUND_API`, which
+with a switch-off link when no other banner is showing. It is independent of `VUE_APP_BACKGROUND_API`, which
 only says whether the build *can* reach a worker.
 
 Two functions in `src/services/BackgroundScrobbling.ts`, and the split is
@@ -529,6 +529,28 @@ the site from scrobbling whenever the worker could not be reached.
 The accepted gap: a browser that lost its localStorage but kept a leftover
 handed-over queue in IndexedDB, while the worker is unreachable. A successful
 handover clears the saved queue, so this needs a stale copy as well.
+
+**A blocked browser can choose to carry on.** The "We can't reach the
+background scrobble worker" banner offers "Continue in this browser anyway"
+next to "Try again", warning of double scrobbles if the worker is also
+scrobbling
+(`continueWithoutAuthority`). Without it, an opted-in browser, or one with a
+trace of a handover, was blocked for as long as the worker was unreachable.
+The choice lasts for the page load only. It lifts only the no-answer gate: a
+later `live: true` answer still blocks, and it is **never offered over a
+local ownership record** (`queueOwner()`), whose queue is known to be on the
+server. It also lets a progress file through `importedQueueMaySend` on no
+answer. It emits `background_authority_overridden` (`opted_in`,
+`handover_evidence`), and `handover_evidence: true` is the case where
+duplicates are actually possible.
+
+**The page shows one banner at a time**, picked by the `banner` computed in
+`Scrobblify.vue`: outage, then a server job, then the Last.fm sign-in prompt,
+then the resume prompt, then a `backgroundNotice` on its own, then the beta
+reminder. A `backgroundNotice` that isn't the banner shows as the winning
+banner's first line. While the worker is unreachable, notices that need the
+worker to act on (`NEEDS_WORKER_NOTICES`, the expired-connection "Fix now")
+are dropped entirely, and so is the scrobble step's "Checking…" text.
 
 **An imported progress file is a queue from somewhere else**, so the local
 evidence above says nothing about it. `importProgressFile` asks

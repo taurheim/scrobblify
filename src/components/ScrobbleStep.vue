@@ -49,7 +49,11 @@
 
     <!-- Paused view -->
     <div v-else-if="paused">
-      <v-alert :type="pauseAlertType" prominent>
+      <!--
+        Not while held back by a worker that couldn't be reached: the parent's
+        banner explains that, and "Checking…" would read as stuck.
+      -->
+      <v-alert v-if="!(blockedByAuthority && workerUnreachable)" :type="pauseAlertType" prominent>
         {{ pauseReason }}
       </v-alert>
 
@@ -319,6 +323,14 @@ export default Vue.extend({
      * so the refusal has to live where the sending does.
      */
     sendingBlocked: {
+      type: Boolean,
+      default: false,
+    },
+    /**
+     * Set once the parent has failed to reach the background worker, and held
+     * across its retries. Its own banner explains the block then.
+     */
+    workerUnreachable: {
       type: Boolean,
       default: false,
     },

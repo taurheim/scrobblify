@@ -10,12 +10,14 @@ import { interceptLastFm, mockLastFmAuth } from '../lastfmMock';
 
   The rule under test: an unanswered authority check blocks scrobbling only for
   a browser that has opted in to the beta or holds some local trace of a
-  handover. Everyone else waits briefly and then scrobbles as normal.
+  handover. Everyone else waits briefly and then scrobbles as normal. A blocked
+  browser can choose to carry on anyway, unless it holds an ownership record.
 */
 
 const FIXTURE_ZIP = path.resolve(__dirname, '..', 'fixtures', 'test-spotify-data.zip');
 const WORKER = 'http://background.invalid/**';
-const UNREACHABLE = "text=Can't reach the background service";
+const UNREACHABLE = "text=We can't reach the background scrobble worker";
+const CONTINUE_ANYWAY = 'button:has-text("Continue in this browser anyway")';
 // Vuetify renders every stepper pane up front, so an unfiltered text match
 // finds the hidden copy of this heading before anything has been sent.
 const FINISHED = 'text=Finished scrobbling >> visible=true';
@@ -99,6 +101,12 @@ async function expectHeldBack(page: Page, scrobbles: string[]) {
   await page.waitForTimeout(3000);
   expect(scrobbles).toEqual([]);
   await expect(page.locator(UNREACHABLE)).toBeVisible();
+  // One banner, ever: not the beta reminder or a sign-in prompt beside it.
+  await expect(page.locator('.scrobblify > .v-alert')).toHaveCount(1);
+  // The banner explains the block; the scrobble step must not claim to be
+  // still checking underneath it.
+  await expect(page.locator('text=Checking whether your import is running')).toHaveCount(0);
+  await expect(page.locator('text=Getting ready')).toHaveCount(0);
 }
 
 test.describe('Background worker unreachable', () => {
@@ -122,11 +130,17 @@ test.describe('Background worker unreachable', () => {
     expect(workerCalls).toContain('/scrobblify/job/live');
   });
 
-  test('an opted-in browser is held back', async ({ page }) => {
+  test('an opted-in browser is held back until it chooses to carry on', async ({ page }) => {
     const { scrobbles } = await openUploadStep(page, 'refuse', {
       'scrobblify.background.beta': '1',
     });
     await expectHeldBack(page, scrobbles);
+
+    await page.locator(CONTINUE_ANYWAY).click();
+    // The attempt held back above picks itself up; no second press needed.
+    await expect(page.locator(FINISHED)).toBeVisible({ timeout: 30000 });
+    expect(scrobbles.length).toBeGreaterThan(0);
+    await expect(page.locator(UNREACHABLE)).toHaveCount(0);
   });
 
   test('a browser holding a handover record is held back even without the opt-in', async ({ page }) => {
@@ -134,6 +148,12 @@ test.describe('Background worker unreachable', () => {
       'scrobblify.background.serverOwns': JSON.stringify({ owner: 'server', id: 'job-1' }),
     });
     await expectHeldBack(page, scrobbles);
+    // The server is known to have this queue, not merely possibly.
+    await expect(page.locator(CONTINUE_ANYWAY)).toHaveCount(0);
+    // Refreshing the worker connection needs the worker, so the unreachable
+    // banner is the only one shown.
+    await expect(page.locator('text=You need to refresh your connection')).toHaveCount(0);
+    await expect(page.locator('button:has-text("Fix now")')).toHaveCount(0);
   });
 });
 
