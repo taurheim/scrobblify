@@ -46,7 +46,7 @@
 
 <script lang="ts">
 import { defineComponent, PropType } from 'vue';
-import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
+import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import {
   IMPORT_DAILY_BUDGET, ScrobbleEstimate, backgroundCanFinish, formatDuration,
 } from '@/services/ScrobbleEstimate';

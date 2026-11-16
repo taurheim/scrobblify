@@ -66,6 +66,9 @@
           >, {{ backgroundJob.failed.toLocaleString() }} rejected by Last.fm</span>.
           <span v-if="jobEta">{{ jobEta }}</span>
         </div>
+        <div v-if="jobNextRun" class="mt-1 text-body-2">
+          {{ jobNextRun }}<span v-if="jobCheckedAt"> Last checked {{ jobCheckedAt }}.</span>
+        </div>
         <div
           v-if="backgroundJob.reason && backgroundJob.state !== 'dormant'"
           class="mt-1 text-body-2"
@@ -267,7 +270,7 @@ import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
 import RateLimitTracker from '@/services/RateLimitTracker';
-import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
+import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import BackgroundOffer from '@/components/BackgroundOffer.vue';
 import * as background from '@/services/BackgroundScrobbling';
@@ -286,6 +289,42 @@ import { trackEvent, trackError, resetUser } from '@/services/Analytics';
  */
 const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
 
+/*
+  The job card refreshes itself while a background job is active and the tab is
+  visible, so the count moves without a reload. The worker only sends on its
+  five-minute tick, so the card asks once shortly after each tick rather than on
+  a short fixed interval: `JOB_POLL_AFTER_RUN_SECONDS` past `nextRunAt` gives the
+  tick time to reach this job and record its batches.
+*/
+const JOB_POLL_AFTER_RUN_SECONDS = 45;
+// Never sooner, so a tick that runs late is not asked about every few seconds.
+const JOB_POLL_MIN_SECONDS = 15;
+// Never later, so a job waiting until tomorrow still notices a pause or cancel
+// made from another device.
+const JOB_POLL_MAX_SECONDS = 10 * 60;
+// After a failed check, or from a worker that sends no `nextRunAt`.
+const JOB_POLL_FALLBACK_SECONDS = 60;
+// How often the countdown and the poll deadline are re-evaluated.
+const JOB_CLOCK_TICK_MS = 15 * 1000;
+
+function clockTime(sec: number): string {
+  return new Date(sec * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+/** "4:25 PM", "12:20 AM tomorrow" or "12:20 AM on Friday", in local time. */
+function runTimeLabel(sec: number, nowSec: number): string {
+  const at = new Date(sec * 1000);
+  const now = new Date(nowSec * 1000);
+  if (at.toDateString() === now.toDateString()) {
+    return clockTime(sec);
+  }
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  if (at.toDateString() === tomorrow.toDateString()) {
+    return `${clockTime(sec)} tomorrow`;
+  }
+  return `${clockTime(sec)} on ${at.toLocaleDateString([], { weekday: 'long' })}`;
+}
 /** Shown when the bearer token for the worker has expired, wherever that is detected. */
 const SESSION_EXPIRED_NOTICE = 'You need to refresh your connection to the scrobble worker.';
 const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sign in. Please try again in a few minutes.';
@@ -418,6 +457,16 @@ export default defineComponent({
        */
       reauthFixNow: false,
       resumeSignInMessage: '',
+      /** Wall clock for the job card's countdown; ticks only while a job is active. */
+      nowSec: Math.floor(Date.now() / 1000),
+      /** When the job card last heard from the server, for "Last checked". */
+      jobCheckedAtSec: null as number | null,
+      /** When the job card next asks the server for the latest count. */
+      jobPollDueSec: 0,
+      jobPolling: false,
+      jobClockTimer: null as number | null,
+      /** Retained so the listener can be removed again. Not reactive state. */
+      onVisibilityChange: null as (() => void) | null,
     };
   },
   async mounted() {
@@ -635,10 +684,31 @@ export default defineComponent({
       window.clearTimeout(this.authorityRetryTimer);
       this.authorityRetryTimer = null;
     }
+    this.stopJobClock();
   },
   watch: {
     currentStep(step: number) {
       trackEvent('step_viewed', { step, step_name: this.stepName(step) });
+    },
+    /*
+      Every assignment of a job is a fresh answer from the server, from
+      whichever path fetched it, so this is the one place that records when it
+      was checked, schedules the next check and starts or stops the clock.
+    */
+    backgroundJob(job: background.JobStatus | null) {
+      this.nowSec = Math.floor(Date.now() / 1000);
+      if (!job) {
+        this.jobCheckedAtSec = null;
+        this.stopJobClock();
+        return;
+      }
+      this.jobCheckedAtSec = this.nowSec;
+      if (job.state === 'active') {
+        this.jobPollDueSec = this.nextJobPollSec(job);
+        this.startJobClock();
+      } else {
+        this.stopJobClock();
+      }
     },
   },
   computed: {
@@ -771,6 +841,28 @@ export default defineComponent({
       const days = Math.ceil(secondsLeft / 86400);
       if (days <= 1) { return 'Should finish within a day.'; }
       return `Should finish in about ${days} days.`;
+    },
+    /**
+     * When the next batch goes out. The scheduler only runs every five
+     * minutes, so without this a count that sits still looks like a stall.
+     */
+    jobNextRun(): string {
+      const job = this.backgroundJob;
+      if (!job || job.state !== 'active' || !job.nextRunAt) { return ''; }
+      const secondsLeft = job.nextRunAt - this.nowSec;
+      if (secondsLeft <= 0) {
+        return 'Sending a batch now; the count updates in a minute or so.';
+      }
+      const at = runTimeLabel(job.nextRunAt, this.nowSec);
+      if (secondsLeft >= 3600) {
+        return `Next batch around ${at}.`;
+      }
+      const minutes = Math.ceil(secondsLeft / 60);
+      const inWords = minutes <= 1 ? 'under a minute' : `${minutes} minutes`;
+      return `Next batch around ${at} (in ${inWords}).`;
+    },
+    jobCheckedAt(): string {
+      return this.jobCheckedAtSec ? clockTime(this.jobCheckedAtSec) : '';
     },
 
     /**
@@ -1823,6 +1915,77 @@ export default defineComponent({
 
     async refreshBackgroundJob() {
       this.backgroundJob = await background.fetchJob();
+    },
+
+    /**
+     * When the card should next ask: just after the job's next tick, within
+     * the bounds above.
+     */
+    nextJobPollSec(job: background.JobStatus): number {
+      const now = Math.floor(Date.now() / 1000);
+      if (!job.nextRunAt) {
+        return now + JOB_POLL_FALLBACK_SECONDS;
+      }
+      return Math.min(
+        now + JOB_POLL_MAX_SECONDS,
+        Math.max(now + JOB_POLL_MIN_SECONDS, job.nextRunAt + JOB_POLL_AFTER_RUN_SECONDS),
+      );
+    },
+
+    startJobClock() {
+      if (this.jobClockTimer !== null) { return; }
+      this.jobClockTimer = window.setInterval(() => this.onJobClockTick(false), JOB_CLOCK_TICK_MS);
+      // A tab coming back to the front checks at once rather than showing a
+      // count from whenever it was hidden.
+      this.onVisibilityChange = () => {
+        if (document.visibilityState === 'visible') {
+          this.onJobClockTick(true);
+        }
+      };
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
+    },
+
+    stopJobClock() {
+      if (this.jobClockTimer !== null) {
+        window.clearInterval(this.jobClockTimer);
+        this.jobClockTimer = null;
+      }
+      if (this.onVisibilityChange) {
+        document.removeEventListener('visibilitychange', this.onVisibilityChange);
+        this.onVisibilityChange = null;
+      }
+    },
+
+    onJobClockTick(returning: boolean) {
+      this.nowSec = Math.floor(Date.now() / 1000);
+      // A hidden tab asks nobody; it catches up when it is shown again.
+      if (document.visibilityState !== 'visible') { return; }
+      if (returning || this.nowSec >= this.jobPollDueSec) {
+        this.pollBackgroundJob();
+      }
+    },
+
+    /**
+     * Refreshes the job card without letting a slow or failed answer undo
+     * anything newer.
+     *
+     * Unlike `refreshBackgroundJob`, a failed check keeps the card: dropping
+     * it would bring back the Resume prompt it replaces, for a queue the server
+     * still holds. "Last checked" says how old the card is instead.
+     */
+    async pollBackgroundJob() {
+      const before = this.backgroundJob;
+      if (this.jobPolling || this.backgroundBusy || !before) { return; }
+      this.jobPolling = true;
+      const job = await background.fetchJob();
+      this.jobPolling = false;
+      // A pause, resume or take-back that happened meanwhile owns the card now.
+      if (this.backgroundBusy || this.backgroundJob !== before) { return; }
+      if (job) {
+        this.backgroundJob = job;
+      } else {
+        this.jobPollDueSec = Math.floor(Date.now() / 1000) + JOB_POLL_FALLBACK_SECONDS;
+      }
     },
 
     async pauseBackgroundJob() {

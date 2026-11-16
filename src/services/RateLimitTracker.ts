@@ -33,7 +33,7 @@ export const MIN_BURST_LIMIT = 50;
 // The daily ceiling is *not* enforced here. Last.fm caps what it stores per UTC
 // calendar day of the scrobble timestamp, not per rolling 24h of sending, and
 // it counts the user's own listening too, which this tracker cannot see. See
-// DailyCap.ts. `dailyCount` below is only kept for telemetry and for the legacy
+// shared/lastfm/dailyCap.ts. `dailyCount` below is only kept for telemetry and for the legacy
 // count fields in saved progress.
 
 // When we do get rate limited, the number of sends we managed inside the burst

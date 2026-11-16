@@ -179,7 +179,7 @@ import { trackEvent } from '@/services/Analytics';
 import StateManager from '@/services/StateManager';
 import * as background from '@/services/BackgroundScrobbling';
 import RateLimitTracker from '@/services/RateLimitTracker';
-import { utcDayStartSec } from '@/services/DailyCap';
+import { utcDayStartSec } from '@/shared/lastfm/dailyCap';
 import { ScrobbleEstimate, estimateScrobbleTime } from '@/services/ScrobbleEstimate';
 
 const workerCode = `

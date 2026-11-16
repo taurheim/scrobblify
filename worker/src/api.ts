@@ -26,16 +26,19 @@ import {
   CREDENTIAL_TTL_SECONDS,
 } from './handoff';
 import { issueSession, authenticate } from './session';
-import { drainJobOnDemand } from './scheduler';
+import { drainJobOnDemand, nextRunAt } from './scheduler';
 import {
   normalizeUsername, randomId, signHandoffState, verifyHandoffState, encryptCredential,
 } from './crypto';
+import { LASTFM_DAILY_CAP } from '../../src/shared/lastfm/dailyCap';
 
 /**
  * Remaining tracks below which background mode is not worth the trade-offs:
- * one day's worth, which the browser can finish by itself.
+ * about one day's worth, which the browser can finish by itself. Last.fm's cap
+ * rather than `TRACKS_PER_DAY` because it must match `MIN_TRACKS_FOR_BACKGROUND`
+ * in ScrobbleStep.vue, which uses the cap.
  */
-export const MIN_TRACKS_FOR_BACKGROUND = TRACKS_PER_DAY;
+export const MIN_TRACKS_FOR_BACKGROUND = LASTFM_DAILY_CAP;
 
 /**
  * Lifetime of a re-authentication state. Short: it exists only to survive one
@@ -331,6 +334,9 @@ function describeJob(job: JobRow, nowSec: number) {
     failed: job.failed_count,
     remaining,
     waitingUntil: job.next_eligible_at > nowSec ? job.next_eligible_at : null,
+    // Shown on the job card so a user can see the next send coming, since
+    // the scheduler only runs every few minutes.
+    nextRunAt: job.state === 'active' ? nextRunAt(job, nowSec) : null,
     estimatedCompletionSec: job.state === 'completed'
       ? job.completed_at
       : nowSec + Math.ceil(daysLeft * 86400),

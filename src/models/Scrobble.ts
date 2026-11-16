@@ -25,7 +25,7 @@ export default class Scrobble {
 
 /**
  * A play Last.fm answered as accepted but has not yet been seen in the user's
- * library. `accepted` is not proof of storage (see DailyCap.ts), so a play only
+ * library. `accepted` is not proof of storage (see shared/lastfm/dailyCap.ts), so a play only
  * counts as scrobbled once it is read back at exactly `timestampSec` — the
  * timestamp it was sent with, which for a re-tagged play differs from
  * `scrobble.timestamp`.

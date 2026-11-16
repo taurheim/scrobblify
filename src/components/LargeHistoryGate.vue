@@ -66,7 +66,7 @@
 
 <script lang="ts">
 import { defineComponent } from 'vue';
-import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
+import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import { IMPORT_DAILY_BUDGET, backgroundCanFinish } from '@/services/ScrobbleEstimate';
 import { trackEvent } from '@/services/Analytics';
 

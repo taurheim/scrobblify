@@ -31,6 +31,7 @@ import {
   signHandoffState,
   verifyHandoffState,
 } from './crypto';
+import { importBudget } from '../../src/shared/lastfm/dailyCap';
 
 /** How long a user has to complete the Last.fm round trip and upload. */
 export const HANDOFF_TTL_SECONDS = 60 * 60;
@@ -86,8 +87,12 @@ export type PreflightResult =
   | { ok: true; handoffId: string; state: string; callbackUrl: string }
   | { ok: false; reason: 'at_capacity' | 'already_live' | 'too_large' | 'paused' };
 
-/** Scrobbles per day a job advances at: Last.fm's daily per-account limit. */
-export const TRACKS_PER_DAY = 750;
+/**
+ * Scrobbles per day a job advances at: Last.fm's daily per-account limit less
+ * the headroom left for the user's own listening, which is all the scheduler
+ * sends into a day (see `shared/lastfm/dailyCap.ts`).
+ */
+export const TRACKS_PER_DAY = importBudget(0);
 
 /**
  * At roughly TRACKS_PER_DAY, a job that cannot finish inside the credential's

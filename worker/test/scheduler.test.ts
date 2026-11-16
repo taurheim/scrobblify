@@ -16,16 +16,23 @@ import { BlobStore, gzip, uploadChunk } from '../src/chunks';
 import { encryptCredential, sha256Hex, randomId } from '../src/crypto';
 import { ALGORITHM_VERSION } from '../src/handoff';
 import { assignTimestamps } from '../src/timestamps';
+import { utcDayStartSec, nextUtcDayStartSec } from '../../src/shared/lastfm/dailyCap';
 import {
   runTick,
   SchedulerEnv,
   DAILY_CAP_BACKOFF_SECONDS,
+  DAY_RESUME_OFFSET_SECONDS,
+  DAY_FULL_REASON,
+  DAY_START_REASON,
+  DAY_FULL_FAILURE,
   PROBE_BATCH_SIZE,
   MAX_BATCHES_PER_JOB_PER_TICK,
   MAX_RECORDED_FAILURES_PER_JOB,
   RECONCILE_GRACE_SECONDS,
   matchOutcomes,
   drainJobOnDemand,
+  nextRunAt,
+  TICK_INTERVAL_SECONDS,
 } from '../src/scheduler';
 import { BatchScrobbleResult, ScrobbleEntry } from '../../src/shared/lastfm/protocol';
 import { WorkerAnalytics } from '../src/analytics';
@@ -136,6 +143,17 @@ class FakeLastFm {
 
   public recentCalls = 0;
 
+  /**
+   * The library's per-UTC-day totals, as `user.getRecentTracks` reports them.
+   * Accepted entries are added to their day, so a job's own sends count
+   * against it across ticks the way they do on Last.fm.
+   */
+  public stored = new Map<number, number>();
+
+  public countCalls = 0;
+
+  public countThrows = false;
+
   constructor(public script: Script[] = []) {}
 
   async scrobbleBatch(entries: ScrobbleEntry[], sessionKey: string): Promise<BatchScrobbleResult> {
@@ -157,11 +175,25 @@ class FakeLastFm {
         present,
       };
     });
+    outcomes.forEach((o, i) => {
+      if (o.accepted && o.present) {
+        const day = utcDayStartSec(entries[i].timestampSec);
+        this.stored.set(day, (this.stored.get(day) ?? 0) + 1);
+      }
+    });
     return {
       accepted: outcomes.filter((o) => o.accepted).length,
       ignored: outcomes.filter((o) => !o.accepted).length,
       outcomes,
     };
+  }
+
+  async countScrobbles(_username: string, fromSec: number) {
+    this.countCalls += 1;
+    if (this.countThrows) {
+      throw new Error('Last.fm API error 8 (HTTP 200)');
+    }
+    return this.stored.get(utcDayStartSec(fromSec)) ?? 0;
   }
 
   async getRecentTracks() {
@@ -1556,6 +1588,114 @@ async function main() {
       throw away a resolvable answer and risk duplicating the batch.
     */
     check('the unresolved batch is kept for the new key', stillSending!.n === 1, stillSending!.n);
+  }
+
+  console.log('\n-- re-tagged plays stop at the day\'s budget --');
+  {
+    /*
+      Last.fm keeps 750 a day and answers everything past that as accepted, so
+      nothing in the reply can stop the job: the library count has to. The
+      user's own 130 leave 570 of the 700 an import may use.
+    */
+    const today = utcDayStartSec(NOW);
+    const h = await harness({ total: 1000 });
+    h.fake.stored.set(today, 130);
+    for (let tick = 0; tick < 4; tick += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await runTick(h.env, NOW + tick * 300);
+    }
+    const sent = h.fake.sent.flatMap((s) => s.entries);
+    check('it sends exactly what the day has room for', sent.length === 570, sent.length);
+    check('leaving room for the user\'s own listening', h.fake.stored.get(today) === 700,
+      h.fake.stored.get(today));
+    check('every re-tagged second is on today, in the past',
+      sent.every((e) => e.timestampSec >= today && e.timestampSec < NOW), sent.length);
+    check('and unique', new Set(sent.map((e) => e.timestampSec)).size === sent.length);
+    const job = await h.job();
+    check('the cursor covers only what was sent', job.cursor === 570, job.cursor);
+    check('the job stays active', job.state === 'active', job.state);
+    check('it waits for the next UTC day',
+      job.next_eligible_at === nextUtcDayStartSec(NOW) + DAY_RESUME_OFFSET_SECONDS, job.next_eligible_at);
+    check('the user is told why', job.state_reason === DAY_FULL_REASON, job.state_reason);
+    check('the wait is not a failure', job.consecutive_failures === 0, job.consecutive_failures);
+    const reached = await h.sql.all<any>(
+      "SELECT * FROM audit WHERE job_id = ? AND event = 'daily_budget_reached'", [h.jobId],
+    );
+    check('the stop is recorded', reached.length === 1, reached.length);
+
+    const resumeAt = nextUtcDayStartSec(NOW) + DAY_RESUME_OFFSET_SECONDS;
+    h.fake.sent = [];
+    await runTick(h.env, resumeAt);
+    const next = h.fake.sent.flatMap((s) => s.entries);
+    check('it resumes on the new day', next.length === MAX_BATCHES_PER_JOB_PER_TICK * 50, next.length);
+    check('with seconds on that day',
+      next.every((e) => e.timestampSec >= nextUtcDayStartSec(NOW) && e.timestampSec < resumeAt));
+    const resumed = await h.job();
+    check('and stops saying it is waiting', resumed.state_reason === null, resumed.state_reason);
+  }
+
+  console.log('\n-- a real-dated play on a full day is failed, not sent --');
+  {
+    // One track: the harness gives every track the same date, and a repeated
+    // second is only preserved once per batch, so more would mix in re-tags.
+    const listenSec = NOW - 2 * 86400;
+    const h = await harness({ total: 1, originalDaysAgo: 2 });
+    h.fake.stored.set(utcDayStartSec(listenSec), 700);
+    await runTick(h.env, NOW);
+    check('nothing is sent to the full day', h.fake.sent.length === 0, h.fake.sent.length);
+    const job = await h.job();
+    check('the play is failed', job.failed_count === 1, job.failed_count);
+    const rows = await h.sql.all<any>('SELECT * FROM failures WHERE job_id = ?', [h.jobId]);
+    check('with a reason the user can read',
+      rows.length === 1 && rows[0].track_index === 0 && rows[0].reason === DAY_FULL_FAILURE, rows);
+    check('and the job moves past it', job.cursor === 1 && job.state === 'completed',
+      { cursor: job.cursor, state: job.state });
+    const inFlight = await h.sql.first<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM batches WHERE job_id = ? AND state = 'sending'", [h.jobId],
+    );
+    check('the unsent play leaves nothing for reconciliation', inFlight!.n === 0, inFlight!.n);
+  }
+
+  console.log('\n-- an unreadable day count sends nothing --');
+  {
+    const h = await harness({ total: 50 });
+    h.fake.countThrows = true;
+    await runTick(h.env, NOW);
+    check('nothing is sent blind', h.fake.sent.length === 0, h.fake.sent.length);
+    const job = await h.job();
+    check('the attempt counts towards backoff', job.consecutive_failures === 1, job.consecutive_failures);
+    check('nothing advances', job.cursor === 0, job.cursor);
+  }
+
+  console.log('\n-- just after midnight it waits for room, not for tomorrow --');
+  {
+    // Sixty seconds into the day, every second below the present margin is
+    // still yesterday's. Today has budget but no seconds yet.
+    const midnight = nextUtcDayStartSec(NOW);
+    const h = await harness({ total: 50 });
+    await runTick(h.env, midnight + 60);
+    check('nothing is sent onto yesterday', h.fake.sent.length === 0, h.fake.sent.length);
+    const job = await h.job();
+    check('it resumes later the same day',
+      job.next_eligible_at === midnight + DAY_RESUME_OFFSET_SECONDS, job.next_eligible_at);
+    check('and says so', job.state_reason === DAY_START_REASON, job.state_reason);
+  }
+
+  console.log('\n-- when a job next sends --');
+  {
+    const tick = TICK_INTERVAL_SECONDS;
+    const due = { next_eligible_at: 0, locked_until: 0 };
+    // NOW is itself a tick boundary; that tick has already happened.
+    check('a due job sends at the next tick, not the one just gone',
+      nextRunAt(due, NOW) === NOW + tick, nextRunAt(due, NOW));
+    check('mid-interval it is still the next boundary',
+      nextRunAt(due, NOW + 7) === NOW + tick, nextRunAt(due, NOW + 7));
+    check('a job held back sends at the first tick after its wait',
+      nextRunAt({ next_eligible_at: NOW + tick + 1, locked_until: 0 }, NOW) === NOW + 2 * tick);
+    check('a wait ending exactly on a tick is picked up by that tick',
+      nextRunAt({ next_eligible_at: NOW + 2 * tick, locked_until: 0 }, NOW) === NOW + 2 * tick);
+    check('a job a tick is running right now is sending now',
+      nextRunAt({ next_eligible_at: NOW + 60, locked_until: NOW + 120 }, NOW + 5) === NOW + 5);
   }
 
   console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILURES`);

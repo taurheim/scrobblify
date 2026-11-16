@@ -12,6 +12,9 @@
   the lower cap on 2026-06-24 without giving a number. Before that the app paced
   to ~2,700 per rolling 24h, so roughly 1,950 plays per heavy user per day were
   counted as scrobbled and never stored.
+
+  Shared by the SPA and the background worker: both budget against the same
+  day, so they must agree on its size and headroom.
 */
 
 export const LASTFM_DAILY_CAP = 750;
