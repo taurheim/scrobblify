@@ -17,8 +17,15 @@
           <li class="mb-2">
             <strong>Scrobbling will take about {{ days }}.</strong> Last.fm keeps at most
             {{ dailyCap.toLocaleString() }} scrobbles a day, your own listening included, so
-            Scrobblify sends up to {{ dailyBudget.toLocaleString() }} a day. You'll need to come
-            back each day to continue; your progress is saved in between.
+            Scrobblify sends up to {{ dailyBudget.toLocaleString() }} a day.
+            <template v-if="canFinishInBackground">
+              You don't have to come back each day, though: once today's share is sent, choose
+              "Finish this in the background" and Scrobblify's server will scrobble the rest for
+              you, even with this tab closed.
+            </template>
+            <template v-else>
+              You'll need to come back each day to continue; your progress is saved in between.
+            </template>
           </li>
           <li>
             <strong>It's hard to undo.</strong> Last.fm has no way to delete scrobbles in bulk.
@@ -27,7 +34,12 @@
 
         <p class="mb-0">
           If any of these are deal breakers for you, there is good news!
-          <a href="https://listenbrainz.org/settings/import/" target="_blank" rel="noopener noreferrer">ListenBrainz</a>
+          <a
+            href="https://listenbrainz.org/settings/import/"
+            target="_blank"
+            rel="noopener noreferrer"
+            @click="listenBrainzClicked('gate_text')"
+          >ListenBrainz</a>
           is an alternative service that will let you transfer your full Spotify history with all
           the correct days and playcounts.
         </p>
@@ -40,13 +52,13 @@
           href="https://listenbrainz.org/settings/import/"
           target="_blank"
           rel="noopener noreferrer"
-          @click="$emit('decline')"
+          @click="listenBrainzClicked('gate_button'); $emit('decline')"
         >
           Use ListenBrainz instead
           <v-icon right small>mdi-open-in-new</v-icon>
         </v-btn>
         <v-spacer></v-spacer>
-        <v-btn color="primary" @click="$emit('accept')">I understand, continue</v-btn>
+        <v-btn color="primary" @click="accept">I understand, continue</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
@@ -55,7 +67,8 @@
 <script lang="ts">
 import Vue from 'vue';
 import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
-import { IMPORT_DAILY_BUDGET } from '@/services/ScrobbleEstimate';
+import { IMPORT_DAILY_BUDGET, backgroundCanFinish } from '@/services/ScrobbleEstimate';
+import { trackEvent } from '@/services/Analytics';
 
 /*
   Blocking on purpose. A large backdated import is the case where users find
@@ -70,14 +83,46 @@ export default Vue.extend({
     value: { type: Boolean, default: false },
     /** Plays whose date will be rewritten to when they are sent. */
     reTaggedCount: { type: Number, required: true },
+    /** Largest queue the background offer would take, or 0 when it is off. */
+    backgroundTrackLimit: { type: Number, default: 0 },
   },
   data() {
     return { dailyCap: LASTFM_DAILY_CAP, dailyBudget: IMPORT_DAILY_BUDGET };
   },
   computed: {
+    estimatedDays(): number {
+      return Math.ceil(this.reTaggedCount / IMPORT_DAILY_BUDGET);
+    },
     days(): string {
-      const n = Math.ceil(this.reTaggedCount / IMPORT_DAILY_BUDGET);
-      return n === 1 ? '1 day' : `${n} days`;
+      return this.estimatedDays === 1 ? '1 day' : `${this.estimatedDays} days`;
+    },
+    // The offer appears on the stop screen, for whatever is left after the first day.
+    canFinishInBackground(): boolean {
+      return backgroundCanFinish(this.reTaggedCount - IMPORT_DAILY_BUDGET, this.backgroundTrackLimit);
+    },
+    eventProps(): Record<string, unknown> {
+      return {
+        re_tagged_count: this.reTaggedCount,
+        estimated_days: this.estimatedDays,
+        background_available: this.canFinishInBackground,
+      };
+    },
+  },
+  watch: {
+    value: {
+      immediate: true,
+      handler(open: boolean) {
+        if (open) { trackEvent('large_history_gate_shown', this.eventProps); }
+      },
+    },
+  },
+  methods: {
+    accept() {
+      trackEvent('large_history_gate_accepted', this.eventProps);
+      this.$emit('accept');
+    },
+    listenBrainzClicked(source: string) {
+      trackEvent('listenbrainz_clicked', { source, ...this.eventProps });
     },
   },
 });

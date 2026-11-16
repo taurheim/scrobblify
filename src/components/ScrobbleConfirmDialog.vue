@@ -9,15 +9,25 @@
           start after midnight UTC ({{ resetAt }} your time, in {{ startsIn }}). At up to
           {{ dailyBudget.toLocaleString() }} a day, these will take
           <strong>{{ days(estimate.laterDays) }}</strong>.
+          <template v-if="canFinishInBackground">
+            You don't have to wait for it: choose "Finish this in the background" when it stops,
+            and Scrobblify's server will send them for you, even with this tab closed.
+          </template>
         </p>
         <p v-else-if="estimate.laterDays > 0" class="scrobble-estimate">
           Last.fm keeps at most {{ dailyCap.toLocaleString() }} scrobbles a day, your own listening
           included, so Scrobblify sends up to {{ dailyBudget.toLocaleString() }} a day and this will
           take <strong>{{ days(estimate.laterDays + 1) }}</strong>. About
           {{ estimate.todayCount.toLocaleString() }} go today, which takes roughly {{ todayDuration }}.
-          Scrobblify then saves your progress and stops. The day resets at midnight UTC
-          ({{ resetAt }} your time), so you'll need to come back after that each day to send the
-          next {{ dailyBudget.toLocaleString() }}.
+          Scrobblify then saves your progress and stops.
+          <template v-if="canFinishInBackground">
+            You can then choose "Finish this in the background" and Scrobblify's server will send
+            the rest for you, even with this tab closed.
+          </template>
+          <template v-else>
+            The day resets at midnight UTC ({{ resetAt }} your time), so you'll need to come back
+            after that each day to send the next {{ dailyBudget.toLocaleString() }}.
+          </template>
         </p>
         <p v-else class="scrobble-estimate">
           This should take about {{ todayDuration }}. Keep this tab open while it runs. If you close
@@ -37,7 +47,9 @@
 <script lang="ts">
 import Vue, { PropType } from 'vue';
 import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
-import { IMPORT_DAILY_BUDGET, ScrobbleEstimate, formatDuration } from '@/services/ScrobbleEstimate';
+import {
+  IMPORT_DAILY_BUDGET, ScrobbleEstimate, backgroundCanFinish, formatDuration,
+} from '@/services/ScrobbleEstimate';
 
 export default Vue.extend({
   name: 'ScrobbleConfirmDialog',
@@ -45,6 +57,8 @@ export default Vue.extend({
     value: { type: Boolean, default: false },
     trackCount: { type: Number, required: true },
     estimate: { type: Object as PropType<ScrobbleEstimate>, required: true },
+    /** Largest queue the background offer would take, or 0 when it is off. */
+    backgroundTrackLimit: { type: Number, default: 0 },
   },
   data() {
     return { dailyCap: LASTFM_DAILY_CAP, dailyBudget: IMPORT_DAILY_BUDGET };
@@ -53,6 +67,10 @@ export default Vue.extend({
     visible: {
       get(): boolean { return this.value; },
       set(val: boolean) { this.$emit('input', val); },
+    },
+    // The offer appears on the stop screen, for whatever is left after today.
+    canFinishInBackground(): boolean {
+      return backgroundCanFinish(this.trackCount - this.estimate.todayCount, this.backgroundTrackLimit);
     },
     todayDuration(): string {
       return formatDuration(this.estimate.todayMs);

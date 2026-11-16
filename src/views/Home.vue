@@ -34,18 +34,31 @@
     Scrobblify will start submitting your listening history to last.fm. Note that last.fm keeps at most 750 scrobbles
     per day (midnight to midnight UTC, your own listening included), so a large history takes several days.
     Scrobblify stops a little short of that each day and only counts scrobbles it can see in your Last.fm library.
-    You can also <strong>save your progress</strong> and come back later if you need to close the page.
-    Your progress will be waiting for you when you return!
+    <template v-if="backgroundEnabled">
+      You've switched on the background scrobbling beta, so you don't have to keep coming back: once a day's
+      share is sent, choose <strong>"Finish this in the background"</strong> and Scrobblify's server carries on
+      with the tab closed.
+    </template>
+    <template v-else>
+      You can also <strong>save your progress</strong> and come back later if you need to close the page.
+      Your progress will be waiting for you when you return!
+    </template>
 
     <h2>Have a big listening history?</h2>
     Last.fm only accepts scrobbles from the past two weeks with their real dates. Scrobblify can still import
     older plays, but only by <strong>giving each one the date it is sent</strong>: plays from months or years
     ago show up on your profile as if you listened to them over the coming days. And with at most 750 scrobbles
-    a day, a history of tens of thousands of plays takes weeks of coming back each day. Last.fm has no way to
-    delete scrobbles in bulk, so this is hard to undo.
+    a day, a history of tens of thousands of plays takes weeks<template v-if="backgroundEnabled"> (with the
+    background beta, Scrobblify's server does the waiting for you)</template><template v-else> of coming back
+    each day</template>. Last.fm has no way to delete scrobbles in bulk, so this is hard to undo.
     <br><br>
     If most of your history is older than two weeks, consider
-    <a href="https://listenbrainz.org/settings/import/" target="_blank" rel="noopener noreferrer">ListenBrainz</a>
+    <a
+      href="https://listenbrainz.org/settings/import/"
+      target="_blank"
+      rel="noopener noreferrer"
+      @click="listenBrainzClicked"
+    >ListenBrainz</a>
     instead. It imports the same Spotify ZIP directly, in one go, and keeps every play on the day you actually
     listened to it. Scrobblify is the better fit for recent plays, or if you specifically want your history on
     Last.fm and don't mind the dates. Once your accounts are connected, all future plays keep their real dates
@@ -66,6 +79,18 @@
 </style>
 <script lang="ts">
 import Vue from 'vue';
+import { trackEvent } from '@/services/Analytics';
+import { isBackgroundEnabled } from '@/services/BackgroundScrobbling';
 
-export default Vue.extend({});
+export default Vue.extend({
+  data() {
+    // The beta opt-in, not live worker capacity: this page only describes what's possible.
+    return { backgroundEnabled: isBackgroundEnabled() };
+  },
+  methods: {
+    listenBrainzClicked() {
+      trackEvent('listenbrainz_clicked', { source: 'home' });
+    },
+  },
+});
 </script>
