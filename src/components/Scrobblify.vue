@@ -192,12 +192,16 @@
         </v-stepper-content>
         <v-stepper-content step="2">
           <upload-step
+            :background-track-limit="backgroundTrackLimit"
             v-on:complete="currentStep = 3"
             v-on:import-progress="importProgressFile"
           ></upload-step>
         </v-stepper-content>
         <v-stepper-content step="3">
-          <select-step v-on:complete="currentStep = 4"></select-step>
+          <select-step
+            :background-track-limit="backgroundTrackLimit"
+            v-on:complete="currentStep = 4"
+          ></select-step>
         </v-stepper-content>
         <v-stepper-content step="4">
           <scrobble-step
@@ -215,7 +219,10 @@
           ></scrobble-step>
         </v-stepper-content>
         <v-stepper-content step="5">
-          <complete-step :has-remaining="hasRemainingTracks"></complete-step>
+          <complete-step
+            :has-remaining="hasRemainingTracks"
+            :background-available="backgroundTrackLimit > 0"
+          ></complete-step>
         </v-stepper-content>
       </v-stepper-items>
     </v-stepper>
@@ -349,6 +356,8 @@ export default Vue.extend({
       errorDetails: '',
       showBackgroundOffer: false,
       backgroundAvailable: false,
+      /** The worker's per-job ceiling, from the same capacity answer. */
+      backgroundMaxTracks: 0,
       backgroundRemaining: 0,
       backgroundAllReTagged: false,
       backgroundBusy: false,
@@ -685,6 +694,17 @@ export default Vue.extend({
     },
   },
   computed: {
+    /*
+      Largest queue the background offer could take right now, or 0 when it
+      won't be offered. The upload and select steps use it to say "the server
+      can finish this" instead of "come back every day"; the offer itself is
+      still gated in ScrobbleStep/`canOfferBackground`.
+    */
+    backgroundTrackLimit(): number {
+      return this.backgroundAvailable && !this.backgroundJob && background.canCompress()
+        ? this.backgroundMaxTracks
+        : 0;
+    },
     authorizeUrl(): string {
       return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
@@ -1580,8 +1600,10 @@ export default Vue.extend({
       try {
         const capacity = await background.fetchCapacity();
         this.backgroundAvailable = !!capacity && capacity.available;
+        this.backgroundMaxTracks = capacity && capacity.available ? capacity.maxTracks : 0;
       } catch (e) {
         this.backgroundAvailable = false;
+        this.backgroundMaxTracks = 0;
       }
     },
 

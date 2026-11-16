@@ -89,7 +89,8 @@
         </div>
         <div v-if="canResume && autoSaved" class="mb-2 text-body-2">
           Your progress has been saved automatically — just come back to this page later
-          and choose "Resume".
+          and choose "Resume"<template v-if="canOfferBackground">, or use "Finish this in the
+          background" above and you won't need to</template>.
         </div>
         <v-alert v-else-if="saveFailed" type="warning" text dense class="mb-2 text-left save-failed">
           Scrobblify couldn't save your progress in this browser. Press
@@ -948,7 +949,17 @@ export default Vue.extend({
       return `Last.fm keeps at most ${LASTFM_DAILY_CAP} scrobbles a day, your own listening included,`
         + ` and silently throws away the rest. Scrobblify stops ${OWN_LISTENING_HEADROOM} short so your own`
         + ' plays today still count. The day resets at midnight UTC: come back after'
-        + ` ${resetAt} (in ${formatDuration(resetMs - nowMs)}) to continue where you left off.`;
+        + ` ${resetAt} (in ${formatDuration(resetMs - nowMs)}) to continue where you left off${this.backgroundHint()}.`;
+    },
+
+    /*
+      The stop screen shows the background offer right under the reason, so a
+      reason that only says "come back" would contradict it.
+    */
+    backgroundHint(): string {
+      return this.canOfferBackground
+        ? ', or hand the rest to Scrobblify\'s server below and skip the wait'
+        : '';
     },
 
     /**
@@ -1754,7 +1765,7 @@ export default Vue.extend({
               if (pendingSecondUnspent) {
                 this.clearPendingSecond(track);
               }
-              this.pauseReason = 'Last.fm says you have hit your daily scrobble limit. Come back tomorrow and resume.';
+              this.pauseReason = `Last.fm says you have hit your daily scrobble limit. Come back tomorrow and resume${this.backgroundHint()}.`;
               this.stopped = true;
               this.paused = true;
               // eslint-disable-next-line no-await-in-loop

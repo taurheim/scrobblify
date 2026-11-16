@@ -140,6 +140,7 @@
       v-model="confirmOpen"
       :track-count="selectedCount"
       :estimate="confirmEstimate"
+      :background-track-limit="backgroundTrackLimit"
       @confirm="scrobbleSelectedTracks"
     ></scrobble-confirm-dialog>
   </div>
@@ -223,6 +224,10 @@ function createSearchWorker(): Worker | null {
 
 export default Vue.extend({
   components: { 'scrobble-confirm-dialog': ScrobbleConfirmDialog },
+  props: {
+    /** Largest queue the background offer would take, or 0 when it is off. */
+    backgroundTrackLimit: { type: Number, default: 0 },
+  },
   beforeCreate() {
     // Non-reactive storage for large arrays
     (this as any)._tracks = [] as any[];

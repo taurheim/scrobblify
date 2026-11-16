@@ -1,5 +1,5 @@
 import { BURST_WINDOW_MS } from '@/services/RateLimitTracker';
-import { importBudget, nextUtcDayStartSec } from '@/shared/lastfm/dailyCap';
+import { LASTFM_DAILY_CAP, importBudget, nextUtcDayStartSec } from '@/shared/lastfm/dailyCap';
 
 const MS_PER_SECOND = 1000;
 const MS_PER_MINUTE = 60 * MS_PER_SECOND;
@@ -13,6 +13,15 @@ export const ESTIMATED_MS_PER_SCROBBLE = MS_PER_SECOND;
 
 /** Most an import sends into one UTC day that holds nothing else. */
 export const IMPORT_DAILY_BUDGET = importBudget(0);
+
+/*
+  Whether the background offer would take a queue this size: big enough to be
+  offered (MIN_TRACKS_FOR_BACKGROUND) and small enough for the worker to
+  accept. `trackLimit` is 0 when the offer is off for this browser.
+*/
+export function backgroundCanFinish(trackCount: number, trackLimit: number): boolean {
+  return trackLimit > 0 && trackCount >= LASTFM_DAILY_CAP && trackCount <= trackLimit;
+}
 
 export interface ScrobbleEstimate {
   /** Tracks this sitting can send before today's budget runs out. */
