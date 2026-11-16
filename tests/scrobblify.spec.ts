@@ -781,6 +781,47 @@ test.describe('Session Resume', () => {
     await expect(page.locator('.upload-step')).toBeHidden();
   });
 
+  // Regression for #102: re-uploading the export and scrobbling from scratch
+  // replaced the saved progress on the first save, so the next resume re-sent
+  // everything before it.
+  async function selectFreshImportOverSavedState(page: Page) {
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, buildState());
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('button:has-text("matching")').click();
+    await page.locator('button:has-text("selected tracks")').click();
+  }
+
+  test('a fresh import asks before replacing saved progress, and offers to resume it', async ({ page }) => {
+    await selectFreshImportOverSavedState(page);
+
+    const dialog = page.locator('.scrobble-confirm');
+    await expect(dialog).toContainText('You have saved progress');
+    await expect(dialog).toContainText('3 of 5 tracks');
+    await expect(dialog.locator('button:has-text("Start scrobbling")')).toHaveCount(0);
+
+    await dialog.locator('button:has-text("Resume saved progress")').click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.overall-progress')).toContainText('3 of 5');
+    expect((await readSavedState(page))?.completedIndices).toEqual([0, 1, 2]);
+  });
+
+  test('a fresh import can still start over once the user chooses to', async ({ page }) => {
+    await selectFreshImportOverSavedState(page);
+
+    const dialog = page.locator('.scrobble-confirm');
+    await dialog.locator('button:has-text("Start over")').click();
+    await expect(page.locator('text=5 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+  });
+
   test('a second Last.fm refuses is only re-timed when this browser chose it', async ({ page }) => {
     const sent: number[] = [];
     await interceptLastFm(page);

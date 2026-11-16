@@ -211,7 +211,9 @@
         <v-stepper-window-item :value="3" eager>
           <select-step
             :background-track-limit="backgroundTrackLimit"
-            v-on:complete="currentStep = 4"
+            :saved-progress="savedProgress"
+            v-on:complete="onSelectionComplete"
+            v-on:resume-saved="resumeFromSaved"
           ></select-step>
         </v-stepper-window-item>
         <v-stepper-window-item :value="4" eager>
@@ -263,6 +265,7 @@ import Scrobblify from '@/scrobblify';
 // Steps
 import AuthenticateStepVue from '@/components/AuthenticateStep.vue';
 import SelectStepVue from '@/components/SelectStep.vue';
+import { SavedProgressSummary } from '@/components/ScrobbleConfirmDialog.vue';
 import UploadStepVue from '@/components/UploadStep.vue';
 import LastFm from '@/api/LastFm';
 import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
@@ -364,6 +367,9 @@ export default defineComponent({
     return {
       currentStep: 1,
       hasResumableState: false,
+      // What the saved progress amounts to, for the select step to warn with
+      // before a fresh run replaces it. Follows `hasResumableState`.
+      savedProgress: null as SavedProgressSummary | null,
       hasRemainingTracks: false,
       // markRaw: a reactive proxy would hide its private members from the
       // StateManager type the handoff functions take, and it holds an IndexedDB
@@ -689,6 +695,27 @@ export default defineComponent({
   watch: {
     currentStep(step: number) {
       trackEvent('step_viewed', { step, step_name: this.stepName(step) });
+    },
+    async hasResumableState(resumable: boolean) {
+      if (!resumable) {
+        this.savedProgress = null;
+        return;
+      }
+      let summary: SavedProgressSummary = { succeeded: 0, total: 0 };
+      try {
+        const state = await this.stateManager.loadState();
+        if (state) {
+          summary = {
+            succeeded: state.originalSucceededCount ?? state.completedIndices.length,
+            total: state.originalTotalTracks || state.totalTracks,
+          };
+        }
+      } catch (e) {
+        // Still warn, just without the numbers.
+      }
+      if (this.hasResumableState) {
+        this.savedProgress = summary;
+      }
     },
     /*
       Every assignment of a job is a fresh answer from the server, from
@@ -2423,6 +2450,12 @@ export default defineComponent({
       api.clearUser();
       resetUser();
       trackEvent('user_logged_out');
+    },
+    onSelectionComplete() {
+      // The user chose to start over, so the saved progress is no longer on
+      // offer; this run's first save replaces it.
+      this.hasResumableState = false;
+      this.currentStep = 4;
     },
     async resumeFromSaved() {
       /*
