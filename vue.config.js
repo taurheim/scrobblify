@@ -107,7 +107,12 @@ function guard(name, handler) {
 function mockMiddlewares() {
   // Required lazily so a plain `npm run serve` never touches tests/.
   /* eslint-disable global-require */
-  const { handleLastFm, lastFmAuthRedirect } = require('./tests/lastfmMock');
+  const {
+    handleLastFm, createLibrary, recordScrobble, lastFmAuthRedirect,
+  } = require('./tests/lastfmMock');
+  // One library for the server's lifetime, so the app's read-back of what
+  // Last.fm stored sees the plays it sent, as it would against the real API.
+  const library = createLibrary();
 
   const entries = [
     {
@@ -128,7 +133,9 @@ function mockMiddlewares() {
         const params = req.method === 'POST'
           ? new URLSearchParams((await readBody(req)).toString('utf8'))
           : url.searchParams;
-        send(res, handleLastFm(params));
+        const response = handleLastFm(params, library);
+        recordScrobble(library, params, JSON.parse(response.body));
+        send(res, response);
       }),
     },
   ];

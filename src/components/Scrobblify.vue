@@ -232,7 +232,7 @@
 <script lang="ts">
 import Vue from 'vue';
 import SpotifyListen from '@/models/SpotifyListen';
-import Scrobble from '@/models/Scrobble';
+import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 import Scrobblify from '@/scrobblify';
 
 // Steps
@@ -245,6 +245,7 @@ import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
 import RateLimitTracker from '@/services/RateLimitTracker';
+import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import BackgroundOffer from '@/components/BackgroundOffer.vue';
 import * as background from '@/services/BackgroundScrobbling';
@@ -276,6 +277,7 @@ interface ProgressSnapshot {
   scrobbledTracks: number;
   originalTotalTracks: number;
   originalSucceededCount: number;
+  pendingVerification: PendingScrobble[];
   sendTimestamps: number[];
   lastReTagTimestampSec: number;
   /**
@@ -767,7 +769,7 @@ export default Vue.extend({
     canOfferBackground(remaining: number): boolean {
       return this.backgroundAvailable
         && !this.backgroundJob
-        && remaining >= 2700;
+        && remaining >= LASTFM_DAILY_CAP;
     },
 
     /**
@@ -2342,6 +2344,7 @@ export default Vue.extend({
 
       this.restoreRateLimitWindow(state, api.getUserName() || state.userName || null);
       this.$store.commit('setReTagCursorSec', state.lastReTagTimestampSec || 0);
+      this.$store.commit('setPendingVerification', StateManager.deserializePending(state.pendingVerification));
       this.$store.commit('setReTagReservedRange', {
         floorSec: state.reTagFloorSec || 0,
         ceilingSec: state.reTagCeilingSec || 0,
@@ -2507,6 +2510,7 @@ export default Vue.extend({
         tracks: StateManager.serializeScrobbles(tracks),
         originalTotalTracks: info.originalTotalTracks || tracks.length,
         originalSucceededCount: info.originalSucceededCount,
+        pendingVerification: StateManager.serializePending(info.pendingVerification || []),
         sendTimestamps: info.sendTimestamps || [],
         lastReTagTimestampSec: info.lastReTagTimestampSec || 0,
         /*

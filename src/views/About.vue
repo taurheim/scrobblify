@@ -43,10 +43,10 @@
 
     <h2>What about rate limits?</h2>
     <p>
-      Last.fm has undocumented rate limits — roughly ~2,800 scrobbles per day and ~1,000 per burst.
-      If you have a large listening history, you might hit these limits. Don't worry — Scrobblify
-      detects when you've been rate-limited and will automatically pause and resume, so you don't
-      have to babysit the process.
+      Last.fm keeps at most 750 scrobbles per day (midnight to midnight UTC), your own listening
+      included, and quietly throws away anything over that. Scrobblify stops a little short of it
+      each day and only counts scrobbles it can see in your Last.fm library, so a large history
+      takes a while: save your progress and come back the next day to continue.
     </p>
 
     <h2>What if I have a huge listening history?</h2>

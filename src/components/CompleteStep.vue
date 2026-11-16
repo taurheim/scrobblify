@@ -2,16 +2,20 @@
   <div class="scrobblify-complete">
     <h1>Finished scrobbling.</h1>
     We scrobbled {{ this.$store.state.tracksScrobbled }} tracks ({{ this.$store.state.tracksFailed }} failed).<br>
+    <div v-if="unconfirmed > 0" class="mt-2">
+      {{ unconfirmed }} more were sent, but your Last.fm library couldn't be read to confirm them,
+      so they aren't counted.
+    </div>
     <div v-if="hasRemaining" class="mt-4">
       <v-alert type="warning" prominent>
-        <strong>Some tracks couldn't be scrobbled due to rate limits.</strong><br>
+        <strong>Some tracks haven't been scrobbled yet.</strong><br>
         Your progress has been saved automatically. You can come back later to scrobble the remaining tracks.
         A backup file has also been downloaded — you can use it to resume on any computer.
         <br><br>
         <strong>Tips:</strong>
         <ul>
-          <li>If you hit the daily limit (~2,800), come back tomorrow</li>
-          <li>If you hit the burst limit (~1,000), wait at least 10 minutes</li>
+          <li>Last.fm keeps at most 750 scrobbles a day (midnight to midnight UTC), your own listening included</li>
+          <li>If you were rate limited, wait at least 10 minutes</li>
           <li>Use the same browser on this computer to auto-resume, or use the downloaded file on another device</li>
         </ul>
       </v-alert>
@@ -68,6 +72,9 @@ export default Vue.extend({
     },
   },
   computed: {
+    unconfirmed(): number {
+      return this.$store.state.pendingVerification.length;
+    },
     userName(): string {
       return this.$store.state.lfmApi.userName;
     },

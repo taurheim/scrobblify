@@ -15,7 +15,7 @@ routes = [{ pattern = "api.savas.ca", custom_domain = true }]
 "blueimp-md5" = "./node_modules/blueimp-md5"
 
 # One tick every 5 minutes. Deliberately not more often: a job advances at
-# roughly 2,700 scrobbles/day whatever we do, so a faster cron only spends the
+# roughly 750 scrobbles/day whatever we do, so a faster cron only spends the
 # shared free-tier invocation budget and pushes harder on Last.fm's per-IP
 # limit without finishing anything sooner.
 [triggers]
@@ -23,10 +23,17 @@ crons = ["*/5 * * * *", "17 * * * *"]
 # The second entry is the hourly blob sweep (BLOB_SWEEP_CRON in src/index.ts),
 # which deletes the uploaded track lists of finished jobs.
 
+# Schema changes are wrangler D1 migrations: CI runs `wrangler d1 migrations
+# apply` on both databases before every deploy, which applies each file in
+# migrations_dir not yet listed in that database's d1_migrations table. A file
+# is tracked by name, so never edit or rename one once it has been merged.
+# Every migration must work with the worker version already running, because
+# that version keeps serving while it runs. See "Schema changes" in README.md.
 [[d1_databases]]
 binding = "DB"
 database_name = "scrobblify"
 database_id = "ac6eddb8-f920-4ec3-9230-a224a64ab367"
+migrations_dir = "schema"
 
 # Uploaded track chunks, kept apart from DB so a full one only refuses uploads.
 # D1 rather than R2 because D1 on the Free plan stops at its limits, while R2
@@ -35,6 +42,7 @@ database_id = "ac6eddb8-f920-4ec3-9230-a224a64ab367"
 binding = "BLOB_DB"
 database_name = "scrobblify-blobs"
 database_id = "4d3d1705-8d46-4d13-a1f0-8508bf4cd563"
+migrations_dir = "schema-blobs"
 
 [vars]
 CALLBACK_URL = "https://api.savas.ca/scrobblify/auth/callback"

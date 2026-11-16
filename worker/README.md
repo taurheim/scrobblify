@@ -1,7 +1,7 @@
 # Scrobblify background worker
 
 Cloudflare Worker that finishes large Last.fm imports unattended, so users with
-more than ~2,700 tracks don't have to keep returning to the tab.
+more than ~750 tracks don't have to keep returning to the tab.
 
 Design: [`docs/superpowers/specs/2026-07-26-background-scrobbling-design.md`](../docs/superpowers/specs/2026-07-26-background-scrobbling-design.md)
 
@@ -40,13 +40,11 @@ npx wrangler d1 create scrobblify
 #    BLOB_DB block of wrangler.toml. (See "Why blobs live in D1" below.)
 npx wrangler d1 create scrobblify-blobs
 
-# 3. Schema. Every file in schema/, in order, then the blob schema.
-npx wrangler d1 execute scrobblify --remote --file schema/001_init.sql
-npx wrangler d1 execute scrobblify --remote --file schema/002_synthetic_floor.sql
-npx wrangler d1 execute scrobblify --remote --file schema/003_export_claim.sql
-npx wrangler d1 execute scrobblify --remote --file schema/004_import_id.sql
-npx wrangler d1 execute scrobblify --remote --file schema/005_dormancy.sql
-npx wrangler d1 execute scrobblify-blobs --remote --file schema-blobs/001_blobs.sql
+# 3. Schema. Applies every file in schema/ and schema-blobs/ (the
+#    migrations_dir of each database in wrangler.toml) and records each in
+#    that database's d1_migrations table. CI repeats this before every deploy.
+npx wrangler d1 migrations apply scrobblify --remote
+npx wrangler d1 migrations apply scrobblify-blobs --remote
 
 # 4. Secrets (see below). Each command prompts for its value.
 npx wrangler secret put LASTFM_API_KEY
@@ -115,28 +113,60 @@ offering a handoff that cannot complete.
 ### Deploying from CI
 
 `.github/workflows/worker.yml` runs `npm test` on every PR that can affect the
-worker, and on a push to `master` also runs `npx wrangler deploy` followed by
-the step 6 smoke test. It can be started by hand from the Actions tab
-(`workflow_dispatch`). It needs two repository secrets:
+worker. On a push to `master` it then applies D1 migrations, runs
+`npx wrangler deploy` and the step 6 smoke test. It can be started by hand
+from the Actions tab (`workflow_dispatch`). It needs two repository secrets:
 
 | Secret | Value |
 | --- | --- |
 | `CLOUDFLARE_ACCOUNT_ID` | the account id (`npx wrangler whoami`, or the dashboard's Workers overview) |
-| `CLOUDFLARE_API_TOKEN` | an API token from the **Edit Cloudflare Workers** template, scoped to this account and the `savas.ca` zone |
+| `CLOUDFLARE_API_TOKEN` | an account API token with **Workers → Editor** on all Workers, **D1 → Edit**, and **Zone → Workers Routes → Edit** on `savas.ca` |
 
-The template's zone permissions are what let the deploy keep the
-`api.savas.ca` custom domain; an account-only token fails on `routes`.
-
-**CI does not apply schema changes.** A PR that adds a `schema/*.sql` file
-must have it run against production with `npx wrangler d1 execute … --remote`
-*before* it merges, since the merge deploys code that expects it. Keep
-migrations additive so the code still running in the meantime is unaffected.
+Scope Workers to the whole account, not to the `scrobblify` worker: custom
+domains do not support per-Worker roles yet, and a token without account-level
+Workers access fails wrangler's first call with `No access to the specified
+service`. The zone permission is what lets the deploy keep the `api.savas.ca`
+custom domain. D1 → Edit is for the migration step.
 
 The deploy installs only `worker/`'s dependencies. `src/shared/` lives outside
 `worker/`, so `wrangler.toml` aliases `blueimp-md5` (its one package import) to
 `worker/node_modules`, and `tsconfig.json` maps its types the same way; without
 that, the bundle only built when the SPA was installed too. The test job does
 install the SPA, because the `client-*` suites typecheck `src/services/`.
+
+### Schema changes
+
+A schema change is a new file in `schema/` (or `schema-blobs/`) named with the
+next number, e.g. `006_whatever.sql`. Merging it is enough: the deploy job runs
+`wrangler d1 migrations apply` on both databases before `wrangler deploy`,
+which applies every file not yet listed in that database's `d1_migrations`
+table, in filename order. Each file and its `d1_migrations` row go in one
+request, and a failure stops the job before anything is deployed.
+`test/schema.ts` loads the same files in the same order, so the suite runs
+against exactly what production gets.
+
+Three rules:
+
+- **A migration must work with the worker that is already running.** That
+  version serves requests while the migration runs, and keeps serving if the
+  deploy after it fails. Add tables, nullable or defaulted columns, indexes
+  and triggers freely. To drop or rename something, first ship code that no
+  longer uses it, then remove it in a later PR.
+- **Never edit or rename a merged file.** Files are tracked by name: an edited
+  one is skipped silently and a renamed one runs a second time. Fix a mistake
+  with a new migration.
+- **Don't run schema SQL against production by hand** with `d1 execute`. A file
+  applied that way isn't recorded, so the next deploy runs it again, and an
+  `ALTER TABLE … ADD COLUMN` fails the second time.
+
+A migration that ran but did damage is undone with D1 Time Travel
+(`npx wrangler d1 time-travel restore <db> --timestamp=<before the deploy>`),
+followed by redeploying the previous worker version.
+
+Production predates this: `001`–`005` and `001_blobs.sql` were applied by hand
+with `d1 execute`, so on 2026-11-15 their names were inserted into a hand-made
+`d1_migrations` table (same layout wrangler creates), after checking that each
+file's columns, indexes and trigger were present.
 
 ### Why blobs live in D1, and what this costs
 
@@ -165,7 +195,7 @@ full blob database refuses new uploads and costs nothing.
 The worker and the SPA can be deployed in either order. The SPA ships through
 the normal CD on merge to master. Nobody is offered the feature without opting
 in: open `https://savas.ca/scrobblify/?beta=1` (sticky; `?beta=0` turns it
-off), start an import with at least 2,700 tracks left, and press
+off), start an import with at least 750 tracks left, and press
 Pause & Save to see the offer. `npx wrangler tail` streams the worker's logs.
 
 ## Secrets
@@ -178,19 +208,18 @@ Local development:
 
 ```powershell
 Copy-Item .dev.vars.example .dev.vars
-# fill in the four values, then apply the schema to the local D1 once:
-npx wrangler d1 execute scrobblify --local --file schema/001_init.sql
-npx wrangler d1 execute scrobblify --local --file schema/002_synthetic_floor.sql
-npx wrangler d1 execute scrobblify --local --file schema/003_export_claim.sql
-npx wrangler d1 execute scrobblify --local --file schema/004_import_id.sql
-npx wrangler d1 execute scrobblify --local --file schema/005_dormancy.sql
-npx wrangler d1 execute scrobblify-blobs --local --file schema-blobs/001_blobs.sql
+# fill in the four values, then apply the schema to the local D1:
+npx wrangler d1 migrations apply scrobblify --local
+npx wrangler d1 migrations apply scrobblify-blobs --local
 npx wrangler dev --local
 ```
 
-`--local` keeps its own D1 in `.wrangler/state`, separate from production and
-unaffected by step 3 of the deploy. Skipping it leaves every route answering
-`500`, because the tables the handlers read do not exist yet.
+`--local` keeps its own D1 in `.wrangler/state`, separate from production.
+Re-run the two `migrations apply` lines after pulling a new migration. Skipping
+them leaves every route answering `500`, because the tables the handlers read
+do not exist yet. A local D1 set up before 2026-11-15 with `d1 execute` has no
+`d1_migrations` table, so `migrations apply` would re-run every file and fail;
+delete `.wrangler/state` and apply from scratch.
 
 Smoke test the same way as production:
 

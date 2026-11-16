@@ -9,7 +9,7 @@
       <v-card-text class="pt-4">
         <p>
           You have <strong>{{ remaining.toLocaleString() }}</strong> tracks left.
-          Last.fm only accepts about 2,700 scrobbles a day from one account, so
+          Last.fm only accepts about {{ dailyLimit.toLocaleString() }} scrobbles a day from one account, so
           finishing here means coming back over the next
           <strong>{{ daysRemaining }}</strong>.
         </p>
@@ -82,14 +82,13 @@
 
 <script lang="ts">
 import Vue from 'vue';
+import { LASTFM_DAILY_CAP } from '@/services/DailyCap';
 
 /*
-  The rate the worker actually paces at, and the same constant `describeJob`
-  in worker/src/api.ts divides by. Last.fm's own ceiling is nearer 2,800, but
-  quoting that here made this dialog promise a date one day earlier than the
+  Last.fm's per-day cap, which is also the per-day constant `describeJob` in
+  worker/src/api.ts divides by, so this dialog promises the same date as the
   status card the user lands on immediately afterwards.
 */
-const DAILY_LIMIT = 2700;
 
 export default Vue.extend({
   name: 'BackgroundOffer',
@@ -105,8 +104,11 @@ export default Vue.extend({
       get(): boolean { return this.value; },
       set(val: boolean) { this.$emit('input', val); },
     },
+    dailyLimit(): number {
+      return LASTFM_DAILY_CAP;
+    },
     daysRemaining(): string {
-      const days = Math.ceil(this.remaining / DAILY_LIMIT);
+      const days = Math.ceil(this.remaining / LASTFM_DAILY_CAP);
       return days === 1 ? '1 day' : `${days} days`;
     },
     mailtoLink(): string {

@@ -1,4 +1,4 @@
-import Scrobble from '@/models/Scrobble';
+import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
 
 export interface SerializedScrobble {
@@ -12,6 +12,11 @@ export interface SerializedScrobble {
    * hasCollapsedTimestamps().
    */
   reTagged?: boolean;
+}
+
+export interface SerializedPendingScrobble extends SerializedScrobble {
+  /** The timestamp the play was actually sent with. */
+  sentTimestampSec: number;
 }
 
 /**
@@ -56,6 +61,12 @@ export interface ScrobbleState {
    * allocator simply starts from the current clock.
    */
   lastReTagTimestampSec?: number;
+  /**
+   * Plays sent but not yet confirmed as stored by reading the user's library
+   * back. They are already inside `completedIndices`, so a resume re-checks them
+   * rather than re-sending them. Absent from files written before this existed.
+   */
+  pendingVerification?: SerializedPendingScrobble[];
   /**
    * Synthetic second already handed to Last.fm for the first remaining track,
    * whose outcome was never observed. Absent in the ordinary case.
@@ -257,6 +268,25 @@ export default class StateManager {
       d.album,
       d.reTagged ?? inferReTagged,
     ));
+  }
+
+  static serializePending(pending: PendingScrobble[]): SerializedPendingScrobble[] {
+    return pending.map((p) => ({
+      ...StateManager.serializeScrobbles([p.scrobble])[0],
+      sentTimestampSec: p.timestampSec,
+    }));
+  }
+
+  static deserializePending(data: SerializedPendingScrobble[] | undefined): PendingScrobble[] {
+    if (!Array.isArray(data)) {
+      return [];
+    }
+    return data
+      .filter((d) => d && Number.isFinite(d.sentTimestampSec))
+      .map((d) => ({
+        scrobble: new Scrobble(d.track, d.artist, new Date(d.timestamp), d.album, !!d.reTagged),
+        timestampSec: d.sentTimestampSec,
+      }));
   }
 
   /**

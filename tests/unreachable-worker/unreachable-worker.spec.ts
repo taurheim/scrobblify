@@ -89,6 +89,7 @@ async function importAndPressScrobble(page: Page) {
   await expect(page.locator('button:has-text("matching")')).toBeVisible({ timeout: 5000 });
   await page.locator('button:has-text("matching")').click();
   await page.locator('button:has-text("selected tracks")').click();
+  await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
 
   await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 5000 });
   await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -233,7 +234,7 @@ test.describe('Offering background scrobbling', () => {
     '/scrobblify/job/live': { ok: true, live: false },
     '/scrobblify/import/': { ok: true, known: false, live: false },
     '/scrobblify/capacity': {
-      available: true, used: 0, capacity: 100, minTracks: 2700, maxTracks: 200000, chunkTracks: 5000,
+      available: true, used: 0, capacity: 100, minTracks: 750, maxTracks: 200000, chunkTracks: 5000,
     },
   };
   const OFFER = 'text=Finish this in the background >> visible=true';

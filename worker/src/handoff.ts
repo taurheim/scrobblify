@@ -86,13 +86,16 @@ export type PreflightResult =
   | { ok: true; handoffId: string; state: string; callbackUrl: string }
   | { ok: false; reason: 'at_capacity' | 'already_live' | 'too_large' | 'paused' };
 
+/** Scrobbles per day a job advances at: Last.fm's daily per-account limit. */
+export const TRACKS_PER_DAY = 750;
+
 /**
- * At roughly 2,700 scrobbles/day, a job that cannot finish inside the
- * credential's 60-day life is guaranteed to be abandoned half-done. Refusing it
- * up front is kinder than accepting it — and this assumes no outages, no global
- * pauses and no daily-limit backoff, so it is already optimistic.
+ * At roughly TRACKS_PER_DAY, a job that cannot finish inside the credential's
+ * 60-day life is guaranteed to be abandoned half-done. Refusing it up front is
+ * kinder than accepting it — and this assumes no outages, no global pauses and
+ * no daily-limit backoff, so it is already optimistic.
  */
-export const MAX_TRACKS_PER_JOB = 2700 * 60;
+export const MAX_TRACKS_PER_JOB = TRACKS_PER_DAY * 60;
 
 /**
  * Step 0: commit what we expect *before* redirecting.
