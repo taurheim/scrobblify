@@ -376,6 +376,7 @@ export default defineComponent({
       // low because we only ever hold one raw file string at a time.
       let parsedData: SpotifyListen[] = [];
       const failedFiles: string[] = [];
+      let skippedRows = 0;
       for (const name of matchingFiles) {
         const shortName = name.split('/').pop() || name;
 
@@ -390,7 +391,9 @@ export default defineComponent({
         }
 
         try {
-          parsedData = parsedData.concat(this.scrobblify.spotifyJsonToListens(jsonString));
+          const parsed = this.scrobblify.parseSpotifyJson(jsonString);
+          parsedData = parsedData.concat(parsed.listens);
+          skippedRows += parsed.skippedRows;
         } catch (e) {
           trackError('upload.parseJson', e, { file: shortName });
           failedFiles.push(shortName);
@@ -418,6 +421,9 @@ export default defineComponent({
       }
       parsedData.sort((a, b) => a.listenDate.getTime() - b.listenDate.getTime());
       this.logs.push(`Found ${parsedData.length} plays in your spotify listening history.`);
+      if (skippedRows > 0) {
+        this.logs.push(`Skipped ${skippedRows} plays whose artist, track or date couldn't be read.`);
+      }
 
       let newData: SpotifyListen[] = [];
       if (this.scrobbleOldPlays) {
@@ -488,6 +494,7 @@ export default defineComponent({
       this.$store.commit('setValidScrobbles', toBeScrobbled);
       trackEvent('upload_parse_completed', {
         total_plays: parsedData.length,
+        skipped_rows: skippedRows,
         valid_count: validData.length,
         to_scrobble_count: toBeScrobbled.length,
         checked_duplicates: this.checkDuplicates,

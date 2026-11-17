@@ -119,10 +119,21 @@
         <v-btn v-if="sessionInvalid" color="primary" :href="authorizeUrl">
           Sign in to Last.fm again
         </v-btn>
+        <!--
+          The loop finishes the send it is waiting on before it stops, and
+          `scrobble()` ignores a click until then. An enabled button here
+          swallowed that click and left the run paused (#123).
+        -->
+        <v-btn v-else-if="canResume && loopActive" variant="outlined" disabled>
+          {{ manuallyPaused ? 'Pausing…' : 'Stopping…' }}
+        </v-btn>
         <v-btn v-else-if="canResume" variant="outlined" :disabled="handoffHalted" @click="scrobble">
           {{ manuallyPaused ? 'Resume Now' : 'Try Again Now' }}
         </v-btn>
         <v-btn v-else variant="outlined" disabled>Wait Here</v-btn>
+        <div v-if="canResume && !loopActive && !leaving" class="mt-2">
+          <v-btn variant="text" size="small" @click="downloadProgress">Download progress file</v-btn>
+        </div>
       </v-card>
     </div>
 
@@ -244,6 +255,7 @@ const NETWORK_ERROR_COOLDOWN_SECONDS = Math.ceil(NETWORK_ERROR_COOLDOWN_MS / MS_
 // wait is long enough to be worth an explicit countdown, which happens when a
 // window saturated by an earlier session has to drain before we can start.
 const PACING_COUNTDOWN_THRESHOLD_MS = 10 * MS_PER_SECOND;
+const MANUAL_PAUSE_REASON = 'Paused. Resume whenever you like.';
 
 // How many consecutive tracks must need *no* wait before a pacing stretch is
 // considered over.
@@ -402,7 +414,7 @@ export default defineComponent({
       default: null,
     },
   },
-  emits: ['complete', 'auto-save', 'save-and-exit', 'checkpoint', 'background'],
+  emits: ['complete', 'auto-save', 'save-and-exit', 'download-progress', 'checkpoint', 'background'],
   data() {
     return {
       scrobbling: false,
@@ -1975,7 +1987,7 @@ export default defineComponent({
             this.pauseReason = `Rate limited by Last.fm. Waiting ${formatDuration(backoffMs)} before retrying (attempt ${this.rateLimitPauseCount} of ${MAX_RATE_LIMIT_RETRIES}).`;
             trackEvent('scrobble_paused', this.progressProps({ reason: 'rate_limit' }));
             await this.pauseWithCountdown(backoffMs);
-            if (!this.leaving) {
+            if (!this.leaving && !this.manuallyPaused) {
               trackEvent('scrobble_rate_limit_cooldown_complete', this.progressProps({
                 track_index: i,
                 burst_count: tracker.burstCount,
@@ -2122,6 +2134,18 @@ export default defineComponent({
       // and the paused panel is where users most often close the tab.
       this.checkpoint();
       this.paused = true;
+      /*
+        Pause was pressed while the send that led here was in flight. Waiting
+        out a backoff would hold "Pausing…" for up to 30 minutes and then carry
+        on scrobbling, because expiry clears `paused`. Returning now lets the
+        loop's pause check stop the run straight away.
+      */
+      if (this.manuallyPaused) {
+        if (!this.handoffHalted) {
+          this.pauseReason = MANUAL_PAUSE_REASON;
+        }
+        return Promise.resolve();
+      }
       const deadline = Date.now() + durationMs;
       this.countdown = Math.ceil(durationMs / MS_PER_SECOND);
 
@@ -2180,7 +2204,7 @@ export default defineComponent({
     },
 
     manualPause() {
-      this.pauseReason = 'Paused. Resume whenever you like.';
+      this.pauseReason = MANUAL_PAUSE_REASON;
       this.paused = true;
       // Tracked separately from `stopped`, which drives the red error styling.
       // A deliberate pause is not a failure, but it is just as terminal: the
@@ -2275,7 +2299,7 @@ export default defineComponent({
      */
     releaseHandoffHalt() {
       this.handoffHalted = false;
-      this.pauseReason = 'Paused. Resume whenever you like.';
+      this.pauseReason = MANUAL_PAUSE_REASON;
     },
 
     requestBackground() {
@@ -2375,6 +2399,14 @@ export default defineComponent({
       // with nothing saving it, so the next resume re-sent all of it.
       this.leaving = true;
       this.cancelCountdown();
+    },
+
+    /**
+     * Downloads the progress as it stands, without leaving. Only offered once
+     * the loop has stopped, so the snapshot cannot miss an in-flight send.
+     */
+    downloadProgress() {
+      this.$emit('download-progress', this.progressSnapshot());
     },
 
     /**

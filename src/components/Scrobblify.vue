@@ -226,6 +226,7 @@
             :persist-progress-if-ahead="onAutoSaveIfAhead"
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
+            v-on:download-progress="onDownloadProgress"
             v-on:auto-save="onAutoSaveBestEffort"
             v-on:background="onBackgroundRequested"
             v-on:checkpoint="onCheckpoint"
@@ -247,6 +248,59 @@
       v-on:accept="startBackgroundHandoff"
       v-on:decline="onBackgroundDeclined"
     ></background-offer>
+    <v-dialog
+      :model-value="fileConflict !== null"
+      max-width="520"
+      v-on:update:model-value="(open) => { if (!open) resolveFileConflict('cancel'); }"
+    >
+      <v-card v-if="fileConflict" class="progress-file-conflict">
+        <template v-if="fileConflict.reason === 'saved_newer'">
+          <v-card-title class="text-wrap">This browser has newer progress for this import</v-card-title>
+          <v-card-text>
+            Saved here: {{ fileConflict.saved.succeeded }} of {{ fileConflict.saved.total }} scrobbled.
+            This file: {{ fileConflict.file.succeeded }} of {{ fileConflict.file.total }}.
+            Using the file would send the
+            {{ fileConflict.saved.succeeded - fileConflict.file.succeeded }} tracks in between
+            to Last.fm again, as duplicates.
+          </v-card-text>
+        </template>
+        <template v-else-if="fileConflict.reason === 'other_import'">
+          <v-card-title class="text-wrap">Replace your saved progress?</v-card-title>
+          <v-card-text>
+            This browser has saved progress for a different import
+            ({{ fileConflict.saved.succeeded }} of {{ fileConflict.saved.total }} scrobbled).
+            Using this file replaces it, and that import's progress is lost unless you
+            have a progress file for it.
+          </v-card-text>
+        </template>
+        <template v-else>
+          <v-card-title class="text-wrap">This import is already finished</v-card-title>
+          <v-card-text>
+            You already finished this import in this browser
+            on {{ new Date(fileConflict.completedAt).toLocaleDateString() }}.
+            Importing this file would send its remaining
+            {{ fileConflict.file.total - fileConflict.file.succeeded }} tracks to Last.fm again, as duplicates.
+            <template v-if="fileConflict.saved && fileConflict.saved.succeeded > 0">
+              It would also replace this browser's saved progress for another import
+              ({{ fileConflict.saved.succeeded }} of {{ fileConflict.saved.total }} scrobbled).
+            </template>
+          </v-card-text>
+        </template>
+        <v-card-actions>
+          <v-spacer></v-spacer>
+          <v-btn variant="text" @click="resolveFileConflict('use_file')">
+            {{ fileConflict.reason === 'completed' ? 'Import anyway' : 'Use this file anyway' }}
+          </v-btn>
+          <v-btn
+            v-if="fileConflict.reason === 'saved_newer'"
+            color="primary"
+            variant="elevated"
+            @click="resolveFileConflict('keep_saved')"
+          >Keep newer progress</v-btn>
+          <v-btn v-else color="primary" variant="elevated" @click="resolveFileConflict('cancel')">Cancel</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
     <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
   </div>
 </template>
@@ -282,6 +336,19 @@ import {
   resolveExportedRepeats,
 } from '@/services/BackgroundHandoff';
 import { trackEvent, trackError, resetUser } from '@/services/Analytics';
+import {
+  ConflictReason, ProgressCount, findCompletedImport, isSameImport, progressOf, recordCompletedImport,
+  savedProgressConflict,
+} from '@/services/ProgressFileConflict';
+
+interface FileConflict {
+  reason: ConflictReason;
+  state: ScrobbleState;
+  source: string;
+  file: ProgressCount;
+  saved: ProgressCount | null;
+  completedAt: string;
+}
 
 /**
  * How far back the browser's re-tag allocator reaches.
@@ -370,6 +437,8 @@ export default defineComponent({
       // What the saved progress amounts to, for the select step to warn with
       // before a fresh run replaces it. Follows `hasResumableState`.
       savedProgress: null as SavedProgressSummary | null,
+      /** A progress file held back until the user confirms it (#124). */
+      fileConflict: null as FileConflict | null,
       hasRemainingTracks: false,
       // markRaw: a reactive proxy would hide its private members from the
       // StateManager type the handoff functions take, and it holds an IndexedDB
@@ -2503,6 +2572,9 @@ export default defineComponent({
         if (!(await this.importedQueueMaySend(state))) {
           return;
         }
+        if (await this.askAboutProgressFile(state, source)) {
+          return;
+        }
         this.restoreFromState(state, source);
       } catch (e) {
         if (e instanceof NotAProgressFileError) {
@@ -2518,6 +2590,67 @@ export default defineComponent({
         this.errorMessage = 'The selected file is not a valid Scrobblify progress file.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
+      }
+    },
+    /**
+     * Opens the conflict dialog if importing `state` would replace newer saved
+     * progress, other saved progress, or re-run a finished import (#124).
+     * Returns whether it did; the dialog's buttons then carry on.
+     */
+    async askAboutProgressFile(state: ScrobbleState, source: string): Promise<boolean> {
+      let saved: ScrobbleState | null = null;
+      if (this.hasResumableState) {
+        try {
+          saved = await this.stateManager.loadState();
+        } catch {
+          // Unreadable saved state is nothing to protect.
+        }
+      }
+      let reason: ConflictReason | null = saved ? savedProgressConflict(saved, state) : null;
+      let completedAt = '';
+      // Saved progress for this same import means it was started again since
+      // it finished, so only a different (or no) saved import is checked.
+      if (!saved || !isSameImport(saved, state)) {
+        const completed = findCompletedImport(state);
+        if (completed) {
+          reason = 'completed';
+          completedAt = completed.completedAt;
+        }
+      }
+      if (!reason) {
+        return false;
+      }
+      this.fileConflict = markRaw({
+        reason,
+        state,
+        source,
+        file: progressOf(state),
+        saved: saved ? progressOf(saved) : null,
+        completedAt,
+      });
+      trackEvent('progress_file_conflict_shown', this.fileConflictProps());
+      return true;
+    },
+    fileConflictProps() {
+      const c = this.fileConflict as FileConflict;
+      return {
+        reason: c.reason,
+        source: c.source,
+        file_succeeded: c.file.succeeded,
+        file_total_tracks: c.file.total,
+        saved_succeeded: c.saved ? c.saved.succeeded : null,
+        saved_total_tracks: c.saved ? c.saved.total : null,
+      };
+    },
+    resolveFileConflict(choice: 'use_file' | 'keep_saved' | 'cancel') {
+      const conflict = this.fileConflict;
+      if (!conflict) { return; }
+      trackEvent('progress_file_conflict_choice', { ...this.fileConflictProps(), choice });
+      this.fileConflict = null;
+      if (choice === 'use_file') {
+        this.restoreFromState(conflict.state, conflict.source);
+      } else if (choice === 'keep_saved') {
+        this.resumeFromSaved();
       }
     },
     /**
@@ -2719,6 +2852,15 @@ export default defineComponent({
       } catch (e) {
         // Not critical — continue anyway
       }
+      // Clearing the saved state forgets the import entirely, so an old
+      // progress file for it would otherwise import as if nothing were sent.
+      recordCompletedImport({
+        importId: (this.$store.state.importId as string) || '',
+        originalTotalTracks: (this.$store.state.originalTotalTracks as number)
+          || (this.$store.state.selectedScrobbles as Scrobble[]).length,
+        userName: (this.$store.state.lfmApi as LastFm).getUserName() || '',
+        completedAt: new Date().toISOString(),
+      });
       this.$store.commit('setResumedScrobbleCount', 0);
       /*
         `carriedFailures` is deliberately *not* cleared here. Completion is
@@ -2916,6 +3058,18 @@ export default defineComponent({
       }
       this.hasRemainingTracks = true;
       this.currentStep = 5;
+    },
+    /** "Download progress file" on a stopped run: a fresh file, without leaving. */
+    onDownloadProgress(info: ProgressSnapshot) {
+      try {
+        this.stateManager.exportToFile(this.buildState(info));
+        trackEvent('progress_file_downloaded', this.saveProps(info, false));
+      } catch (e) {
+        trackError('scrobblify.onDownloadProgress', e);
+        this.errorMessage = 'Failed to download your progress file.';
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+      }
     },
   },
 });

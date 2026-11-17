@@ -89,7 +89,7 @@ Errors arrive two ways: a filterable `scrobblify_error` event (properties:
 | Upload / parsing | `upload.loadZip`, `upload.extractFile`, `upload.parseJson`, `upload.removeInvalidListens`, `upload.filterDuplicates` |
 | Auth | `auth.init`, `auth.strip_token_url` |
 | Scrobbling | `scrobble.repeatedFailures` |
-| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load) |
+| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load), `scrobblify.onDownloadProgress` |
 | Uncaught | `vue.errorHandler`, `window.onerror`, `unhandledrejection` |
 
 Last.fm failures are normalized to `Last.fm API error <code> (HTTP <status>)`
@@ -125,7 +125,34 @@ of "Start scrobbling". It emits `saved_progress_prompt_shown` and
 Shown minus choices is cancels. Since 2026-11-16; earlier `scrobble_started`
 at `total_succeeded = 0` after higher progress for the same
 `original_total_tracks` is this bug. Importing an *older progress file* over
-newer saved progress is a separate path (#124) this does not cover.
+newer saved progress is the next paragraph (#124).
+
+**An imported progress file never silently loses or repeats progress** (#124).
+Before restoring a file, `askAboutProgressFile` (`src/services/ProgressFileConflict.ts`)
+compares it with the saved progress and opens a dialog when:
+
+| `reason` | When | Buttons |
+| --- | --- | --- |
+| `saved_newer` | same import, saved `originalSucceededCount` higher | **Keep newer progress** (resumes saved) / Use this file anyway |
+| `other_import` | different import, saved progress has > 0 scrobbled | **Cancel** / Use this file anyway |
+| `completed` | saved progress (if any) is a different import, and this browser finished the file's import | **Cancel** / Import anyway |
+
+`completed` outranks `other_import` (its dialog mentions the replacement too),
+because duplicates can't be undone. "Same import" is equal `importId`; files without one fall back to equal
+`originalTotalTracks` for the same (or an unknown) user. Finishing an import
+clears the saved state, so `onScrobbleComplete` records it in localStorage
+(`scrobblify.completedImports`, last 20). Without ids on both sides, only a file
+saved before the import finished counts. It emits `progress_file_conflict_shown`
+and `progress_file_conflict_choice` (`choice`: `use_file` / `keep_saved` /
+`cancel`), both carrying `reason`, `source`, `file_succeeded`,
+`file_total_tracks`, `saved_succeeded`, `saved_total_tracks`. Before 2026-11-16
+a `session_resumed` with `source` `file`/`zip` at lower `completion_pct` than
+the user's previous event is this bug. Background-worker completions are not
+recorded, and a device with no local state has nothing to compare against.
+To keep files fresh, progress files are named `scrobblify-progress-YYYY-MM-DD-HHMM.json`
+(local time), and a stopped run's paused panel has a **Download progress file**
+button (`progress_file_downloaded`, same properties as `session_saved`) that
+doesn't leave the page.
 
 Before that, a fresh import that re-tags more than one day's budget (700
 plays) hits a blocking `LargeHistoryGate` on "Choose which tracks to scrobble":
@@ -233,6 +260,16 @@ sets `manuallyPaused` and gets `info` styling via `pauseAlertType` instead of a
 red `error` banner. Setting only `paused` renders a **disabled** "Wait Here"
 button waiting on an auto-resume the loop has already returned from — a dead end
 that stranded manual pauses, `repeated_rejections` and `repeated_failures`.
+
+A stop isn't immediate: the loop finishes the send it is waiting on first, and
+`scrobble()`'s `loopActive` re-entry guard ignores clicks until then. So while
+`canResume && loopActive` the button is a disabled **Pausing…** (or
+**Stopping…**), not Resume Now (#123). An enabled button there swallowed the
+click and left the run paused; before the guard (2026-11-15) the same click
+started a second loop and double-sent. If the in-flight send then fails (network
+error, rate limit), `pauseWithCountdown` returns at once while `manuallyPaused`
+is set rather than waiting out the backoff: its expiry clears `paused`, so the
+run used to carry on scrobbling after a 30-second to 30-minute "Pausing…".
 
 `session_invalid` is the one terminal path whose way back is *not* a retry.
 Last.fm error 9 ("Invalid session key") means the stored key has been
@@ -508,6 +545,14 @@ back corrupted on memory-constrained mobile browsers. **A file that can't be
 read or parsed is skipped, not fatal**; the import proceeds with what survived
 and warns the user in the log. Only a ZIP where *every* history file fails is an
 error. Don't "simplify" this back into an early return.
+
+The same goes for **rows**: `parseSpotifyJson` skips a play whose track or
+artist isn't text (finite numbers are coerced, so an artist named `1975`
+survives) or whose `ts` isn't a date, and counts it. The log says
+"Skipped N plays…" and `upload_parse_completed` carries `skipped_rows`. One
+non-string artist used to throw `t.split is not a function` and skip the whole
+file (#122), so `upload.parseJson` errors with that message Before 2026-11-16
+are this, not corruption.
 
 The file matcher is anchored to the **basename** (`/^Streaming_History_Audio_.*\.json$/`
 tested against `name.split('/').pop()`), and that anchoring is load-bearing.

@@ -152,26 +152,49 @@ export default class Scrobblify {
     return { unique, duplicateCount };
   }
 
-  public spotifyJsonToListens(jsonString: string): SpotifyListen[] {
+  /*
+    Parses one Spotify history file. Rows that can't become a play (an artist
+    or track that isn't text, or a timestamp that isn't a date) are skipped
+    and counted rather than thrown: one odd row used to skip the whole file.
+  */
+  public parseSpotifyJson(jsonString: string): { listens: SpotifyListen[]; skippedRows: number } {
     // Strip a leading UTF-8 BOM (\uFEFF) and surrounding whitespace before
     // parsing. Some Spotify exports prepend a BOM, which makes JSON.parse fail
     // with "Unrecognized token ''" in Safari/WebKit (the BOM renders as blank).
     const cleaned = jsonString.replace(/^\uFEFF/, '').trim();
     const parsedJson: any[] = JSON.parse(cleaned);
-    return parsedJson
-      .filter((play) => play.master_metadata_track_name != null)
-      .map((play) => {
-        const artistName: string = play.master_metadata_album_artist_name || '';
-        const allArtists: string[] = artistName.split(', ');
-
-        return new SpotifyListen(
-          allArtists[0],
-          play.master_metadata_track_name,
-          new Date(play.ts),
+    const asText = (value: unknown): string | null => {
+      if (typeof value === 'string') return value;
+      if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+      return null;
+    };
+    const listens: SpotifyListen[] = [];
+    let skippedRows = 0;
+    parsedJson
+      .filter((play) => play != null && play.master_metadata_track_name != null)
+      .forEach((play) => {
+        const trackName = asText(play.master_metadata_track_name);
+        const artistName = play.master_metadata_album_artist_name == null
+          ? ''
+          : asText(play.master_metadata_album_artist_name);
+        const listenDate = new Date(play.ts);
+        if (trackName === null || artistName === null || Number.isNaN(listenDate.getTime())) {
+          skippedRows++;
+          return;
+        }
+        listens.push(new SpotifyListen(
+          artistName.split(', ')[0],
+          trackName,
+          listenDate,
           play.ms_played,
-          play.master_metadata_album_album_name || '',
-        );
+          asText(play.master_metadata_album_album_name) || '',
+        ));
       });
+    return { listens, skippedRows };
+  }
+
+  public spotifyJsonToListens(jsonString: string): SpotifyListen[] {
+    return this.parseSpotifyJson(jsonString).listens;
   }
 
   public parseMultipleJsonFiles(jsonStrings: string[]): SpotifyListen[] {
