@@ -13,6 +13,10 @@ export interface MockLibrary {
   plays: MockPlay[];
   /** Plays kept per UTC day of the timestamp; the rest are accepted and dropped. */
   dailyCap: number;
+  /** Unsigned `user.getrecenttracks` is refused with error 17; signed reads work. */
+  hiddenProfile: boolean;
+  /** Every `user.getrecenttracks` fails with this Last.fm error code (0 = off). */
+  recentTracksError: number;
   add(play: MockPlay): void;
   countOnDay(uts: number): number;
 }
@@ -23,10 +27,18 @@ export interface MockResponse {
   body: string;
 }
 
-export function interceptLastFm(page: Page, options?: { dailyCap?: number }): Promise<MockLibrary>;
+export interface MockLibraryOptions {
+  hiddenProfile?: boolean;
+  recentTracksError?: number;
+}
+
+export function interceptLastFm(
+  page: Page,
+  options?: { dailyCap?: number } & MockLibraryOptions,
+): Promise<MockLibrary>;
 export function mockLastFmAuth(page: Page): Promise<void>;
 export function handleLastFm(params: URLSearchParams, library: MockLibrary): MockResponse;
-export function createLibrary(dailyCap?: number): MockLibrary;
+export function createLibrary(dailyCap?: number, options?: MockLibraryOptions): MockLibrary;
 export function recordScrobble(library: MockLibrary, params: URLSearchParams, body: unknown): void;
 export function lastFmAuthRedirect(basePath?: string): string;
 export const MOCK_USER: string;

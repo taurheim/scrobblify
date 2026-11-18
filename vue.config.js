@@ -113,7 +113,11 @@ function mockMiddlewares() {
   } = require('./tests/lastfmMock');
   // One library for the server's lifetime, so the app's read-back of what
   // Last.fm stored sees the plays it sent, as it would against the real API.
-  const library = createLibrary();
+  // MOCK_LASTFM_HIDDEN_PROFILE=1 (`npm run dev:mock -- --hidden-profile`)
+  // refuses unsigned history reads, as Last.fm does for hidden listening.
+  const library = createLibrary(undefined, {
+    hiddenProfile: process.env.MOCK_LASTFM_HIDDEN_PROFILE === '1',
+  });
 
   const entries = [
     {

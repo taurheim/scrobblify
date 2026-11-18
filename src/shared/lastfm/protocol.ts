@@ -39,6 +39,7 @@ export const ApiErrorCode = {
   InvalidSessionKey: 9,
   TokenNotAuthorized: 14,
   TokenExpired: 15,
+  LoginRequired: 17,
   SuspendedApiKey: 26,
   RateLimitExceeded: 29,
 } as const;
@@ -314,6 +315,15 @@ export function isRateLimitError(error: unknown): boolean {
  */
 export function isInvalidSessionKeyError(error: unknown): boolean {
   return hasErrorCode(error, [ApiErrorCode.InvalidSessionKey]);
+}
+
+/**
+ * Error 17, "Login: User required to be logged in": Last.fm will not show this
+ * user's data to the request. It is what an unsigned `user.getrecenttracks`
+ * gets for a profile with hidden recent listening.
+ */
+export function isLoginRequiredError(error: unknown): boolean {
+  return hasErrorCode(error, [ApiErrorCode.LoginRequired]);
 }
 
 /** The API key itself is suspended; every caller using it is dead until fixed. */

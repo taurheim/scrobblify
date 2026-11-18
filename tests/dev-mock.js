@@ -2,6 +2,7 @@
 //
 //   npm run dev:mock                 classic flow only
 //   npm run dev:mock -- --background also mocks the background worker
+//   npm run dev:mock -- --hidden-profile the user hides recent listening (#137)
 //
 // Starts a dev server whose Last.fm is served by the mock middleware in
 // vue.config.js, then prints a URL. Open it in whatever browser you like: the
@@ -52,6 +53,9 @@ const READY_URL = `${BASE_URL}/scrobblify/`;
 
 const args = process.argv.slice(2);
 const BACKGROUND = args.includes('--background');
+// The mocked user hides their recent listening: unsigned
+// `user.getrecenttracks` is refused with error 17 (#137).
+const HIDDEN_PROFILE = args.includes('--hidden-profile');
 // With --background the URL carries `?beta=1`, because the handoff offer is
 // behind that opt-in. It is sticky (localStorage), so it only needs visiting
 // once per browser profile; `?beta=0` switches it back off.
@@ -116,6 +120,10 @@ function banner() {
   console.log('');
   console.log('  "Click here to authorize" goes to the mock and signs you in as');
   console.log('  "testuser". All Last.fm calls return canned data.');
+  if (HIDDEN_PROFILE) {
+    console.log('  testuser hides their recent listening: unsigned history reads');
+    console.log('  are refused with error 17.');
+  }
   if (BACKGROUND) {
     console.log('');
     console.log('  Background worker MOCKED (no wrangler needed).');
@@ -156,7 +164,11 @@ async function main() {
     {
       stdio: 'inherit',
       shell: true,
-      env: { ...process.env, ...mockEnv({ background: BACKGROUND }) },
+      env: {
+        ...process.env,
+        ...mockEnv({ background: BACKGROUND }),
+        ...(HIDDEN_PROFILE ? { MOCK_LASTFM_HIDDEN_PROFILE: '1' } : {}),
+      },
     },
   );
 

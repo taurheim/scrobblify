@@ -22,7 +22,18 @@ const MOCK_SESSION_KEY = 'fake-session-key';
 const DEFAULT_DAILY_CAP = 750;
 const SECONDS_PER_DAY = 24 * 60 * 60;
 
-function createLibrary(dailyCap = DEFAULT_DAILY_CAP) {
+/** Last.fm's answer to an unsigned read of a profile with hidden recent listening. */
+const LOGIN_REQUIRED = { error: 17, message: 'Login: User required to be logged in' };
+
+/**
+ * @param {number} dailyCap
+ * @param {{ hiddenProfile?: boolean, recentTracksError?: number }} options
+ *   `hiddenProfile`: the user hides their recent listening, so an *unsigned*
+ *   `user.getrecenttracks` is refused with error 17 and only a request signed
+ *   with their session key is answered. `recentTracksError`: every
+ *   `user.getrecenttracks`, signed or not, fails with this Last.fm error code.
+ */
+function createLibrary(dailyCap = DEFAULT_DAILY_CAP, { hiddenProfile = false, recentTracksError = 0 } = {}) {
   const plays = [];
   const countOnDay = (uts) => {
     const day = Math.floor(uts / SECONDS_PER_DAY);
@@ -31,6 +42,8 @@ function createLibrary(dailyCap = DEFAULT_DAILY_CAP) {
   return {
     plays,
     dailyCap,
+    hiddenProfile,
+    recentTracksError,
     /** Store a play as Last.fm would: silently not at all once its day is full. */
     add(play) {
       if (countOnDay(play.uts) < this.dailyCap) {
@@ -134,6 +147,12 @@ function handleLastFm(params, library) {
   }
 
   if (apiMethod === 'user.getrecenttracks') {
+    if (library.recentTracksError) {
+      return { ...json({ error: library.recentTracksError, message: 'Mocked failure' }), status: 403 };
+    }
+    if (library.hiddenProfile && !(params.get('sk') && params.get('api_sig'))) {
+      return { ...json(LOGIN_REQUIRED), status: 403 };
+    }
     return json(recentTracksBody(library, params));
   }
 
@@ -180,8 +199,8 @@ function requestParams(request) {
 // Intercept all Last.fm API calls and fulfill them with fake data. Resolves to
 // the mock's library, so a test can inspect what was really "stored" or
 // pre-fill a day.
-async function interceptLastFm(page, { dailyCap = DEFAULT_DAILY_CAP } = {}) {
-  const library = createLibrary(dailyCap);
+async function interceptLastFm(page, { dailyCap = DEFAULT_DAILY_CAP, ...options } = {}) {
+  const library = createLibrary(dailyCap, options);
 
   page.on('response', async (response) => {
     const request = response.request();

@@ -189,7 +189,7 @@ export default class LastFm {
       from: LastFm.dateToSecondsString(from, 'floor'),
       to: LastFm.dateToSecondsString(to, 'ceil'),
     };
-    const response = await this.makeRequest('GET', requestParams);
+    const response = await this.readRecentTracks(requestParams);
     const tracks = response.recenttracks.track;
     if (!Array.isArray(tracks)) {
       return [];
@@ -234,7 +234,7 @@ export default class LastFm {
         limit: String(PAGE),
       };
       // eslint-disable-next-line no-await-in-loop
-      const response = await this.makeRequest('GET', requestParams);
+      const response = await this.readRecentTracks(requestParams);
       let tracks = response && response.recenttracks && response.recenttracks.track;
       if (tracks && !Array.isArray(tracks)) {
         tracks = [tracks];
@@ -289,7 +289,7 @@ export default class LastFm {
       limit: PAGE_SIZE.toString(),
       page: '1',
     };
-    const firstResponse = await this.makeRequest('GET', firstParams);
+    const firstResponse = await this.readRecentTracks(firstParams);
     const attr = firstResponse.recenttracks['@attr'];
     const totalPages = parseInt(attr.totalPages, 10);
     const total = parseInt(attr.total, 10);
@@ -317,7 +317,7 @@ export default class LastFm {
         limit: PAGE_SIZE.toString(),
         page: page.toString(),
       };
-      const response = await this.makeRequest('GET', params);
+      const response = await this.readRecentTracks(params);
       const tracks = response.recenttracks.track;
       if (Array.isArray(tracks)) {
         for (const track of tracks) {
@@ -344,7 +344,7 @@ export default class LastFm {
     if (this.userName === null) {
       throw new Error('Couldn\'t find username');
     }
-    const response = await this.makeRequest('GET', {
+    const response = await this.readRecentTracks({
       method: 'user.getrecenttracks',
       user: this.userName,
       from: String(Math.floor(fromSec)),
@@ -454,6 +454,30 @@ export default class LastFm {
   /** https://www.last.fm/api/show/track.scrobble — ignoredMessage codes. */
   public static describeIgnoreCode(code: number, message: string): string {
     return protocol.describeIgnoreCode(code, message);
+  }
+
+  /**
+   * `user.getrecenttracks`, signed with the session key when there is one.
+   *
+   * Last.fm refuses an unsigned read of a profile whose recent listening is
+   * hidden (error 17) but answers its owner's signed one, so unsigned reads
+   * never confirmed a single play for those users (#137). A key Last.fm
+   * rejects (error 9) is retried unsigned, as every read was before: the
+   * scrobble step owns telling the user to sign in again, and a public
+   * profile's history is still readable meanwhile.
+   */
+  private async readRecentTracks(params: {[key: string]: string}): Promise<any> {
+    if (!this.userAuthKey) {
+      return this.makeRequest('GET', params);
+    }
+    try {
+      return await this.makeRequest('GET', params, true);
+    } catch (e) {
+      if (!LastFm.isSessionKeyError(e)) {
+        throw e;
+      }
+      return this.makeRequest('GET', params);
+    }
   }
 
   private async makeRequest(
@@ -572,6 +596,11 @@ export default class LastFm {
   // retrying it can only fail the same way; the user has to sign in again.
   public static isSessionKeyError(error: unknown): boolean {
     return protocol.isInvalidSessionKeyError(error);
+  }
+
+  // Error 17: Last.fm won't show this user's library to the request.
+  public static isLoginRequiredError(error: unknown): boolean {
+    return protocol.isLoginRequiredError(error);
   }
 
   // No session key at all, so nothing was sent. Like error 9 the only way
