@@ -133,12 +133,15 @@
 <script lang="ts">
 import { defineComponent } from 'vue';
 import { BUILD_NUMBER, GIT_SHA } from './buildInfo';
-import { DeployedBuild, fetchDeployedBuild, isStaleBuild } from './services/BuildCheck';
+import { DeployedBuild, compareDeployedBuild, fetchDeployedBuild } from './services/BuildCheck';
 import { trackEvent } from './services/Analytics';
 
 const RECHECK_INTERVAL_MS = 30 * 60 * 1000;
 // Returning to a backgrounded tab rechecks, but not on every quick switch.
 const MIN_RECHECK_GAP_MS = 5 * 60 * 1000;
+// An older build's version.json is usually a cached copy that keeps coming
+// back (#138); report each sha once per page load, not on every recheck.
+const reportedOlderShas = new Set<string>();
 // Remembers which deployed build a reload was meant to pick up, so a reload
 // that came back stale anyway (an intermediary still caching index.html) is
 // distinguishable in analytics from a user who never reloaded.
@@ -203,14 +206,22 @@ export default defineComponent({
       this.lastBuildCheckAt = Date.now();
       try {
         const deployed = await fetchDeployedBuild();
-        if (!deployed) {
+        const comparison = deployed && compareDeployedBuild(deployed);
+        if (!deployed || comparison === 'older') {
+          if (deployed && !reportedOlderShas.has(deployed.sha)) {
+            reportedOlderShas.add(deployed.sha);
+            trackEvent('stale_build_older_ignored', {
+              fetched_sha: deployed.sha,
+              fetched_run: deployed.run,
+            });
+          }
           if (this.buildCheck === 'pending') {
             this.buildCheck = 'unknown';
           }
           return;
         }
         this.deployedBuild = deployed;
-        if (!isStaleBuild(deployed)) {
+        if (comparison === 'current') {
           this.buildCheck = 'current';
           return;
         }

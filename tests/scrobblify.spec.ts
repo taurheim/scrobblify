@@ -3550,13 +3550,15 @@ test.describe('Invalid session key', () => {
 });
 
 test.describe('Stale build detection', () => {
-  const VERSION_JSON = '**/scrobblify/version.json';
+  // Matches with or without a query string.
+  const VERSION_JSON = (url: URL) => url.pathname.endsWith('/scrobblify/version.json');
+  const BUILD_CHECK = '#site-footer span[data-build-check]';
 
-  function serveVersion(page: Page, sha: () => string) {
+  function serveVersion(page: Page, sha: () => string, run: () => number = () => 999999) {
     return page.route(VERSION_JSON, (route) => route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ sha: sha(), run: 999 }),
+      body: JSON.stringify({ sha: sha(), run: run() }),
     }));
   }
 
@@ -3564,6 +3566,53 @@ test.describe('Stale build detection', () => {
     const title = await page.locator('#site-footer span[title]').getAttribute('title');
     return (title || '').split(' ')[0];
   }
+
+  // The footer reads "<sha> · Build <run>"; see buildLabel in App.vue.
+  async function runningRun(page: Page): Promise<number> {
+    const title = await page.locator('#site-footer span[title]').getAttribute('title');
+    const run = (title || '').split(' ').pop() || '';
+    expect(run, 'the test server must be a numbered build; see playwright.config.ts').toMatch(/^\d+$/);
+    return Number(run);
+  }
+
+  test('ignores a version.json from an older build than the running one (#138)', async ({ page }) => {
+    const events = captureEvents(page);
+    let answer: { sha: string; run: number } | null = null;
+    await page.route(VERSION_JSON, (route) => (answer
+      ? route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(answer) })
+      : route.fulfill({ status: 404, body: 'Not found' })));
+    await page.goto('/');
+    await expect(page.locator(BUILD_CHECK)).toHaveAttribute('data-build-check', 'unknown');
+    const run = await runningRun(page);
+
+    // A browser-cached answer from an earlier deploy: different sha, lower run.
+    answer = { sha: '0137860', run: run - 1 };
+    await page.reload();
+    await expect(page.locator(BUILD_CHECK)).toHaveAttribute('data-build-check', 'unknown');
+    await expect(page.locator('#update-available')).toHaveCount(0);
+    expect(events.filter((e) => e.name === 'stale_build_detected')).toEqual([]);
+    expect(events.filter((e) => e.name === 'stale_build_older_ignored').map((e) => e.props))
+      .toEqual([expect.objectContaining({ fetched_sha: '0137860', fetched_run: run - 1 })]);
+
+    answer = { sha: '0000000', run: run + 1 };
+    await page.reload();
+    await expect(page.locator('#update-available')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(BUILD_CHECK)).toHaveAttribute('data-build-check', 'stale');
+  });
+
+  test('asks for version.json at a fresh URL on every check, so no cached answer is reused', async ({ page }) => {
+    const urls: string[] = [];
+    await page.route(VERSION_JSON, (route) => {
+      urls.push(route.request().url());
+      return route.fulfill({ status: 404, body: 'Not found' });
+    });
+    await page.goto('/');
+    await expect(page.locator(BUILD_CHECK)).toHaveAttribute('data-build-check', 'unknown');
+    await page.reload();
+    await expect(page.locator(BUILD_CHECK)).toHaveAttribute('data-build-check', 'unknown');
+    await expect.poll(() => urls.length).toBe(2);
+    expect(new Set(urls).size).toBe(2);
+  });
 
   test('offers a reload when a newer build is deployed, and clears once current', async ({ page }) => {
     let deployed = '0000000';

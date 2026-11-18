@@ -26,5 +26,10 @@ export default defineConfig({
     url: `http://localhost:${PORT}/scrobblify/`,
     reuseExistingServer: true,
     timeout: 180000,
+    // Number the build as CI does (vue.config.js reads GITHUB_RUN_NUMBER), so
+    // the stale-build check compares run numbers here as it does in production.
+    env: {
+      GITHUB_RUN_NUMBER: process.env.GITHUB_RUN_NUMBER || '100',
+    },
   },
 });

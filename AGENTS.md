@@ -88,8 +88,8 @@ than the fix is this, not a regression. Mitigations:
   (`reloaded`, `skip_reason`: `recent_reload` / `run_active` / `no_storage`,
   `path`, `message`).
 - The app fetches `version.json` (`src/services/BuildCheck.ts`) on load, every
-  30 minutes and when a backgrounded tab returns, and if its `sha` differs from
-  `build_sha` shows a "newer version — Reload" banner. It is hidden while a run
+  30 minutes and when a backgrounded tab returns, and if it names a newer build
+  than `build_sha` shows a "newer version — Reload" banner. It is hidden while a run
   is actively scrobbling (`scrobbleRunActive` in the store), because a reload
   then drops everything since the last checkpoint. It emits
   `stale_build_detected` (`latest_sha`, `latest_run`, `reloaded_for_latest` —
@@ -97,6 +97,18 @@ than the fix is this, not a regression. Mitigations:
   `index.html`) and `stale_build_reload_clicked`. Tabs on builds from before
   this shipped can't detect themselves, so they still show up as old
   `build_sha`s until they reload.
+- "Newer" means a different sha **and** a higher `run` than the tab's
+  `build_number` (#138). Some returning users' browsers kept handing back a
+  `version.json` they had fetched days earlier, despite `cache: 'no-store'`, so
+  tabs on the current build were told an *older* build was newer, and
+  reloading for it didn't help. Every fetch now carries a unique `?t=` query,
+  and an answer whose `run` isn't above the tab's own is ignored and reported
+  once per sha per page load as `stale_build_older_ignored` (`fetched_sha`,
+  `fetched_run`). Local builds (`build_number` `local`) and files without a
+  `run` fall back to comparing the sha alone. **`stale_build_detected` with
+  `latest_run` below `build_number` before this fix (2026-11-17) is this bug.**
+  Playwright numbers its test server's build (`GITHUB_RUN_NUMBER`, default
+  `100`, in `playwright.config.ts`) so this comparison runs in tests.
 
 ### Errors
 
@@ -124,8 +136,9 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `tracks_selected` → `scrobble_started` / `scrobble_resumed` / `scrobble_paused` /
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
 `session_resumed`, `session_resume_blocked`, and `user_logged_out`.
-`stale_build_detected` / `stale_build_reload_clicked` / `chunk_load_failed` are
-outside the funnel (see "Old builds keep running" above).
+`stale_build_detected` / `stale_build_reload_clicked` /
+`stale_build_older_ignored` / `chunk_load_failed` are outside the funnel (see
+"Old builds keep running" above).
 
 Since 2026-11-15 `tracks_selected` fires when the user confirms the "Scrobble N
 tracks?" dialog, not on the select step's button. That dialog estimates the
