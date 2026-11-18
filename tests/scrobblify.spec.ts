@@ -74,6 +74,37 @@ test.describe('About Page', () => {
     await page.goto('/#/about');
     await expect(page.locator('body')).toContainText('Scrobblify');
   });
+
+  // A deleted chunk from an older build: the server answers with HTML (or 404).
+  async function failAboutChunk(page: Page, failures: number) {
+    const requests = { count: 0 };
+    await page.route('**/js/about*.js', (route) => {
+      requests.count += 1;
+      if (requests.count <= failures) {
+        return route.fulfill({ status: 404, contentType: 'text/html', body: '<!DOCTYPE html>' });
+      }
+      return route.continue();
+    });
+    return requests;
+  }
+
+  test('reloads once when a lazy route chunk fails to load', async ({ page }) => {
+    const requests = await failAboutChunk(page, 1);
+    await page.goto('/#/');
+    await page.evaluate(() => { window.location.hash = '#/about'; });
+    await expect(page.locator('.about h1').first()).toHaveText('What is Scrobblify?', { timeout: 10000 });
+    expect(requests.count).toBe(2);
+  });
+
+  test('does not reload-loop when the chunk is missing again', async ({ page }) => {
+    const requests = await failAboutChunk(page, Infinity);
+    await page.goto('/#/');
+    await page.evaluate(() => { window.location.hash = '#/about'; });
+    await expect.poll(() => requests.count, { timeout: 10000 }).toBe(2);
+    await page.waitForTimeout(1500);
+    expect(requests.count).toBe(2);
+    await expect(page.locator('.about')).toHaveCount(0);
+  });
 });
 
 test.describe('Scrobble Page - Authentication Step', () => {

@@ -31,6 +31,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      # The deployed site depends on it; see public/.htaccess and #136.
+      - name: Check build output
+        run: test -f dist/.htaccess && test -f dist/index.html
 
   e2e-tests:
     name: E2E Tests

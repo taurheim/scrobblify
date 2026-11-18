@@ -2,6 +2,7 @@ import { createApp } from 'vue';
 import {
   initAnalytics, registerGlobalErrorHandlers, trackError, trackPageView,
 } from '@/services/Analytics';
+import { installChunkReload } from '@/services/ChunkReload';
 import vuetify from './plugins/vuetify';
 import App from './App.vue';
 import router from './router';
@@ -25,6 +26,8 @@ app.config.errorHandler = (err, vm, info) => {
 router.afterEach((to) => {
   trackPageView(to.fullPath);
 });
+
+installChunkReload(router);
 
 app.use(router);
 app.use(store);

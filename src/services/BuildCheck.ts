@@ -4,8 +4,8 @@ import { GIT_SHA } from '../buildInfo';
   Detects a tab running an older build than the one deployed.
 
   Browsers keep serving an old index.html (heuristic caching, restored or
-  discarded tabs), and the FTP deploy leaves old hashed chunks in place, so a
-  stale page still boots fine and runs code missing every fix since. In
+  discarded tabs), and with its chunks in the browser's cache a stale page
+  still boots fine and runs code missing every fix since. In
   telemetry this showed up as users on builds days to months old, still hitting
   bugs that had been fixed for them.
 

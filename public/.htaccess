@@ -1,13 +1,36 @@
 # Deployed to the server alongside the build (copied from public/ into dist/).
+# CI's upload-artifact step must keep include-hidden-files: true, or this file
+# silently never reaches the server (it didn't from #105 until #136). cd.yml
+# refuses to deploy an artifact without it: the FTP sync deletes server files
+# that drop out of the build, so a build without this file would also remove
+# the SPA fallback below and break every deep link.
 #
 # index.html names the current build's hashed JS/CSS chunks, so it must be
 # revalidated on every load. Without a Cache-Control header browsers cache it
-# heuristically (often for days), and because the FTP deploy leaves old chunks
-# on the server a stale copy still boots, running code missing every fix since.
-# version.json is what the app polls to detect that, so it can't be cached
-# either. "no-cache" still allows a cheap 304 when nothing changed.
+# heuristically (often for days), and a stale copy runs code missing every fix
+# since. version.json is what the app polls to detect that, so it can't be
+# cached either. "no-cache" still allows a cheap 304 when nothing changed.
 <IfModule mod_headers.c>
   <FilesMatch "^(index\.html|version\.json)$">
     Header set Cache-Control "no-cache"
   </FilesMatch>
+</IfModule>
+
+# The FTP deploy deletes the previous build's chunks. A missing asset used to
+# get the SPA fallback below, i.e. index.html with "200 text/html", which
+# Cloudflare then cached for hours as if it were the script ("Unexpected token
+# '<'"). Asset paths that don't exist are now a plain 404, so an old page fails
+# fast and the router can reload it (src/services/ChunkReload.ts).
+#
+# The fallback itself is spelled out here rather than left to the server:
+# a .htaccess that turns on RewriteEngine replaces any rewrite rules a parent
+# directory applies, and this file replaces whatever the server had here.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteRule ^(js|css|img|fonts|media)/ - [R=404,L]
+  RewriteRule ^index\.html$ - [L]
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule . /scrobblify/index.html [L]
 </IfModule>

@@ -56,17 +56,37 @@ on the site as a hover tooltip on "Scrobblify" in the footer, and the deployed
 `/scrobblify/version.json` (written by the CI build job) has the full SHA and
 build time.
 
-**Old builds keep running long after a deploy.** Until 2026-10-03 `index.html`
-was served with no `Cache-Control`, so browsers cached it heuristically, and the
-FTP deploy never deletes old hashed chunks, so a stale copy still boots. About
-5–7% of fresh page loads ran a superseded build for days after each deploy (one
-user was on code two months old), and those users kept hitting already-fixed
-bugs. **Before calling a fix ineffective, check `build_sha`**: an occurrence on
-a build older than the fix is this, not a regression. Two mitigations:
+**Old builds keep running long after a deploy.** Until #136's `.htaccess`
+reached the server, `index.html` was served with no `Cache-Control`, so
+browsers cached it heuristically, and a stale copy still boots while its chunks
+are in the browser's cache. About 5–7% of fresh page
+loads ran a superseded build for days after each deploy (one user was on code
+two months old), and those users kept hitting already-fixed bugs. **Before
+calling a fix ineffective, check `build_sha`**: an occurrence on a build older
+than the fix is this, not a regression. Mitigations:
 
 - `public/.htaccess` sets `Cache-Control: no-cache` on `index.html` and
-  `version.json` (Vue CLI copies dotfiles from `public/`). Verify after a
-  deploy with `curl -I https://savas.ca/scrobblify/`.
+  `version.json`. It shipped in #105 (2026-10-03) but **never reached the
+  server until #136** (2026-11): `actions/upload-artifact` drops dotfiles
+  unless `include-hidden-files: true`, so the deployed artifact had no
+  `.htaccess`. CI and CD now fail if `dist/.htaccess` is missing. Verify after
+  a deploy with `curl -I https://savas.ca/scrobblify/`; if no `Cache-Control`
+  shows up, the host is ignoring it and the rule belongs in Cloudflare.
+- **The FTP deploy deletes the previous build's chunks** (FTP-Deploy-Action
+  syncs against `.ftp-deploy-sync-state.json` and removes what dropped out).
+  Its `exclude` option can't keep them: excluded files are neither deleted nor
+  uploaded. Missing chunks used to get the SPA fallback, `index.html` as
+  `200 text/html`, which Cloudflare cached for 4h under the `.js` URL
+  (`Unexpected token '<'`). `.htaccess` now answers missing `js/`, `css/`,
+  `img/`, `fonts/` and `media/` paths with a 404, and also carries the SPA
+  fallback itself, because enabling `RewriteEngine` there replaces any parent
+  rewrite rules. A build without `.htaccess` would make the sync delete it and
+  break every deep link, which is why `cd.yml` checks for it.
+- `src/services/ChunkReload.ts`: when a lazy route's chunk fails to load
+  (`router.onError`), the target URL is loaded in full, at most once a minute
+  per tab and never while `scrobbleRunActive`. It emits `chunk_load_failed`
+  (`reloaded`, `skip_reason`: `recent_reload` / `run_active` / `no_storage`,
+  `path`, `message`).
 - The app fetches `version.json` (`src/services/BuildCheck.ts`) on load, every
   30 minutes and when a backgrounded tab returns, and if its `sha` differs from
   `build_sha` shows a "newer version — Reload" banner. It is hidden while a run
@@ -104,8 +124,8 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `tracks_selected` → `scrobble_started` / `scrobble_resumed` / `scrobble_paused` /
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
 `session_resumed`, `session_resume_blocked`, and `user_logged_out`.
-`stale_build_detected` / `stale_build_reload_clicked` are outside the funnel
-(see "Old builds keep running" above).
+`stale_build_detected` / `stale_build_reload_clicked` / `chunk_load_failed` are
+outside the funnel (see "Old builds keep running" above).
 
 Since 2026-11-15 `tracks_selected` fires when the user confirms the "Scrobble N
 tracks?" dialog, not on the select step's button. That dialog estimates the
