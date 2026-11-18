@@ -19,6 +19,13 @@ jobs:
           run_id: ${{ github.event.workflow_run.id }}
           name: dist
           path: dist/
+      # The FTP sync deletes server files missing from the artifact, so a build
+      # without .htaccess would also take down the SPA fallback (#136).
+      - name: Check artifact
+        run: |
+          for f in .htaccess index.html version.json; do
+            test -f "dist/$f" || { echo "::error::dist/$f is missing from the artifact"; exit 1; }
+          done
       - name: Deploy via FTP
         uses: SamKirkland/FTP-Deploy-Action@v4.3.6
         with:
