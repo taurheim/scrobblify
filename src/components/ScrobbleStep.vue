@@ -37,7 +37,10 @@
           Overall: {{ totalSucceeded }} of {{ originalTotalTracks }} scrobbled
         </div>
         <div v-if="pending.length > 0">
-          {{ pending.length }} more sent, being checked on Last.fm
+          <template v-if="libraryUnreadable">
+            {{ pending.length }} more sent, but {{ libraryUnreadableNote }}
+          </template>
+          <template v-else>{{ pending.length }} more sent, being checked on Last.fm</template>
         </div>
         <div>
           This session: {{ scrobbledTracks }} of {{ tracksToScrobble.length }}
@@ -105,7 +108,10 @@
         <div class="mb-3 overall-progress">
           {{ totalSucceeded }} of {{ originalTotalTracks }} completed so far
           <span v-if="pending.length > 0" class="font-weight-regular">
-            ({{ pending.length }} more sent, checked on Last.fm when you resume)
+            <template v-if="libraryUnreadable">
+              ({{ pending.length }} more sent, but {{ libraryUnreadableNote }})
+            </template>
+            <template v-else>({{ pending.length }} more sent, checked on Last.fm when you resume)</template>
           </span>
         </div>
 
@@ -151,8 +157,13 @@
         quietly counting what Last.fm merely accepted.
       -->
       <v-alert v-if="pending.length > 0" type="warning" variant="tonal" class="mt-2">
-        {{ pending.length }} more were sent, but Scrobblify couldn't read your Last.fm library to
-        confirm them, so they aren't counted above.
+        <template v-if="libraryUnreadable">
+          {{ pending.length }} more were sent, but {{ libraryUnreadableNote }}. They aren't counted above.
+        </template>
+        <template v-else>
+          {{ pending.length }} more were sent, but Scrobblify couldn't read your Last.fm library to
+          confirm them, so they aren't counted above.
+        </template>
       </v-alert>
     </div>
 
@@ -433,6 +444,10 @@ export default defineComponent({
       // seconds), counting this run's sends since the last read.
       dayStored: {} as Record<number, number>,
       verifyErrorReported: false,
+      // Last.fm refused to read the library back (error 17) this run. Not a
+      // blip, so the plays are no longer described as "being checked" and are
+      // not read again until the next run.
+      libraryUnreadable: false,
       // High-water mark of the send-time timestamp allocator for re-tagged
       // plays. Persisted so a resume cannot reuse an earlier run's seconds.
       reTagCursorSec: 0,
@@ -644,6 +659,11 @@ export default defineComponent({
       return this.stopped ? 'error' : 'warning';
     },
 
+    libraryUnreadableNote(): string {
+      return 'Last.fm won\'t let Scrobblify read your recent listening to confirm them'
+        + ' (this happens when it is hidden in your Last.fm privacy settings)';
+    },
+
     /** Tracks in this session that have not been processed yet. */
     tracksRemaining(): number {
       return Math.max(0, this.tracksToScrobble.length - this.scrobbledTracks);
@@ -790,6 +810,7 @@ export default defineComponent({
         succeeded_tracks: this.confirmedTracks,
         failed_tracks: this.failedTracks.length,
         unconfirmed_tracks: this.pending.length,
+        library_unreadable: this.libraryUnreadable,
         not_stored_tracks: this.droppedTracks,
         is_resumed: this.isResumed,
         previously_scrobbled: this.previouslyScrobbled,
@@ -814,10 +835,15 @@ export default defineComponent({
     },
 
     async refreshStored(api: LastFm, tracker: RateLimitTracker, daySec: number) {
-      let stored: number;
-      try {
-        stored = await api.countStoredScrobbles(daySec, nextUtcDayStartSec(daySec) - 1);
-      } catch (e) {
+      let stored: number | null = null;
+      if (!this.libraryUnreadable) {
+        try {
+          stored = await api.countStoredScrobbles(daySec, nextUtcDayStartSec(daySec) - 1);
+        } catch (e) {
+          this.noteReadFailure(e);
+        }
+      }
+      if (stored === null) {
         // The library can't be read (network, private profile). Fall back to
         // what this browser itself sent that day, which misses the user's own
         // listening but is the best floor available.
@@ -831,6 +857,16 @@ export default defineComponent({
 
     recordStored(daySec: number) {
       this.dayStored = { ...this.dayStored, [daySec]: (this.dayStored[daySec] || 0) + 1 };
+    },
+
+    /*
+      Error 17 even though reads are signed with the session key (#137): Last.fm
+      will not show this library to us, and asking again won't change that.
+    */
+    noteReadFailure(e: unknown) {
+      if (LastFm.isLoginRequiredError(e)) {
+        this.libraryUnreadable = true;
+      }
     },
 
     /**
@@ -885,13 +921,14 @@ export default defineComponent({
      * so it is recorded as failed.
      *
      * If the library can't be read, everything stays unconfirmed and is checked
-     * again at the next opportunity, including after a resume.
+     * again at the next opportunity, including after a resume. Unless Last.fm
+     * refused outright (`libraryUnreadable`): then not until the next run.
      *
      * Returns true when a lost play was dated today or later: the day's cap is
      * full, and the run must stop rather than keep sending into it.
      */
     async verifyPending(api: LastFm): Promise<boolean> {
-      if (this.pending.length === 0) {
+      if (this.pending.length === 0 || this.libraryUnreadable) {
         return false;
       }
       const batch = this.pending.slice();
@@ -903,10 +940,14 @@ export default defineComponent({
           missing = await this.unconfirmed(api, missing);
         }
       } catch (e) {
+        this.noteReadFailure(e);
         if (!this.verifyErrorReported) {
           this.verifyErrorReported = true;
+          const message = (e instanceof Error && e.message) || String(e);
           trackEvent('scrobble_verify_failed', this.progressProps({
-            message: (e instanceof Error && e.message) || String(e),
+            // The request echo carries the username, which split one cause
+            // into a group per user.
+            message: message.replace(/\. Request: [\s\S]*$/, ''),
           }));
         }
         return false;
@@ -1056,6 +1097,8 @@ export default defineComponent({
       // paused view keeps rendering. This tracks whether the send loop is
       // actually executing, which is what a handoff has to wait for.
       this.loopActive = true;
+      // Asked again each run: the user may have changed the setting since.
+      this.libraryUnreadable = false;
       /*
         Held for the whole loop, including the gaps between tracks, so that a
         freezing tab's exclusive request cannot be granted while this tab still

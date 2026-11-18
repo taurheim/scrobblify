@@ -46,6 +46,24 @@ async function scrobbleSelection(page: Page) {
   await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
 }
 
+type Tracked = { name: string; props: Record<string, unknown> };
+
+// What `trackEvent` would have sent, read from its dev-build console echo:
+// nothing is captured from localhost, so this is the only place it shows.
+function captureEvents(page: Page): Tracked[] {
+  const events: Tracked[] = [];
+  page.on('console', (msg) => {
+    const match = msg.text().match(/^\[scrobblify:event\] (\S+) ([\s\S]*)$/);
+    if (!match) return;
+    try {
+      events.push({ name: match[1], props: JSON.parse(match[2]) });
+    } catch {
+      // Not ours.
+    }
+  });
+  return events;
+}
+
 test.describe('Home Page', () => {
   test('renders home page with instructions', async ({ page }) => {
     await page.goto('/');
@@ -2266,6 +2284,66 @@ test.describe('Session Resume', () => {
     expect(scrobbled).toEqual(['Track 1', 'Track 2', 'Track 3', 'Track 4', 'Track 5']);
     await expect(page.locator('.overall-progress')).toContainText('5 of 10');
   });
+
+  test('plays from a profile with hidden recent listening are still confirmed', async ({ page }) => {
+    // Regression for #137: the read-back was unsigned, and Last.fm refuses an
+    // unsigned read of a hidden profile with error 17. Nothing was ever
+    // confirmed: "0 scrobbled", every play "sent, couldn't confirm".
+    test.setTimeout(60000);
+    const library = await interceptLastFm(page, { hiddenProfile: true });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, reTaggedState(5));
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
+    expect(library.plays).toHaveLength(5);
+    await expect(page.locator('text=We scrobbled 5 tracks')).toBeVisible();
+    await expect(page.locator('text=couldn\'t be read to confirm')).toHaveCount(0);
+  });
+
+  test('a library Last.fm will not let us read is not reported as "being checked"', async ({ page }) => {
+    // Even signed, a read can be refused for good (#137). Promising the plays
+    // will be checked "when you resume" was untrue for the rest of the import.
+    test.setTimeout(60000);
+    const events = captureEvents(page);
+    await interceptLastFm(page, { recentTracksError: 17 });
+    const scrobbled: string[] = [];
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(route.request().postData() || '');
+      if (params.get('method') === 'track.scrobble') {
+        scrobbled.push(params.get('track[0]') || '');
+        // Slow enough that the pause lands mid-run.
+        await new Promise((resolve) => { setTimeout(resolve, 700); });
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, reTaggedState(10));
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await page.waitForTimeout(2500);
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    await expect.poll(() => scrobbled.length, { timeout: 20000 }).toBeGreaterThanOrEqual(2);
+    await page.getByRole('button', { name: 'Pause & Save' }).click();
+    await expect(page.getByRole('button', { name: 'Resume Now' })).toBeVisible({ timeout: 10000 });
+
+    await expect(page.locator('text=checked on Last.fm when you resume')).toHaveCount(0);
+    await expect(page.locator('text=won\'t let Scrobblify read your recent listening')).toBeVisible();
+    await expect.poll(() => events.find((e) => e.name === 'scrobble_stopped')?.props).toMatchObject({
+      reason: 'manual',
+      library_unreadable: true,
+    });
+  });
 });
 
 test.describe('Rate limit handling', () => {
@@ -3160,6 +3238,55 @@ test.describe('Import robustness', () => {
       expect(range.to).toMatch(/^\d+$/);
     }
   });
+
+  // One play from yesterday, already in the library, run through the
+  // duplicate check.
+  async function checkDuplicatesOfOnePlay(page: Page, library: MockLibrary) {
+    const uts = Math.floor(Date.now() / 1000) - 86400;
+    library.add({
+      track: 'Bohemian Rhapsody', artist: 'Queen', album: '', uts,
+    });
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await page.reload();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': JSON.stringify([
+        play('Bohemian Rhapsody', 'Queen', new Date(uts * 1000).toISOString()),
+      ]),
+    }));
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+  }
+
+  test('the duplicate check can read a profile with hidden recent listening', async ({ page }) => {
+    // #137: the history read was unsigned, which Last.fm refuses with error 17
+    // for a hidden profile, so every play was sent again.
+    const library = await interceptLastFm(page, { hiddenProfile: true });
+    await checkDuplicatesOfOnePlay(page, library);
+    await expect(page.locator('text=Found 1 duplicates')).toBeVisible({ timeout: 30000 });
+  });
+
+  test('the duplicate check still reads history when the stored session key is dead', async ({ page }) => {
+    // Signing a read with a revoked key fails with error 9, where an unsigned
+    // read of a public profile works. The scrobble step deals with the dead
+    // key; the duplicate check must not lose its answer to it first.
+    const library = await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('method') === 'user.getrecenttracks' && url.searchParams.get('sk')) {
+        await route.fulfill({
+          status: 403,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 9, message: 'Invalid session key - Please re-authenticate' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    await checkDuplicatesOfOnePlay(page, library);
+    await expect(page.locator('text=Found 1 duplicates')).toBeVisible({ timeout: 30000 });
+  });
 });
 
 test.describe('Invalid session key', () => {
@@ -3510,24 +3637,6 @@ test.describe('Browser storage unavailable', () => {
   const JOURNAL_KEY = 'scrobblify.background.inflightSecond';
   const STOPPED = "text=couldn't store data in this browser >> visible=true";
   const SAVE_FAILED = "text=couldn't save your progress in this browser >> visible=true";
-
-  type Tracked = { name: string; props: Record<string, unknown> };
-
-  // What `trackEvent` would have sent, read from its dev-build console echo:
-  // nothing is captured from localhost, so this is the only place it shows.
-  function captureEvents(page: Page): Tracked[] {
-    const events: Tracked[] = [];
-    page.on('console', (msg) => {
-      const match = msg.text().match(/^\[scrobblify:event\] (\S+) ([\s\S]*)$/);
-      if (!match) return;
-      try {
-        events.push({ name: match[1], props: JSON.parse(match[2]) });
-      } catch {
-        // Not ours.
-      }
-    });
-    return events;
-  }
 
   // The journal write fails the way a full localStorage does.
   async function blockJournal(page: Page) {

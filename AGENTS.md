@@ -220,7 +220,9 @@ request but discards the play (see below). `scrobble_not_stored` (`not_stored`,
 `re_tagged_not_stored`, `checked`) fires when plays Last.fm answered as
 accepted are missing from the user's library on a day at the cap, and
 `scrobble_verify_failed` (once per run, `message`) when the library couldn't be
-read back at all — see "Last.fm's daily cap".
+read back at all — see "Last.fm's daily cap". Its `message` no longer carries
+the request echo (`. Request: {…}`, which included the username and split one
+cause into a group per user) since #137.
 
 **`scrobble_paused` and `scrobble_stopped` are deliberately separate events**, so
 "how often does a run end early, and why" is answerable without knowing which
@@ -402,7 +404,16 @@ and since Last.fm's cap dropped to 750 on 2026-06-24 that overstates heavy
 users by up to ~1,950 per day each: **`total_succeeded` and `completion_pct`
 from 2026-06-24 until the fix are inflated** wherever a user sent more than ~750
 in a UTC day. Events now also carry `unconfirmed_tracks` (sent, not yet read
-back) and `not_stored_tracks` (accepted, then missing on a full day).
+back) and `not_stored_tracks` (accepted, then missing on a full day), and since
+#137 `library_unreadable` (Last.fm refused the read-back this run, so
+`unconfirmed_tracks` will not be confirmed; see "Last.fm's daily cap").
+
+**Hidden-profile users confirmed nothing from build 50 (#125) until #137.** The
+read-back was unsigned, which Last.fm refuses with error 17 for a user who
+hides their recent listening, so their `total_succeeded` stayed flat while
+`unconfirmed_tracks` grew to the import size. In that window, a user with
+`scrobble_verify_failed` `Last.fm API error 17` has plays that were sent and
+almost certainly stored, not lost.
 
 Even now it is an **upper bound** for real-dated plays: Last.fm silently
 discards a scrobble duplicating an existing (artist, track, timestamp) while
@@ -532,11 +543,30 @@ the source of truth:
   re-checks them instead of re-sending. If the library can't be read (network,
   private profile) they stay pending, the run carries on, and the Complete step
   reports them as "sent, couldn't confirm" rather than counting them.
+- **Signed reads.** Every `user.getrecenttracks` (budget, verify, the upload
+  duplicate check and a background take-back's repeat check) goes through
+  `LastFm.readRecentTracks`, which signs it with the session key (`sk` +
+  `api_sig`) when there is one, as the worker always has. Last.fm refuses an
+  *unsigned* read of a profile with hidden recent listening (error 17,
+  "User required to be logged in") but answers its owner (#137). A key it
+  rejects (error 9) is retried unsigned, as every read was before: the
+  scrobble loop's `session_invalid` stop handles the dead key, and a public
+  profile's history stays readable meanwhile. Credentials in a failed read's
+  error message are redacted like any other request's.
+- **Refused for good.** If a read still fails with error 17, the run sets
+  `libraryUnreadable`: no more reads until the next run (each run asks again,
+  in case the setting changed), the budget falls back to this browser's own
+  sends, and the scrobbling and paused panels say Last.fm won't let Scrobblify
+  read the listening rather than "being checked" / "checked when you resume".
+  Every scrobble event carries it as `library_unreadable`.
 
 The Last.fm mock (`tests/lastfmMock.js`) models this, for Playwright and
 `dev:mock` alike: its library is stateful, enforces the cap per UTC day and
 fills itself (`recordScrobble`) from any `track.scrobble` response that says
-accepted, including ones a test answers with its own route.
+accepted, including ones a test answers with its own route. `hiddenProfile`
+(`interceptLastFm(page, { hiddenProfile: true })`, or `npm run dev:mock --
+--hidden-profile`) refuses unsigned `user.getrecenttracks` with error 17, and
+`recentTracksError` fails every one, signed or not, with the given code.
 
 **The background worker budgets the same way, but does not verify.** Before
 each batch the scheduler reads the day's count (`LastFmClient.countScrobbles`,
