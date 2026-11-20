@@ -172,9 +172,14 @@ function localFlagOverride(key: string): boolean | undefined {
 }
 
 /**
- * Whether a PostHog feature flag is on for this user. False until flags have
- * loaded, when analytics is off, and when PostHog is blocked, so a flag can
- * only ever *add* a feature to the default experience.
+ * Whether a PostHog feature flag is on for this *signed-in* user. False until
+ * flags have loaded, before `identifyUser` has made the Last.fm username the
+ * distinct id, when analytics is off, and when PostHog is blocked, so a flag
+ * can only ever *add* a feature to the default experience.
+ *
+ * Requiring identification is what makes a percentage rollout stick to a user:
+ * PostHog buckets on the distinct id, which before sign-in is a random
+ * per-browser id. Once identified it is the username on every browser.
  */
 export function isFeatureEnabled(key: string): boolean {
   if (process.env.NODE_ENV !== 'production') {
@@ -187,7 +192,8 @@ export function isFeatureEnabled(key: string): boolean {
     return false;
   }
   try {
-    return posthog.isFeatureEnabled(key) === true;
+    return posthog.get_property('$user_state') === 'identified'
+      && posthog.isFeatureEnabled(key) === true;
   } catch (e) {
     return false;
   }
@@ -197,16 +203,31 @@ function noop(): void {
   // Nothing to unsubscribe.
 }
 
+const flagListeners = new Set<() => void>();
+
+function notifyFlagListeners(): void {
+  flagListeners.forEach((listener) => {
+    try {
+      listener();
+    } catch (e) {
+      // ignore
+    }
+  });
+}
+
 /**
- * Calls `callback` whenever flags (re)load, e.g. after `identifyUser`.
- * Returns an unsubscribe function.
+ * Calls `callback` whenever `isFeatureEnabled` may have changed: flags
+ * (re)loaded, or the user was identified (identifying under the id PostHog
+ * already has doesn't reload flags). Returns an unsubscribe function.
  */
 export function onFeatureFlags(callback: () => void): () => void {
   if (!initialized) {
     return noop;
   }
+  flagListeners.add(callback);
+  let releasePosthog: () => void = noop;
   try {
-    return posthog.onFeatureFlags(() => {
+    releasePosthog = posthog.onFeatureFlags(() => {
       try {
         callback();
       } catch (e) {
@@ -214,8 +235,12 @@ export function onFeatureFlags(callback: () => void): () => void {
       }
     });
   } catch (e) {
-    return noop;
+    // ignore
   }
+  return () => {
+    flagListeners.delete(callback);
+    releasePosthog();
+  };
 }
 
 /*
@@ -231,6 +256,7 @@ export function identifyUser(userName: string | null): void {
   } catch (e) {
     // ignore
   }
+  notifyFlagListeners();
 }
 
 export function resetUser(): void {

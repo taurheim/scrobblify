@@ -726,10 +726,14 @@ export default defineComponent({
       trackEvent('background_reauth_failed');
     }
     this.probeBackgroundAvailability();
-    // The rollout flag can switch on after mount: flags load asynchronously
-    // and reload when signing in identifies the user.
+    // The rollout flag can change after mount: flags load asynchronously, and
+    // it only counts once signing in has identified the user.
     this.releaseFlagListener = onFeatureFlags(() => {
-      if (!this.backgroundProbed) {
+      if (!background.isBackgroundEnabled()) {
+        this.backgroundProbed = false;
+        this.backgroundAvailable = false;
+        this.backgroundMaxTracks = 0;
+      } else if (!this.backgroundProbed) {
         this.probeBackgroundAvailability();
       }
     });
@@ -1730,8 +1734,10 @@ export default defineComponent({
       }
       try {
         const capacity = await background.fetchCapacity();
-        this.backgroundAvailable = !!capacity && capacity.available;
-        this.backgroundMaxTracks = capacity && capacity.available ? capacity.maxTracks : 0;
+        // The flag may have turned off while this was in flight.
+        const offered = background.isBackgroundEnabled();
+        this.backgroundAvailable = offered && !!capacity && capacity.available;
+        this.backgroundMaxTracks = offered && capacity && capacity.available ? capacity.maxTracks : 0;
       } catch (e) {
         this.backgroundAvailable = false;
         this.backgroundMaxTracks = 0;

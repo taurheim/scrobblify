@@ -759,11 +759,13 @@ The handoff offer is rolled out two ways: visit any page with `?beta=1` to opt a
 browser in, or `?beta=0` to opt it out (stored as `'0'`, which also overrides
 the flag). Otherwise the PostHog flag **`scrobblify-background-scrobbling`**
 decides: `test_scrobblify` gets 100%, and you ramp it up by raising the 0%
-"everyone" condition. The flag buckets on `distinct_id`, which is the Last.fm
-username once signed in. It reads false until flags load, when PostHog is
-blocked, and on localhost. `Scrobblify.vue` re-runs the capacity probe through
-`onFeatureFlags` when a flag reload, such as the one after `identifyUser`,
-turns it on.
+"everyone" condition. The flag only counts once `identifyUser` has made the
+Last.fm username PostHog's distinct id (`$user_state` `identified`), so a
+user's bucket is the same on every browser and survives a raised percentage
+(PostHog's hash is stable; only lowering it removes people). Before sign-in, and
+when PostHog is blocked or on localhost, it reads false. `Scrobblify.vue` listens through
+`onFeatureFlags` (flag reloads and `identifyUser`) and re-probes capacity, or
+withdraws the offer, as it changes.
 Locally, `localStorage['scrobblify.flags'] = '{"scrobblify-background-scrobbling":true}'`
 forces it (non-production builds only). `background_offer_shown` carries
 `offer_source` (`opt_in` / `flag`).
