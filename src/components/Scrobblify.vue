@@ -335,7 +335,9 @@ import {
   beginHandoff, completeHandoff, uploadListFromState, stateFromExport,
   resolveExportedRepeats,
 } from '@/services/BackgroundHandoff';
-import { trackEvent, trackError, resetUser } from '@/services/Analytics';
+import {
+  trackEvent, trackError, resetUser, onFeatureFlags,
+} from '@/services/Analytics';
 import {
   ConflictReason, ProgressCount, findCompletedImport, isSameImport, progressOf, recordCompletedImport,
   savedProgressConflict,
@@ -469,6 +471,10 @@ export default defineComponent({
       /** Teardown for the cross-tab freeze responder. Not reactive. */
       releaseFreezeResponder: null as (() => void) | null,
       releaseTabRoster: null as (() => void) | null,
+      /** Teardown for the PostHog flag listener. Not reactive. */
+      releaseFlagListener: null as (() => void) | null,
+      /** Whether the capacity probe has run, so a flag reload doesn't repeat it. */
+      backgroundProbed: false,
       /**
        * Set when we cannot establish whether the server owns the queue. A
        * belt-and-braces gate on Resume alongside `hasResumableState`: that flag
@@ -720,6 +726,13 @@ export default defineComponent({
       trackEvent('background_reauth_failed');
     }
     this.probeBackgroundAvailability();
+    // The rollout flag can switch on after mount: flags load asynchronously
+    // and reload when signing in identifies the user.
+    this.releaseFlagListener = onFeatureFlags(() => {
+      if (!this.backgroundProbed) {
+        this.probeBackgroundAvailability();
+      }
+    });
 
     /*
       Back-forward cache recovery.
@@ -754,6 +767,9 @@ export default defineComponent({
       // Leaves the roster, so a closed tab does not make every future handoff
       // wait out the full window for an acknowledgement that cannot come.
       this.releaseTabRoster();
+    }
+    if (this.releaseFlagListener) {
+      this.releaseFlagListener();
     }
     if (this.authorityRetryTimer) {
       window.clearTimeout(this.authorityRetryTimer);
@@ -1691,12 +1707,13 @@ export default defineComponent({
      * Failure is silent and simply means "don't offer".
      *
      * `isBackgroundEnabled` rather than `isBackgroundConfigured`: this is the
-     * offer path, so it is the one place the beta opt-in applies.
+     * offer path, so it is the one place the beta opt-in and rollout flag apply.
      */
     async probeBackgroundAvailability() {
       if (!background.isBackgroundEnabled() || !background.canCompress()) {
         return;
       }
+      this.backgroundProbed = true;
       /*
         No durable stop, no offer.
 
@@ -1741,6 +1758,7 @@ export default defineComponent({
       trackEvent('background_offer_shown', {
         entry_point: 'scrobble_step',
         track_count: remaining,
+        offer_source: background.backgroundOfferSource(),
       });
     },
 
@@ -2801,7 +2819,11 @@ export default defineComponent({
       this.backgroundRemaining = remaining;
       this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
-      trackEvent('background_offer_shown', { entry_point: entryPoint, track_count: remaining });
+      trackEvent('background_offer_shown', {
+        entry_point: entryPoint,
+        track_count: remaining,
+        offer_source: background.backgroundOfferSource(),
+      });
     },
 
     /**

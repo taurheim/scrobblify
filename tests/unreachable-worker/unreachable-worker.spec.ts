@@ -286,6 +286,31 @@ test.describe('Offering background scrobbling', () => {
     await expect(page.locator(OFFER)).toBeVisible({ timeout: 15000 });
   });
 
+  const FLAG_ON = { 'scrobblify.flags': JSON.stringify({ 'scrobblify-background-scrobbling': true }) };
+
+  test('the rollout flag offers it without the opt-in', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, FLAG_ON);
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    // Only an explicit opt-in shows the beta reminder.
+    await expect(page.locator('text=Background scrobbling (beta) is switched on')).toHaveCount(0);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile());
+
+    await expect(page.locator(OFFER)).toBeVisible({ timeout: 15000 });
+  });
+
+  test('?beta=0 keeps it off even when the rollout flag is on', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, FLAG_ON);
+    await page.goto('/?beta=0#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    workerCalls.length = 0;
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile());
+
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 15000 });
+    await page.waitForTimeout(2000);
+    await expect(page.locator(OFFER)).toHaveCount(0);
+    expect(workerCalls).not.toContain('/scrobblify/capacity');
+  });
+
   // 1,600 plays from a year ago: after the first day's 700, 900 are left,
   // which is enough for the offer on the stop screen.
   async function openLargeHistoryGate(page: Page) {

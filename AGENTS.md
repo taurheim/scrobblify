@@ -199,7 +199,8 @@ them. The gate and the confirmation use `backgroundCanFinish` (fed by
 `backgroundTrackLimit`, the capacity probe's `maxTracks`, 0 when the offer is
 off). The stop reasons and the paused panel use `canOfferBackground`, since the
 offer sits right under them. The Complete step uses `backgroundTrackLimit > 0`.
-Home and About only know the opt-in (`isBackgroundEnabled()`), not live
+Home and About only know the opt-in or flag (`isBackgroundEnabled()`, read
+once on mount, so the flag counts there only once it has loaded), not live
 capacity. New copy along those lines needs the same branch.
 
 Gate telemetry, since 2026-11-16: `large_history_gate_shown` and
@@ -754,15 +755,30 @@ Two traps already paid for:
 
 ## Background scrobbling beta gate
 
-The handoff offer is invite-only: visit any page with `?beta=1` to opt a
-browser in, `?beta=0` to opt out. An opted-in browser shows an info banner
-with a switch-off link when no other banner is showing. It is independent of `VUE_APP_BACKGROUND_API`, which
+The handoff offer is rolled out two ways: visit any page with `?beta=1` to opt a
+browser in, or `?beta=0` to opt it out (stored as `'0'`, which also overrides
+the flag). Otherwise the PostHog flag **`scrobblify-background-scrobbling`**
+decides: `test_scrobblify` gets 100%, and you ramp it up by raising the 0%
+"everyone" condition. The flag buckets on `distinct_id`, which is the Last.fm
+username once signed in. It reads false until flags load, when PostHog is
+blocked, and on localhost. `Scrobblify.vue` re-runs the capacity probe through
+`onFeatureFlags` when a flag reload, such as the one after `identifyUser`,
+turns it on.
+Locally, `localStorage['scrobblify.flags'] = '{"scrobblify-background-scrobbling":true}'`
+forces it (non-production builds only). `background_offer_shown` carries
+`offer_source` (`opt_in` / `flag`).
+
+Only an explicit opt-in shows the info banner with a switch-off link (when no
+other banner is showing), and only the explicit opt-in counts in
+`mayScrobbleWithoutAuthority`'s outage rule, so neither depends on flag-load
+timing. All of this is independent of `VUE_APP_BACKGROUND_API`, which
 only says whether the build *can* reach a worker.
 
 Two functions in `src/services/BackgroundScrobbling.ts`, and the split is
 load-bearing:
 
-- `isBackgroundEnabled()` — configured **and** opted in. Guards the *offer*
+- `isBackgroundEnabled()` — configured **and** (opted in, or flagged and not
+  opted out); see `backgroundOfferSource()`. Guards the *offer*
   only: `probeBackgroundAvailability` and `preflight`.
 - `isBackgroundConfigured()` — configured. Guards every *recovery* path: the
   live-job authority check, finishing a handoff on return from Last.fm, and
