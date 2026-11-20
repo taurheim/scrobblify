@@ -157,6 +157,68 @@ export function trackError(context: string, error: unknown, extra: Record<string
 }
 
 /*
+  Outside production builds, `localStorage['scrobblify.flags']` (a JSON object
+  of flag key → boolean) overrides PostHog. Nothing initializes PostHog on
+  localhost, so this is how tests and `dev:mock` turn a flag on.
+*/
+function localFlagOverride(key: string): boolean | undefined {
+  try {
+    const raw = window.localStorage.getItem('scrobblify.flags');
+    const value = raw ? JSON.parse(raw)[key] : undefined;
+    return typeof value === 'boolean' ? value : undefined;
+  } catch (e) {
+    return undefined;
+  }
+}
+
+/**
+ * Whether a PostHog feature flag is on for this user. False until flags have
+ * loaded, when analytics is off, and when PostHog is blocked, so a flag can
+ * only ever *add* a feature to the default experience.
+ */
+export function isFeatureEnabled(key: string): boolean {
+  if (process.env.NODE_ENV !== 'production') {
+    const override = localFlagOverride(key);
+    if (override !== undefined) {
+      return override;
+    }
+  }
+  if (!initialized) {
+    return false;
+  }
+  try {
+    return posthog.isFeatureEnabled(key) === true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function noop(): void {
+  // Nothing to unsubscribe.
+}
+
+/**
+ * Calls `callback` whenever flags (re)load, e.g. after `identifyUser`.
+ * Returns an unsubscribe function.
+ */
+export function onFeatureFlags(callback: () => void): () => void {
+  if (!initialized) {
+    return noop;
+  }
+  try {
+    return posthog.onFeatureFlags(() => {
+      try {
+        callback();
+      } catch (e) {
+        // ignore
+      }
+    });
+  } catch (e) {
+    return noop;
+  }
+}
+
+/*
   Associates subsequent events with the user's Last.fm username. This makes it
   possible to look up a specific user's session when they report a problem.
 */

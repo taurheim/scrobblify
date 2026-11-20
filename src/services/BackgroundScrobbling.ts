@@ -9,7 +9,7 @@
  * The one exception is `finalizeHandoff`, whose failure mode is genuinely
  * dangerous — see `HandoffOutcome`.
  */
-import { trackError, trackEvent } from '@/services/Analytics';
+import { isFeatureEnabled, trackError, trackEvent } from '@/services/Analytics';
 import type { FailedTrackDetail } from '@/services/StateManager';
 
 /**
@@ -17,6 +17,9 @@ import type { FailedTrackDetail } from '@/services/StateManager';
  * offered. Set at build time; `undefined` is a valid, safe configuration.
  */
 const API_BASE = process.env.VUE_APP_BACKGROUND_API || '';
+
+/** PostHog flag that rolls the offer out to users who haven't opted in. */
+export const BACKGROUND_FLAG = 'scrobblify-background-scrobbling';
 
 const BETA_STORAGE_KEY = 'scrobblify.background.beta';
 const SESSION_STORAGE_KEY = 'scrobblify.background.session';
@@ -133,8 +136,23 @@ export function isBetaOptedIn(): boolean {
   }
 }
 
+/** Set by `?beta=0`; keeps the offer off even when the rollout flag is on. */
+export function isBetaOptedOut(): boolean {
+  try {
+    return window.localStorage.getItem(BETA_STORAGE_KEY) === '0';
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Whether to *offer* the handoff to this user.
+ * Whether to *offer* the handoff to this user, and why.
+ *
+ * `?beta=1` / `?beta=0` (see `consumeBetaParam`) decide outright. Otherwise
+ * the PostHog flag `BACKGROUND_FLAG` does, which is how the offer is rolled out
+ * by percentage. The flag only ever adds the offer: recovery paths read
+ * `isBackgroundConfigured`, and the outage rule in `mayScrobbleWithoutAuthority`
+ * reads the explicit opt-in, so neither depends on whether flags have loaded.
  *
  * The opt-in is sticky rather than read from the URL on each load, because
  * the URL does not survive the flow: `stripQuery` discards the whole query
@@ -143,17 +161,24 @@ export function isBetaOptedIn(): boolean {
  * therefore switch itself off precisely when a handoff came back, stranding a
  * user whose tracks are already uploaded.
  */
-export function isBackgroundEnabled(): boolean {
-  return isBackgroundConfigured() && isBetaOptedIn();
+export function backgroundOfferSource(): 'opt_in' | 'flag' | null {
+  if (!isBackgroundConfigured() || isBetaOptedOut()) {
+    return null;
+  }
+  if (isBetaOptedIn()) {
+    return 'opt_in';
+  }
+  return isFeatureEnabled(BACKGROUND_FLAG) ? 'flag' : null;
 }
 
+export function isBackgroundEnabled(): boolean {
+  return backgroundOfferSource() !== null;
+}
+
+/** `false` records an explicit opt-out, which also overrides the flag. */
 export function setBetaOptIn(on: boolean): void {
   try {
-    if (on) {
-      window.localStorage.setItem(BETA_STORAGE_KEY, '1');
-    } else {
-      window.localStorage.removeItem(BETA_STORAGE_KEY);
-    }
+    window.localStorage.setItem(BETA_STORAGE_KEY, on ? '1' : '0');
   } catch {
     // Nothing to do; `isBetaOptedIn` will keep answering false.
   }
