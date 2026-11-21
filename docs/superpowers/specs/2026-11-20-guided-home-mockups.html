@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Scrobblify: states matrix</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #eceff1; font-family: 'Avenir', 'Segoe UI', Helvetica, Arial, sans-serif; color: #2c3e50; -webkit-font-smoothing: antialiased; }
+  .page { max-width: 1500px; margin: 0 auto; padding: 28px 24px 80px; }
+  h1.doc { font-size: 26px; margin: 0 0 4px; }
+  .docsub { color: #607d8b; margin: 0 0 22px; }
+  h2.sec { font-size: 15px; text-transform: uppercase; letter-spacing: .08em; color: #546e7a; margin: 40px 0 12px; border-bottom: 2px solid #cfd8dc; padding-bottom: 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 18px; }
+  .cell .cap { font-size: 12px; font-weight: 700; margin: 0 0 6px; }
+  .cell .cap span { font-weight: 400; color: #78909c; }
+  .cell .when { font-size: 11.5px; color: #78909c; margin: 6px 0 0; line-height: 1.35; }
+
+  /* fake browser */
+  .win { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.15), 0 6px 18px rgba(0,0,0,.06); overflow: hidden; position: relative; min-height: 300px; text-align: center; font-size: 13px; }
+  .win.tall { min-height: 360px; }
+  .nav { padding: 14px 10px 8px; }
+  .logo { font-size: 22px; font-weight: 700; display: inline-flex; align-items: center; gap: 6px; }
+  .logo .img { width: 22px; height: 22px; border-radius: 50%; background: radial-gradient(circle, #fff 0 22%, #ED1C24 23% 100%); }
+  .chip { font-size: 9.5px; font-weight: 700; letter-spacing: .05em; padding: 2px 7px; border-radius: 99px; background: #673ab7; color: #fff; vertical-align: middle; cursor: pointer; }
+  .links { font-size: 12px; margin-top: 2px; }
+  .links b { color: #ED1C24; }
+  .body { padding: 10px 18px 18px; }
+  .foot { font-size: 9.5px; letter-spacing: .05em; color: rgba(44,62,80,.4); padding: 4px 0 10px; }
+
+  /* vuetify-ish */
+  .h { font-size: 19px; font-weight: 700; margin: 4px 0 4px; }
+  .muted { color: #78909c; }
+  .vcard { background: #fff; border-radius: 6px; box-shadow: 0 2px 1px -1px rgba(0,0,0,.2), 0 1px 1px rgba(0,0,0,.14), 0 1px 3px rgba(0,0,0,.12); padding: 14px; text-align: left; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+  .two .vcard { display: flex; flex-direction: column; gap: 4px; }
+  .two .vcard .t { font-weight: 700; font-size: 13.5px; }
+  .two .vcard .d { color: #78909c; font-size: 11.5px; flex: 1; }
+  .btn { display: inline-block; background: #ED1C24; color: #fff; border-radius: 4px; padding: 7px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; box-shadow: 0 2px 3px rgba(0,0,0,.2); text-align: center; }
+  .btn.block { display: block; }
+  .btn.out { background: transparent; color: #ED1C24; border: 1px solid #ED1C24; box-shadow: none; }
+  .btn.txt { background: transparent; color: #ED1C24; box-shadow: none; }
+  .btn.dis { background: #e0e0e0; color: #9e9e9e; box-shadow: none; }
+  a, .a { color: #ED1C24; text-decoration: underline; cursor: pointer; }
+  .sep { border-top: 1px solid #eceff1; margin: 16px 0 10px; padding-top: 10px; }
+  .lbar { position: relative; height: 18px; background: #ffcdd2; border-radius: 4px; overflow: hidden; margin: 8px 0 6px; }
+  .lbar i { display: block; height: 100%; background: #ED1C24; }
+  .lbar span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: #2c3e50; text-shadow: 0 0 3px #fff, 0 0 3px #fff; }
+  .lbar.grey { background: #e0e0e0; } .lbar.grey i { background: #9e9e9e; }
+  .prog { height: 6px; background: #ffcdd2; border-radius: 99px; overflow: hidden; margin: 8px 0 6px; }
+  .prog i { display: block; height: 100%; background: #ED1C24; }
+  .prog.grey { background: #e0e0e0; } .prog.grey i { background: #9e9e9e; }
+  .big { font-size: 44px; font-weight: 700; line-height: 1; margin-top: 18px; }
+  .line { margin-top: 2px; }
+  .line b { color: #2c3e50; }
+  .close { font-size: 11.5px; color: #78909c; margin-top: 18px; }
+  ol.steps { text-align: left; padding-left: 20px; margin: 8px 0 12px; }
+  ol.steps li { margin-bottom: 8px; line-height: 1.4; }
+  .alert { border-radius: 4px; padding: 10px 12px; text-align: left; font-size: 12px; margin-bottom: 10px; }
+  .alert.warn { background: #fff3e0; border-left: 4px solid #fb8c00; }
+  .alert.err { background: #ffebee; border-left: 4px solid #e53935; }
+  .alert.info { background: #e3f2fd; border-left: 4px solid #1e88e5; }
+
+  /* dialog */
+  .scrim { position: absolute; inset: 0; background: rgba(33,33,33,.46); display: flex; align-items: center; justify-content: center; padding: 14px; }
+  .dlg { background: #fff; border-radius: 6px; box-shadow: 0 11px 15px -7px rgba(0,0,0,.2), 0 24px 38px 3px rgba(0,0,0,.14); width: 100%; max-width: 330px; text-align: left; padding: 16px; }
+  .dlg .h { font-size: 17px; }
+  .dlg .acts { display: flex; justify-content: flex-end; gap: 6px; margin-top: 14px; align-items: center; }
+  .fine { font-size: 11px; color: #78909c; margin-top: 8px; line-height: 1.4; }
+  .stepper { display: flex; justify-content: center; gap: 10px; font-size: 10.5px; color: #90a4ae; padding: 4px 0 8px; border-bottom: 1px solid #eceff1; }
+  .stepper .on { color: #2c3e50; font-weight: 700; }
+  .faq { text-align: left; border-top: 1px solid #e0e0e0; }
+  .faq div { border-bottom: 1px solid #e0e0e0; padding: 9px 2px; display: flex; justify-content: space-between; font-weight: 600; font-size: 12px; }
+  .faq .open { flex-direction: column; }
+  .faq .open p { font-weight: 400; color: #607d8b; margin: 5px 0 0; line-height: 1.4; }
+  .acts2 { font-size: 11.5px; margin-top: 6px; } .barrow { display:flex; gap:8px; align-items:center; max-width:330px; margin:34px auto 10px; } .btn.sq { padding: 6px 10px; white-space: nowrap; } .acts3 { display:flex; gap:6px; justify-content:center; margin-top:10px; } .menu { position: absolute; background: #fff; border-radius: 4px; box-shadow: 0 5px 5px -3px rgba(0,0,0,.2), 0 8px 10px 1px rgba(0,0,0,.14); text-align: left; font-size: 12.5px; min-width: 190px; padding: 4px 0; }
+  .menu div { padding: 8px 14px; }
+  .menu div.red { color: #e53935; }
+  .pop { position: absolute; top: 44px; left: 50%; transform: translateX(-10%); background: #fff; border-radius: 4px; box-shadow: 0 5px 5px -3px rgba(0,0,0,.2), 0 8px 10px 1px rgba(0,0,0,.14); padding: 10px 12px; text-align: left; font-size: 12px; width: 210px; }
+  table.mx { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; font-size: 12.5px; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  table.mx th, table.mx td { padding: 8px 10px; border-bottom: 1px solid #eceff1; text-align: left; vertical-align: top; }
+  table.mx th { background: #f5f7f8; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: #546e7a; }
+  table.mx td.k { font-weight: 700; white-space: nowrap; }
+  .new { font-size: 9.5px; font-weight: 700; color: #fff; background: #43a047; border-radius: 3px; padding: 1px 4px; margin-left: 4px; }
+  .chg { font-size: 9.5px; font-weight: 700; color: #fff; background: #fb8c00; border-radius: 3px; padding: 1px 4px; margin-left: 4px; }
+  .same { font-size: 9.5px; font-weight: 700; color: #fff; background: #90a4ae; border-radius: 3px; padding: 1px 4px; margin-left: 4px; }
+</style></head>
+<body><div class="page">
+
+<h1 class="doc">Scrobblify: guided home + background, all states (v6)</h1>
+<p class="docsub">Current theme and header. Placeholder copy. <span class="new">NEW</span> new screen · <span class="chg">CHANGED</span> existing screen rewritten · <span class="same">SAME</span> untouched.</p>
+
+<h2 class="sec">State matrix</h2>
+<table class="mx">
+  <tr><th>Surface</th><th>Condition</th><th>What the user sees</th><th>Primary action</th><th>Telemetry</th></tr>
+  <tr><td class="k">Header</td><td>Beta browser (opt-in or flag)</td><td>Static BETA tag next to wordmark. Replaces beta banner. (<code>?beta=0</code> still opts out.)</td><td>-</td><td>-</td></tr>
+  <tr><td class="k">Home</td><td>No stored username, no saved progress</td><td>Headline, one line, two equal cards, "Already scrobbling?" link</td><td>Either card</td><td><code>home_choice</code></td></tr>
+  <tr><td class="k"></td><td>Clicked "I need to get it"</td><td>Cards swap to 3 numbered lines + Back + "Already have it? Start"</td><td>Spotify link</td><td><code>home_choice: get_export</code></td></tr>
+  <tr><td class="k"></td><td>Returning, signed in, saved progress</td><td>"Welcome back" card with progress bar</td><td>Continue</td><td><code>home_returning_shown</code></td></tr>
+  <tr><td class="k"></td><td>Returning, session key cleared/absent</td><td>Same card</td><td>Sign in to continue</td><td><code>home_returning_shown</code></td></tr>
+  <tr><td class="k"></td><td>Returning, last known server job</td><td>Card shows count + % bar, "Running on our server", link to Last.fm</td><td>none</td><td><code>home_returning_shown</code></td></tr>
+  <tr><td class="k"></td><td>Returning, username only (no progress)</td><td>Card without a bar</td><td>Start an import</td><td><code>home_returning_shown</code></td></tr>
+  <tr><td class="k">About</td><td>Always</td><td>Short intro + collapsible FAQ (dates, 750/day, duplicates, data, ListenBrainz, connect Spotify)</td><td>-</td><td><code>listenbrainz_clicked: about</code></td></tr>
+  <tr><td class="k">Confirm dialog</td><td>&lt; 750 remaining, or not beta, or server full</td><td>Today's "Scrobble N tracks?" dialog</td><td>Start scrobbling</td><td><code>tracks_selected</code></td></tr>
+  <tr><td class="k"></td><td>Beta + server has room + ≥ 750 remaining</td><td>"N plays ready · about X days" + one-line fine print + Details</td><td>Scrobble them for me</td><td><code>background_offer_shown (confirm)</code></td></tr>
+  <tr><td class="k"></td><td>Same, more than 60 days (≤ ~65k plays)</td><td>Same dialog plus a warning to come back after 60 days</td><td>Scrobble them for me</td><td>-</td></tr>
+  <tr><td class="k"></td><td>Same, and this browser has saved progress</td><td>Today's "Resume saved / Start over" first; server choice only after Start over</td><td>Resume saved progress</td><td><code>saved_progress_choice</code></td></tr>
+  <tr><td class="k">Paused panel</td><td>Mid-run stop, beta, ≥ 750 left</td><td>One line under the stop reason</td><td>Let Scrobblify finish this →</td><td><code>background_offer_shown (scrobble_step)</code></td></tr>
+  <tr><td class="k">Large-history gate</td><td>New import, &gt; 700 re-tagged</td><td>Unchanged, ListenBrainz off-ramp kept</td><td>I understand</td><td>unchanged</td></tr>
+  <tr><td class="k">Sign-in</td><td>Server chosen</td><td>Last.fm approval for the server app only</td><td>-</td><td><code>background_handoff_*</code></td></tr>
+  <tr><td class="k"></td><td>Tab chosen / small import / not beta</td><td>Last.fm approval for the browser app only (skipped if already signed in)</td><td>-</td><td><code>auth_success</code></td></tr>
+  <tr><td class="k"></td><td>Back from Last.fm, duplicates ticked</td><td>"Checking which plays are already on Last.fm…", then the count if any were skipped</td><td>Start</td><td>-</td></tr>
+  <tr><td class="k"></td><td>"Already scrobbling?"</td><td>Server sign-in → status page; else local progress → Continue in this tab; else Nothing to resume</td><td>varies</td><td><code>home_choice: resume</code></td></tr>
+  <tr><td class="k"></td><td>Move back, browser has no sign-in</td><td>Explainer pop-up about the two Last.fm connections</td><td>Continue to Last.fm</td><td>-</td></tr>  <tr><td class="k">Status page</td><td>Job active, sending</td><td>Count + % bar · "done around D"</td><td>Pause (right of bar) · Move back / Cancel buttons</td><td>-</td></tr>
+  <tr><td class="k"></td><td>Job active, today full</td><td>"Today's 700 are in · more from T"</td><td>Pause (right of bar) · Move back / Cancel buttons</td><td>-</td></tr>
+  <tr><td class="k"></td><td>No server sign-in (expired / other device)</td><td>Bar from public data, controls hidden</td><td>Sign in to manage</td><td>-</td></tr>
+  <tr><td class="k"></td><td>Paused</td><td>Grey bar, "Paused"</td><td>Resume</td><td>-</td></tr>
+  <tr><td class="k"></td><td>needs_reauth</td><td>"Last.fm signed us out" (day 60, or revoked)</td><td>Sign in again (resumes automatically)</td><td>-</td></tr>
+  <tr><td class="k"></td><td>dormant</td><td>"On hold: waiting 14 days for you"; reconnect disabled when full</td><td>Reconnect</td><td>-</td></tr>
+  <tr><td class="k"></td><td>Completed</td><td>100%, "All N are on Last.fm"</td><td>See your profile</td><td>-</td></tr>
+  <tr><td class="k"></td><td>Worker unreachable</td><td>Warning above page, one line</td><td>Try again / Continue in this browser anyway</td><td><code>background_authority_overridden</code></td></tr>
+</table>
+
+<!-- ============ HEADER + HOME ============ -->
+<h2 class="sec">Header &amp; Home</h2>
+<div class="grid">
+
+  <div class="cell">
+    <p class="cap">Header · beta browser <span class="new">NEW</span></p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body"><div class="h">Your Spotify history, on Last.fm</div><div class="muted">…</div></div>
+    </div>
+    <p class="when">Only for beta browsers. Just a tag, no popover.</p>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Home · first visit <span class="chg">CHANGED</span></p>
+    <div class="win tall">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify</div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="h">Your Spotify history, on Last.fm</div>
+        <div class="muted">Copy everything you've played on Spotify onto your Last.fm profile.</div>
+        <div class="two">
+          <div class="vcard"><div class="t">I have my Spotify export</div><div class="d">The ZIP Spotify emailed you.</div><span class="btn block">Start</span></div>
+          <div class="vcard"><div class="t">I need to get it</div><div class="d">Request it from Spotify. Takes a few days.</div><span class="btn block">Show me how</span></div>
+        </div>
+        <div class="sep">Already scrobbling? <span class="a">Sign in to pick up where you left off</span></div>
+      </div>
+      <div class="foot">Scrobblify · built by Niko Savas</div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Home · "I need to get it" <span class="new">NEW</span></p>
+    <div class="win tall">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify</div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body" style="text-align:left">
+        <div class="muted" style="font-size:11.5px">← Back</div>
+        <div class="h">Get your history from Spotify</div>
+        <ol class="steps">
+          <li>Go to <a>your Spotify privacy settings</a> and request <b>Extended streaming history</b> (not "Account data").</li>
+          <li>Wait for Spotify's email. Usually a few days.</li>
+          <li>Download the ZIP and <a>bring it here</a>. No need to unzip it.</li>
+        </ol>
+        <div class="sep" style="text-align:center">Already have it? <a>Start</a></div>
+      </div>
+    </div>
+    <p class="when">Swaps out the two cards in place. No new route.</p>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Home · returning, signed in, saved progress <span class="new">NEW</span></p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify</div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body"><div class="vcard" style="max-width:290px;margin:14px auto 0">
+        <div class="h" style="font-size:17px">Welcome back, niko</div>
+        <div class="lbar"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div><div style="height:12px"></div>
+        <span class="btn block">Continue</span>
+        <div class="fine" style="text-align:center">Not you, or starting fresh? <a>Start a new import</a></div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Home · returning, signed out <span class="new">NEW</span></p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify</div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body"><div class="vcard" style="max-width:290px;margin:14px auto 0">
+        <div class="h" style="font-size:17px">Welcome back, niko</div>
+        <div class="lbar"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div><div style="height:12px"></div>
+        <span class="btn block">Sign in to continue</span>
+        <div class="fine" style="text-align:center">Not you, or starting fresh? <a>Start a new import</a></div>
+      </div></div>
+    </div>
+    <p class="when">Key cleared by error 9 or never stored; username kept.</p>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Home · returning, job on the server <span class="new">NEW</span></p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body"><div class="vcard" style="max-width:290px;margin:14px auto 0">
+        <div class="h" style="font-size:17px">Welcome back, niko</div>
+        <div class="lbar"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div>
+        <div class="muted" style="font-size:11.5px">Running on our server. Your plays show up on <a>Last.fm</a> as they go.</div>
+      </div></div>
+    </div>
+    <p class="when">Uses the last job snapshot this browser saw. No "new import" link while a job exists.</p>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Home · returning, username only <span class="new">NEW</span></p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify</div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body"><div class="vcard" style="max-width:290px;margin:14px auto 0">
+        <div class="h" style="font-size:17px">Welcome back, niko</div>
+        <div class="muted" style="font-size:11.5px;margin:4px 0 12px">Have a new Spotify export?</div>
+        <span class="btn block">Start an import</span>
+        <div class="fine" style="text-align:center"><a>Not you?</a> · <a>Need your export?</a></div>
+      </div></div>
+    </div>
+    <p class="when">E.g. finished an import before. "Need your export?" opens the get-it steps.</p>
+  </div>
+
+  <div class="cell">
+    <p class="cap">About · FAQ <span class="chg">CHANGED</span></p>
+    <div class="win tall">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify</div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="h">About</div>
+        <div class="muted" style="margin-bottom:12px">Scrobblify copies your Spotify history to Last.fm.</div>
+        <div class="faq">
+          <div class="open">Why do old plays get today's date? <p>Last.fm only accepts real dates from the last 2 weeks. Want them? <a>ListenBrainz</a> keeps every date.</p></div>
+          <div>Why does it take days? <span>+</span></div>
+          <div>Will it add duplicates? <span>+</span></div>
+          <div>Where does my data go? <span>+</span></div>
+          <div>How do I track new plays? <span>+</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ CHOICE ============ -->
+<h2 class="sec">Choosing how to send</h2>
+<div class="grid">
+
+  <div class="cell">
+    <p class="cap">Confirm · small import or not beta <span class="same">SAME</span></p>
+    <div class="win">
+      <div class="stepper"><span>Upload</span><span class="on">Choose</span><span>Send</span><span>Done</span></div>
+      <div class="scrim"><div class="dlg">
+        <div class="h">Scrobble 412 tracks?</div>
+        <div class="muted">About 2 minutes.</div>
+        <div class="acts"><span class="btn txt">Cancel</span><span class="btn">Start scrobbling</span></div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Confirm · beta, big import <span class="chg">CHANGED</span></p>
+    <div class="win">
+      <div class="stepper"><span>Upload</span><span class="on">Choose</span><span>Send</span><span>Done</span></div>
+      <div class="scrim"><div class="dlg">
+        <div class="h">38,412 plays ready</div>
+        <div class="muted">Takes about 55 days. You don't need to keep this open.</div>
+        <div style="margin-top:14px"><span class="btn block">Scrobble them for me</span></div>
+        <div class="fine">Our server keeps a Last.fm sign-in and your track list until it's done. <a>Details</a></div>
+        <div style="text-align:center;margin-top:10px;font-size:12px">or <a>keep it in this tab</a></div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Confirm · beta, more than 60 days <span class="new">NEW</span></p>
+    <div class="win tall">
+      <div class="stepper"><span>Upload</span><span class="on">Choose</span><span>Send</span><span>Done</span></div>
+      <div class="scrim"><div class="dlg">
+        <div class="h">61,250 plays ready</div>
+        <div class="muted">Takes about 88 days. You don't need to keep this open.</div>
+        <div class="alert warn" style="margin:12px 0 0">You have more than 60 days' worth of plays. You'll need to come back after 60 days and sign in to Last.fm again.</div>
+        <div style="margin-top:12px"><span class="btn block">Scrobble them for me</span></div>
+        <div class="fine">Our server keeps a Last.fm sign-in and your track list until it's done. <a>Details</a></div>
+        <div style="text-align:center;margin-top:10px;font-size:12px">or <a>keep it in this tab</a></div>
+      </div></div>
+    </div>
+    <p class="when">Over ~65,000 plays (what fits the server's storage), only the tab option shows.</p>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Confirm · Details expanded <span class="chg">CHANGED</span></p>
+    <div class="win tall">
+      <div class="stepper"><span>Upload</span><span class="on">Choose</span><span>Send</span><span>Done</span></div>
+      <div class="scrim"><div class="dlg">
+        <div class="h">38,412 plays ready</div>
+        <div class="muted">Takes about 55 days. You don't need to keep this open.</div>
+        <div style="margin-top:12px"><span class="btn block">Scrobble them for me</span></div>
+        <ul class="fine" style="padding-left:16px;margin:8px 0 0">
+          <li>Plays sent more than 2 weeks after you played them get the date they're sent.</li>
+          <li>Last.fm asks you to approve our server. Its sign-in is encrypted and deleted when the import ends, you cancel, or after 60 days.</li>
+          <li>Artist, track, album and time are uploaded, and deleted when it ends.</li>
+          <li>Beta: something odd? <a>Email me</a>.</li>
+        </ul>
+        <div style="text-align:center;margin-top:8px;font-size:12px">or <a>keep it in this tab</a></div>
+      </div></div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Confirm · saved progress first <span class="same">SAME</span></p>
+    <div class="win">
+      <div class="stepper"><span>Upload</span><span class="on">Choose</span><span>Send</span><span>Done</span></div>
+      <div class="scrim"><div class="dlg">
+        <div class="h">You have saved progress</div>
+        <div class="muted">9,987 already scrobbled from this import.</div>
+        <div class="acts"><span class="btn txt">Start over</span><span class="btn">Resume saved progress</span></div>
+      </div></div>
+    </div>
+    <p class="when">Start over → the big-import dialog above. Resume → the same choice for what's left.</p>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Paused panel · mid-run offer <span class="chg">CHANGED</span></p>
+    <div class="win">
+      <div class="stepper"><span>Upload</span><span>Choose</span><span class="on">Send</span><span>Done</span></div>
+      <div class="body">
+        <div class="alert info"><b>Today's share is sent.</b> Come back after 4:00 PM to continue.<div style="margin-top:8px"><span class="btn">Resume now</span></div></div>
+        <div style="font-size:12.5px"><a>Let Scrobblify finish this →</a></div>
+      </div>
+    </div>
+    <p class="when">Opens the same dialog. Replaces the separate "Finish this in the background" alert.</p>
+  </div>
+</div>
+
+<h2 class="sec">Signing in (moved to after choosing) <span class="new">NEW</span></h2>
+<p class="docsub" style="margin-top:-4px">Flow: Upload → Choose → pick server or tab → sign in to <b>that</b> Last.fm app only → Send. The selected tracks are saved in the browser before the redirect and restored after.</p>
+<div class="grid">
+  <div class="cell">
+    <p class="cap">Return from Last.fm · checking duplicates</p>
+    <div class="win"><div class="stepper"><span>Upload</span><span>Choose</span><span class="on">Send</span><span>Done</span></div>
+      <div class="body"><div class="h" style="margin-top:30px">Signed in as niko</div>
+        <div class="prog" style="max-width:240px;margin:14px auto 8px"><i style="width:60%"></i></div>
+        <div class="muted">Checking which plays are already on Last.fm…</div></div></div>
+    <p class="when">Only if "Check for duplicates" was ticked. Then sends (tab) or uploads (server).</p>
+  </div>
+  <div class="cell">
+    <p class="cap">Duplicates removed</p>
+    <div class="win"><div class="stepper"><span>Upload</span><span>Choose</span><span class="on">Send</span><span>Done</span></div>
+      <div class="body"><div class="h" style="margin-top:30px">37,980 new plays</div>
+        <div class="muted">432 were already on Last.fm and were skipped.</div>
+        <div style="margin-top:14px"><span class="btn">Start</span></div></div></div>
+    <p class="when">Shown only when some were skipped; otherwise it goes straight on.</p>
+  </div>
+  <div class="cell">
+    <p class="cap">"Already scrobbling?" · server had nothing, local progress found</p>
+    <div class="win"><div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body"><div class="vcard" style="max-width:290px;margin:10px auto 0">
+        <div class="h" style="font-size:16px">Nothing running on our server</div>
+        <div class="muted" style="font-size:11.5px;margin:4px 0 10px">This browser has progress saved: 9,987 / 38,412.</div>
+        <span class="btn block">Continue in this tab</span>
+        <div class="fine" style="text-align:center">Last.fm will ask you to approve this browser too.</div></div></div></div>
+  </div>
+  <div class="cell">
+    <p class="cap">"Already scrobbling?" · nothing anywhere</p>
+    <div class="win"><div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body"><div class="vcard" style="max-width:290px;margin:10px auto 0">
+        <div class="h" style="font-size:16px">Nothing to resume</div>
+        <div class="muted" style="font-size:11.5px;margin:4px 0 10px">No import on our server, and no progress saved in this browser.</div>
+        <span class="btn block">Start an import</span>
+        <div class="fine" style="text-align:center">Saved a progress file? <a>Drop it in here</a>.</div></div></div></div>
+  </div>
+  <div class="cell">
+    <p class="cap">Move back to this tab · explainer</p>
+    <div class="win tall"><div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="scrim"><div class="dlg">
+        <div class="h">Move back to this tab?</div>
+        <div class="muted" style="margin-top:6px;line-height:1.45">Scrobblify connects to Last.fm in two ways: one for our server and one for your browser. To send from this tab, Last.fm will ask you to approve the browser one. Your progress comes back with you.</div>
+        <div class="acts"><span class="btn txt">Cancel</span><span class="btn">Continue to Last.fm</span></div>
+      </div></div></div>
+    <p class="when">Only when this browser has no Last.fm sign-in of its own. Otherwise Move back runs straight away.</p>
+  </div>
+</div>
+
+<!-- ============ STATUS ============ -->
+<h2 class="sec">Status page (replaces the stepper while a job exists) <span class="new">NEW</span></h2>
+<div class="grid">
+
+  <div class="cell">
+    <p class="cap">Sending</p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="barrow"><div class="lbar" style="flex:1;margin:0;height:26px"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div><span class="btn out sq" title="Pause">❚❚ Pause</span></div>
+        <div class="line">Done around <b>Jan 4</b></div>
+        <div class="close">Safe to close this tab</div><div class="acts3"><span class="btn out">Move back to this tab</span><span class="btn txt">Cancel</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Today full</p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="barrow"><div class="lbar" style="flex:1;margin:0;height:26px"><i style="width:27%"></i><span>10,371 / 38,412 · 27%</span></div><span class="btn out sq" title="Pause">❚❚ Pause</span></div>
+        <div class="line">Today's 700 are in · more from <b>4:20 PM</b></div>
+        <div class="close">Safe to close this tab</div><div class="acts3"><span class="btn out">Move back to this tab</span><span class="btn txt">Cancel</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cell"><p class="cap">Not signed in to the server (14-day sign-in expired, or another device)</p><div class="win"><div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div><div class="body"><div class="lbar" style="max-width:300px;margin:34px auto 10px;height:26px"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div><div class="line">Running on our server · done around <b>Jan 4</b></div><div style="margin-top:12px"><span class="btn">Sign in to manage</span></div><div class="close">Pause, move back and cancel need a Last.fm sign-in.</div></div></div><p class="when">Bar comes from the public <code>/job/live</code> answer. Sign-in uses the existing worker re-auth route.</p></div>
+  <div class="cell">
+    <p class="cap">Paused</p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="barrow"><div class="lbar grey" style="flex:1;margin:0;height:26px"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div><span class="btn sq">▶ Resume</span></div><div class="line">Paused</div>
+        <div class="acts3"><span class="btn out">Move back to this tab</span><span class="btn txt">Cancel</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Needs sign-in (needs_reauth)</p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="lbar grey" style="max-width:300px;margin:34px auto 10px;height:26px"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div>
+        <div class="line">Last.fm signed us out</div>
+        <div style="margin-top:12px"><span class="btn">Sign in again</span></div>
+        <div class="acts3"><span class="btn out">Move back to this tab</span><span class="btn txt">Cancel</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">On hold (dormant)</p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="lbar grey" style="max-width:300px;margin:34px auto 10px;height:26px"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div>
+        <div class="line">On hold: waiting 14 days for you · kept until Feb 2</div>
+        <div style="margin-top:12px"><span class="btn">Reconnect</span></div>
+        <div class="acts3"><span class="btn out">Move back to this tab</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">On hold, server full</p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="lbar grey" style="max-width:300px;margin:34px auto 10px;height:26px"><i style="width:26%"></i><span>9,987 / 38,412 · 26%</span></div>
+        <div class="line">On hold · our server is full right now</div>
+        <div style="margin-top:12px"><span class="btn dis">Reconnect</span></div>
+        <div class="acts3"><span class="btn out">Move back to this tab</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Done</p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="lbar" style="max-width:300px;margin:34px auto 10px;height:26px"><i style="width:100%"></i><span style="color:#fff;text-shadow:none">38,412 / 38,412 · 100%</span></div>
+        <div class="line">All done<span class="muted"> · 12 rejected by Last.fm</span></div>
+        <div style="margin-top:12px"><span class="btn">See your profile</span></div>
+      </div>
+    </div>
+    <p class="when">"· N rejected" only when there are any.</p>
+  </div>
+
+  <div class="cell">
+    <p class="cap">Worker unreachable <span class="chg">CHANGED</span></p>
+    <div class="win">
+      <div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
+      <div class="body">
+        <div class="alert warn">Can't reach our server right now.
+          <div style="margin-top:8px"><span class="btn">Try again</span> <span class="btn txt">Continue in this browser anyway</span></div></div>
+        <div class="fine" style="text-align:center">"Continue anyway" is hidden when this browser handed its queue over.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div></body></html>
