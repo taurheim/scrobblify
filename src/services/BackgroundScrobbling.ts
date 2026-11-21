@@ -186,6 +186,14 @@ export function setBetaOptIn(on: boolean): void {
 
 const HANDED_OVER_IMPORT_KEY = 'scrobblify.background.handedOverImport';
 
+export function clearHandedOverImport(): void {
+  try {
+    window.localStorage.removeItem(HANDED_OVER_IMPORT_KEY);
+  } catch {
+    // Nothing to clear.
+  }
+}
+
 /**
  * The import id of the queue this browser last handed to the worker.
  *
@@ -193,31 +201,40 @@ const HANDED_OVER_IMPORT_KEY = 'scrobblify.background.handedOverImport';
  * public `/scrobblify/import/:id` route after the local queue has been
  * cleared. It is deliberately **not** handover evidence for
  * `mayScrobbleWithoutAuthority`; the ownership records are.
+ *
+ * The record is per Last.fm user, so a different user on the same browser
+ * (after "Not you?", say) never sees it. A handover without an import id or
+ * user clears it, so it never points at an older handover.
  */
-export function recordHandedOverImport(importId: string): void {
-  if (!importId) {
+export function recordHandedOverImport(importId: string, username: string): void {
+  if (!importId || !username) {
+    clearHandedOverImport();
     return;
   }
   try {
-    window.localStorage.setItem(HANDED_OVER_IMPORT_KEY, importId);
+    window.localStorage.setItem(HANDED_OVER_IMPORT_KEY, JSON.stringify({ importId, username }));
   } catch {
     // Private browsing. Home just won't show the job's progress.
   }
 }
 
-export function handedOverImport(): string {
-  try {
-    return window.localStorage.getItem(HANDED_OVER_IMPORT_KEY) || '';
-  } catch {
+export function handedOverImport(username: string | null): string {
+  if (!username) {
     return '';
   }
-}
-
-export function clearHandedOverImport(): void {
   try {
-    window.localStorage.removeItem(HANDED_OVER_IMPORT_KEY);
+    const raw = window.localStorage.getItem(HANDED_OVER_IMPORT_KEY);
+    if (!raw) {
+      return '';
+    }
+    const record = JSON.parse(raw);
+    if (!record || typeof record.importId !== 'string' || typeof record.username !== 'string') {
+      return '';
+    }
+    const same = record.username.trim().toLowerCase() === username.trim().toLowerCase();
+    return same ? record.importId : '';
   } catch {
-    // Nothing to clear.
+    return '';
   }
 }
 
