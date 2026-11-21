@@ -57,7 +57,7 @@ progress-file conflict dialogs and the error dialog.
 | `returning.bar`                   | Has progress                  | {done} / {total} · {pct}%     |
 | `returning.continue`              | Saved progress, signed in     | Continue                      |
 | `returning.signIn`                | Saved progress, not signed in | Continue                      |
-| `returning.server`                | Last known job on the server  | Scrobbling in the background! |
+| `returning.server`                | Last known job on the server  | Scrobbling remotely, it's safe to close this tab. |
 | `returning.newImport`             | Saved progress                | {Not you?} · {Start over}                    |
 | `returning.noProgress.body`       | Username only                 |                               |
 | `returning.noProgress.button`     | Username only                 | Upload Spotify zip            |

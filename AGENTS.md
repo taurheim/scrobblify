@@ -227,8 +227,8 @@ them. The gate and the confirmation use `backgroundCanFinish` (fed by
 `backgroundTrackLimit`, the capacity probe's `maxTracks`, 0 when the offer is
 off). The stop reasons and the paused panel use `canOfferBackground`, since the
 offer sits right under them. The Complete step uses `backgroundTrackLimit > 0`.
-Home's welcome-back card shows a live server job ("Scrobbling in the
-background!") to any browser that handed it over, whatever its beta status,
+Home's welcome-back card shows a live server job ("Scrobbling remotely, it's
+safe to close this tab.") to any browser that handed it over, whatever its beta status,
 and the header shows the BETA tag while it does (`showingServerJob` in the
 store), besides the opt-in and flag. Otherwise Home and About have no
 background-specific copy (About's "Where does my data go?" answer mentions the

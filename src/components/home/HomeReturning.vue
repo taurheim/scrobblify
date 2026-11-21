@@ -12,7 +12,7 @@
       >
         <span class="returning-bar-label">{{ barLabel }}</span>
       </v-progress-linear>
-      <p v-if="state.kind === 'server_job'" class="mt-3 mb-0">Scrobbling in the background!</p>
+      <p v-if="state.kind === 'server_job'" class="mt-3 mb-0">Scrobbling remotely, it's safe to close this tab.</p>
     </v-card-text>
 
     <v-card-actions v-if="state.kind === 'saved'" class="flex-column">

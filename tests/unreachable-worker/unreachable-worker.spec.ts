@@ -457,7 +457,7 @@ test.describe('Home with a job on the server', () => {
     await openHome(page, 'testuser', LIVE);
     const card = page.locator('.returning-card');
     await expect(card.locator('.returning-bar')).toContainText('1,200 / 4,000 · 30%');
-    await expect(card).toContainText('Scrobbling in the background!');
+    await expect(card).toContainText("Scrobbling remotely, it's safe to close this tab.");
     await expect(card.locator('button')).toHaveCount(0);
   });
 
@@ -470,13 +470,13 @@ test.describe('Home with a job on the server', () => {
   test('another user\'s handed-over import is not shown', async ({ page }) => {
     const paths = await openHome(page, 'someoneelse', LIVE);
     await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
-    await expect(page.locator('text=Scrobbling in the background!')).toHaveCount(0);
+    await expect(page.getByText("Scrobbling remotely, it's safe to close this tab.")).toHaveCount(0);
     expect(paths.filter((p) => p.startsWith('/scrobblify/import/'))).toEqual([]);
   });
 
   test('a live job shows the BETA tag to a browser outside the beta', async ({ page }) => {
     await openHome(page, 'testuser', LIVE);
-    await expect(page.locator('.returning-card')).toContainText('Scrobbling in the background!');
+    await expect(page.locator('.returning-card')).toContainText("Scrobbling remotely, it's safe to close this tab.");
     expect(await page.evaluate(() => localStorage.getItem('scrobblify.background.beta'))).toBeNull();
     await expect(page.locator('#logo .beta-tag')).toHaveText('BETA');
     await page.locator('#nav a:has-text("About")').click();
