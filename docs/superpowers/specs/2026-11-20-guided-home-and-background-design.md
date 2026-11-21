@@ -40,7 +40,7 @@ they are; the change is structure and copy.
 - The "Background scrobbling (beta) is switched on for this browser" banner is
   removed. `?beta=0` still opts out.
 - **Revised 2026-11-21:** a beta banner is back on every page for beta
-  browsers, now with a feedback line: "Background scrobbling is in beta.
+  browsers, now with a feedback line: "You're trying the scrobblify beta.
   Something not working, or have a suggestion? Email niko@savas.ca." and
   **Switch it off** (`?beta=0` on the current page). Strings `beta.banner` and
   `beta.banner.off`. Shipped with PR 3 (Plan 2).

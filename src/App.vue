@@ -27,7 +27,7 @@
       class="mx-auto mb-4 flex-0-0"
       max-width="720"
     >
-      Background scrobbling is in beta. Something not working, or have a suggestion?
+      You're trying the scrobblify beta. Something not working, or have a suggestion?
       Email <a href="mailto:niko@savas.ca">niko@savas.ca</a>.
       <a :href="betaOffHref">Switch it off</a>
     </v-alert>

@@ -932,8 +932,8 @@ only the hash doesn't reload, so it applies on the next load), and shows a
 **BETA** tag in the header whenever `isBackgroundEnabled()` (re-read on
 `onFeatureFlags`), or while Home shows this user's live server job
 (`showingServerJob`). Whenever `isBackgroundEnabled()`, every page also shows
-the beta banner (`#beta-banner`, back since 2026-11-21): "Background
-scrobbling is in beta. Something not working, or have a suggestion? Email
+the beta banner (`#beta-banner`, back since 2026-11-21): "You're trying the
+scrobblify beta. Something not working, or have a suggestion? Email
 niko@savas.ca." and a **Switch it off** link, `betaOffHref`, which reloads the
 current page with `?beta=0` added to the real query string (built from
 `location`, since dev's hash router doesn't own it). Only the explicit opt-in counts in

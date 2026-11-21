@@ -227,7 +227,7 @@ New strings shipped with sign-in after choosing (PR 3). Placeholder copy; rewrit
 
 | ID | When | Draft |
 | --- | --- | --- |
-| `beta.banner` | Every page, beta browser (`isBackgroundEnabled()`) | Background scrobbling is in beta. Something not working, or have a suggestion? Email niko@savas.ca. |
+| `beta.banner` | Every page, beta browser (`isBackgroundEnabled()`) | You're trying the scrobblify beta. Something not working, or have a suggestion? Email niko@savas.ca. |
 | `beta.banner.off` | Same, link at the end of the banner | Switch it off |
 | `signin.signingIn` | `/scrobble`, back from Last.fm while the token is exchanged | Signing in to Last.fm… |
 | `signin.signingIn.label` | Same, screen-reader label of the spinner | Signing in |
