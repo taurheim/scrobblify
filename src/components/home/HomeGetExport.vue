@@ -46,10 +46,10 @@
       <p>
         I'd recommend checking out
         <a
-          href="https://musicbrainz.org/register"
+          href="https://listenbrainz.org/"
           target="_blank"
           rel="noopener noreferrer"
-        >MusicBrainz</a>
+        >ListenBrainz</a>
         which does not have this limitation and lets you keep all your original listening dates:
       </p>
       <ol>
