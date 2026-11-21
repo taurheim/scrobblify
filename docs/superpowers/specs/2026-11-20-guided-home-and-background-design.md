@@ -34,7 +34,9 @@ they are; the change is structure and copy.
 ## 1. Header
 
 - Unchanged, except a static **BETA** tag next to the wordmark for beta
-  browsers (`isBackgroundEnabled()`). No popover.
+  browsers (`isBackgroundEnabled()`), and for any browser showing this user's
+  server job (so a `?beta=1` user who opens a new browser still sees it on their
+  status page). No popover.
 - The "Background scrobbling (beta) is switched on for this browser" banner is
   removed. `?beta=0` still opts out.
 
@@ -147,6 +149,16 @@ A local-progress branch would be unreachable and is deliberately absent.
 
 All the existing resume guards stay: `restoreFromState` still refuses without a
 browser session key, and `scrobblePlay` still throws `NotAuthenticatedError`.
+
+### 4.5 The server-authority check after the new sign-in
+
+Every sign-in is a full-page Last.fm redirect, so the page mounts again with the
+username known and `enforceServerAuthority` asks `/job/live` before anything can
+be sent (sending already refuses while `authorityPending`). A user with a job on
+the server who uploads their zip again on a new browser is therefore shown the
+status page instead of sending. This must keep holding when sign-in moves: the
+first send after a sign-in may not start until the authority check has answered
+or fallen through (`mayScrobbleWithoutAuthority`).
 
 ## 5. The server choice
 
@@ -341,7 +353,9 @@ Playwright (`tests/scrobblify.spec.ts`), using `tests/lastfmMock.js` and
 - **About:** questions expand; ListenBrainz link emits `source: about`.
 - **Sign-in after choose:** upload and choose work signed out; the tab path
   signs in to the browser app and resumes the selection after the redirect;
-  the duplicate check runs after sign-in and shows the skipped count.
+  the duplicate check runs after sign-in and shows the skipped count; with a
+  live job for the user on the mock worker, a fresh browser that uploads and
+  signs in gets the status page and sends nothing.
 - **Server choice:** shown for beta + room + ≥750; not shown for small, non-beta
   or full; shown before sign-in for a flagged browser that has never signed in
   (via the local flag override); the over-60 warning appears above 60 days;
