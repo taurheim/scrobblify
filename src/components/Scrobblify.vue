@@ -574,6 +574,13 @@ export default defineComponent({
       reauthFixNow: false,
       resumeSignInMessage: '',
       /**
+       * What the sign-in banner's button signs in for. Only a refused resume of
+       * this browser's saved progress should resume it afterwards; a refused
+       * progress file must not, or the button would resume a *different*
+       * import the user may just have declined (#153).
+       */
+      resumeSignInIntent: 'resume' as 'resume' | 'reconnect',
+      /**
        * The saved progress is the selection this browser went to Last.fm to
        * send, not an earlier session, so the resume prompt leaves it alone
        * until `continueSignInIntent` has dealt with it.
@@ -2732,9 +2739,12 @@ export default defineComponent({
         this.checkingDuplicates = false;
       }
     },
-    /** The sign-in banner's button: sign in, then resume the saved progress. */
+    /**
+     * The sign-in banner's button: sign in, then resume the saved progress if
+     * that was what was refused; otherwise just come back signed in.
+     */
     signInToResume() {
-      startSignIn(this.$store.state.lfmApi as LastFm, { kind: 'resume' });
+      startSignIn(this.$store.state.lfmApi as LastFm, { kind: this.resumeSignInIntent });
     },
     /**
      * `state.totalTracks` is only the tracks left to do, so on its own it makes
@@ -3012,6 +3022,7 @@ export default defineComponent({
         this.resumeSignInMessage = source === 'saved'
           ? 'Sign in to Last.fm first, then choose Resume.'
           : 'Sign in to Last.fm first, then import your progress file again.';
+        this.resumeSignInIntent = source === 'saved' ? 'resume' : 'reconnect';
         return;
       }
       // A selection coming back from sign-in is not a resume, so it stays out

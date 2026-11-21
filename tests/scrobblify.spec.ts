@@ -2427,6 +2427,32 @@ test.describe('Session Resume', () => {
     await expect(page.locator('text=1 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   });
 
+  // #153: signing in from a refused *file* must not resume the other saved import.
+  test('signing in after a refused progress file does not resume the saved import instead', async ({ page }) => {
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    await page.goto('/#/scrobble');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await seedSavedState(page, buildState({ importId: 'aaaaaaaaaaaaaaaaaaaaaaaa' }));
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(buildState({
+        importId: 'bbbbbbbbbbbbbbbbbbbbbbbb', completedIndices: [0, 1, 2, 3], originalSucceededCount: 4,
+      }))),
+    });
+    await page.locator('.progress-file-conflict button:has-text("Use this file anyway")').click();
+    await expect(page.locator('text=then import your progress file again')).toBeVisible({ timeout: 5000 });
+
+    await page.getByRole('button', { name: 'Sign in to Last.fm' }).click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.upload-step')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeHidden();
+  });
+
   test('re-importing a progress file for a finished import warns first', async ({ page }) => {
     test.setTimeout(60000);
     const importId = 'cccccccccccccccccccccccc';
