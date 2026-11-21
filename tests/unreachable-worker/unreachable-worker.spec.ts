@@ -416,3 +416,57 @@ test.describe('BETA tag', () => {
     await expect(page.locator(TAG)).toHaveCount(0);
   });
 });
+
+test.describe('Home with a job on the server', () => {
+  const IMPORT_ID = 'c1c2c3c4c5c6c7c8c9c0d1d2d3d4d5d6';
+  const RECORD_KEY = 'scrobblify.background.handedOverImport';
+
+  async function openHome(page: Page, recordUser: string, answer: Record<string, unknown> | 'refuse') {
+    await page.route(WORKER, async (route: Route) => {
+      const { pathname } = new URL(route.request().url());
+      if (answer !== 'refuse' && pathname === `/scrobblify/import/${IMPORT_ID}`) {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(answer) });
+        return;
+      }
+      await route.abort('internetdisconnected');
+    });
+    await page.goto('/#/');
+    await page.evaluate(([key, id, user]) => {
+      localStorage.setItem('scrobblifyLfmUserName', 'testuser');
+      localStorage.setItem(key, JSON.stringify({ importId: id, username: user }));
+    }, [RECORD_KEY, IMPORT_ID, recordUser]);
+    await page.reload();
+  }
+
+  const LIVE = {
+    ok: true, known: true, live: true, state: 'active', cursor: 1200, scrobbledCount: 1200, totalTracks: 4000,
+  };
+
+  test('shows the job\'s progress from the handed-over import id', async ({ page }) => {
+    await openHome(page, 'testuser', LIVE);
+    const card = page.locator('.returning-card');
+    await expect(card.locator('.returning-bar')).toContainText('1,200 / 4,000 · 30%');
+    await expect(card).toContainText('Scrobbling in the background!');
+    await expect(card.locator('button')).toHaveCount(0);
+  });
+
+  test('another user\'s handed-over import is not shown', async ({ page }) => {
+    await openHome(page, 'someoneelse', LIVE);
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
+    await expect(page.locator('text=Scrobbling in the background!')).toHaveCount(0);
+  });
+
+  test('a finished job falls back to the plain welcome-back card and forgets the id', async ({ page }) => {
+    await openHome(page, 'testuser', {
+      ok: true, known: true, live: false, state: 'completed', cursor: 4000, scrobbledCount: 4000, totalTracks: 4000,
+    });
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
+    expect(await page.evaluate((key) => localStorage.getItem(key), RECORD_KEY)).toBeNull();
+  });
+
+  test('an unreachable worker shows the plain card but keeps the id for next time', async ({ page }) => {
+    await openHome(page, 'testuser', 'refuse');
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
+    expect(await page.evaluate((key) => localStorage.getItem(key), RECORD_KEY)).not.toBeNull();
+  });
+});
