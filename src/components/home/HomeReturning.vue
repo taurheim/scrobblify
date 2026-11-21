@@ -19,7 +19,7 @@
       <v-btn color="primary" variant="flat" block @click="$emit('continue')">Continue</v-btn>
       <div class="returning-links mt-2">
         <button type="button" class="link-button" @click="$emit('not-you')">Not you?</button>
-        <span aria-hidden="true">·</span>
+        <span aria-hidden="true"> · </span>
         <button type="button" class="link-button" @click="$emit('start-over')">Start over</button>
       </div>
     </v-card-actions>
@@ -28,7 +28,7 @@
       <v-btn color="primary" variant="flat" block @click="$emit('upload')">Upload Spotify zip</v-btn>
       <div class="returning-links mt-2">
         <button type="button" class="link-button" @click="$emit('not-you')">Not you?</button>
-        <span aria-hidden="true">·</span>
+        <span aria-hidden="true"> · </span>
         <button type="button" class="link-button" @click="$emit('show-get-export')">Show me how</button>
       </div>
     </v-card-actions>

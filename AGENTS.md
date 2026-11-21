@@ -797,13 +797,17 @@ timing. All of this is independent of `VUE_APP_BACKGROUND_API`, which
 only says whether the build *can* reach a worker.
 
 `scrobblify.background.handedOverImport` (localStorage) holds JSON
-`{ importId, username }` for the queue this browser last handed over: written
+`{ importId, username, originalTotal? }` for the queue this browser last handed over: written
 in `completeHandoff` when a handover goes live, cleared after a confirmed
 take-back, when a newer handover's import id or user is unknown (so it never
 names an older one), or when Home sees the job ended or unknown to the worker.
 Home uses it, only for the same Last.fm user (case-insensitive) and only while
 the job is live, to show progress through the public `/scrobblify/import/:id`
-route; a signed-out or on-hold job gets the plain card. It is display-only and
+route; a signed-out or on-hold job gets the plain card. That route counts only
+the tracks the worker was handed, so Home shows the whole import as
+`originalTotal - (totalTracks - scrobbledCount)` of `originalTotal` (the
+import's `originalTotalTracks`); a record without it (older ones) falls back to
+the server's own numbers. It is display-only and
 deliberately **not** handover evidence.
 
 Two functions in `src/services/BackgroundScrobbling.ts`, and the split is

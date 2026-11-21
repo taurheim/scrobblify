@@ -421,7 +421,12 @@ test.describe('Home with a job on the server', () => {
   const IMPORT_ID = 'c1c2c3c4c5c6c7c8c9c0d1d2d3d4d5d6';
   const RECORD_KEY = 'scrobblify.background.handedOverImport';
 
-  async function openHome(page: Page, recordUser: string, answer: Record<string, unknown> | 'refuse') {
+  async function openHome(
+    page: Page,
+    recordUser: string,
+    answer: Record<string, unknown> | 'refuse',
+    originalTotal?: number,
+  ) {
     const paths: string[] = [];
     await page.route(WORKER, async (route: Route) => {
       const { pathname } = new URL(route.request().url());
@@ -433,10 +438,13 @@ test.describe('Home with a job on the server', () => {
       await route.abort('internetdisconnected');
     });
     await page.goto('/#/');
-    await page.evaluate(([key, id, user]) => {
+    const record = originalTotal === undefined
+      ? { importId: IMPORT_ID, username: recordUser }
+      : { importId: IMPORT_ID, username: recordUser, originalTotal };
+    await page.evaluate(([key, value]) => {
       localStorage.setItem('scrobblifyLfmUserName', 'testuser');
-      localStorage.setItem(key, JSON.stringify({ importId: id, username: user }));
-    }, [RECORD_KEY, IMPORT_ID, recordUser]);
+      localStorage.setItem(key, value);
+    }, [RECORD_KEY, JSON.stringify(record)]);
     await page.reload();
     return paths;
   }
@@ -451,6 +459,12 @@ test.describe('Home with a job on the server', () => {
     await expect(card.locator('.returning-bar')).toContainText('1,200 / 4,000 · 30%');
     await expect(card).toContainText('Scrobbling in the background!');
     await expect(card.locator('button')).toHaveCount(0);
+  });
+
+  test('counts the whole import, not just the server\'s share, when its size was recorded', async ({ page }) => {
+    // 1,000 were scrobbled in the browser before 4,000 were handed over.
+    await openHome(page, 'testuser', LIVE, 5000);
+    await expect(page.locator('.returning-card .returning-bar')).toContainText('2,200 / 5,000 · 44%');
   });
 
   test('another user\'s handed-over import is not shown', async ({ page }) => {

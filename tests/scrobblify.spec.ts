@@ -194,6 +194,7 @@ test.describe('Home Page', () => {
     const card = page.locator('.returning-card');
     await expect(card.locator('.v-card-title')).toHaveText('Welcome back, testuser');
     await expect(card.locator('.returning-bar')).toContainText('3 / 5 · 60%');
+    await expect(card.locator('.returning-links')).toHaveText(/^\s*Not you\?\s+·\s+Start over\s*$/);
     await expect(page.locator('.home-card')).toHaveCount(0);
     await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'saved_signed_out' } });
 

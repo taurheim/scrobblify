@@ -52,10 +52,19 @@ export async function detectReturning(
     through to the plain card; the status page on /scrobble explains it. A
     record the server doesn't know, or whose job has ended, is dropped.
   */
-  const importId = background.handedOverImport(username);
-  if (importId) {
-    const status = await background.importStatus(importId, RETURNING_STATUS_TIMEOUT_MS);
+  const handedOver = background.handedOverImport(username);
+  if (handedOver) {
+    const status = await background.importStatus(handedOver.importId, RETURNING_STATUS_TIMEOUT_MS);
     if (status && status.live) {
+      // The worker counts only the tracks it was handed; show the whole import.
+      const { originalTotal } = handedOver;
+      if (originalTotal > 0 && originalTotal >= status.totalTracks) {
+        const remaining = status.totalTracks - status.scrobbledCount;
+        const done = Math.min(originalTotal, Math.max(0, originalTotal - remaining));
+        return {
+          kind: 'server_job', username, done, total: originalTotal,
+        };
+      }
       return {
         kind: 'server_job', username, done: status.scrobbledCount, total: status.totalTracks,
       };
