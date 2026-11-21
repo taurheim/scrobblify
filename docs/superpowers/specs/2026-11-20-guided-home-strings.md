@@ -31,7 +31,7 @@ progress-file conflict dialogs and the error dialog.
 | `home.need.title`   | Card 2      | Don't have it yet?                              |
 | `home.need.body`    | Card 2      |                                                 |
 | `home.need.button`  | Card 2      | Show me how                                     |
-| `home.already`      | Below cards | Already used Scrobblify?                        |
+| `home.already`      | Below cards | Already scrobbling on scrobblify?                        |
 | `home.already.link` | Below cards | Re-connect to last.fm                           |
 
 
@@ -207,11 +207,7 @@ status page or the steps.
 | `signin.dupes.title` | Some plays were skipped as duplicates | {count} plays to scrobble |
 | `signin.dupes.body` | Same | Skipped {skipped} that are already on Last.fm. |
 | `signin.dupes.button` | Same | Start |
-| `signin.nothingOnServer.title` | "Already used Scrobblify?", no server job, this browser has progress | Scrobblify isn't scrobbling anything for you |
-| `signin.nothingOnServer.body` | Same | But this browser has saved progress ({done} / {total}). |
-| `signin.nothingOnServer.button` | Same | Scrobble the rest locally |
-| `signin.nothingOnServer.hint` | Same | Last.fm will ask you to approve Scrobblify once more. |
-| `signin.nothing.title` | "Already used Scrobblify?", nothing anywhere | Nothing to resume |
+| `signin.nothing.title` | "Already scrobbling on scrobblify?", nothing anywhere | Nothing to resume |
 | `signin.nothing.body` | Same | Scrobblify isn't scrobbling anything for you, and this browser has no saved progress. |
 | `signin.nothing.button` | Same | Upload Spotify zip |
 | `signin.nothing.file` | Same | Have a progress file? {Upload it here}. |

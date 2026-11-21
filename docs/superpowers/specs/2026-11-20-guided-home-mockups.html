@@ -83,14 +83,14 @@
 </style></head>
 <body><div class="page">
 
-<h1 class="doc">Scrobblify: guided home + background, all states (v6)</h1>
+<h1 class="doc">Scrobblify: guided home + background, all states (v7)</h1>
 <p class="docsub">Current theme and header. Placeholder copy. <span class="new">NEW</span> new screen · <span class="chg">CHANGED</span> existing screen rewritten · <span class="same">SAME</span> untouched.</p>
 
 <h2 class="sec">State matrix</h2>
 <table class="mx">
   <tr><th>Surface</th><th>Condition</th><th>What the user sees</th><th>Primary action</th><th>Telemetry</th></tr>
   <tr><td class="k">Header</td><td>Beta browser (opt-in or flag)</td><td>Static BETA tag next to wordmark. Replaces beta banner. (<code>?beta=0</code> still opts out.)</td><td>-</td><td>-</td></tr>
-  <tr><td class="k">Home</td><td>No stored username, no saved progress</td><td>Headline, one line, two equal cards, "Already scrobbling?" link</td><td>Either card</td><td><code>home_choice</code></td></tr>
+  <tr><td class="k">Home</td><td>No stored username, no saved progress</td><td>Headline, one line, two equal cards, "Already scrobbling on scrobblify?" link</td><td>Either card</td><td><code>home_choice</code></td></tr>
   <tr><td class="k"></td><td>Clicked "I need to get it"</td><td>Cards swap to 3 numbered lines + Back + "Already have it? Start"</td><td>Spotify link</td><td><code>home_choice: get_export</code></td></tr>
   <tr><td class="k"></td><td>Returning, signed in, saved progress</td><td>"Welcome back" card with progress bar</td><td>Continue</td><td><code>home_returning_shown</code></td></tr>
   <tr><td class="k"></td><td>Returning, session key cleared/absent</td><td>Same card</td><td>Sign in to continue</td><td><code>home_returning_shown</code></td></tr>
@@ -106,7 +106,7 @@
   <tr><td class="k">Sign-in</td><td>Server chosen</td><td>Last.fm approval for the server app only</td><td>-</td><td><code>background_handoff_*</code></td></tr>
   <tr><td class="k"></td><td>Tab chosen / small import / not beta</td><td>Last.fm approval for the browser app only (skipped if already signed in)</td><td>-</td><td><code>auth_success</code></td></tr>
   <tr><td class="k"></td><td>Back from Last.fm, duplicates ticked</td><td>"Checking which plays are already on Last.fm…", then the count if any were skipped</td><td>Start</td><td>-</td></tr>
-  <tr><td class="k"></td><td>"Already scrobbling?"</td><td>Server sign-in → status page; else local progress → Continue in this tab; else Nothing to resume</td><td>varies</td><td><code>home_choice: resume</code></td></tr>
+  <tr><td class="k"></td><td>"Already scrobbling on scrobblify?"</td><td>Server sign-in → status page; else Nothing to resume</td><td>varies</td><td><code>home_choice: resume</code></td></tr>
   <tr><td class="k"></td><td>Move back, browser has no sign-in</td><td>Explainer pop-up about the two Last.fm connections</td><td>Continue to Last.fm</td><td>-</td></tr>  <tr><td class="k">Status page</td><td>Job active, sending</td><td>Count + % bar · "done around D"</td><td>Pause (right of bar) · Move back / Cancel buttons</td><td>-</td></tr>
   <tr><td class="k"></td><td>Job active, today full</td><td>"Today's 700 are in · more from T"</td><td>Pause (right of bar) · Move back / Cancel buttons</td><td>-</td></tr>
   <tr><td class="k"></td><td>No server sign-in (expired / other device)</td><td>Bar from public data, controls hidden</td><td>Sign in to manage</td><td>-</td></tr>
@@ -141,7 +141,7 @@
           <div class="vcard"><div class="t">I have my Spotify export</div><div class="d">The ZIP Spotify emailed you.</div><span class="btn block">Start</span></div>
           <div class="vcard"><div class="t">I need to get it</div><div class="d">Request it from Spotify. Takes a few days.</div><span class="btn block">Show me how</span></div>
         </div>
-        <div class="sep">Already scrobbling? <span class="a">Sign in to pick up where you left off</span></div>
+        <div class="sep">Already scrobbling on scrobblify? <span class="a">Re-connect to last.fm</span></div>
       </div>
       <div class="foot">Scrobblify · built by Niko Savas</div>
     </div>
@@ -349,16 +349,7 @@
     <p class="when">Shown only when some were skipped; otherwise it goes straight on.</p>
   </div>
   <div class="cell">
-    <p class="cap">"Already scrobbling?" · server had nothing, local progress found</p>
-    <div class="win"><div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
-      <div class="body"><div class="vcard" style="max-width:290px;margin:10px auto 0">
-        <div class="h" style="font-size:16px">Nothing running on our server</div>
-        <div class="muted" style="font-size:11.5px;margin:4px 0 10px">This browser has progress saved: 9,987 / 38,412.</div>
-        <span class="btn block">Continue in this tab</span>
-        <div class="fine" style="text-align:center">Last.fm will ask you to approve this browser too.</div></div></div></div>
-  </div>
-  <div class="cell">
-    <p class="cap">"Already scrobbling?" · nothing anywhere</p>
+    <p class="cap">"Already scrobbling on scrobblify?" · nothing anywhere</p>
     <div class="win"><div class="nav"><div class="logo"><span class="img"></span>scrobblify <span class="chip">BETA</span></div><div class="links"><b>Home</b> | <b>Scrobble</b> | <b>About</b></div></div>
       <div class="body"><div class="vcard" style="max-width:290px;margin:10px auto 0">
         <div class="h" style="font-size:16px">Nothing to resume</div>

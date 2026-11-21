@@ -49,7 +49,7 @@ Title, then two equal cards side by side (stacked on mobile):
 | Already got your streaming history zip? | → `/scrobble` (upload step) | `home_choice` `choice: have_export` |
 | Don't have it yet? | Swaps the cards for the three "get your history" steps, in place, with ← Back | `home_choice` `choice: get_export` |
 
-Below the cards: "Already used Scrobblify? Re-connect to last.fm" → the
+Below the cards: "Already scrobbling on scrobblify? Re-connect to last.fm" → the
 "already used" sign-in path (section 4.4), `home_choice` `choice: resume`.
 
 ### Returning visitor
@@ -59,10 +59,15 @@ username or saved progress (`StateManager`). One card:
 
 | Situation | Card |
 | --- | --- |
-| Saved progress, browser signed in | Title, labelled progress bar, **Continue** |
-| Saved progress, browser not signed in | Same, **Continue** goes through the browser's Last.fm sign-in first |
+| Saved progress | Title, labelled progress bar, **Continue** |
 | Last known server job (from this browser's handover record) | Title, bar, "Scrobbling in the background!". No button |
 | Username only | Title, **Upload Spotify zip**, "Not you?", "Show me how" |
+
+**Continue** resumes the saved progress through the resume entry point of the
+server choice (section 5) *before* any sign-in, then signs in to whichever
+Last.fm application the chosen path needs (skipped if this browser already has
+it). This is how a user who started scrobbling locally and has since joined the
+beta is offered the server for the rest.
 
 "Not you?" clears the stored username (existing `clearToken` behaviour).
 "Start over" (saved-progress states) goes to the upload step; the existing
@@ -108,7 +113,7 @@ for **only the one it needs**.
 | --- | --- |
 | Server (beta, big import, server chosen) | Worker application only |
 | Tab (small import, not beta, or "scrobble locally") | Browser application only; skipped if already signed in |
-| "Already used Scrobblify?" | Worker first; see 4.4 |
+| "Already scrobbling on scrobblify?" | Worker first; see 4.4 |
 | Scrobble the rest locally (move back) | Browser application, only if this browser has none; see 6.3 |
 
 ### 4.2 Surviving the redirect
@@ -129,15 +134,16 @@ On the server path the browser has no Last.fm key of its own, so the check reads
 duplicate check on that path; the read fails soft, as today, and the import
 proceeds with everything.
 
-### 4.4 "Already used Scrobblify?"
+### 4.4 "Already scrobbling on scrobblify?"
 
 1. Sign in to the **worker** application.
 2. Live or parked server job for this user → status page.
-3. No job, and this browser has saved progress → "Scrobblify isn't scrobbling
-   anything for you" with **Scrobble the rest locally** (a second sign-in, to
-   the browser application).
-4. Nothing anywhere → "Nothing to resume", **Upload Spotify zip**, and a link to
+3. Otherwise → "Nothing to resume", **Upload Spotify zip**, and a link to
    import a progress file.
+
+The link only shows on the first-visit page, so this browser never has saved
+progress here (a browser with saved progress gets the returning-visitor card).
+A local-progress branch would be unreachable and is deliberately absent.
 
 All the existing resume guards stay: `restoreFromState` still refuses without a
 browser session key, and `scrobblePlay` still throws `NotAuthenticatedError`.
