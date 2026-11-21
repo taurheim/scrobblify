@@ -2290,6 +2290,7 @@ export default defineComponent({
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         background.clearHandoffLineage(carriedLineage.ranges, carriedLineage.knownFromSec);
+        background.clearHandedOverImport();
         /*
           Said out loud when it applies, and it now rarely does. A track that
           was sent without a confirmed reply comes back pinned to the exact

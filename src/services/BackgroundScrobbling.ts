@@ -184,6 +184,43 @@ export function setBetaOptIn(on: boolean): void {
   }
 }
 
+const HANDED_OVER_IMPORT_KEY = 'scrobblify.background.handedOverImport';
+
+/**
+ * The import id of the queue this browser last handed to the worker.
+ *
+ * Display only: Home uses it to show a running job's progress through the
+ * public `/scrobblify/import/:id` route after the local queue has been
+ * cleared. It is deliberately **not** handover evidence for
+ * `mayScrobbleWithoutAuthority`; the ownership records are.
+ */
+export function recordHandedOverImport(importId: string): void {
+  if (!importId) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(HANDED_OVER_IMPORT_KEY, importId);
+  } catch {
+    // Private browsing. Home just won't show the job's progress.
+  }
+}
+
+export function handedOverImport(): string {
+  try {
+    return window.localStorage.getItem(HANDED_OVER_IMPORT_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function clearHandedOverImport(): void {
+  try {
+    window.localStorage.removeItem(HANDED_OVER_IMPORT_KEY);
+  } catch {
+    // Nothing to clear.
+  }
+}
+
 /**
  * Applies `?beta=1` / `?beta=0` from the current URL, and reports whether the
  * opt-in is now on.
