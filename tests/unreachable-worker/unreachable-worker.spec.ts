@@ -3,7 +3,7 @@ import {
 } from '@playwright/test';
 import path from 'path';
 import JSZip from 'jszip';
-import { interceptLastFm, mockLastFmAuth } from '../lastfmMock';
+import { interceptLastFm, mockLastFmAuth, routeLastFmSignIn } from '../lastfmMock';
 
 /*
   Runs only under `playwright.unreachable-worker.config.ts`, which compiles in
@@ -328,6 +328,93 @@ test.describe('Signing in while the page mounts', () => {
     await expect(page.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('text=Resume previous session?')).toHaveCount(0);
     expect(scrobbles).toEqual([]);
+  });
+});
+
+test.describe('Signing in after choosing', () => {
+  async function readSavedState(page: Page): Promise<Record<string, any> | null> {
+    return page.evaluate(() => new Promise<Record<string, any> | null>((resolve, reject) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains('scrobbleState')) {
+          request.result.createObjectStore('scrobbleState');
+        }
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const req = db.transaction('scrobbleState', 'readonly').objectStore('scrobbleState').get('current');
+        req.onsuccess = () => { db.close(); resolve(req.result || null); };
+        req.onerror = () => { db.close(); reject(req.error); };
+      };
+      request.onerror = () => reject(request.error);
+    }));
+  }
+
+  /*
+    Spec 4.5: someone whose import is running on the server uploads it again
+    on a browser that has never seen them. Nothing in it says "handed over",
+    and the username only arrives with the sign-in that now comes after
+    choosing, so the server's answer to that sign-in is all that stops a
+    second copy of the queue going out.
+  */
+  test('a fresh browser that chooses and signs in while a job is live sends nothing', async ({ page }) => {
+    const scrobbles: string[] = [];
+    const workerCalls: string[] = [];
+    const worker: Record<string, unknown> = {
+      '/scrobblify/job/live': { ok: true, live: true },
+      '/scrobblify/import/': { ok: true, known: false, live: false },
+      '/scrobblify/capacity': {
+        available: true, used: 0, capacity: 100, minTracks: 750, maxTracks: 200000, chunkTracks: 5000,
+      },
+    };
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    await page.route(WORKER, async (route: Route) => {
+      const { pathname } = new URL(route.request().url());
+      workerCalls.push(pathname);
+      const match = Object.keys(worker).find((prefix) => pathname.startsWith(prefix));
+      if (!match) {
+        await route.abort('internetdisconnected');
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(worker[match]) });
+    });
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('button:has-text("matching")').click({ timeout: 5000 });
+    await page.locator('button:has-text("selected tracks")').click();
+    await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 10000 });
+    // Long enough for a send that was going to happen to have happened.
+    await page.waitForTimeout(3000);
+    expect(scrobbles).toEqual([]);
+    expect(workerCalls).toContain('/scrobblify/job/live');
+    await expect(page.locator('text=Resume previous session?')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeHidden();
+    // Kept, untouched, for when the server lets go of the import.
+    const saved = await readSavedState(page);
+    expect(saved).not.toBeNull();
+    expect(saved!.completedIndices).toEqual([]);
+    expect(saved!.totalTracks).toBeGreaterThan(0);
+    expect(saved!.totalTracks).toBe(saved!.originalTotalTracks);
   });
 });
 test.describe('Offering background scrobbling', () => {

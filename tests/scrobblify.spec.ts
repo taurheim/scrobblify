@@ -8,7 +8,7 @@ import LastFm from '../src/api/LastFm';
 import Scrobble from '../src/models/Scrobble';
 // Shared Last.fm mock, also used by the `npm run dev:mock` interactive script.
 import {
-  interceptLastFm, mockLastFmAuth, MockLibrary,
+  interceptLastFm, mockLastFmAuth, MockLibrary, routeLastFmSignIn,
 } from './lastfmMock';
 
 const FIXTURE_ZIP = path.resolve(__dirname, 'fixtures', 'test-spotify-data.zip');
@@ -37,19 +37,6 @@ async function goToUploadStep(page: Page): Promise<MockLibrary> {
   // Auth step should auto-complete since we're "authenticated"
   await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
   return library;
-}
-
-// Stands in for Last.fm's authorize page: sends the browser straight back to
-// the app's callback with a fresh token, which `interceptLastFm` exchanges for
-// user `testuser`.
-async function routeLastFmSignIn(page: Page) {
-  await page.route('https://www.last.fm/api/auth/**', (route) => route.fulfill({
-    status: 302,
-    // Absolute: a relative location would resolve against www.last.fm.
-    headers: {
-      location: `${new URL(page.url()).origin}/#/scrobble?token=t-${Math.random().toString(16).slice(2, 10)}`,
-    },
-  }));
 }
 
 // The scrobble button opens a confirmation with a time estimate; starting

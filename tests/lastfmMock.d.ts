@@ -37,6 +37,8 @@ export function interceptLastFm(
   options?: { dailyCap?: number } & MockLibraryOptions,
 ): Promise<MockLibrary>;
 export function mockLastFmAuth(page: Page): Promise<void>;
+/** Answers Last.fm's authorize page with a redirect back to the app, signed in as MOCK_USER. */
+export function routeLastFmSignIn(page: Page): Promise<void>;
 export function handleLastFm(params: URLSearchParams, library: MockLibrary): MockResponse;
 export function createLibrary(dailyCap?: number, options?: MockLibraryOptions): MockLibrary;
 export function recordScrobble(library: MockLibrary, params: URLSearchParams, body: unknown): void;

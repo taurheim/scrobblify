@@ -233,9 +233,23 @@ async function mockLastFmAuth(page) {
   }, [MOCK_USER, MOCK_SESSION_KEY]);
 }
 
+// Stands in for Last.fm's authorize page: sends the browser straight back to
+// the app's callback with a fresh token, which `interceptLastFm` exchanges for
+// MOCK_USER. Fresh per request, because the app refuses to resubmit a token.
+async function routeLastFmSignIn(page) {
+  await page.route('https://www.last.fm/api/auth/**', (route) => route.fulfill({
+    status: 302,
+    // Absolute: a relative location would resolve against www.last.fm.
+    headers: {
+      location: `${new URL(page.url()).origin}/#/scrobble?token=t-${Math.random().toString(16).slice(2, 10)}`,
+    },
+  }));
+}
+
 module.exports = {
   interceptLastFm,
   mockLastFmAuth,
+  routeLastFmSignIn,
   handleLastFm,
   createLibrary,
   recordScrobble,
