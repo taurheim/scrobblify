@@ -4,7 +4,11 @@
 
     <home-get-export v-if="gettingExport" @back="gettingExport = false" />
 
-    <template v-else-if="ready && returning.kind === 'none'">
+    <div v-else-if="!ready" class="home-loading-wrap">
+      <v-progress-circular indeterminate color="primary" class="home-loading" />
+    </div>
+
+    <template v-else-if="returning.kind === 'none'">
       <div class="home-cards">
         <v-card class="home-card">
           <v-card-title class="text-wrap">Already got your streaming history zip?</v-card-title>
@@ -59,6 +63,11 @@
 .home-already {
   margin-top: 24px;
 }
+
+.home-loading-wrap {
+  display: flex;
+  justify-content: center;
+}
 </style>
 
 <script lang="ts">
@@ -89,8 +98,13 @@ export default defineComponent({
   methods: {
     async refreshReturning() {
       const api = this.$store.state.lfmApi as LastFm;
-      this.returning = await detectReturning(api, this.stateManager);
-      this.ready = true;
+      try {
+        this.returning = await detectReturning(api, this.stateManager);
+      } catch {
+        this.returning = { kind: 'none' };
+      } finally {
+        this.ready = true;
+      }
     },
     go(choice: HomeChoice) {
       trackEvent('home_choice', { choice });

@@ -9,7 +9,11 @@ export type ReturningState =
   | { kind: 'server_job'; username: string | null; done: number; total: number }
   | { kind: 'username_only'; username: string };
 
+// Job end states plus handoff end states (the import route can return a handoff row).
 const ENDED_STATES = ['completed', 'failed', 'cancelled', 'expired', 'reaped'];
+
+// Home waits on this before rendering, so it gets less time than the scrobble step.
+const RETURNING_STATUS_TIMEOUT_MS = 3000;
 
 export function progressLabel(done: number, total: number): string {
   const pct = total > 0 ? Math.floor((100 * done) / total) : 0;
@@ -32,6 +36,8 @@ export async function detectReturning(
   stateManager: StateManager,
 ): Promise<ReturningState> {
   const username = api.getUserName();
+  // Started now so the IndexedDB read overlaps the worker check.
+  const savedLoad = stateManager.loadState().catch(() => null);
 
   /*
     Only a *live* job (sending, paused or stopped by errors, all of which keep
@@ -41,7 +47,7 @@ export async function detectReturning(
   */
   const importId = background.handedOverImport(username);
   if (importId) {
-    const status = await background.importStatus(importId);
+    const status = await background.importStatus(importId, RETURNING_STATUS_TIMEOUT_MS);
     if (status && status.live) {
       return {
         kind: 'server_job', username, done: status.scrobbledCount, total: status.totalTracks,
@@ -52,19 +58,18 @@ export async function detectReturning(
     }
   }
 
-  let saved = null;
-  try {
-    saved = await stateManager.loadState();
-  } catch {
-    saved = null;
-  }
+  const saved = await savedLoad;
   if (saved && saved.totalTracks > 0) {
     const total = saved.originalTotalTracks || saved.totalTracks;
+    const indexCount = Array.isArray(saved.completedIndices) ? saved.completedIndices.length : 0;
     const done = typeof saved.originalSucceededCount === 'number'
       ? saved.originalSucceededCount
-      : saved.completedIndices.length;
+      : indexCount;
+    const owner = saved.userName || username;
+    const sameUser = !!username && !!saved.userName
+      && saved.userName.trim().toLowerCase() === username.trim().toLowerCase();
     return {
-      kind: 'saved', username, signedIn: api.isAuthenticated(), done, total,
+      kind: 'saved', username: owner, signedIn: sameUser && api.isAuthenticated(), done, total,
     };
   }
 
