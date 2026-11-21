@@ -143,14 +143,30 @@ params** — an early version leaked a user's Last.fm session key into analytics
 
 ### Funnel events
 
-`step_viewed` → `auth_success` / `auth_failed` / `auth_token_invalid` →
+`step_viewed` →
 `upload_parse_started` / `upload_parse_completed` / `upload_no_matching_files` →
-`tracks_selected` → `scrobble_started` / `scrobble_resumed` / `scrobble_paused` /
+`tracks_selected` → `sign_in_started` → `auth_success` / `auth_failed` /
+`auth_token_invalid` → `selection_resumed_after_sign_in` →
+`scrobble_started` / `scrobble_resumed` / `scrobble_paused` /
 `scrobble_stopped` / `scrobble_completed`, plus `session_saved`,
 `session_resumed`, `session_resume_blocked`, and `user_logged_out`.
 `stale_build_detected` / `stale_build_reload_clicked` /
 `stale_build_older_ignored` / `chunk_load_failed` are outside the funnel (see
 "Old builds keep running" above).
+
+Since 2026-11-21 signing in comes *after* choosing (see "Signing in after
+choosing" below). `/scrobble` opens on Upload, so `step_viewed` starts at step
+2 and **no longer reports step 1**; the stepper keeps its old numbers (2
+Upload, 3 Choose, 4 Send, 5 Done) so later steps stay comparable. Before that
+date the order was `step_viewed` (step 1) → `auth_*` → `upload_*`. A browser
+with a stored session still emits `auth_success` (`returning: true`) on every
+`/scrobble` load and skips `sign_in_started` and
+`selection_resumed_after_sign_in`. `sign_in_started` carries `intent` (`send`,
+`resume` or `reconnect`); `selection_resumed_after_sign_in` carries
+`track_count` and `duplicates_skipped`, and replaces `session_resumed` for a
+selection coming back from Last.fm, which is not a resume.
+`upload_parse_completed` carries `duplicates_deferred` (true when "Check for
+duplicates" was ticked while signed out, so the check runs after sign-in).
 
 Home emits `home_choice` (`choice`: `have_export`, `get_export` or `resume`;
 `resume` is the "Already scrobbling on scrobblify?" link) on first visits
@@ -163,11 +179,14 @@ remembered username, saved progress (welcomed under the progress's own
 (`user_logged_out`) only when the card was about the stored user, never deletes
 saved progress, and hides the card for the rest of the tab (`sessionStorage`
 `scrobblify.home.dismissedReturning`; a fresh Last.fm sign-in, one that
-exchanged a token, clears it). Until sign-in moves after choosing, every Home
-button that moves on (Start, Continue, Start over, Upload Spotify zip,
-Re-connect) opens `/scrobble`. Home reads the stored user itself
-(`LastFm.loadStoredUser()`), since only `/scrobble`'s sign-in step runs
-`init()`.
+exchanged a token, clears it). Start, Start over and Upload Spotify zip open
+`/scrobble`. **Continue** opens it when this browser is signed in as the
+progress's owner, and otherwise starts a `resume` sign-in that resumes the
+saved progress by itself on the way back. **Re-connect to last.fm** starts a
+`reconnect` sign-in when signed out (landing on `/scrobble`, where the job or
+resume banner takes over) and just opens `/scrobble` when signed in. Home reads
+the stored user itself (`LastFm.loadStoredUser()`), since only `/scrobble`'s
+sign-in handler (`AuthenticateStep`) runs `init()`.
 
 Since 2026-11-15 `tracks_selected` fires when the user confirms the "Scrobble N
 tracks?" dialog, not on the select step's button. That dialog estimates the
@@ -359,17 +378,20 @@ context's volume drops from this fix on.
 
 **A cleared key must never be resumed past.** `clearSessionKey()` keeps the
 username, and the resume used to check only that, so "Save Progress & Leave" →
-sign-in step → **Resume** jumped to the scrobble step with no key. Every send
+sign-in step (as it was then) → **Resume** jumped to the scrobble step with no key. Every send
 threw `Not authenticated.` in ~100ms, it stopped as `repeated_failures`, and the
 nine tracks those failures consumed were saved as completed and never sent
 (seen in production right after the error-9 fix shipped, with no `auth_success`
 in between). Two guards now, since 2026-09-27:
 
 - `restoreFromState()` (saved-state and file resumes) refuses when
-  `!api.isAuthenticated()`: it stays on the sign-in step, writes nothing, and
-  shows a "Sign in to Last.fm first" prompt with a sign-in button. The saved
-  state survives the Last.fm redirect, so the banner comes back after it. It
-  emits `session_resume_blocked`, not `session_resumed`.
+  `!api.isAuthenticated()`: it stays where it is (there is no sign-in step
+  since 2026-11-21), writes nothing, and shows a "Sign in to Last.fm first"
+  banner. Its **Sign in to Last.fm** button starts a `resume` sign-in
+  (`signInToResume`), and on the way back the saved progress resumes by itself
+  once the server-authority check has answered (it lands on Send; the user
+  still presses Scrobble). A file has to be imported again. It emits
+  `session_resume_blocked`, not `session_resumed`.
 - `scrobblePlay` throws a typed `NotAuthenticatedError`
   (`LastFm.isNotAuthenticatedError`) when there is no key, and the loop treats
   it like error 9 — first occurrence, track unconsumed, saved, sign-in link —
@@ -383,6 +405,69 @@ the data as `auth_success` `returning: false` followed within a minute by error
 9). If that exchange fails while a key is stored, the stored key is kept rather
 than logging the user out; if it is dead too, the first scrobble says so.
 `auth.getSession` is never sent with (or signed over) the old `sk`.
+
+**Signing in after choosing** (since 2026-11-21). Signing in is no longer a
+step. `AuthenticateStep` is a headless handler above the stepper: on mount it
+runs `init()` (exchanging any callback `?token=`), shows "Signing in to
+Last.fm…" only while exchanging a token, plus the expired-token prompt or an
+error, and emits `complete` (`fresh`: the load arrived with a token) or
+`failed`. There is no 2-second delay any more. Sign-in starts wherever a
+Last.fm session is first needed, through `startSignIn` in
+`src/services/SignInIntent.ts`, which records *why* in sessionStorage
+(`scrobblify.signInIntent`; Last.fm returns to the same tab, and nothing in
+memory survives the trip), emits `sign_in_started` and redirects. The kinds:
+
+| `intent` | Started by | On the way back |
+| --- | --- | --- |
+| `send` (`importId`, `checkDuplicates`) | Confirming "Scrobble N tracks?" while signed out | The saved selection is restored onto Send |
+| `resume` | Home's Continue (not signed in as the progress's owner); the sign-in banner's button | `resumeFromSaved`, which refuses by itself while sending is withheld |
+| `reconnect` | Home's "Re-connect to last.fm" while signed out | Nothing; the job or resume banner takes over |
+
+`onAuthenticated` waits for `mounted` to settle (`_mountSettled`; the child
+mounts and can emit first, while the mount is still finishing a handoff return
+and the job status), raises `authorityPending`, awaits
+`enforceServerAuthority`, and only then runs `continueSignInIntent`, which
+reads the intent once (`takeSignInIntent`). So nothing carried over from before
+the round trip can restore or send ahead of the authority check, and a live
+job (or no answer) leaves the selection saved for the resume prompt to offer
+later. Nothing auto-starts: the user lands on Send and presses **Scrobble**, as
+after any resume. A `send` intent only acts on a saved state that is still the
+unsent selection it names (`isUnsentSelection`: same `importId`, nothing
+completed or pending), and only while the user is still on Upload. While coming
+back, `heldForSignIn` keeps the resume prompt off that selection; a failed
+exchange (`failed`, `signInFailed`) releases it as ordinary saved progress.
+
+A signed-out send saves the selection to IndexedDB as an **ordinary
+`ScrobbleState` with 0 completed** before redirecting (a failed save reports
+`scrobblify.saveBeforeSignIn`, shows "Couldn't save your selection before
+signing in." and doesn't redirect). So **an abandoned sign-in (Back from
+Last.fm, a closed tab) leaves the selection as ordinary saved progress**, and
+the next visit offers it through the resume prompt and Home's card; a
+`session_resumed` (`source: saved`) at 0 progress can be this. Because that
+save replaces whatever is saved, it applies #102 itself: it refuses while
+`sendingBlocked` (the "Hold on…" notice), and when the confirmation didn't know
+of saved progress (`savedProgress` null: the resume prompt was withheld, or
+another tab saved since) it reads the disk and refuses any saved state for a
+different import (or with no id) with "You have saved progress that would be
+replaced. Go back and choose Resume or Start over.", re-exposing it so the next
+Scrobble asks.
+
+**The duplicate check waits for the username.** With "Check for duplicates"
+ticked while signed out, the upload step skips it ("Duplicates will be checked
+after you sign in.", `duplicates_deferred: true`, store
+`deferredDuplicateCheck`), and the `send` intent carries `checkDuplicates`.
+After sign-in, `dropQueuedDuplicates` runs `Scrobblify.filterQueuedDuplicates`
+(the same filter, on the chosen queue, keeping its order) while showing
+"Checking for plays already on Last.fm…", then "Skipped N that are already on
+Last.fm." until the run starts. Its writes are **compare-and-set**, since
+another tab may have moved on meanwhile: it re-reads the disk (`stillOurs`)
+before writing, saves the filtered queue with `saveStateIfAhead` (which refuses
+a different import or one further along), and clears an all-duplicates queue
+with `clearStateIfMatching`. It gives up if the user has left Upload. If the
+check fails, the queue is sent unfiltered with the upload step's error dialog;
+if only the write fails, the filtered queue is sent from memory and checkpoints
+save it. Both report `scrobblify.deferredDuplicates`. A signed-in user's check
+still runs during upload, as before.
 
 `manualPause()` deliberately does **not** save. It only raises the flags; the
 save and the `scrobble_stopped` event happen in the scrobble loop's pause check,
@@ -756,7 +841,7 @@ build is attempted with any of them set.
 
 `/mock/lastfm/auth` hands back a random single-use token and redirects to
 `<publicPath>#/scrobble?token=…` rather than pre-seeding localStorage, so the
-authenticate step runs for real: the app exchanges the token against the mocked
+sign-in handler (`AuthenticateStep`) runs for real: the app exchanges the token against the mocked
 `auth.getSession` exactly as it would in production. The token must be fresh per
 click, because `LastFm.init` records the token it has begun exchanging in
 sessionStorage and refuses to resubmit it.
@@ -796,24 +881,35 @@ The handoff offer is rolled out two ways: visit any page with `?beta=1` to opt a
 browser in, or `?beta=0` to opt it out (stored as `'0'`, which also overrides
 the flag). Otherwise the PostHog flag **`scrobblify-background-scrobbling`**
 decides: `test_scrobblify` gets 100%, and you ramp it up by raising the 0%
-"everyone" condition. The flag only counts once `identifyUser` has made the
-Last.fm username PostHog's distinct id (`$user_state` `identified`), so a
-user's bucket is the same on every browser and survives a raised percentage
-(PostHog's hash is stable; only lowering it removes people). Before sign-in, and
-when PostHog is blocked or on localhost, it reads false. `Scrobblify.vue` listens through
+"everyone" condition. The flag is honoured **before sign-in too** (since
+2026-11-21, because the server choice is moving ahead of sign-in):
+`isFeatureEnabled` no longer requires identification. Before `identifyUser`,
+PostHog buckets on its random per-browser distinct id; once `identifyUser` has
+made the Last.fm username the distinct id (`$user_state` `identified`,
+`isIdentified()`), the username decides, so a user's bucket is the same on
+every browser and survives a raised percentage (PostHog's hash is stable; only
+lowering it removes people). The two buckets can disagree for a brand-new
+user's first offer; recovery paths don't read the flag, so a job already handed
+over is unaffected. When PostHog is blocked or on localhost, it reads false.
+`Scrobblify.vue` listens through
 `onFeatureFlags` (flag reloads and `identifyUser`) and re-probes capacity, or
 withdraws the offer, as it changes.
 Locally, `localStorage['scrobblify.flags'] = '{"scrobblify-background-scrobbling":true}'`
 forces it (non-production builds only). `background_offer_shown` carries
-`offer_source` (`opt_in` / `flag`).
+`offer_source` (`opt_in` / `flag` / `flag_anonymous`; `flag_anonymous` is the
+flag answering for a browser PostHog hasn't identified yet, from 2026-11-21).
 
 `App.vue` applies `?beta=` once per page load (`consumeBetaParam`, in
 `created()`), so an invite link works on any page (in dev's hash mode, editing
 only the hash doesn't reload, so it applies on the next load), and shows a
 **BETA** tag in the header whenever `isBackgroundEnabled()` (re-read on
 `onFeatureFlags`), or while Home shows this user's live server job
-(`showingServerJob`). The old "switched on for this browser — Switch it off"
-banner is gone; `?beta=0` still opts out. Only the explicit opt-in counts in
+(`showingServerJob`). Whenever `isBackgroundEnabled()`, every page also shows
+the beta banner (`#beta-banner`, back since 2026-11-21): "Background
+scrobbling is in beta. Something not working, or have a suggestion? Email
+niko@savas.ca." and a **Switch it off** link, `betaOffHref`, which reloads the
+current page with `?beta=0` added to the real query string (built from
+`location`, since dev's hash router doesn't own it). Only the explicit opt-in counts in
 `mayScrobbleWithoutAuthority`'s outage rule, so it doesn't depend on flag-load
 timing. All of this is independent of `VUE_APP_BACKGROUND_API`, which
 only says whether the build *can* reach a worker.
