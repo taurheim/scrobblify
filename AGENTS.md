@@ -180,9 +180,11 @@ remembered username, saved progress (welcomed under the progress's own
 saved progress, and hides the card for the rest of the tab (`sessionStorage`
 `scrobblify.home.dismissedReturning`; a fresh Last.fm sign-in, one that
 exchanged a token, clears it). Start, Start over and Upload Spotify zip open
-`/scrobble`. **Continue** opens it when this browser is signed in as the
-progress's owner, and otherwise starts a `resume` sign-in that resumes the
-saved progress by itself on the way back. **Re-connect to last.fm** starts a
+`/scrobble`. **Continue** resumes the saved progress without a second click:
+signed in as the progress's owner, it records an in-app `resume` intent
+(`setSignInIntent`) and opens `/scrobble`, which resumes on mount; otherwise
+it starts a `resume` sign-in through Last.fm (`startSignIn`) that resumes on
+the way back. **Re-connect to last.fm** starts a
 `reconnect` sign-in when signed out (landing on `/scrobble`, where the job or
 resume banner takes over) and just opens `/scrobble` when signed in. Home reads
 the stored user itself (`LastFm.loadStoredUser()`), since only `/scrobble`'s
@@ -387,10 +389,13 @@ in between). Two guards now, since 2026-09-27:
 - `restoreFromState()` (saved-state and file resumes) refuses when
   `!api.isAuthenticated()`: it stays where it is (there is no sign-in step
   since 2026-11-21), writes nothing, and shows a "Sign in to Last.fm first"
-  banner. Its **Sign in to Last.fm** button starts a `resume` sign-in
-  (`signInToResume`), and on the way back the saved progress resumes by itself
-  once the server-authority check has answered (it lands on Send; the user
-  still presses Scrobble). A file has to be imported again. It emits
+  banner. Its **Sign in to Last.fm** button (`signInToResume`) starts a
+  `resume` sign-in when the refused resume was this browser's *saved*
+  progress, and on the way back that progress resumes by itself once the
+  server-authority check has answered (it lands on Send; the user still
+  presses Scrobble). After a refused progress *file* it starts a `reconnect`
+  sign-in instead, so the other saved import isn't resumed in its place
+  (#153); the file has to be imported again. It emits
   `session_resume_blocked`, not `session_resumed`.
 - `scrobblePlay` throws a typed `NotAuthenticatedError`
   (`LastFm.isNotAuthenticatedError`) when there is no key, and the loop treats
@@ -410,18 +415,34 @@ than logging the user out; if it is dead too, the first scrobble says so.
 step. `AuthenticateStep` is a headless handler above the stepper: on mount it
 runs `init()` (exchanging any callback `?token=`), shows "Signing in to
 Last.fm…" only while exchanging a token, plus the expired-token prompt or an
-error, and emits `complete` (`fresh`: the load arrived with a token) or
+error, and emits `complete` (`fresh`: the load arrived with a callback
+`?token=`, i.e. came back from Last.fm, whether or not the exchange worked) or
 `failed`. There is no 2-second delay any more. Sign-in starts wherever a
 Last.fm session is first needed, through `startSignIn` in
 `src/services/SignInIntent.ts`, which records *why* in sessionStorage
 (`scrobblify.signInIntent`; Last.fm returns to the same tab, and nothing in
-memory survives the trip), emits `sign_in_started` and redirects. The kinds:
+memory survives the trip), emits `sign_in_started` and redirects. A page
+reached in-app by a user who is already signed in records an intent with
+`setSignInIntent` instead (no redirect, no `sign_in_started`). The kinds:
 
 | `intent` | Started by | On the way back |
 | --- | --- | --- |
 | `send` (`importId`, `checkDuplicates`) | Confirming "Scrobble N tracks?" while signed out | The saved selection is restored onto Send |
-| `resume` | Home's Continue (not signed in as the progress's owner); the sign-in banner's button | `resumeFromSaved`, which refuses by itself while sending is withheld |
-| `reconnect` | Home's "Re-connect to last.fm" while signed out | Nothing; the job or resume banner takes over |
+| `resume` | Home's Continue: through Last.fm when not signed in as the progress's owner, in-app when signed in; the sign-in banner's button after a refused *saved* resume | `resumeFromSaved`, which refuses by itself while sending is withheld |
+| `reconnect` | Home's "Re-connect to last.fm" while signed out; the sign-in banner's button after a refused progress file (#153) | Nothing; the job or resume banner takes over |
+
+**An intent only steers the sign-in it was recorded for.** Each carries
+`inApp` (true from `setSignInIntent`, false from `startSignIn`) and `createdAt`
+(ms). `continueSignInIntent` takes it (it is gone either way) and ignores it
+unless a Last.fm intent meets a `fresh` completion or an in-app one a
+completion without a token, and ignores anything older than 60 minutes (Last.fm
+tokens expire in about an hour). Otherwise an abandoned trip (Back from
+Last.fm, a closed tab) left its intent behind, and the next visit with a stored
+session, or an "Authorize again" return that wrote none, acted on it.
+`holdSelectionAwaitingSignIn` applies the same rule. Being in sessionStorage,
+an untaken intent never outlives the tab.
+Work still awaiting after the page has unmounted (`_unmounted`) stops without
+acting, and doesn't consume an intent it hasn't taken yet.
 
 `onAuthenticated` waits for `mounted` to settle (`_mountSettled`; the child
 mounts and can emit first, while the mount is still finishing a handoff return
@@ -450,7 +471,10 @@ of saved progress (`savedProgress` null: the resume prompt was withheld, or
 another tab saved since) it reads the disk and refuses any saved state for a
 different import (or with no id) with "You have saved progress that would be
 replaced. Go back and choose Resume or Start over.", re-exposing it so the next
-Scrobble asks.
+Scrobble asks. The saved selection carries no `userName` while signed out
+(`buildState` stamps one only when signed in, or for a queue already on Send),
+so a username `clearSessionKey()` left behind doesn't make a sign-in as someone
+else look like the wrong user. for the username.** With "Check for duplicates"
 
 **The duplicate check waits for the username.** With "Check for duplicates"
 ticked while signed out, the upload step skips it ("Duplicates will be checked
@@ -897,7 +921,10 @@ withdraws the offer, as it changes.
 Locally, `localStorage['scrobblify.flags'] = '{"scrobblify-background-scrobbling":true}'`
 forces it (non-production builds only). `background_offer_shown` carries
 `offer_source` (`opt_in` / `flag` / `flag_anonymous`; `flag_anonymous` is the
-flag answering for a browser PostHog hasn't identified yet, from 2026-11-21).
+flag answering for a browser PostHog hasn't identified yet, from 2026-11-21)
+and `entry_point` (`scrobble_step`, `resume`, or `sign_in` for a selection
+restored after signing in, from 2026-11-21), which its decline and opt-in
+events repeat.
 
 `App.vue` applies `?beta=` once per page load (`consumeBetaParam`, in
 `created()`), so an invite link works on any page (in dev's hash mode, editing

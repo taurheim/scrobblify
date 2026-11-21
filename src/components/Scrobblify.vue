@@ -499,6 +499,8 @@ export default defineComponent({
       pendingSnapshot: null as ProgressSnapshot | null,
       /** State to hand off, when the offer came from a resume rather than a live queue. */
       pendingState: null as ScrobbleState | null,
+      /** `entry_point` of the open offer, for its decline and opt-in events. */
+      pendingEntryPoint: 'resume',
       /** Retained so the listener can be removed again. Not reactive state. */
       onPageShow: null as ((event: PageTransitionEvent) => void) | null,
       /** Teardown for the cross-tab ownership subscription. Not reactive. */
@@ -791,8 +793,8 @@ export default defineComponent({
         trackEvent('background_reauth_failed');
       }
       this.probeBackgroundAvailability();
-      // The rollout flag can change after mount: flags load asynchronously, and
-      // it only counts once signing in has identified the user.
+      // The rollout flag can change after mount: flags load asynchronously,
+      // and signing in identifies the user, after which the username decides.
       this.releaseFlagListener = onFeatureFlags(() => {
         if (!background.isBackgroundEnabled()) {
           this.backgroundProbed = false;
@@ -1815,6 +1817,7 @@ export default defineComponent({
       }
       this.pendingSnapshot = info;
       this.pendingState = null;
+      this.pendingEntryPoint = 'scrobble_step';
       this.backgroundRemaining = remaining;
       this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
@@ -1831,7 +1834,7 @@ export default defineComponent({
      */
     onBackgroundDeclined() {
       trackEvent('background_offer_declined', {
-        entry_point: this.pendingSnapshot ? 'scrobble_step' : 'resume',
+        entry_point: this.pendingEntryPoint,
         track_count: this.backgroundRemaining,
         all_re_tagged: this.backgroundAllReTagged,
       });
@@ -1873,7 +1876,7 @@ export default defineComponent({
       }
 
       const username = (this.$store.state.lfmApi as LastFm).getUserName() || state.userName || '';
-      const entryPoint = this.pendingSnapshot ? 'scrobble_step' : 'resume';
+      const entryPoint = this.pendingEntryPoint;
 
       // Recorded before the redirect. The saved state is destroyed once the
       // server takes ownership, and it is the only place this lineage lives.
@@ -3051,6 +3054,11 @@ export default defineComponent({
         this.resumeSignInIntent = source === 'saved' ? 'resume' : 'reconnect';
         return;
       }
+      if (state.userName && api.getUserName() && api.getUserName() !== state.userName) {
+        this.errorMessage = `This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`;
+        this.showError = true;
+        return;
+      }
       // A selection coming back from sign-in is not a resume, so it stays out
       // of the resume funnel.
       if (source === 'sign_in') {
@@ -3060,11 +3068,6 @@ export default defineComponent({
         });
       } else {
         trackEvent('session_resumed', this.resumeProps(state, source));
-      }
-      if (state.userName && api.getUserName() && api.getUserName() !== state.userName) {
-        this.errorMessage = `This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`;
-        this.showError = true;
-        return;
       }
 
       this.restoreRateLimitWindow(state, api.getUserName() || state.userName || null);
@@ -3129,8 +3132,9 @@ export default defineComponent({
 
       // A resume of this size is the clearest signal that the browser is the
       // wrong place to be doing this: the user has already come back at least
-      // once and still has weeks of it ahead.
-      this.offerBackgroundForState(state, 'resume');
+      // once and still has weeks of it ahead. A selection back from sign-in
+      // is reported apart from resumes.
+      this.offerBackgroundForState(state, source === 'sign_in' ? 'sign_in' : 'resume');
     },
 
     /**
@@ -3154,6 +3158,7 @@ export default defineComponent({
       // completed/failed index sets.
       this.pendingSnapshot = null;
       this.pendingState = state;
+      this.pendingEntryPoint = entryPoint;
       this.backgroundRemaining = remaining;
       this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
@@ -3239,9 +3244,21 @@ export default defineComponent({
       for (let i = 0; i < info.scrobbledTracks; i++) {
         completedIndices.push(i);
       }
+      /*
+        Whose queue this is. A selection made signed out belongs to whoever
+        signs in for it, not to a username `clearSessionKey()` left behind, so
+        it is stamped with none (a later sign-in as someone else would
+        otherwise be refused as the wrong user). A queue on Send or later was
+        reached signed in, so it keeps its name even after a rejected key
+        cleared the session, as the saves after `session_invalid` do.
+        `enforceServerAuthority` loses nothing: it reads the stored username
+        before falling back to the saved one, and that is the same leftover.
+      */
+      const api = this.$store.state.lfmApi as LastFm;
+      const userName = api.isAuthenticated() || this.currentStep >= 4 ? api.getUserName() || '' : '';
 
       return {
-        userName: (this.$store.state.lfmApi as LastFm).getUserName() || '',
+        userName,
         totalTracks: tracks.length,
         completedIndices,
         failedIndices,

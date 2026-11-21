@@ -78,8 +78,9 @@ beta is offered the server for the rest.
 
 For now (Plan 2), **Continue** without a browser session signs in to the
 browser application first and resumes the saved progress by itself on the way
-back (onto Send; the user presses Scrobble). The server-choice resume entry
-point comes with Plan 3.
+back (onto Send; the user presses Scrobble). Signed in as the progress's owner,
+it opens `/scrobble`, which resumes it directly, with no second Resume click.
+The server-choice resume entry point comes with Plan 3.
 
 "Not you?" clears the stored username (existing `clearToken` behaviour).
 "Start over" (saved-progress states) goes to the upload step; the existing
