@@ -383,7 +383,7 @@ export type ReturningState =
   | { kind: 'server_job'; username: string | null; done: number; total: number }
   | { kind: 'username_only'; username: string };
 
-const TERMINAL_JOB_STATES = ['completed', 'failed', 'cancelled'];
+const ENDED_STATES = ['completed', 'failed', 'cancelled', 'expired', 'reaped'];
 
 export function progressLabel(done: number, total: number): string {
   const pct = total > 0 ? Math.floor((100 * done) / total) : 0;
@@ -407,17 +407,22 @@ export async function detectReturning(
 ): Promise<ReturningState> {
   const username = api.getUserName();
 
-  const importId = background.handedOverImport();
+  /*
+    Only a *live* job (sending, paused or stopped by errors, all of which keep
+    their place) is shown as running. One that is signed out or on hold falls
+    through to the plain card; the status page on /scrobble explains it. A
+    record the server doesn't know, or whose job has ended, is dropped.
+  */
+  const importId = background.handedOverImport(username);
   if (importId) {
     const status = await background.importStatus(importId);
-    if (status && status.known) {
-      if (status.state && TERMINAL_JOB_STATES.includes(status.state)) {
-        background.clearHandedOverImport();
-      } else {
-        return {
-          kind: 'server_job', username, done: status.scrobbledCount, total: status.totalTracks,
-        };
-      }
+    if (status && status.live) {
+      return {
+        kind: 'server_job', username, done: status.scrobbledCount, total: status.totalTracks,
+      };
+    }
+    if (status && (!status.known || ENDED_STATES.includes(status.state || ''))) {
+      background.clearHandedOverImport();
     }
   }
 
@@ -795,7 +800,7 @@ test.describe('Home with a job on the server', () => {
     await page.goto('/#/');
     await page.evaluate((id) => {
       localStorage.setItem('scrobblifyLfmUserName', 'testuser');
-      localStorage.setItem('scrobblify.background.handedOverImport', id);
+      localStorage.setItem('scrobblify.background.handedOverImport', JSON.stringify({ importId: id, username: 'testuser' }));
     }, importId);
     await page.reload();
 
@@ -819,7 +824,7 @@ test.describe('Home with a job on the server', () => {
     await page.goto('/#/');
     await page.evaluate((id) => {
       localStorage.setItem('scrobblifyLfmUserName', 'testuser');
-      localStorage.setItem('scrobblify.background.handedOverImport', id);
+      localStorage.setItem('scrobblify.background.handedOverImport', JSON.stringify({ importId: id, username: 'testuser' }));
     }, importId);
     await page.reload();
 
@@ -1229,11 +1234,11 @@ explicit opt-in counts in
 and after the paragraph that sentence belongs to, add:
 
 ```markdown
-`scrobblify.background.handedOverImport` (localStorage) holds the import id of
+`scrobblify.background.handedOverImport` (localStorage) holds the import id and Last.fm username of
 the queue this browser last handed over, written when a handover goes live and
 cleared after a confirmed take-back or once the job is seen finished. Home uses
 it with the public `/scrobblify/import/:id` route to show a running job's
-progress. It is display-only and deliberately **not** handover evidence.
+progress, only to the same Last.fm user, and only while the job is live (a signed-out or on-hold job gets the plain card). It is display-only and deliberately **not** handover evidence.
 ```
 
 - [ ] **Step 5: Commit**
