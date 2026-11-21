@@ -90,7 +90,7 @@ import {
   detectReturning, HOME_DISMISSED_KEY, ReturningState, sameUser,
 } from '@/services/ReturningVisitor';
 import { resetUser, trackEvent } from '@/services/Analytics';
-import { startSignIn } from '@/services/SignInIntent';
+import { setSignInIntent, startSignIn } from '@/services/SignInIntent';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
 
@@ -169,14 +169,16 @@ export default defineComponent({
       trackEvent('home_choice', { choice: 'get_export' });
       this.gettingExport = true;
     },
-    // Not signed in as the progress's owner: sign in first, and it resumes by
-    // itself on the way back.
+    // Resumes the saved progress either way: not signed in as its owner, sign
+    // in first; signed in, /scrobble's sign-in handler picks the same intent
+    // up on mount, so there's no second "Resume" click.
     continueSaved() {
       const r = this.returning;
       if (r.kind === 'saved' && !r.signedIn) {
         startSignIn(this.$store.state.lfmApi as LastFm, { kind: 'resume' });
         return;
       }
+      setSignInIntent({ kind: 'resume' });
       this.openScrobble();
     },
     // /scrobble's resume banner, or its upload step, takes it from here.

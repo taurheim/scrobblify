@@ -275,10 +275,13 @@ test.describe('Home Page', () => {
     await expect(page.locator('.returning-card')).toBeVisible();
     await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'saved_signed_in' } });
 
-    // Already signed in: straight to the resume prompt, no Last.fm round trip.
+    // Already signed in: no Last.fm round trip, and it resumes without a
+    // second click on the resume prompt.
     await page.locator('.returning-card button:has-text("Continue")').click();
     await expect(page).toHaveURL(/#\/scrobble/);
-    await expect(page.locator('text=Resume previous session')).toBeVisible({ timeout: 10000 });
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
     expect(events.filter((e) => e.name === 'sign_in_started')).toEqual([]);
   });
 

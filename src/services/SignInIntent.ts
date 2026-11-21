@@ -57,14 +57,18 @@ export function peekSignInIntent(): SignInIntent | null {
   }
 }
 
-/** Records the intent and leaves for Last.fm. */
-export function startSignIn(api: LastFm, intent: SignInIntent): void {
+/** Records the intent without leaving: the page it is acted on is reached in-app. */
+export function setSignInIntent(intent: SignInIntent): void {
   try {
     sessionStorage.setItem(KEY, JSON.stringify(intent));
   } catch {
-    // Private modes can refuse storage. Sign-in still works; the page just
-    // won't carry on by itself afterwards.
+    // Private modes can refuse storage. The page just won't carry on by itself.
   }
+}
+
+/** Records the intent and leaves for Last.fm. */
+export function startSignIn(api: LastFm, intent: SignInIntent): void {
+  setSignInIntent(intent);
   trackEvent('sign_in_started', { intent: intent.kind });
   window.location.href = api.getAuthorizeUrl();
 }
