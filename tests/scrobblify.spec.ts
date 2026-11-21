@@ -178,12 +178,32 @@ test.describe('Home Page', () => {
     await expect(page.locator('.home-card')).toHaveCount(2);
   });
 
-  test('"Re-connect to last.fm" opens the scrobble page', async ({ page }) => {
+  test('"Re-connect to last.fm" signs in and opens the scrobble page', async ({ page }) => {
     const events = captureEvents(page);
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
     await page.goto('/#/');
     await page.locator('button:has-text("Re-connect to last.fm")').click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page).toHaveURL(/\/#\/scrobble$/);
+    expect(events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
+    expect(events).toContainEqual({ name: 'sign_in_started', props: { intent: 'reconnect' } });
+  });
+
+  test('"Re-connect to last.fm" when already signed in just opens the scrobble page', async ({ page }) => {
+    const events = captureEvents(page);
+    await interceptLastFm(page);
+    await page.goto('/#/');
+    await mockLastFmAuth(page);
+    // Nothing saved, so a stored session alone shows the returning card;
+    // dismissed for the tab, which keeps the session.
+    await page.evaluate(() => sessionStorage.setItem('scrobblify.home.dismissedReturning', '1'));
+    await page.reload();
+    await page.locator('button:has-text("Re-connect to last.fm")').click();
     await expect(page).toHaveURL(/#\/scrobble/);
-    await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    expect(events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
+    expect(events.filter((e) => e.name === 'sign_in_started')).toEqual([]);
   });
 
   test('has navigation links', async ({ page }) => {
@@ -238,19 +258,41 @@ test.describe('Home Page', () => {
     await expect(card.locator('.returning-links')).toHaveText(/^\s*Not you\?\s+·\s+Start over\s*$/);
     await expect(page.locator('.home-card')).toHaveCount(0);
     await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'saved_signed_out' } });
+  });
 
-    await card.locator('button:has-text("Continue")').click();
-    await expect(page).toHaveURL(/#\/scrobble/);
+  test('Continue on saved progress while signed out signs in and resumes', async ({ page }) => {
+    const events = captureEvents(page);
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    await page.goto('/#/');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await seedSavedState(page, SAVED);
+    await page.reload();
+
+    await page.locator('.returning-card button:has-text("Continue")').click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page).toHaveURL(/\/#\/scrobble$/);
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    expect(events).toContainEqual({ name: 'sign_in_started', props: { intent: 'resume' } });
   });
 
   test('a signed-in visitor with saved progress is reported as such', async ({ page }) => {
     const events = captureEvents(page);
+    await interceptLastFm(page);
     await page.goto('/#/');
     await mockLastFmAuth(page);
     await seedSavedState(page, SAVED);
     await page.reload();
     await expect(page.locator('.returning-card')).toBeVisible();
     await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'saved_signed_in' } });
+
+    // Already signed in: straight to the resume prompt, no Last.fm round trip.
+    await page.locator('.returning-card button:has-text("Continue")').click();
+    await expect(page).toHaveURL(/#\/scrobble/);
+    await expect(page.locator('text=Resume previous session')).toBeVisible({ timeout: 10000 });
+    expect(events.filter((e) => e.name === 'sign_in_started')).toEqual([]);
   });
 
   test('"Not you?" on saved progress signs out and shows the first visit, keeping the progress', async ({ page }) => {

@@ -11,7 +11,7 @@
     <home-returning
       v-else-if="returning.kind !== 'none' && !dismissedReturning"
       :state="returning"
-      @continue="openScrobble"
+      @continue="continueSaved"
       @start-over="openScrobble"
       @upload="openScrobble"
       @not-you="notYou"
@@ -90,6 +90,7 @@ import {
   detectReturning, HOME_DISMISSED_KEY, ReturningState, sameUser,
 } from '@/services/ReturningVisitor';
 import { resetUser, trackEvent } from '@/services/Analytics';
+import { startSignIn } from '@/services/SignInIntent';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
 
@@ -155,14 +156,30 @@ export default defineComponent({
     },
     go(choice: HomeChoice) {
       trackEvent('home_choice', { choice });
+      const api = this.$store.state.lfmApi as LastFm;
+      // "Re-connect to last.fm" signs in first; /scrobble's job or resume
+      // banner takes it from there.
+      if (choice === 'resume' && !api.isAuthenticated()) {
+        startSignIn(api, { kind: 'reconnect' });
+        return;
+      }
       this.$router.push('/scrobble');
     },
     showGetExport() {
       trackEvent('home_choice', { choice: 'get_export' });
       this.gettingExport = true;
     },
-    // Until sign-in moves after choosing (Plan 3), /scrobble's own sign-in
-    // step and resume banner take it from here.
+    // Not signed in as the progress's owner: sign in first, and it resumes by
+    // itself on the way back.
+    continueSaved() {
+      const r = this.returning;
+      if (r.kind === 'saved' && !r.signedIn) {
+        startSignIn(this.$store.state.lfmApi as LastFm, { kind: 'resume' });
+        return;
+      }
+      this.openScrobble();
+    },
+    // /scrobble's resume banner, or its upload step, takes it from here.
     openScrobble() {
       this.$router.push('/scrobble');
     },
