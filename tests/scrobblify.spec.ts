@@ -65,9 +65,40 @@ function captureEvents(page: Page): Tracked[] {
 }
 
 test.describe('Home Page', () => {
-  test('renders home page with instructions', async ({ page }) => {
-    await page.goto('/');
-    await expect(page.locator('body')).toContainText('Scrobblify');
+  test('a first visit offers two equal choices and a way back in', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await expect(page.locator('h1')).toHaveText('Retroactively scrobble Spotify plays to last.fm');
+    await expect(page.locator('text=Already got your streaming history zip?')).toBeVisible();
+    await expect(page.locator("text=Don't have it yet?")).toBeVisible();
+    await expect(page.locator('text=Already scrobbling on scrobblify?')).toBeVisible();
+
+    await page.locator('.home-card:has-text("Already got your") button:has-text("Start")').click();
+    await expect(page).toHaveURL(/#\/scrobble/);
+    await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'have_export' } });
+  });
+
+  test('"Show me how" swaps the choices for the steps, and Back brings them back', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await page.locator('button:has-text("Show me how")').click();
+
+    await expect(page.locator('h2:has-text("Get your history from Spotify")')).toBeVisible();
+    await expect(page.locator('.get-export li')).toHaveCount(3);
+    await expect(page.locator('.get-export a[href="https://www.spotify.com/account/privacy/"]')).toBeVisible();
+    await expect(page.locator('.home-card')).toHaveCount(0);
+    await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'get_export' } });
+
+    await page.locator('.get-export-back').click();
+    await expect(page.locator('.home-card')).toHaveCount(2);
+  });
+
+  test('"Re-connect to last.fm" opens the scrobble page', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await page.locator('a:has-text("Re-connect to last.fm")').click();
+    await expect(page).toHaveURL(/#\/scrobble/);
+    await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
   });
 
   test('has navigation links', async ({ page }) => {
