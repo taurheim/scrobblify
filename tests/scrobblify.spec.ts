@@ -140,7 +140,7 @@ test.describe('Home Page', () => {
   test('"Re-connect to last.fm" opens the scrobble page', async ({ page }) => {
     const events = captureEvents(page);
     await page.goto('/#/');
-    await page.locator('a:has-text("Re-connect to last.fm")').click();
+    await page.locator('button:has-text("Re-connect to last.fm")').click();
     await expect(page).toHaveURL(/#\/scrobble/);
     await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
   });
@@ -216,10 +216,32 @@ test.describe('Home Page', () => {
     await mockLastFmAuth(page);
     await seedSavedState(page, SAVED);
     await page.reload();
-    await page.locator('.returning-card a:has-text("Not you?")').click();
+    await page.locator('.returning-card button:has-text("Not you?")').click();
     await expect(page.locator('.home-card')).toHaveCount(2);
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBeNull();
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBeNull();
     expect(await readSavedState(page)).not.toBeNull();
+
+    // The dismissal lasts for the tab, not just this mount of Home.
+    await page.goto('/#/about');
+    await expect(page.locator('body')).toContainText('Scrobblify');
+    await page.goto('/#/');
+    await expect(page.locator('.home-card')).toHaveCount(2);
+    await expect(page.locator('.returning-card')).toHaveCount(0);
+  });
+
+  test('"Not you?" on someone else\'s saved progress keeps the stored user signed in', async ({ page }) => {
+    await page.goto('/#/');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, { ...SAVED, userName: 'alice' });
+    await page.reload();
+
+    const card = page.locator('.returning-card');
+    await expect(card.locator('.v-card-title')).toHaveText('Welcome back, alice');
+    await card.locator('button:has-text("Not you?")').click();
+    await expect(page.locator('.home-card')).toHaveCount(2);
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBe('testuser');
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).not.toBeNull();
   });
 
   test('a remembered username with nothing saved is offered an upload, and "Not you?" forgets it', async ({ page }) => {
@@ -234,7 +256,7 @@ test.describe('Home Page', () => {
     await expect(card.locator('button:has-text("Upload Spotify zip")')).toBeVisible();
     await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'username_only' } });
 
-    await card.locator('a:has-text("Not you?")').click();
+    await card.locator('button:has-text("Not you?")').click();
     await expect(page.locator('.home-card')).toHaveCount(2);
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBeNull();
   });
@@ -243,7 +265,7 @@ test.describe('Home Page', () => {
     await page.goto('/#/');
     await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
     await page.reload();
-    await page.locator('.returning-card a:has-text("Show me how")').click();
+    await page.locator('.returning-card button:has-text("Show me how")').click();
     await expect(page.locator('h2:has-text("Get your history from Spotify")')).toBeVisible();
   });
 });

@@ -422,8 +422,10 @@ test.describe('Home with a job on the server', () => {
   const RECORD_KEY = 'scrobblify.background.handedOverImport';
 
   async function openHome(page: Page, recordUser: string, answer: Record<string, unknown> | 'refuse') {
+    const paths: string[] = [];
     await page.route(WORKER, async (route: Route) => {
       const { pathname } = new URL(route.request().url());
+      paths.push(pathname);
       if (answer !== 'refuse' && pathname === `/scrobblify/import/${IMPORT_ID}`) {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(answer) });
         return;
@@ -436,6 +438,7 @@ test.describe('Home with a job on the server', () => {
       localStorage.setItem(key, JSON.stringify({ importId: id, username: user }));
     }, [RECORD_KEY, IMPORT_ID, recordUser]);
     await page.reload();
+    return paths;
   }
 
   const LIVE = {
@@ -451,9 +454,10 @@ test.describe('Home with a job on the server', () => {
   });
 
   test('another user\'s handed-over import is not shown', async ({ page }) => {
-    await openHome(page, 'someoneelse', LIVE);
+    const paths = await openHome(page, 'someoneelse', LIVE);
     await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
     await expect(page.locator('text=Scrobbling in the background!')).toHaveCount(0);
+    expect(paths.filter((p) => p.startsWith('/scrobblify/import/'))).toEqual([]);
   });
 
   test('a finished job falls back to the plain welcome-back card and forgets the id', async ({ page }) => {

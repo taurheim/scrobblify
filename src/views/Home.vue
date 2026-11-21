@@ -5,7 +5,7 @@
     <home-get-export v-if="gettingExport" @back="gettingExport = false" />
 
     <div v-else-if="!ready" class="home-loading-wrap">
-      <v-progress-circular indeterminate color="primary" class="home-loading" />
+      <v-progress-circular indeterminate color="primary" class="home-loading" aria-label="Loading" />
     </div>
 
     <home-returning
@@ -35,7 +35,7 @@
       </div>
       <p class="home-already">
         Already scrobbling on scrobblify?
-        <a href="#" @click.prevent="go('resume')">Re-connect to last.fm</a>
+        <button type="button" class="link-button" @click="go('resume')">Re-connect to last.fm</button>
       </p>
     </template>
   </div>
@@ -86,10 +86,29 @@ import LastFm from '@/api/LastFm';
 import HomeGetExport from '@/components/home/HomeGetExport.vue';
 import HomeReturning from '@/components/home/HomeReturning.vue';
 import StateManager from '@/services/StateManager';
-import { detectReturning, ReturningState } from '@/services/ReturningVisitor';
+import { detectReturning, ReturningState, sameUser } from '@/services/ReturningVisitor';
 import { resetUser, trackEvent } from '@/services/Analytics';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
+
+// Per tab, so a dismissed card stays dismissed when the visitor comes back to Home.
+const DISMISSED_KEY = 'scrobblify.home.dismissedReturning';
+
+function readDismissed(): boolean {
+  try {
+    return sessionStorage.getItem(DISMISSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeDismissed() {
+  try {
+    sessionStorage.setItem(DISMISSED_KEY, '1');
+  } catch {
+    // Private modes can refuse storage; the in-component flag still holds.
+  }
+}
 
 export default defineComponent({
   components: { 'home-get-export': HomeGetExport, 'home-returning': HomeReturning },
@@ -105,6 +124,7 @@ export default defineComponent({
     };
   },
   async mounted() {
+    this.dismissedReturning = readDismissed();
     await this.refreshReturning();
   },
   methods: {
@@ -116,7 +136,7 @@ export default defineComponent({
         api.loadStoredUser();
         this.returning = await detectReturning(api, this.stateManager);
         const r = this.returning;
-        if (r.kind !== 'none') {
+        if (r.kind !== 'none' && !this.dismissedReturning) {
           let state: string = r.kind;
           if (r.kind === 'saved') {
             state = r.signedIn ? 'saved_signed_in' : 'saved_signed_out';
@@ -143,14 +163,21 @@ export default defineComponent({
       this.$router.push('/scrobble');
     },
     /*
-      Signs out and shows the first visit for the rest of this visit. Saved
-      progress is deliberately kept: it may still be the user's, and it stays
-      reachable from /scrobble's resume banner.
+      Shows the first visit for the rest of this tab. Signs out only when the
+      card welcomed the stored user: saved progress can belong to someone
+      else, and signing out the stored user for it would log out the wrong
+      person. Saved progress is deliberately kept: it may still be the
+      user's, and it stays reachable from /scrobble's resume banner.
     */
     notYou() {
-      (this.$store.state.lfmApi as LastFm).clearUser();
-      resetUser();
-      trackEvent('user_logged_out');
+      const api = this.$store.state.lfmApi as LastFm;
+      const r = this.returning;
+      if (r.kind === 'username_only' || (r.kind === 'saved' && sameUser(r.username, api.getUserName()))) {
+        api.clearUser();
+        resetUser();
+        trackEvent('user_logged_out');
+      }
+      writeDismissed();
       this.dismissedReturning = true;
     },
   },

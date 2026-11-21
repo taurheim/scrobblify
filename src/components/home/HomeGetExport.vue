@@ -1,6 +1,8 @@
 <template>
   <div class="get-export">
-    <a href="#" class="get-export-back" @click.prevent="$emit('back')">← Back</a>
+    <button type="button" class="link-button get-export-back" @click="$emit('back')">
+      <span aria-hidden="true">←</span> Back
+    </button>
     <h2>Get your history from Spotify</h2>
     <ol>
       <li>

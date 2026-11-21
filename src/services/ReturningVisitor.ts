@@ -16,8 +16,15 @@ const ENDED_STATES = ['completed', 'failed', 'cancelled', 'expired', 'reaped'];
 const RETURNING_STATUS_TIMEOUT_MS = 3000;
 
 export function progressLabel(done: number, total: number): string {
-  const pct = total > 0 ? Math.floor((100 * done) / total) : 0;
-  return `${done.toLocaleString()} / ${total.toLocaleString()} · ${pct}%`;
+  const shown = total > 0 ? Math.min(done, total) : done;
+  const pct = total > 0 ? Math.floor((100 * shown) / total) : 0;
+  return `${shown.toLocaleString()} / ${total.toLocaleString()} · ${pct}%`;
+}
+
+/** Whether two Last.fm usernames are the same account (case-insensitive). */
+export function sameUser(a: string | null | undefined, b: string | null | undefined): boolean {
+  return typeof a === 'string' && typeof b === 'string' && a.trim() !== '' && b.trim() !== ''
+    && a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
 export function progressPct(done: number, total: number): number {
@@ -65,11 +72,11 @@ export async function detectReturning(
     const done = typeof saved.originalSucceededCount === 'number'
       ? saved.originalSucceededCount
       : indexCount;
-    const owner = saved.userName || username;
-    const sameUser = !!username && !!saved.userName
-      && saved.userName.trim().toLowerCase() === username.trim().toLowerCase();
+    const savedUser = typeof saved.userName === 'string' && saved.userName ? saved.userName : null;
+    const owner = savedUser || username;
+    const ownerSignedIn = sameUser(savedUser, username) && api.isAuthenticated();
     return {
-      kind: 'saved', username: owner, signedIn: sameUser && api.isAuthenticated(), done, total,
+      kind: 'saved', username: owner, signedIn: ownerSignedIn, done, total,
     };
   }
 

@@ -71,6 +71,17 @@
     color: rgb(var(--v-theme-primary));
   }
 
+  /* An action styled as a link; a real <button> so it isn't a fake navigation. */
+  .link-button {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: rgb(var(--v-theme-primary));
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
   .v-application p,
   .v-overlay-container p {
     margin-bottom: 16px;

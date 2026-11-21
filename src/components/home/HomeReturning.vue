@@ -18,18 +18,18 @@
     <v-card-actions v-if="state.kind === 'saved'" class="flex-column">
       <v-btn color="primary" variant="flat" block @click="$emit('continue')">Continue</v-btn>
       <div class="returning-links mt-2">
-        <a href="#" @click.prevent="$emit('not-you')">Not you?</a>
-        ·
-        <a href="#" @click.prevent="$emit('start-over')">Start over</a>
+        <button type="button" class="link-button" @click="$emit('not-you')">Not you?</button>
+        <span aria-hidden="true">·</span>
+        <button type="button" class="link-button" @click="$emit('start-over')">Start over</button>
       </div>
     </v-card-actions>
 
     <v-card-actions v-else-if="state.kind === 'username_only'" class="flex-column">
       <v-btn color="primary" variant="flat" block @click="$emit('upload')">Upload Spotify zip</v-btn>
       <div class="returning-links mt-2">
-        <a href="#" @click.prevent="$emit('not-you')">Not you?</a>
-        ·
-        <a href="#" @click.prevent="$emit('show-get-export')">Show me how</a>
+        <button type="button" class="link-button" @click="$emit('not-you')">Not you?</button>
+        <span aria-hidden="true">·</span>
+        <button type="button" class="link-button" @click="$emit('show-get-export')">Show me how</button>
       </div>
     </v-card-actions>
   </v-card>
