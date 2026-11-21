@@ -1,15 +1,11 @@
 <template>
-  <div>
-    <h1>Authorize the Scrobblify application with last.fm</h1>
-    <a :href="authorizeUrl">Click here to authorize</a>
-
-    <div v-if="checkingAuth">
-      <v-progress-circular indeterminate color="primary">
-      </v-progress-circular>
-      Checking for authentication...
+  <div class="auth-handler">
+    <div v-if="checkingAuth && hadToken" class="d-flex justify-center align-center mb-4">
+      <v-progress-circular indeterminate color="primary" size="24" class="mr-2" aria-label="Signing in" />
+      Signing in to Last.fm…
     </div>
 
-    <v-alert v-if="tokenExpired" type="warning" prominent class="mt-4">
+    <v-alert v-if="tokenExpired" type="warning" prominent class="mb-4">
       <div>
         <strong>Your sign-in link was already used or has expired.</strong>
       </div>
@@ -38,10 +34,18 @@ import { HOME_DISMISSED_KEY } from '@/services/ReturningVisitor';
 
 export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
-  emits: ['complete'],
+  emits: {
+    /**
+     * Signed in, either already (`fresh: false`) or by exchanging the
+     * callback's `?token=` just now (`fresh: true`).
+     */
+    complete: (payload: { fresh: boolean }) => typeof payload.fresh === 'boolean',
+  },
   data() {
     return {
       checkingAuth: false,
+      /** Whether this load arrived with a callback `?token=` to exchange. */
+      hadToken: false,
       tokenExpired: false,
       showError: false,
       errorMessage: '',
@@ -53,15 +57,11 @@ export default defineComponent({
       return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
   },
-  methods: {
-    finishStep() {
-      this.$emit('complete');
-    },
-  },
   async mounted() {
+    this.hadToken = !!this.$route.query.token;
+    const { hadToken } = this;
     this.$data.checkingAuth = true;
     const api = this.$store.state.lfmApi as LastFm;
-    const hadToken = !!this.$route.query.token;
     try {
       await api.init(this.$route.query);
     } catch (e) {
@@ -107,9 +107,8 @@ export default defineComponent({
           // Storage refused; the card just stays hidden for this tab.
         }
       }
-      setTimeout(() => {
-        this.$emit('complete');
-      }, 2000);
+      this.$data.checkingAuth = false;
+      this.$emit('complete', { fresh: hadToken });
     } else {
       this.$data.checkingAuth = false;
     }

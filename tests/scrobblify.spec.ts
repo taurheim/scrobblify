@@ -39,6 +39,19 @@ async function goToUploadStep(page: Page): Promise<MockLibrary> {
   return library;
 }
 
+// Stands in for Last.fm's authorize page: sends the browser straight back to
+// the app's callback with a fresh token, which `interceptLastFm` exchanges for
+// user `testuser`.
+async function routeLastFmSignIn(page: Page) {
+  await page.route('https://www.last.fm/api/auth/**', (route) => route.fulfill({
+    status: 302,
+    // Absolute: a relative location would resolve against www.last.fm.
+    headers: {
+      location: `${new URL(page.url()).origin}/#/scrobble?token=t-${Math.random().toString(16).slice(2, 10)}`,
+    },
+  }));
+}
+
 // The scrobble button opens a confirmation with a time estimate; starting
 // needs the dialog's own button.
 async function scrobbleSelection(page: Page) {
@@ -347,23 +360,22 @@ test.describe('About Page', () => {
 });
 
 test.describe('Scrobble Page - Authentication Step', () => {
-  test('shows authentication step by default', async ({ page }) => {
+  test('a signed-out visitor starts at upload, with no sign-in step', async ({ page }) => {
+    await interceptLastFm(page);
     await page.goto('/#/scrobble');
-    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Authenticate with last.fm')).toHaveCount(0);
+    await expect(page.locator('h1:has-text("Authorize")')).toHaveCount(0);
+    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
   });
 
-  test('shows Last.fm auth link', async ({ page }) => {
-    await page.goto('/#/scrobble');
-    await expect(page.locator('a[href*="last.fm/api/auth"]')).toBeVisible({ timeout: 5000 });
-  });
-
-  test('auto-advances when already authenticated', async ({ page }) => {
+  test('a signed-in visitor starts at upload with their name shown', async ({ page }) => {
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
     await page.reload();
-    // Should auto-advance past step 1 to the upload step
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible();
   });
 
   test('does not re-exchange a single-use token when the callback URL is revisited', async ({ page }) => {
@@ -395,9 +407,9 @@ test.describe('Scrobble Page - Authentication Step', () => {
 
     // Revisit the callback URL with the same token still present.
     await page.goto('/#/scrobble?token=single-use-token');
-    // Wait for init() to settle (the "checking auth" spinner clears once the
+    // Wait for init() to settle (the "signing in" spinner clears once the
     // token exchange is skipped) rather than an arbitrary delay.
-    await expect(page.locator('text=Checking for authentication')).toBeHidden({ timeout: 10000 });
+    await expect(page.locator('text=Signing in to Last.fm')).toBeHidden({ timeout: 10000 });
     expect(getSessionCount).toBe(1);
   });
 
@@ -979,8 +991,7 @@ test.describe('Session Resume', () => {
     // not against the shrunken remainder.
     await expect(page.locator('.overall-progress')).toContainText('3 of 5');
 
-    // Outlast AuthenticateStep's delayed `complete` emit before interacting, so
-    // the click can't race the stepper transition it used to trigger.
+    // Let the sign-in handler and the authority check settle before interacting.
     await page.waitForTimeout(2500);
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
     await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
@@ -989,9 +1000,10 @@ test.describe('Session Resume', () => {
   });
 
   test('resuming immediately is not undone by the delayed auth redirect', async ({ page }) => {
-    // Regression: AuthenticateStep emits `complete` on a 2s setTimeout. Resuming
-    // inside that window used to jump to the scrobble step and then get dragged
-    // back to the upload step, silently losing the resumed session.
+    // Regression: AuthenticateStep used to emit `complete` on a 2s setTimeout,
+    // and resuming inside that window jumped to the scrobble step and then got
+    // dragged back to the upload step, losing the resumed session. The emit is
+    // immediate now, but `onAuthenticated` must still never move the stepper.
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
@@ -1002,7 +1014,7 @@ test.describe('Session Resume', () => {
     await page.getByRole('button', { name: 'Resume', exact: true }).click();
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
 
-    // Outlast the delayed auth emit, then confirm we're still on the scrobble step.
+    // Give a late auth emit time to land, then confirm we're still on the scrobble step.
     await page.waitForTimeout(4000);
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
     await expect(page.locator('.upload-step')).toBeHidden();
@@ -2711,8 +2723,10 @@ test.describe('Authentication - clearUser', () => {
     // Now click "Not you?" to log out
     await page.locator('text=Not you?').click();
 
-    // Should go back to step 1 (auth step)
-    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible({ timeout: 5000 });
+    // Signed out: the name goes, and the page stays on upload (there is no
+    // sign-in step to go back to).
+    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0, { timeout: 5000 });
+    await expect(page.locator('.upload-step')).toBeVisible();
 
     // Verify localStorage was cleared
     const authKey = await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'));
@@ -3563,14 +3577,16 @@ test.describe('Invalid session key', () => {
     // ...and it must not be picked up again on the next visit.
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBeNull();
 
-    // Coming back later lands on sign-in, with the whole queue still waiting.
+    // Coming back later lands signed out on upload, with the whole queue still waiting.
     await page.reload();
-    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
     await expect(page.locator('text=Resume previous session?')).toBeVisible();
 
     // Returning from Last.fm's authorize page with a fresh token.
     await loadFresh(page, '/#/scrobble?token=fresh-token');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    // Upload shows at once; the name shows once the token has been exchanged.
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
     await page.getByRole('button', { name: 'Resume', exact: true }).click();
     await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -3601,7 +3617,8 @@ test.describe('Invalid session key', () => {
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
     await loadFresh(page, '/#/scrobble?token=fresh-token');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    // Upload shows at once; the name shows once the token has been exchanged.
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
 
     expect(getSessionRequests).toHaveLength(1);
     // The old key must not ride along on (and be signed into) the exchange.
@@ -3626,7 +3643,7 @@ test.describe('Invalid session key', () => {
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
     await loadFresh(page, '/#/scrobble?token=already-used-token');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('text=/already used or has expired/i')).toBeHidden();
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBe('fake-session-key');
   });
@@ -3669,18 +3686,21 @@ test.describe('Invalid session key', () => {
     await page.getByRole('button', { name: 'Resume', exact: true }).click();
 
     await expect(page.locator('text=Sign in to Last.fm first, then choose Resume.')).toBeVisible({ timeout: 5000 });
-    await expect(page.getByRole('link', { name: 'Sign in to Last.fm', exact: true }))
-      .toHaveAttribute('href', /last\.fm\/api\/auth/);
-    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible();
+    const signIn = page.getByRole('button', { name: 'Sign in to Last.fm', exact: true });
+    await expect(signIn).toBeVisible();
+    await expect(page.locator('.upload-step')).toBeVisible();
     await expect(page.locator('text=12 tracks ready to scrobble')).toBeHidden();
 
     await page.waitForTimeout(1000);
     expect(scrobbled).toHaveLength(0);
     expect(await readSavedState(page)).toEqual(seeded);
 
-    // Back from Last.fm's authorize page, the same progress is offered again.
-    await loadFresh(page, '/#/scrobble?token=fresh-token');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    // The banner's button goes to Last.fm's authorize page; back from it, the
+    // same progress is offered again.
+    await routeLastFmSignIn(page);
+    await signIn.click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.upload-step')).toBeVisible();
     await expect(page.locator('text=Sign in to Last.fm first')).toHaveCount(0);
     await page.getByRole('button', { name: 'Resume', exact: true }).click();
     await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });

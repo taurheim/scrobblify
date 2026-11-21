@@ -1,6 +1,6 @@
 <template>
   <div class="scrobblify">
-    <div v-if="currentStep > 1">
+    <div v-if="signedIn">
       Currently authenticated as: {{ this.$store.state.lfmApi.userName }}.
       <a role="button" tabindex="0" @click="clearToken" @keydown.enter="clearToken">Not you?</a>
     </div>
@@ -137,7 +137,7 @@
         <div><strong>{{ resumeSignInMessage }}</strong></div>
         <div class="mt-1">Your saved progress is kept, and nothing has been scrobbled yet.</div>
         <div class="mt-2">
-          <v-btn color="primary" :href="authorizeUrl">Sign in to Last.fm</v-btn>
+          <v-btn color="primary" @click="signInToResume">Sign in to Last.fm</v-btn>
         </div>
       </template>
 
@@ -162,23 +162,33 @@
       </template>
     </v-alert>
 
+    <!--
+      Not a step: it exchanges a `?token=` coming back from Last.fm, and says
+      so only while that happens or if it fails. Signing in starts from
+      wherever it is needed, through `startSignIn`.
+    -->
+    <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
+
     <v-stepper v-model="currentStep">
       <v-stepper-header>
-        <v-stepper-item
-          color="primary" :complete="currentStep > 1" :value="1" title="Authenticate with last.fm"
-        />
-        <v-divider></v-divider>
-        <v-stepper-item
-          color="primary" :complete="currentStep > 2" :value="2" title="Upload your spotify play history"
-        />
-        <v-divider></v-divider>
-        <v-stepper-item
-          color="primary" :complete="currentStep > 3" :value="3" title="Choose which tracks to scrobble"
-        />
-        <v-divider></v-divider>
-        <v-stepper-item color="primary" :complete="currentStep > 4" :value="4" title="Scrobble!" />
-        <v-divider></v-divider>
-        <v-stepper-item color="primary" :value="5" title="Complete" />
+        <!--
+          `value` keeps the old step numbers (2 upload … 5 complete) so
+          `step_viewed` stays comparable; the badge counts from 1 on screen.
+        -->
+        <template v-for="(item, i) in stepperItems" :key="item.value">
+          <v-divider v-if="i > 0"></v-divider>
+          <v-stepper-item
+            color="primary"
+            :complete="item.value < 5 && currentStep > item.value"
+            :value="item.value"
+            :title="item.title"
+          >
+            <template #icon="{ hasCompleted }">
+              <v-icon v-if="hasCompleted" icon="$complete"></v-icon>
+              <template v-else>{{ i + 1 }}</template>
+            </template>
+          </v-stepper-item>
+        </template>
       </v-stepper-header>
       <!--
         Every step is `eager` so all of them mount up front, as they did under
@@ -186,9 +196,6 @@
         expect to already be listening when an earlier step finishes.
       -->
       <v-stepper-window>
-        <v-stepper-window-item :value="1" eager>
-          <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
-        </v-stepper-window-item>
         <v-stepper-window-item :value="2" eager>
           <upload-step
             :background-track-limit="backgroundTrackLimit"
@@ -314,6 +321,7 @@ import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
+import { startSignIn } from '@/services/SignInIntent';
 import RateLimitTracker from '@/services/RateLimitTracker';
 import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import ErrorDialog from '@/components/ErrorDialog.vue';
@@ -394,6 +402,14 @@ const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sig
  */
 const NEEDS_WORKER_NOTICES = [SESSION_EXPIRED_NOTICE, REAUTH_UNREACHABLE_NOTICE];
 
+/** The stepper's steps. Signing in isn't one, so they start at 2. */
+const STEPPER_ITEMS = [
+  { value: 2, title: 'Upload your spotify play history' },
+  { value: 3, title: 'Choose which tracks to scrobble' },
+  { value: 4, title: 'Scrobble!' },
+  { value: 5, title: 'Complete' },
+];
+
 interface ProgressSnapshot {
   scrobbledTracks: number;
   originalTotalTracks: number;
@@ -422,7 +438,15 @@ export default defineComponent({
   },
   data() {
     return {
-      currentStep: 1,
+      // Step numbers start at 2 (upload): signing in is no longer a step, and
+      // keeping the old numbers keeps `step_viewed` comparable.
+      currentStep: 2,
+      /**
+       * Whether the header shows who is signed in. A flag, because the store's
+       * `LastFm` isn't reactive: set when the sign-in handler confirms a
+       * session, cleared by "Not you?".
+       */
+      signedIn: false,
       hasResumableState: false,
       // What the saved progress amounts to, for the select step to warn with
       // before a fresh run replaces it. Follows `hasResumableState`.
@@ -806,6 +830,9 @@ export default defineComponent({
     },
   },
   computed: {
+    stepperItems(): { value: number; title: string }[] {
+      return STEPPER_ITEMS;
+    },
     /*
       Largest queue the background offer could take right now, or 0 when it
       won't be offered. The upload and select steps use it to say "the server
@@ -816,9 +843,6 @@ export default defineComponent({
       return this.backgroundAvailable && !this.backgroundJob && background.canCompress()
         ? this.backgroundMaxTracks
         : 0;
-    },
-    authorizeUrl(): string {
-      return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
     /*
       Whether this browser is allowed to send at all.
@@ -2447,19 +2471,16 @@ export default defineComponent({
     },
 
     /**
-     * AuthenticateStep confirms an existing session and then emits `complete`
-     * on a 2 second delay (so the "Checking for authentication..." spinner is
-     * readable). The user can act inside that window — most importantly they can
-     * hit "Resume", which jumps straight to the scrobble step. Advancing
-     * unconditionally would then yank them back to the upload step a moment
-     * later, losing the resumed session. Only ever move *forward* off step 1.
+     * AuthenticateStep emits `complete` as soon as it has confirmed a session,
+     * whether stored or just exchanged from a callback token. That can land
+     * while `mounted` is still awaiting, or after the user has already acted
+     * (pressed Resume, say), so this never moves the stepper: the user stays
+     * wherever they are.
      */
-    onAuthenticated() {
+    async onAuthenticated() {
+      this.signedIn = true;
       // Signed in now, so a resume held back for want of a key can go ahead.
       this.resumeSignInMessage = '';
-      if (this.currentStep === 1) {
-        this.currentStep = 2;
-      }
       /*
         The username is only knowable now, so for a browser that arrived
         without one — cleared storage, a new device, a fresh profile — this is
@@ -2468,15 +2489,28 @@ export default defineComponent({
         the check here would leave the case it was built for uncovered.
 
         `authorityPending` is raised *synchronously*, before the await inside
-        the check can yield. This component deliberately supports the user
-        pressing Resume during the two-second authentication transition, so
-        leaving the flag down until the request resolved would leave Resume
-        live across exactly the window the check is meant to cover.
+        the check can yield. The user can act while the sign-in settles (Resume
+        may already be on screen), so leaving the flag down until the request
+        resolved would leave Resume live across exactly the window the check
+        is meant to cover.
       */
       this.authorityPending = true;
       // Leaves local records as they were. The gate stays shut on an
       // unanswered question unless `mayScrobbleWithoutAuthority` allows it.
-      this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+      await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+      // Only once the server has answered, so nothing carried on from before
+      // the Last.fm round trip can start ahead of the check.
+      await this.continueSignInIntent();
+    },
+    /**
+     * Carries on with whatever sent this browser to Last.fm (`SignInIntent`).
+     */
+    async continueSignInIntent() {
+      // Filled in when sending a signed-out selection lands.
+    },
+    /** The sign-in banner's button: sign in, then resume the saved progress. */
+    signInToResume() {
+      startSignIn(this.$store.state.lfmApi as LastFm, { kind: 'resume' });
     },
     /**
      * `state.totalTracks` is only the tracks left to do, so on its own it makes
@@ -2498,7 +2532,8 @@ export default defineComponent({
     },
     clearToken() {
       const api = this.$store.state.lfmApi as LastFm;
-      this.currentStep = 1;
+      this.currentStep = 2;
+      this.signedIn = false;
       api.clearUser();
       resetUser();
       trackEvent('user_logged_out');
@@ -2676,7 +2711,7 @@ export default defineComponent({
       // `clearSessionKey()` keeps it after Last.fm rejects a key. Resuming then
       // sent every track unsigned, and the failures were saved as completed.
       // Nothing is written here, so the saved state survives the sign-in
-      // redirect and the banner offers it again afterwards.
+      // redirect; the sign-in banner below carries the user on from here.
       if (!api.isAuthenticated()) {
         trackEvent('session_resume_blocked', { source, reason: 'not_authenticated' });
         // Only the saved-state resume survives the redirect; a file has to be
@@ -2684,7 +2719,6 @@ export default defineComponent({
         this.resumeSignInMessage = source === 'saved'
           ? 'Sign in to Last.fm first, then choose Resume.'
           : 'Sign in to Last.fm first, then import your progress file again.';
-        this.currentStep = 1;
         return;
       }
       trackEvent('session_resumed', this.resumeProps(state, source));
