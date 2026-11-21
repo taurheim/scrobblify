@@ -1,5 +1,16 @@
 # Agent notes for scrobblify
 
+## Bugs you find along the way
+
+Any bug you come across, whether from testing, reviewing or reading code, gets a
+GitHub issue, even when it's outside the task at hand: `gh issue list --state
+all --search "<keywords>"` first, then comment on a match or
+`gh issue create --label bug`. Include how to reproduce it, the cause with
+`file:line`, a suggested fix and a regression test. Don't fix it in the same
+change unless asked. Issues are public, so they carry no user-identifying data
+(see "File issues" in the `hunting-posthog-bugs` skill for what that rules out).
+Mention the issue numbers when you report back.
+
 ## Debugging with PostHog
 
 This app reports usage and errors to PostHog from the browser. The PostHog MCP
