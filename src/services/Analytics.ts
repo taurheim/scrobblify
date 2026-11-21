@@ -172,14 +172,15 @@ function localFlagOverride(key: string): boolean | undefined {
 }
 
 /**
- * Whether a PostHog feature flag is on for this *signed-in* user. False until
- * flags have loaded, before `identifyUser` has made the Last.fm username the
- * distinct id, when analytics is off, and when PostHog is blocked, so a flag
- * can only ever *add* a feature to the default experience.
+ * Whether a PostHog feature flag is on. False until flags have loaded, when
+ * analytics is off, and when PostHog is blocked, so a flag can only ever *add*
+ * a feature to the default experience.
  *
- * Requiring identification is what makes a percentage rollout stick to a user:
- * PostHog buckets on the distinct id, which before sign-in is a random
- * per-browser id. Once identified it is the username on every browser.
+ * Honoured before sign-in too, because the server choice now comes before
+ * sign-in. Before `identifyUser`, PostHog buckets on a random per-browser id;
+ * after it, on the Last.fm username, which is what makes a rollout stick to a
+ * user across browsers. The two can disagree for a brand-new user's first
+ * offer; `isIdentified()` lets callers tell them apart.
  */
 export function isFeatureEnabled(key: string): boolean {
   if (process.env.NODE_ENV !== 'production') {
@@ -192,8 +193,19 @@ export function isFeatureEnabled(key: string): boolean {
     return false;
   }
   try {
-    return posthog.get_property('$user_state') === 'identified'
-      && posthog.isFeatureEnabled(key) === true;
+    return posthog.isFeatureEnabled(key) === true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Whether PostHog has identified this browser by Last.fm username. */
+export function isIdentified(): boolean {
+  if (!initialized) {
+    return false;
+  }
+  try {
+    return posthog.get_property('$user_state') === 'identified';
   } catch (e) {
     return false;
   }
