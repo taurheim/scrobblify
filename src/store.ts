@@ -28,6 +28,7 @@ export interface RootState {
   pendingReTagSec: number;
   importId: string;
   scrobbleRunActive: boolean;
+  showingServerJob: boolean;
 }
 
 export default createStore<RootState>({
@@ -129,6 +130,9 @@ export default createStore<RootState>({
     // Reloading then would drop everything since the last checkpoint, so the
     // "new version available" banner stays hidden until the run stops.
     scrobbleRunActive: false,
+    // True while a page is showing this user's background job, so the header
+    // shows the BETA tag even without the opt-in or flag.
+    showingServerJob: false,
   },
   mutations: {
     setValidScrobbles(state, tracks: SpotifyListen[]) {
@@ -178,6 +182,9 @@ export default createStore<RootState>({
     },
     setScrobbleRunActive(state, active: boolean) {
       state.scrobbleRunActive = active;
+    },
+    setShowingServerJob(state, on: boolean) {
+      state.showingServerJob = on;
     },
     trackScrobbled(state, count = 1) {
       state.tracksScrobbled += count;

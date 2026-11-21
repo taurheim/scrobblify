@@ -184,6 +184,75 @@ export function setBetaOptIn(on: boolean): void {
   }
 }
 
+const HANDED_OVER_IMPORT_KEY = 'scrobblify.background.handedOverImport';
+
+export function clearHandedOverImport(): void {
+  try {
+    window.localStorage.removeItem(HANDED_OVER_IMPORT_KEY);
+  } catch {
+    // Nothing to clear.
+  }
+}
+
+/**
+ * The import id of the queue this browser last handed to the worker.
+ *
+ * Display only: Home uses it to show a running job's progress through the
+ * public `/scrobblify/import/:id` route after the local queue has been
+ * cleared. It is deliberately **not** handover evidence for
+ * `mayScrobbleWithoutAuthority`; the ownership records are.
+ *
+ * The record is per Last.fm user, so a different user on the same browser
+ * (after "Not you?", say) never sees it. A handover without an import id or
+ * user clears it, so it never points at an older handover.
+ *
+ * `originalTotal` is the whole import's size. The worker only counts the
+ * tracks it was handed, so without it Home would show the server's share
+ * ("800 / 916") as if progress had gone backwards. Stored only when positive.
+ */
+export function recordHandedOverImport(importId: string, username: string, originalTotal = 0): void {
+  if (!importId || !username) {
+    clearHandedOverImport();
+    return;
+  }
+  const record: { importId: string; username: string; originalTotal?: number } = { importId, username };
+  if (Number.isFinite(originalTotal) && originalTotal > 0) {
+    record.originalTotal = originalTotal;
+  }
+  try {
+    window.localStorage.setItem(HANDED_OVER_IMPORT_KEY, JSON.stringify(record));
+  } catch {
+    // Private browsing. Home just won't show the job's progress.
+  }
+}
+
+/** The record for `username`, or null. `originalTotal` is 0 when unknown (older records). */
+export function handedOverImport(
+  username: string | null,
+): { importId: string; originalTotal: number } | null {
+  if (!username) {
+    return null;
+  }
+  try {
+    const raw = window.localStorage.getItem(HANDED_OVER_IMPORT_KEY);
+    if (!raw) {
+      return null;
+    }
+    const record = JSON.parse(raw);
+    if (!record || typeof record.importId !== 'string' || typeof record.username !== 'string') {
+      return null;
+    }
+    if (!record.importId || record.username.trim().toLowerCase() !== username.trim().toLowerCase()) {
+      return null;
+    }
+    const total = record.originalTotal;
+    const originalTotal = typeof total === 'number' && Number.isFinite(total) && total > 0 ? total : 0;
+    return { importId: record.importId, originalTotal };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Applies `?beta=1` / `?beta=0` from the current URL, and reports whether the
  * opt-in is now on.
@@ -198,7 +267,7 @@ export function setBetaOptIn(on: boolean): void {
  * (`history.replaceState` against `$router.replace`), so whichever lands last
  * silently reinstates what the other removed. Re-applying the same value on a
  * later load is idempotent, and leaving it visible keeps the invite link
- * shareable and the opt-out link honest.
+ * shareable.
  */
 export function consumeBetaParam(): boolean {
   let raw: string | null = null;

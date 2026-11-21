@@ -68,8 +68,7 @@ export default class LastFm {
     // Clean up any legacy persisted auth token from older versions; tokens are single-use.
     localStorage.removeItem(this.USER_AUTH_TOKEN_LOCALSTORAGE_KEY_LEGACY);
 
-    this.setUserAuthKey(localStorage.getItem(this.USER_AUTH_KEY_LOCALSTORAGE_KEY));
-    this.setUserName(localStorage.getItem(this.USER_NAME_LOCALSTORAGE_KEY));
+    this.loadStoredUser();
     // Auth token is single-use and only valid for ~60 minutes; always take the
     // fresh value from the URL query (returned by Last.fm's auth callback).
     this.userAuthToken = queryParams.token || null;
@@ -118,6 +117,12 @@ export default class LastFm {
         this.userAuthToken = null;
       }
     }
+  }
+
+  /** Picks up the session key and username a previous visit stored. */
+  public loadStoredUser() {
+    this.setUserAuthKey(localStorage.getItem(this.USER_AUTH_KEY_LOCALSTORAGE_KEY));
+    this.setUserName(localStorage.getItem(this.USER_NAME_LOCALSTORAGE_KEY));
   }
 
   /*

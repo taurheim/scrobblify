@@ -1,5 +1,16 @@
 # Agent notes for scrobblify
 
+## Bugs you find along the way
+
+Any bug you come across, whether from testing, reviewing or reading code, gets a
+GitHub issue, even when it's outside the task at hand: `gh issue list --state
+all --search "<keywords>"` first, then comment on a match or
+`gh issue create --label bug`. Include how to reproduce it, the cause with
+`file:line`, a suggested fix and a regression test. Don't fix it in the same
+change unless asked. Issues are public, so they carry no user-identifying data
+(see "File issues" in the `hunting-posthog-bugs` skill for what that rules out).
+Mention the issue numbers when you report back.
+
 ## Debugging with PostHog
 
 This app reports usage and errors to PostHog from the browser. The PostHog MCP
@@ -140,6 +151,23 @@ params** — an early version leaked a user's Last.fm session key into analytics
 `stale_build_older_ignored` / `chunk_load_failed` are outside the funnel (see
 "Old builds keep running" above).
 
+Home emits `home_choice` (`choice`: `have_export`, `get_export` or `resume`;
+`resume` is the "Already scrobbling on scrobblify?" link) on first visits
+(`get_export` also from the welcome-back card's "Show me how"), and
+`home_returning_shown` (`state`: `saved_signed_in`, `saved_signed_out`,
+`server_job` or `username_only`) when it shows the welcome-back card instead
+(`src/services/ReturningVisitor.ts`). The card appears when this browser has a
+remembered username, saved progress (welcomed under the progress's own
+`userName`), or a live job it handed over. "Not you?" on the card signs out
+(`user_logged_out`) only when the card was about the stored user, never deletes
+saved progress, and hides the card for the rest of the tab (`sessionStorage`
+`scrobblify.home.dismissedReturning`; a fresh Last.fm sign-in, one that
+exchanged a token, clears it). Until sign-in moves after choosing, every Home
+button that moves on (Start, Continue, Start over, Upload Spotify zip,
+Re-connect) opens `/scrobble`. Home reads the stored user itself
+(`LastFm.loadStoredUser()`), since only `/scrobble`'s sign-in step runs
+`init()`.
+
 Since 2026-11-15 `tracks_selected` fires when the user confirms the "Scrobble N
 tracks?" dialog, not on the select step's button. That dialog estimates the
 run time (`src/services/ScrobbleEstimate.ts`): re-tagged plays get today's
@@ -199,15 +227,19 @@ them. The gate and the confirmation use `backgroundCanFinish` (fed by
 `backgroundTrackLimit`, the capacity probe's `maxTracks`, 0 when the offer is
 off). The stop reasons and the paused panel use `canOfferBackground`, since the
 offer sits right under them. The Complete step uses `backgroundTrackLimit > 0`.
-Home and About only know the opt-in or flag (`isBackgroundEnabled()`, read
-once on mount, so the flag counts there only once it has loaded), not live
-capacity. New copy along those lines needs the same branch.
+Home's welcome-back card shows a live server job ("Scrobbling remotely, it's
+safe to close this tab.") to any browser that handed it over, whatever its beta status,
+and the header shows the BETA tag while it does (`showingServerJob` in the
+store), besides the opt-in and flag. Otherwise Home and About have no
+background-specific copy (About's "Where does my data go?" answer mentions the
+background service to everyone).
 
 Gate telemetry, since 2026-11-16: `large_history_gate_shown` and
 `large_history_gate_accepted` carry `re_tagged_count`, `estimated_days` and
 `background_available`. `listenbrainz_clicked` carries `source`: `gate_button`
-(which also closes the gate), `gate_text` (the inline link) or `home` (the Home
-page; no other properties). A click only means the link was opened, not that
+(which also closes the gate), `gate_text` (the inline link) or `about` (the
+About page's FAQ; no other properties). `home` was the old Home page's link,
+removed in the guided-home release. A click only means the link was opened, not that
 the user imported anything there. Shown minus accepted is not "went to
 ListenBrainz": closing the tab looks the same.
 
@@ -770,11 +802,34 @@ Locally, `localStorage['scrobblify.flags'] = '{"scrobblify-background-scrobbling
 forces it (non-production builds only). `background_offer_shown` carries
 `offer_source` (`opt_in` / `flag`).
 
-Only an explicit opt-in shows the info banner with a switch-off link (when no
-other banner is showing), and only the explicit opt-in counts in
-`mayScrobbleWithoutAuthority`'s outage rule, so neither depends on flag-load
+`App.vue` applies `?beta=` once per page load (`consumeBetaParam`, in
+`created()`), so an invite link works on any page (in dev's hash mode, editing
+only the hash doesn't reload, so it applies on the next load), and shows a
+**BETA** tag in the header whenever `isBackgroundEnabled()` (re-read on
+`onFeatureFlags`), or while Home shows this user's live server job
+(`showingServerJob`). The old "switched on for this browser — Switch it off"
+banner is gone; `?beta=0` still opts out. Only the explicit opt-in counts in
+`mayScrobbleWithoutAuthority`'s outage rule, so it doesn't depend on flag-load
 timing. All of this is independent of `VUE_APP_BACKGROUND_API`, which
 only says whether the build *can* reach a worker.
+
+`scrobblify.background.handedOverImport` (localStorage) holds JSON
+`{ importId, username, originalTotal? }` for the queue this browser last handed
+over (`originalTotal` is the import's `originalTotalTracks`). It is written in
+`completeHandoff` when a handover goes live, and cleared after a confirmed
+take-back; when a handover has no import id or user (so it never names an
+older one); when `completeHandoff` finds no local state while the handoff is
+active (its import id can't be known); and when Home sees the job ended or
+unknown to the worker.
+Home uses it, only for the same Last.fm user (case-insensitive) and only while
+the job is live, to show progress through the public `/scrobblify/import/:id`
+route; a signed-out or on-hold job gets the plain card. That route counts only
+the tracks the worker was handed, so `overallProgress`
+(`src/services/ReturningVisitor.ts`) shows the whole import as
+`originalTotal - (totalTracks - scrobbledCount)` of `originalTotal`; plays this
+browser gave up on before the handover count as done there. A record without
+`originalTotal` (older ones) falls back to the server's own numbers. It is display-only and
+deliberately **not** handover evidence.
 
 Two functions in `src/services/BackgroundScrobbling.ts`, and the split is
 load-bearing:
@@ -823,8 +878,8 @@ duplicates are actually possible.
 
 **The page shows one banner at a time**, picked by the `banner` computed in
 `Scrobblify.vue`: outage, then a server job, then the Last.fm sign-in prompt,
-then the resume prompt, then a `backgroundNotice` on its own, then the beta
-reminder. A `backgroundNotice` that isn't the banner shows as the winning
+then the resume prompt, then a `backgroundNotice` on its own. A
+`backgroundNotice` that isn't the banner shows as the winning
 banner's first line. While the worker is unreachable, notices that need the
 worker to act on (`NEEDS_WORKER_NOTICES`, the expired-connection "Fix now")
 are dropped entirely, and so is the scrobble step's "Checking…" text.
@@ -938,3 +993,10 @@ CI is unaffected, since it starts from nothing and uses the default.
 Verify a regression test actually catches its bug with
 `git stash push -- <source file>`, re-run, `git stash pop`. A test that passes
 both ways is testing nothing.
+
+To compare against an older build (before/after screenshots, say), check it out
+with `git worktree add --detach <dir> <sha>` and serve it on its own port. If you
+link `node_modules` into it with a junction instead of installing, **delete the
+junction first** (`Remove-Item <dir>\node_modules`, which removes only the link)
+before `git worktree remove`: removing the worktree follows the junction and
+empties the real `node_modules`. `npm ci` restores it.

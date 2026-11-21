@@ -14,8 +14,6 @@
       v-if="banner"
       :type="bannerType"
       :prominent="banner === 'job' || banner === 'signIn' || banner === 'resume'"
-      :variant="banner === 'beta' ? 'tonal' : undefined"
-      :density="banner === 'beta' ? 'compact' : undefined"
       class="mb-4"
     >
       <div v-if="showBackgroundNotice" :class="{ 'mb-3': banner !== 'notice' }">
@@ -161,16 +159,6 @@
           style="display: none"
           @change="onImportFile"
         >
-      </template>
-
-      <!--
-        Sticky opt-in, so it needs to be visible and reversible: a flag the user
-        cannot see is one they cannot report a bug against or switch off. Last
-        in line, so it only shows when nothing more useful does.
-      -->
-      <template v-else-if="banner === 'beta'">
-        Background scrobbling (beta) is switched on for this browser.
-        <a :href="betaOffHref">Switch it off</a>.
       </template>
     </v-alert>
 
@@ -458,8 +446,6 @@ export default defineComponent({
       backgroundBusy: false,
       backgroundJob: null as background.JobStatus | null,
       backgroundNotice: '',
-      /** Set from `?beta=1`. Gates the offer only — never recovery. */
-      betaOptedIn: false,
       /** Snapshot from the scrobble step, held while the offer dialog is open. */
       pendingSnapshot: null as ProgressSnapshot | null,
       /** State to hand off, when the offer came from a resume rather than a live queue. */
@@ -552,14 +538,6 @@ export default defineComponent({
   },
   async mounted() {
     trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
-
-    /*
-      Before anything else, because it is pure local state and the handoff
-      return below can navigate away. Only the *offer* reads it; the recovery
-      paths further down deliberately do not, so a browser that arrives here
-      without the flag still learns about a job it left running.
-    */
-    this.betaOptedIn = background.consumeBetaParam();
 
     // Ordering matters. A handoff coming back from Last.fm must be finished
     // before anything reads local state, because the upload derives its bytes
@@ -871,9 +849,8 @@ export default defineComponent({
      *            because a notice that leaves Resume available is a "nothing
      *            happened" report (a handoff that didn't go through), and the
      *            prompt is what the user acts on; it shows as its first line.
-     *   beta   — the opt-in reminder, only when nothing else needs saying.
      */
-    banner(): 'outage' | 'job' | 'signIn' | 'resume' | 'notice' | 'beta' | null {
+    banner(): 'outage' | 'job' | 'signIn' | 'resume' | 'notice' | null {
       if (this.authorityUnknown) { return 'outage'; }
       if (this.backgroundJob) { return 'job'; }
       if (this.resumeSignInMessage) { return 'signIn'; }
@@ -882,14 +859,12 @@ export default defineComponent({
         return 'resume';
       }
       if (this.showBackgroundNotice) { return 'notice'; }
-      if (this.betaOptedIn) { return 'beta'; }
       return null;
     },
     bannerType(): string {
       switch (this.banner) {
         case 'job': return this.jobAlertType;
-        case 'resume':
-        case 'beta': return 'info';
+        case 'resume': return 'info';
         default: return 'warning';
       }
     },
@@ -979,23 +954,6 @@ export default defineComponent({
     },
     jobCheckedAt(): string {
       return this.jobCheckedAtSec ? clockTime(this.jobCheckedAtSec) : '';
-    },
-
-    /**
-     * An opt-out link for the current page.
-     *
-     * Built from `location` rather than the router because the parameter lives
-     * in the real query string in both routing modes — outside production the
-     * router runs in hash mode, where `$route` owns only what follows the `#`.
-     */
-    betaOffHref(): string {
-      try {
-        const params = new URLSearchParams(window.location.search);
-        params.set('beta', '0');
-        return `${window.location.pathname}?${params.toString()}${window.location.hash}`;
-      } catch (e) {
-        return '?beta=0';
-      }
     },
   },
   methods: {
@@ -2332,6 +2290,7 @@ export default defineComponent({
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         background.clearHandoffLineage(carriedLineage.ranges, carriedLineage.knownFromSec);
+        background.clearHandedOverImport();
         /*
           Said out loud when it applies, and it now rarely does. A track that
           was sent without a confirmed reply comes back pinned to the exact

@@ -21,6 +21,8 @@ export default defineConfig({
   use: {
     baseURL: `http://localhost:${PORT}`,
     headless: true,
+    // Pins toLocaleString() output (e.g. "1,200 / 4,000") whatever the host's locale.
+    locale: 'en-US',
   },
   webServer: {
     command: `npx vue-cli-service serve --port ${PORT}`,

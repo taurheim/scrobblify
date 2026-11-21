@@ -1,95 +1,189 @@
 <template>
   <div class="home">
-    <h1>So you want to start tracking your spotify plays...</h1>
-    You've come to the right place! Last.fm is a free service that lets you track the music you listen to.
-    <br>
-    <h2>How to connect your last.fm and spotify accounts</h2>
-    <ol>
-      <li>Go to <a href="https://www.last.fm/join">https://www.last.fm/join</a> and create a last.fm account.</li>
-      <li>Go to <a href="https://www.last.fm/settings/applications">https://www.last.fm/settings/applications</a> and connect your accounts.</li>
-    </ol>
-    <br>
-    Now all your plays will be automatically scrobbled (saved) to last.fm! You can use last.fm to track your listening history and use cool tools like <a href="https://savas.ca/lastwave">LastWave</a>.
+    <h1 class="home-title">Retroactively scrobble Spotify plays to last.fm</h1>
 
-    <h2>But I want to see cool graphs right now!</h2>
-    Well you're in luck - Scrobblify to the rescue! Scrobblify lets you
-    retroactively scrobble your Spotify listening history straight to last.fm.
-    <br><br>
-    <b>1. Request your Extended Streaming History from Spotify</b><br>
-    Go to <a href="https://www.spotify.com/account/privacy/">your Spotify account</a> (Account &gt; Privacy &gt; Download your data).
-    Make sure you request the <strong>"Extended streaming history"</strong> specifically — this is
-    different from the basic "Account data" download.
-    The extended history includes your full listening history with timestamps, which is what Scrobblify needs.
-    Spotify says it can take up to 30 days, but it usually only takes a few days.<br>
-    <b>2. Download your data when it's ready</b><br>
-    You'll get an email from Spotify when your data is ready. Go back to your
-    <a href="https://www.spotify.com/account/privacy/">privacy settings</a> and download the ZIP file.<br>
-    <b>3. Create a last.fm account</b><br>
-    Create a new account <a href="https://www.last.fm/join">here</a> (an existing account will also work — Scrobblify
-    will check to make sure it doesn't add any duplicate scrobbles).<br>
-    <b>4. Drag and drop your ZIP file into Scrobblify</b><br>
-    No need to unzip or open any files! Just drag and drop the ZIP file directly into the
-    <router-link to="/scrobble">Scrobble</router-link> page and Scrobblify will handle the rest.<br>
-    <b>5. Sit back and let it run!</b><br>
-    Scrobblify will start submitting your listening history to last.fm. Note that last.fm keeps at most 750 scrobbles
-    per day (midnight to midnight UTC, your own listening included), so a large history takes several days.
-    Scrobblify stops a little short of that each day and only counts scrobbles it can see in your Last.fm library.
-    <template v-if="backgroundEnabled">
-      You've switched on the background scrobbling beta, so you don't have to keep coming back: once a day's
-      share is sent, choose <strong>"Finish this in the background"</strong> and Scrobblify's server carries on
-      with the tab closed.
-    </template>
+    <home-get-export v-if="gettingExport" @back="gettingExport = false" />
+
+    <div v-else-if="!ready" class="home-loading-wrap">
+      <v-progress-circular indeterminate color="primary" class="home-loading" aria-label="Loading" />
+    </div>
+
+    <home-returning
+      v-else-if="returning.kind !== 'none' && !dismissedReturning"
+      :state="returning"
+      @continue="openScrobble"
+      @start-over="openScrobble"
+      @upload="openScrobble"
+      @not-you="notYou"
+      @show-get-export="showGetExport"
+    />
+
     <template v-else>
-      You can also <strong>save your progress</strong> and come back later if you need to close the page.
-      Your progress will be waiting for you when you return!
+      <div class="home-cards">
+        <v-card class="home-card">
+          <v-card-title class="text-wrap">Already got your streaming history zip?</v-card-title>
+          <v-card-actions>
+            <v-btn color="primary" variant="flat" block @click="go('have_export')">Start</v-btn>
+          </v-card-actions>
+        </v-card>
+        <v-card class="home-card">
+          <v-card-title class="text-wrap">Don't have it yet?</v-card-title>
+          <v-card-actions>
+            <v-btn color="primary" variant="flat" block @click="showGetExport">Show me how</v-btn>
+          </v-card-actions>
+        </v-card>
+      </div>
+      <p class="home-already">
+        Already scrobbling on scrobblify?
+        <button type="button" class="link-button" @click="go('resume')">Re-connect to last.fm</button>
+      </p>
     </template>
-
-    <h2>Have a big listening history?</h2>
-    Last.fm only accepts scrobbles from the past two weeks with their real dates. Scrobblify can still import
-    older plays, but only by <strong>giving each one the date it is sent</strong>: plays from months or years
-    ago show up on your profile as if you listened to them over the coming days. And with at most 750 scrobbles
-    a day, a history of tens of thousands of plays takes weeks<template v-if="backgroundEnabled"> (with the
-    background beta, Scrobblify's server does the waiting for you)</template><template v-else> of coming back
-    each day</template>. Last.fm has no way to delete scrobbles in bulk, so this is hard to undo.
-    <br><br>
-    If most of your history is older than two weeks, consider
-    <a
-      href="https://listenbrainz.org/settings/import/"
-      target="_blank"
-      rel="noopener noreferrer"
-      @click="listenBrainzClicked"
-    >ListenBrainz</a>
-    instead. It imports the same Spotify ZIP directly, in one go, and keeps every play on the day you actually
-    listened to it. Scrobblify is the better fit for recent plays, or if you specifically want your history on
-    Last.fm and don't mind the dates. Once your accounts are connected, all future plays keep their real dates
-    either way.
   </div>
 </template>
+
 <style>
 .home {
-  text-align: left;
-  max-width: 1000px;
+  max-width: 720px;
   margin: 0 auto;
   padding: 0 5%;
 }
 
-.home h2 {
-  margin-top: 20px;
+.home-title {
+  margin: 8px 0 24px;
+}
+
+.home-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 600px) {
+  .home-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+.home-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.home-already {
+  margin-top: 24px;
+}
+
+.home-loading-wrap {
+  display: flex;
+  justify-content: center;
 }
 </style>
+
 <script lang="ts">
-import { defineComponent } from 'vue';
-import { trackEvent } from '@/services/Analytics';
-import { isBackgroundEnabled } from '@/services/BackgroundScrobbling';
+import { defineComponent, markRaw } from 'vue';
+import LastFm from '@/api/LastFm';
+import HomeGetExport from '@/components/home/HomeGetExport.vue';
+import HomeReturning from '@/components/home/HomeReturning.vue';
+import StateManager from '@/services/StateManager';
+import {
+  detectReturning, HOME_DISMISSED_KEY, ReturningState, sameUser,
+} from '@/services/ReturningVisitor';
+import { resetUser, trackEvent } from '@/services/Analytics';
+
+type HomeChoice = 'have_export' | 'get_export' | 'resume';
+
+function readDismissed(): boolean {
+  try {
+    return sessionStorage.getItem(HOME_DISMISSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeDismissed() {
+  try {
+    sessionStorage.setItem(HOME_DISMISSED_KEY, '1');
+  } catch {
+    // Private modes can refuse storage; the in-component flag still holds.
+  }
+}
 
 export default defineComponent({
+  components: { 'home-get-export': HomeGetExport, 'home-returning': HomeReturning },
   data() {
-    // The beta opt-in, not live worker capacity: this page only describes what's possible.
-    return { backgroundEnabled: isBackgroundEnabled() };
+    return {
+      // Nothing renders until the returning check settles, so a returning
+      // visitor never sees the first-visit page flash first.
+      ready: false,
+      gettingExport: false,
+      dismissedReturning: false,
+      returning: { kind: 'none' } as ReturningState,
+      stateManager: markRaw(new StateManager()),
+    };
+  },
+  async mounted() {
+    this.dismissedReturning = readDismissed();
+    await this.refreshReturning();
+  },
+  beforeUnmount() {
+    this.$store.commit('setShowingServerJob', false);
   },
   methods: {
-    listenBrainzClicked() {
-      trackEvent('listenbrainz_clicked', { source: 'home' });
+    async refreshReturning() {
+      const api = this.$store.state.lfmApi as LastFm;
+      try {
+        // Only /scrobble's sign-in step runs init(), so a visit that starts
+        // here has to read the stored user itself.
+        api.loadStoredUser();
+        this.returning = await detectReturning(api, this.stateManager);
+        const r = this.returning;
+        this.$store.commit('setShowingServerJob', r.kind === 'server_job' && !this.dismissedReturning);
+        if (r.kind !== 'none' && !this.dismissedReturning) {
+          let state: string = r.kind;
+          if (r.kind === 'saved') {
+            state = r.signedIn ? 'saved_signed_in' : 'saved_signed_out';
+          }
+          trackEvent('home_returning_shown', { state });
+        }
+      } catch {
+        this.returning = { kind: 'none' };
+        this.$store.commit('setShowingServerJob', false);
+      } finally {
+        this.ready = true;
+      }
+    },
+    go(choice: HomeChoice) {
+      trackEvent('home_choice', { choice });
+      this.$router.push('/scrobble');
+    },
+    showGetExport() {
+      trackEvent('home_choice', { choice: 'get_export' });
+      this.gettingExport = true;
+    },
+    // Until sign-in moves after choosing (Plan 3), /scrobble's own sign-in
+    // step and resume banner take it from here.
+    openScrobble() {
+      this.$router.push('/scrobble');
+    },
+    /*
+      Shows the first visit for the rest of this tab. Signs out only when the
+      card welcomed the stored user: saved progress can belong to someone
+      else, and signing out the stored user for it would log out the wrong
+      person. Saved progress is deliberately kept: it may still be the
+      user's, and it stays reachable from /scrobble's resume banner.
+    */
+    notYou() {
+      const api = this.$store.state.lfmApi as LastFm;
+      const r = this.returning;
+      if (r.kind === 'username_only' || (r.kind === 'saved' && sameUser(r.username, api.getUserName()))) {
+        api.clearUser();
+        resetUser();
+        trackEvent('user_logged_out');
+      }
+      writeDismissed();
+      this.dismissedReturning = true;
+      this.$store.commit('setShowingServerJob', false);
     },
   },
 });

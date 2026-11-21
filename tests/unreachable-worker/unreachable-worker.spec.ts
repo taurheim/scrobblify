@@ -103,7 +103,7 @@ async function expectHeldBack(page: Page, scrobbles: string[]) {
   await page.waitForTimeout(3000);
   expect(scrobbles).toEqual([]);
   await expect(page.locator(UNREACHABLE)).toBeVisible();
-  // One banner, ever: not the beta reminder or a sign-in prompt beside it.
+  // One banner, ever: not a sign-in prompt beside it.
   await expect(page.locator('.scrobblify > .v-alert')).toHaveCount(1);
   // The banner explains the block; the scrobble step must not claim to be
   // still checking underneath it.
@@ -291,8 +291,6 @@ test.describe('Offering background scrobbling', () => {
   test('the rollout flag offers it without the opt-in', async ({ page }) => {
     const { workerCalls } = await openUploadStep(page, WILLING_WORKER, FLAG_ON);
     await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
-    // Only an explicit opt-in shows the beta reminder.
-    await expect(page.locator('text=Background scrobbling (beta) is switched on')).toHaveCount(0);
     await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile());
 
     await expect(page.locator(OFFER)).toBeVisible({ timeout: 15000 });
@@ -377,5 +375,126 @@ test.describe('Offering background scrobbling', () => {
 
     await expect(page.locator("text=hand the rest to Scrobblify's server below >> visible=true"))
       .toBeVisible({ timeout: 30000 });
+  });
+});
+
+test.describe('BETA tag', () => {
+  const TAG = '#logo .beta-tag';
+
+  test('an opted-in browser sees the BETA tag on every page', async ({ page }) => {
+    await page.goto('/?beta=1#/');
+    await expect(page.locator(TAG)).toHaveText('BETA');
+    await page.goto('/#/about');
+    await expect(page.locator(TAG)).toBeVisible();
+  });
+
+  test('the rollout flag shows the tag without the opt-in', async ({ page }) => {
+    await page.goto('/#/');
+    await page.evaluate(() => window.localStorage.setItem(
+      'scrobblify.flags',
+      JSON.stringify({ 'scrobblify-background-scrobbling': true }),
+    ));
+    await page.reload();
+    await expect(page.locator(TAG)).toBeVisible();
+  });
+
+  test('a browser outside the beta sees no tag; opting in shows the tag but no banner', async ({ page }) => {
+    await page.goto('/#/');
+    await expect(page.locator('#logo')).toBeVisible();
+    await expect(page.locator(TAG)).toHaveCount(0);
+    await page.goto('/?beta=1#/scrobble');
+    await expect(page.locator('.scrobblify')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(TAG)).toBeVisible();
+    await expect(page.locator('text=Background scrobbling (beta) is switched on')).toHaveCount(0);
+  });
+
+  test('?beta=0 removes the tag again', async ({ page }) => {
+    await page.goto('/?beta=1#/');
+    await expect(page.locator(TAG)).toBeVisible();
+    await page.goto('/?beta=0#/');
+    await expect(page.locator('#logo')).toBeVisible();
+    await expect(page.locator(TAG)).toHaveCount(0);
+  });
+});
+
+test.describe('Home with a job on the server', () => {
+  const IMPORT_ID = 'c1c2c3c4c5c6c7c8c9c0d1d2d3d4d5d6';
+  const RECORD_KEY = 'scrobblify.background.handedOverImport';
+
+  async function openHome(
+    page: Page,
+    recordUser: string,
+    answer: Record<string, unknown> | 'refuse',
+    originalTotal?: number,
+  ) {
+    const paths: string[] = [];
+    await page.route(WORKER, async (route: Route) => {
+      const { pathname } = new URL(route.request().url());
+      paths.push(pathname);
+      if (answer !== 'refuse' && pathname === `/scrobblify/import/${IMPORT_ID}`) {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(answer) });
+        return;
+      }
+      await route.abort('internetdisconnected');
+    });
+    await page.goto('/#/');
+    const record = originalTotal === undefined
+      ? { importId: IMPORT_ID, username: recordUser }
+      : { importId: IMPORT_ID, username: recordUser, originalTotal };
+    await page.evaluate(([key, value]) => {
+      localStorage.setItem('scrobblifyLfmUserName', 'testuser');
+      localStorage.setItem(key, value);
+    }, [RECORD_KEY, JSON.stringify(record)]);
+    await page.reload();
+    return paths;
+  }
+
+  const LIVE = {
+    ok: true, known: true, live: true, state: 'active', cursor: 1200, scrobbledCount: 1200, totalTracks: 4000,
+  };
+
+  test('shows the job\'s progress from the handed-over import id', async ({ page }) => {
+    await openHome(page, 'testuser', LIVE);
+    const card = page.locator('.returning-card');
+    await expect(card.locator('.returning-bar')).toContainText('1,200 / 4,000 · 30%');
+    await expect(card).toContainText("Scrobbling remotely, it's safe to close this tab.");
+    await expect(card.locator('button')).toHaveCount(0);
+  });
+
+  test('counts the whole import, not just the server\'s share, when its size was recorded', async ({ page }) => {
+    // 1,000 were scrobbled in the browser before 4,000 were handed over.
+    await openHome(page, 'testuser', LIVE, 5000);
+    await expect(page.locator('.returning-card .returning-bar')).toContainText('2,200 / 5,000 · 44%');
+  });
+
+  test('another user\'s handed-over import is not shown', async ({ page }) => {
+    const paths = await openHome(page, 'someoneelse', LIVE);
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
+    await expect(page.getByText("Scrobbling remotely, it's safe to close this tab.")).toHaveCount(0);
+    expect(paths.filter((p) => p.startsWith('/scrobblify/import/'))).toEqual([]);
+  });
+
+  test('a live job shows the BETA tag to a browser outside the beta', async ({ page }) => {
+    await openHome(page, 'testuser', LIVE);
+    await expect(page.locator('.returning-card')).toContainText("Scrobbling remotely, it's safe to close this tab.");
+    expect(await page.evaluate(() => localStorage.getItem('scrobblify.background.beta'))).toBeNull();
+    await expect(page.locator('#logo .beta-tag')).toHaveText('BETA');
+    await page.locator('#nav a:has-text("About")').click();
+    await expect(page.locator('#logo .beta-tag')).toHaveCount(0);
+  });
+
+  test('a finished job falls back to the plain welcome-back card and forgets the id', async ({ page }) => {
+    await openHome(page, 'testuser', {
+      ok: true, known: true, live: false, state: 'completed', cursor: 4000, scrobbledCount: 4000, totalTracks: 4000,
+    });
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
+    await expect(page.locator('#logo .beta-tag')).toHaveCount(0);
+    expect(await page.evaluate((key) => localStorage.getItem(key), RECORD_KEY)).toBeNull();
+  });
+
+  test('an unreachable worker shows the plain card but keeps the id for next time', async ({ page }) => {
+    await openHome(page, 'testuser', 'refuse');
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
+    expect(await page.evaluate((key) => localStorage.getItem(key), RECORD_KEY)).not.toBeNull();
   });
 });

@@ -34,6 +34,7 @@ import { defineComponent } from 'vue';
 import LastFm from '@/api/LastFm';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import { trackEvent, trackError, identifyUser } from '@/services/Analytics';
+import { HOME_DISMISSED_KEY } from '@/services/ReturningVisitor';
 
 export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
@@ -98,6 +99,14 @@ export default defineComponent({
     if (api.isAuthenticated()) {
       identifyUser(api.getUserName());
       trackEvent('auth_success', { returning: !hadToken });
+      if (hadToken) {
+        // A fresh sign-in may be someone else: Home's "Not you?" shouldn't outlast it.
+        try {
+          sessionStorage.removeItem(HOME_DISMISSED_KEY);
+        } catch {
+          // Storage refused; the card just stays hidden for this tab.
+        }
+      }
       setTimeout(() => {
         this.$emit('complete');
       }, 2000);

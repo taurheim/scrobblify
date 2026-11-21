@@ -384,6 +384,7 @@ export async function completeHandoff(
     // told. This branch previously fell through without announcing anything.
     if (active !== false) {
       api.setQueueOwner({ owner: 'server', id: handoffId });
+      api.clearHandedOverImport();
     } else {
       api.releaseQueueOwnerIfUnclaimed(handoffId);
     }
@@ -408,6 +409,7 @@ export async function completeHandoff(
     // can reconcile it against terminal job status rather than being blocked
     // by a flag nothing ever clears.
     api.setQueueOwner({ owner: 'server', id: outcome.jobId });
+    api.recordHandedOverImport(state.importId || '', state.userName || '', state.originalTotalTracks || 0);
     try {
       await stateManager.clearState();
     } catch (e) {
@@ -450,6 +452,7 @@ export async function completeHandoff(
     */
     const jobId = await api.jobIdForHandoff(handoffId);
     api.setQueueOwner({ owner: 'server', id: jobId });
+    api.recordHandedOverImport(state.importId || '', state.userName || '', state.originalTotalTracks || 0);
     try {
       await stateManager.clearState();
     } catch (e) {

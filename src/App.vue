@@ -6,6 +6,13 @@
     <div id="nav">
       <div id="logo">
         <img src="./assets/logo.png" alt=""> scrobblify
+        <v-chip
+          v-if="betaTag || $store.state.showingServerJob"
+          class="beta-tag ml-1"
+          size="x-small"
+          color="deep-purple"
+          variant="flat"
+        >BETA</v-chip>
       </div>
       <router-link to="/">Home</router-link> |
       <router-link to="/scrobble">Scrobble</router-link> |
@@ -62,6 +69,17 @@
   .v-application a,
   .v-overlay-container a {
     color: rgb(var(--v-theme-primary));
+  }
+
+  /* An action styled as a link; a real <button> so it isn't a fake navigation. */
+  .link-button {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: rgb(var(--v-theme-primary));
+    text-decoration: underline;
+    cursor: pointer;
   }
 
   .v-application p,
@@ -134,7 +152,8 @@
 import { defineComponent } from 'vue';
 import { BUILD_NUMBER, GIT_SHA } from './buildInfo';
 import { DeployedBuild, compareDeployedBuild, fetchDeployedBuild } from './services/BuildCheck';
-import { trackEvent } from './services/Analytics';
+import { onFeatureFlags, trackEvent } from './services/Analytics';
+import { consumeBetaParam, isBackgroundEnabled } from './services/BackgroundScrobbling';
 
 const RECHECK_INTERVAL_MS = 30 * 60 * 1000;
 // Returning to a backgrounded tab rechecks, but not on every quick switch.
@@ -170,6 +189,10 @@ export default defineComponent({
       checkingBuild: false,
       lastBuildCheckAt: 0,
       buildCheckTimer: null as number | null,
+      // Shown whenever this browser is offered background scrobbling. Refreshed
+      // when PostHog flags load or the user is identified.
+      betaTag: false,
+      releaseFlagListener: null as (() => void) | null,
     };
   },
   computed: {
@@ -180,12 +203,29 @@ export default defineComponent({
       return this.buildCheck === 'stale' && !this.$store.state.scrobbleRunActive;
     },
   },
+  created() {
+    /*
+      `?beta=1` / `?beta=0` is applied here, once per page load, so an invite
+      link works on any page and not only /scrobble. Children mount after
+      this, so their offer checks already see the opt-in. In hash mode (dev),
+      editing only the hash doesn't reload, so a parameter typed there applies
+      on the next reload.
+    */
+    consumeBetaParam();
+    this.betaTag = isBackgroundEnabled();
+  },
   mounted() {
+    this.releaseFlagListener = onFeatureFlags(() => {
+      this.betaTag = isBackgroundEnabled();
+    });
     this.checkBuild();
     this.buildCheckTimer = window.setInterval(this.checkBuild, RECHECK_INTERVAL_MS);
     document.addEventListener('visibilitychange', this.onVisibilityChange);
   },
   beforeUnmount() {
+    if (this.releaseFlagListener) {
+      this.releaseFlagListener();
+    }
     if (this.buildCheckTimer !== null) {
       window.clearInterval(this.buildCheckTimer);
     }

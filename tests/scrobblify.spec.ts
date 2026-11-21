@@ -64,10 +64,85 @@ function captureEvents(page: Page): Tracked[] {
   return events;
 }
 
+// Writes a saved session straight into IndexedDB, which is exactly what
+// `StateManager.saveState` produces. Lets the resume path be exercised
+// without first having to drive a real pause.
+async function seedSavedState(page: Page, state: Record<string, unknown>) {
+  await page.evaluate(async (savedState) => {
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('scrobbleState')) {
+          db.createObjectStore('scrobbleState');
+        }
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction('scrobbleState', 'readwrite');
+        tx.objectStore('scrobbleState').put(savedState, 'current');
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }, state);
+}
+
+async function readSavedState(page: Page): Promise<Record<string, any> | null> {
+  return page.evaluate(() => new Promise<Record<string, any> | null>((resolve, reject) => {
+    const request = indexedDB.open('scrobblify', 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('scrobbleState')) {
+        db.createObjectStore('scrobbleState');
+      }
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      const req = db.transaction('scrobbleState', 'readonly').objectStore('scrobbleState').get('current');
+      req.onsuccess = () => { db.close(); resolve(req.result || null); };
+      req.onerror = () => { db.close(); reject(req.error); };
+    };
+    request.onerror = () => reject(request.error);
+  }));
+}
+
 test.describe('Home Page', () => {
-  test('renders home page with instructions', async ({ page }) => {
-    await page.goto('/');
-    await expect(page.locator('body')).toContainText('Scrobblify');
+  test('a first visit offers two equal choices and a way back in', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await expect(page.locator('h1')).toHaveText('Retroactively scrobble Spotify plays to last.fm');
+    await expect(page.locator('text=Already got your streaming history zip?')).toBeVisible();
+    await expect(page.locator("text=Don't have it yet?")).toBeVisible();
+    await expect(page.locator('text=Already scrobbling on scrobblify?')).toBeVisible();
+
+    await page.locator('.home-card:has-text("Already got your") button:has-text("Start")').click();
+    await expect(page).toHaveURL(/#\/scrobble/);
+    await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'have_export' } });
+  });
+
+  test('"Show me how" swaps the choices for the steps, and Back brings them back', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await page.locator('button:has-text("Show me how")').click();
+
+    await expect(page.locator('h2:has-text("Get your history from Spotify")')).toBeVisible();
+    await expect(page.locator('.get-export li')).toHaveCount(3);
+    await expect(page.locator('.get-export a[href="https://www.spotify.com/account/privacy/"]')).toBeVisible();
+    await expect(page.locator('.home-card')).toHaveCount(0);
+    await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'get_export' } });
+
+    await page.locator('.get-export-back').click();
+    await expect(page.locator('.home-card')).toHaveCount(2);
+  });
+
+  test('"Re-connect to last.fm" opens the scrobble page', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await page.locator('button:has-text("Re-connect to last.fm")').click();
+    await expect(page).toHaveURL(/#\/scrobble/);
+    await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
   });
 
   test('has navigation links', async ({ page }) => {
@@ -85,12 +160,158 @@ test.describe('Home Page', () => {
       /^([0-9a-f]{7}|dev) · Build (\d+|local)$/,
     );
   });
+
+  test('shows no BETA tag in a build without a worker, even with ?beta=1', async ({ page }) => {
+    await page.goto('/?beta=1#/');
+    await expect(page.locator('#logo')).toBeVisible();
+    await expect(page.locator('#logo .beta-tag')).toHaveCount(0);
+  });
+
+  const SAVED = {
+    userName: 'testuser',
+    totalTracks: 5,
+    completedIndices: [0, 1, 2],
+    failedIndices: [],
+    tracks: [1, 2, 3, 4, 5].map((n) => ({
+      track: `Track ${n}`, artist: `Artist ${n}`, album: `Album ${n}`, timestamp: Date.UTC(2024, 0, n),
+    })),
+    originalTotalTracks: 5,
+    originalSucceededCount: 3,
+    sendTimestamps: [],
+    burstCount: 0,
+    dailyCount: 0,
+    dailyCountDate: new Date().toISOString().split('T')[0],
+    savedAt: new Date().toISOString(),
+  };
+
+  test('a visitor with saved progress gets a welcome-back card instead', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await seedSavedState(page, SAVED);
+    await page.reload();
+
+    const card = page.locator('.returning-card');
+    await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to testuser');
+    await expect(card.locator('.returning-bar')).toContainText('3 / 5 · 60%');
+    await expect(card.locator('.returning-links')).toHaveText(/^\s*Not you\?\s+·\s+Start over\s*$/);
+    await expect(page.locator('.home-card')).toHaveCount(0);
+    await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'saved_signed_out' } });
+
+    await card.locator('button:has-text("Continue")').click();
+    await expect(page).toHaveURL(/#\/scrobble/);
+  });
+
+  test('a signed-in visitor with saved progress is reported as such', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, SAVED);
+    await page.reload();
+    await expect(page.locator('.returning-card')).toBeVisible();
+    await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'saved_signed_in' } });
+  });
+
+  test('"Not you?" on saved progress signs out and shows the first visit, keeping the progress', async ({ page }) => {
+    await page.goto('/#/');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, SAVED);
+    await page.reload();
+    await page.locator('.returning-card button:has-text("Not you?")').click();
+    await expect(page.locator('.home-card')).toHaveCount(2);
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBeNull();
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBeNull();
+    expect(await readSavedState(page)).not.toBeNull();
+
+    // The dismissal lasts for the tab, not just this mount of Home.
+    await page.goto('/#/about');
+    await expect(page.locator('body')).toContainText('Scrobblify');
+    await page.goto('/#/');
+    await expect(page.locator('.home-card')).toHaveCount(2);
+    await expect(page.locator('.returning-card')).toHaveCount(0);
+  });
+
+  test('"Not you?" on someone else\'s saved progress keeps the stored user signed in', async ({ page }) => {
+    await page.goto('/#/');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, { ...SAVED, userName: 'alice' });
+    await page.reload();
+
+    const card = page.locator('.returning-card');
+    await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to alice');
+    await card.locator('button:has-text("Not you?")').click();
+    await expect(page.locator('.home-card')).toHaveCount(2);
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBe('testuser');
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).not.toBeNull();
+  });
+
+  test('a remembered username with nothing saved is offered an upload, and "Not you?" forgets it', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.goto('/#/');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await page.reload();
+
+    const card = page.locator('.returning-card');
+    await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to testuser');
+    await expect(card.locator('.returning-bar')).toHaveCount(0);
+    await expect(card.locator('button:has-text("Upload Spotify zip")')).toBeVisible();
+    await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'username_only' } });
+
+    await card.locator('button:has-text("Not you?")').click();
+    await expect(page.locator('.home-card')).toHaveCount(2);
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBeNull();
+  });
+
+  test('a fresh Last.fm sign-in brings back a card dismissed with "Not you?"', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await page.reload();
+    await page.locator('.returning-card button:has-text("Not you?")').click();
+    await expect(page.locator('.home-card')).toHaveCount(2);
+
+    await page.goto('/#/scrobble?token=fresh-token');
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).not.toBeNull();
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('scrobblify.home.dismissedReturning'))).toBeNull();
+    await page.goto('/#/');
+    await expect(page.locator('.returning-card')).toBeVisible();
+  });
+
+  test('"Show me how" on the returning card opens the steps', async ({ page }) => {
+    await page.goto('/#/');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await page.reload();
+    await page.locator('.returning-card button:has-text("Show me how")').click();
+    await expect(page.locator('h2:has-text("Get your history from Spotify")')).toBeVisible();
+  });
 });
 
 test.describe('About Page', () => {
   test('renders about page', async ({ page }) => {
     await page.goto('/#/about');
     await expect(page.locator('body')).toContainText('Scrobblify');
+  });
+
+  test('answers questions in a collapsible FAQ, with ListenBrainz one click away', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.context().route('https://listenbrainz.org/**', (route) => route.fulfill({ status: 200, body: '' }));
+    await page.goto('/#/about');
+
+    await expect(page.locator('.about')).toContainText('buy me a coffee');
+    await expect(page.locator('.about-faq .v-expansion-panel')).toHaveCount(4);
+    const dates = page.locator('.about-faq .v-expansion-panel:has-text("Why do old plays get today\'s date?")');
+    await expect(dates.locator('.v-expansion-panel-text__wrapper')).toBeHidden();
+    await dates.locator('.v-expansion-panel-title').click();
+    await expect(dates).toContainText('Last.fm only accepts plays from the last two weeks');
+
+    const popup = page.waitForEvent('popup');
+    await dates.locator('a:has-text("ListenBrainz")').click();
+    await popup;
+    await expect.poll(() => events).toContainEqual({ name: 'listenbrainz_clicked', props: { source: 'about' } });
+
+    await expect(page.locator('.about h2:has-text("Who built Scrobblify?")')).toBeVisible();
+    await expect(page.locator('.about h2:has-text("Contribute")')).toBeVisible();
+    await expect(page.locator('text=Support Scrobblify')).toHaveCount(0);
   });
 
   // A deleted chunk from an older build: the server answers with HTML (or 404).
@@ -110,7 +331,7 @@ test.describe('About Page', () => {
     const requests = await failAboutChunk(page, 1);
     await page.goto('/#/');
     await page.evaluate(() => { window.location.hash = '#/about'; });
-    await expect(page.locator('.about h1').first()).toHaveText('What is Scrobblify?', { timeout: 10000 });
+    await expect(page.locator('.about h1').first()).toHaveText('About', { timeout: 10000 });
     expect(requests.count).toBe(2);
   });
 
@@ -697,50 +918,6 @@ test.describe('LastFm API client', () => {
     }
   });
 });
-
-// Writes a saved session straight into IndexedDB, which is exactly what
-// `StateManager.saveState` produces. Lets the resume path be exercised
-// without first having to drive a real pause.
-async function seedSavedState(page: Page, state: Record<string, unknown>) {
-  await page.evaluate(async (savedState) => {
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.open('scrobblify', 1);
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains('scrobbleState')) {
-          db.createObjectStore('scrobbleState');
-        }
-      };
-      request.onsuccess = () => {
-        const db = request.result;
-        const tx = db.transaction('scrobbleState', 'readwrite');
-        tx.objectStore('scrobbleState').put(savedState, 'current');
-        tx.oncomplete = () => { db.close(); resolve(); };
-        tx.onerror = () => { db.close(); reject(tx.error); };
-      };
-      request.onerror = () => reject(request.error);
-    });
-  }, state);
-}
-
-async function readSavedState(page: Page): Promise<Record<string, any> | null> {
-  return page.evaluate(() => new Promise<Record<string, any> | null>((resolve, reject) => {
-    const request = indexedDB.open('scrobblify', 1);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains('scrobbleState')) {
-        db.createObjectStore('scrobbleState');
-      }
-    };
-    request.onsuccess = () => {
-      const db = request.result;
-      const req = db.transaction('scrobbleState', 'readonly').objectStore('scrobbleState').get('current');
-      req.onsuccess = () => { db.close(); resolve(req.result || null); };
-      req.onerror = () => { db.close(); reject(req.error); };
-    };
-    request.onerror = () => reject(request.error);
-  }));
-}
 
 test.describe('Session Resume', () => {
   function buildState(overrides: Record<string, unknown> = {}) {
