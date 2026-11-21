@@ -196,7 +196,9 @@ export default defineComponent({
     /*
       `?beta=1` / `?beta=0` is applied here, once per page load, so an invite
       link works on any page and not only /scrobble. Children mount after
-      this, so their offer checks already see the opt-in.
+      this, so their offer checks already see the opt-in. In hash mode (dev),
+      editing only the hash doesn't reload, so a parameter typed there applies
+      on the next reload.
     */
     consumeBetaParam();
     this.betaTag = isBackgroundEnabled();

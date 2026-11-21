@@ -103,7 +103,7 @@ async function expectHeldBack(page: Page, scrobbles: string[]) {
   await page.waitForTimeout(3000);
   expect(scrobbles).toEqual([]);
   await expect(page.locator(UNREACHABLE)).toBeVisible();
-  // One banner, ever: not the beta reminder or a sign-in prompt beside it.
+  // One banner, ever: not a sign-in prompt beside it.
   await expect(page.locator('.scrobblify > .v-alert')).toHaveCount(1);
   // The banner explains the block; the scrobble step must not claim to be
   // still checking underneath it.
@@ -291,8 +291,6 @@ test.describe('Offering background scrobbling', () => {
   test('the rollout flag offers it without the opt-in', async ({ page }) => {
     const { workerCalls } = await openUploadStep(page, WILLING_WORKER, FLAG_ON);
     await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
-    // Only an explicit opt-in shows the beta reminder.
-    await expect(page.locator('text=Background scrobbling (beta) is switched on')).toHaveCount(0);
     await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile());
 
     await expect(page.locator(OFFER)).toBeVisible({ timeout: 15000 });
@@ -400,11 +398,12 @@ test.describe('BETA tag', () => {
     await expect(page.locator(TAG)).toBeVisible();
   });
 
-  test('a browser outside the beta sees no tag and no beta banner', async ({ page }) => {
+  test('a browser outside the beta sees no tag; opting in shows the tag but no banner', async ({ page }) => {
     await page.goto('/#/');
     await expect(page.locator('#logo')).toBeVisible();
     await expect(page.locator(TAG)).toHaveCount(0);
     await page.goto('/?beta=1#/scrobble');
+    await expect(page.locator('.scrobblify')).toBeVisible({ timeout: 10000 });
     await expect(page.locator(TAG)).toBeVisible();
     await expect(page.locator('text=Background scrobbling (beta) is switched on')).toHaveCount(0);
   });

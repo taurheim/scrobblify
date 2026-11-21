@@ -198,7 +198,7 @@ export function setBetaOptIn(on: boolean): void {
  * (`history.replaceState` against `$router.replace`), so whichever lands last
  * silently reinstates what the other removed. Re-applying the same value on a
  * later load is idempotent, and leaving it visible keeps the invite link
- * shareable and the opt-out link honest.
+ * shareable.
  */
 export function consumeBetaParam(): boolean {
   let raw: string | null = null;
