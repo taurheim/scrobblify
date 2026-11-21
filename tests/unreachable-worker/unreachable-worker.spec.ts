@@ -398,14 +398,35 @@ test.describe('BETA tag', () => {
     await expect(page.locator(TAG)).toBeVisible();
   });
 
-  test('a browser outside the beta sees no tag; opting in shows the tag but no banner', async ({ page }) => {
+  test('a browser outside the beta sees no tag or banner; opting in shows both', async ({ page }) => {
     await page.goto('/#/');
     await expect(page.locator('#logo')).toBeVisible();
     await expect(page.locator(TAG)).toHaveCount(0);
+    await expect(page.locator('#beta-banner')).toHaveCount(0);
     await page.goto('/?beta=1#/scrobble');
     await expect(page.locator('.scrobblify')).toBeVisible({ timeout: 10000 });
     await expect(page.locator(TAG)).toBeVisible();
-    await expect(page.locator('text=Background scrobbling (beta) is switched on')).toHaveCount(0);
+    await expect(page.locator('#beta-banner')).toBeVisible();
+    await expect(page.locator('#beta-banner')).toContainText('niko@savas.ca');
+  });
+
+  test('the beta banner shows on Home and About too, and Switch it off opts out', async ({ page }) => {
+    await page.goto('/?beta=1#/');
+    await expect(page.locator('#beta-banner')).toBeVisible();
+    // v-alert is `flex: 1 1` in v-app's full-height column, so it can stretch or collapse.
+    const { height } = (await page.locator('#beta-banner').boundingBox())!;
+    expect(height).toBeGreaterThan(40);
+    expect(height).toBeLessThan(120);
+    await page.locator('#nav a:has-text("About")').click();
+    await expect(page).toHaveURL(/#\/about$/);
+    await expect(page.locator('#beta-banner')).toBeVisible();
+    await page.locator('#beta-banner a:has-text("Switch it off")').click();
+    await page.waitForURL(/\?beta=0#\/about$/);
+    await expect(page.locator('#logo')).toBeVisible();
+    await expect(page.locator('#beta-banner')).toHaveCount(0);
+    await expect(page.locator(TAG)).toHaveCount(0);
+    expect(await page.evaluate(() => window.localStorage.getItem('scrobblify.background.beta')))
+      .toBe('0');
   });
 
   test('?beta=0 removes the tag again', async ({ page }) => {
