@@ -132,7 +132,8 @@ Errors arrive two ways: a filterable `scrobblify_error` event (properties:
 | Upload / parsing | `upload.loadZip`, `upload.extractFile`, `upload.parseJson`, `upload.removeInvalidListens`, `upload.filterDuplicates` |
 | Auth | `auth.init`, `auth.strip_token_url` |
 | Scrobbling | `scrobble.repeatedFailures` |
-| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load), `scrobblify.onDownloadProgress` |
+| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load), `scrobblify.onDownloadProgress`, `scrobblify.saveBeforeSignIn` (a signed-out selection couldn't be saved before the Last.fm redirect) |
+| Sign-in | `scrobblify.deferredDuplicates` (the duplicate check deferred to after sign-in failed; the queue is sent unfiltered) |
 | Uncaught | `vue.errorHandler`, `window.onerror`, `unhandledrejection` |
 
 Last.fm failures are normalized to `Last.fm API error <code> (HTTP <status>)`

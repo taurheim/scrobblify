@@ -131,8 +131,7 @@
       <!--
         Resuming needs a session key to scrobble with. Without one, every track
         used to fail in a burst and be saved as done, so the resume is held here
-        instead, with the saved progress left untouched. A fresh selection made
-        while signed out is held here too, on the select step.
+        instead, with the saved progress left untouched.
       -->
       <template v-else-if="banner === 'signIn'">
         <div><strong>{{ resumeSignInMessage }}</strong></div>
@@ -172,6 +171,15 @@
       wherever it is needed, through `startSignIn`.
     -->
     <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
+
+    <!-- The duplicate check a signed-out user asked for, run after sign-in. -->
+    <div v-if="checkingDuplicates" class="d-flex justify-center align-center mb-4 checking-duplicates">
+      <v-progress-circular indeterminate color="primary" size="24" class="mr-2" aria-label="Checking for duplicates" />
+      Checking for plays already on Last.fm…
+    </div>
+    <v-alert v-if="skippedDuplicates > 0" type="info" class="mb-4 skipped-duplicates">
+      Skipped {{ skippedDuplicates }} that are already on Last.fm.
+    </v-alert>
 
     <v-stepper v-model="currentStep">
       <v-stepper-header>
@@ -325,7 +333,7 @@ import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
-import { startSignIn } from '@/services/SignInIntent';
+import { peekSignInIntent, startSignIn, takeSignInIntent } from '@/services/SignInIntent';
 import RateLimitTracker from '@/services/RateLimitTracker';
 import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import ErrorDialog from '@/components/ErrorDialog.vue';
@@ -553,6 +561,16 @@ export default defineComponent({
        */
       reauthFixNow: false,
       resumeSignInMessage: '',
+      /**
+       * The saved progress is the selection this browser went to Last.fm to
+       * send, not an earlier session, so the resume prompt leaves it alone
+       * until `continueSignInIntent` has dealt with it.
+       */
+      heldForSignIn: false,
+      /** The deferred duplicate check is running. */
+      checkingDuplicates: false,
+      /** Plays it dropped; shown until the user starts sending. */
+      skippedDuplicates: 0,
       /** Wall clock for the job card's countdown; ticks only while a job is active. */
       nowSec: Math.floor(Date.now() / 1000),
       /** When the job card last heard from the server, for "Last checked". */
@@ -574,6 +592,9 @@ export default defineComponent({
     });
   },
   async mounted() {
+    // Read before anything awaits: the sign-in handler strips the token from
+    // the URL once it has tried it.
+    const returningFromSignIn = !!this.$route.query.token;
     try {
       trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
 
@@ -608,6 +629,9 @@ export default defineComponent({
       }
 
       try {
+        if (returningFromSignIn) {
+          await this.holdSelectionAwaitingSignIn();
+        }
         await this.exposeSavedStateUnlessStale('mounted', !!unresolved || !!owner);
       } catch (e) {
         // IndexedDB not available — not critical, just skip resume
@@ -808,6 +832,11 @@ export default defineComponent({
     currentStep(step: number) {
       trackEvent('step_viewed', { step, step_name: this.stepName(step) });
     },
+    '$store.state.scrobbleRunActive': function onRunActive(active: boolean) {
+      if (active) {
+        this.skippedDuplicates = 0;
+      }
+    },
     async hasResumableState(resumable: boolean) {
       if (!resumable) {
         this.savedProgress = null;
@@ -899,7 +928,7 @@ export default defineComponent({
       if (this.authorityUnknown) { return 'outage'; }
       if (this.backgroundJob) { return 'job'; }
       if (this.resumeSignInMessage) { return 'signIn'; }
-      if (this.hasResumableState && this.currentStep <= 2 && !this.ownershipBlocked
+      if (this.hasResumableState && !this.heldForSignIn && this.currentStep <= 2 && !this.ownershipBlocked
         && !this.authorityPending) {
         return 'resume';
       }
@@ -2541,9 +2570,87 @@ export default defineComponent({
     },
     /**
      * Carries on with whatever sent this browser to Last.fm (`SignInIntent`).
+     * Runs only once the server-authority check has answered.
      */
     async continueSignInIntent() {
-      // Filled in when sending a signed-out selection lands.
+      try {
+        const intent = takeSignInIntent();
+        if (!intent || intent.kind === 'reconnect') {
+          return;
+        }
+        if (intent.kind === 'resume') {
+          // `resumeFromSaved` refuses by itself while sending is withheld.
+          if (this.hasResumableState) {
+            await this.resumeFromSaved();
+          }
+          return;
+        }
+        // A job on the server, or no answer about one: the selection stays
+        // saved, and the resume prompt offers it once sending is allowed.
+        if (this.ownershipBlocked || this.authorityUnknown) {
+          return;
+        }
+        const state = await this.stateManager.loadState().catch(() => null);
+        if (!state || (state.importId || '') !== intent.importId || state.completedIndices.length > 0) {
+          return;
+        }
+        const ready = intent.checkDuplicates ? await this.dropQueuedDuplicates(state) : state;
+        if (ready) {
+          this.restoreFromState(ready, 'sign_in');
+        }
+      } finally {
+        this.heldForSignIn = false;
+      }
+    },
+    /**
+     * On the way back from Last.fm with a selection to send: keeps the resume
+     * prompt off it (see `heldForSignIn`). Only the saved selection the intent
+     * names counts; any other saved progress is offered as usual.
+     */
+    async holdSelectionAwaitingSignIn() {
+      const intent = peekSignInIntent();
+      if (!intent || intent.kind !== 'send') {
+        return;
+      }
+      const state = await this.stateManager.loadState().catch(() => null);
+      this.heldForSignIn = !!state && (state.importId || '') === intent.importId;
+    },
+    /**
+     * The duplicate check a signed-out user asked for, on the queue they chose.
+     * Returns the queue to send, or null when every play was already on
+     * Last.fm. If the check fails, the queue is sent unfiltered, as the upload
+     * step does.
+     */
+    async dropQueuedDuplicates(state: ScrobbleState): Promise<ScrobbleState | null> {
+      this.checkingDuplicates = true;
+      try {
+        const queue = StateManager.deserializeScrobbles(state.tracks);
+        const { unique, duplicateCount } = await new Scrobblify(this.$store.state.lfmApi as LastFm)
+          .filterQueuedDuplicates(queue);
+        if (duplicateCount === 0) {
+          return state;
+        }
+        if (unique.length === 0) {
+          await this.persist(() => this.stateManager.clearState());
+          this.hasResumableState = false;
+          this.skippedDuplicates = duplicateCount;
+          return null;
+        }
+        const filtered: ScrobbleState = {
+          ...state,
+          tracks: StateManager.serializeScrobbles(unique),
+          totalTracks: unique.length,
+          originalTotalTracks: unique.length,
+        };
+        await this.persist(() => this.stateManager.saveState(filtered));
+        this.skippedDuplicates = duplicateCount;
+        return filtered;
+      } catch (e) {
+        trackError('scrobblify.deferredDuplicates', e);
+        return state;
+      } finally {
+        this.checkingDuplicates = false;
+      }
     },
     /** The sign-in banner's button: sign in, then resume the saved progress. */
     signInToResume() {
@@ -2575,11 +2682,39 @@ export default defineComponent({
       resetUser();
       trackEvent('user_logged_out');
     },
-    onSelectionComplete() {
-      // Nothing to send with yet. The selection stays on screen; the saved
-      // progress, if any, is untouched.
-      if (!(this.$store.state.lfmApi as LastFm).isAuthenticated()) {
-        this.resumeSignInMessage = 'Sign in to Last.fm first, then press Scrobble again.';
+    async onSelectionComplete() {
+      /*
+        Nothing to send with yet, so sign in first. The selection is saved as
+        ordinary progress (nothing sent) because nothing in memory survives
+        the trip to Last.fm; `continueSignInIntent` restores it afterwards. An
+        abandoned sign-in leaves it as saved progress for next time.
+      */
+      const api = this.$store.state.lfmApi as LastFm;
+      if (!api.isAuthenticated()) {
+        const snapshot: ProgressSnapshot = {
+          scrobbledTracks: 0,
+          originalTotalTracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
+          originalSucceededCount: 0,
+          pendingVerification: [],
+          sendTimestamps: [],
+          lastReTagTimestampSec: this.$store.state.reTagCursorSec as number,
+          burstCount: 0,
+          dailyCount: 0,
+        };
+        try {
+          const state = this.buildState(snapshot);
+          await this.persist(() => this.stateManager.saveState(state));
+          startSignIn(api, {
+            kind: 'send',
+            importId: state.importId || '',
+            checkDuplicates: this.$store.state.deferredDuplicateCheck as boolean,
+          });
+        } catch (e) {
+          trackError('scrobblify.saveBeforeSignIn', e);
+          this.errorMessage = "Couldn't save your selection before signing in.";
+          this.errorDetails = (e as Error).message || String(e);
+          this.showError = true;
+        }
         return;
       }
       // The user chose to start over, so the saved progress is no longer on
@@ -2764,7 +2899,16 @@ export default defineComponent({
           : 'Sign in to Last.fm first, then import your progress file again.';
         return;
       }
-      trackEvent('session_resumed', this.resumeProps(state, source));
+      // A selection coming back from sign-in is not a resume, so it stays out
+      // of the resume funnel.
+      if (source === 'sign_in') {
+        trackEvent('selection_resumed_after_sign_in', {
+          track_count: state.totalTracks,
+          duplicates_skipped: this.skippedDuplicates,
+        });
+      } else {
+        trackEvent('session_resumed', this.resumeProps(state, source));
+      }
       if (state.userName && api.getUserName() && api.getUserName() !== state.userName) {
         this.errorMessage = `This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`;
         this.showError = true;

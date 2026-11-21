@@ -461,12 +461,16 @@ export default defineComponent({
       this.logs.push(`Found ${validData.length} valid scrobbles`);
 
       let toBeScrobbled: SpotifyListen[] = [];
+      const deferDuplicates = this.checkDuplicates
+        && !(this.$store.state.lfmApi as LastFm).isAuthenticated();
+      this.$store.commit('setDeferredDuplicateCheck', deferDuplicates);
 
       if (!this.checkDuplicates) {
         toBeScrobbled = validData;
         this.logs.push(`Skipping duplicate check — ${validData.length} tracks ready.`);
-      } else if (!(this.$store.state.lfmApi as LastFm).isAuthenticated()) {
-        // Reading the history needs a username, which only signing in gives.
+      } else if (deferDuplicates) {
+        // Reading the history needs a username, which only signing in gives,
+        // so the chosen queue is checked after sign-in instead.
         toBeScrobbled = validData;
         this.logs.push('Duplicates will be checked after you sign in.');
       } else {
@@ -503,6 +507,7 @@ export default defineComponent({
         valid_count: validData.length,
         to_scrobble_count: toBeScrobbled.length,
         checked_duplicates: this.checkDuplicates,
+        duplicates_deferred: deferDuplicates,
       });
     },
   },

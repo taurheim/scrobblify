@@ -59,6 +59,34 @@ async function scrobbleSelection(page: Page) {
   await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
 }
 
+// Builds a ZIP in-memory so each test can decide exactly what the history
+// files hold, without checking another binary fixture into the repo.
+async function makeZip(files: Record<string, string>): Promise<Buffer> {
+  const zip = new JSZip();
+  for (const [name, content] of Object.entries(files)) {
+    zip.file(`Spotify Extended Streaming History/${name}`, content);
+  }
+  return zip.generateAsync({ type: 'nodebuffer' });
+}
+
+function play(track: string, artist: string, ts: string) {
+  return {
+    ts,
+    master_metadata_track_name: track,
+    master_metadata_album_artist_name: artist,
+    master_metadata_album_album_name: 'An Album',
+    ms_played: 300000,
+  };
+}
+
+async function uploadZip(page: Page, buffer: Buffer) {
+  await page.locator('.drop-zone input[type="file"]').setInputFiles({
+    name: 'my_spotify_data.zip',
+    mimeType: 'application/zip',
+    buffer,
+  });
+}
+
 type Tracked = { name: string; props: Record<string, unknown> };
 
 // What `trackEvent` would have sent, read from its dev-build console echo:
@@ -369,41 +397,6 @@ test.describe('Scrobble Page - Authentication Step', () => {
     await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
   });
 
-  test('a signed-out selection is held for sign-in, not sent', async ({ page }) => {
-    const scrobbles: string[] = [];
-    await interceptLastFm(page);
-    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
-      const params = new URLSearchParams(
-        route.request().method() === 'POST'
-          ? route.request().postData() || ''
-          : new URL(route.request().url()).search,
-      );
-      if (params.get('method') === 'track.scrobble') {
-        scrobbles.push(params.get('track[0]') || '');
-      }
-      await route.fallback();
-    });
-    await page.goto('/#/scrobble');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
-
-    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
-    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
-    await page.locator('label:has-text("Check for duplicates")').click();
-    await page.locator('button:has-text("Find tracks")').click();
-    // No username to read the history with, so no "Couldn't find username" error.
-    await expect(page.locator('text=Duplicates will be checked after you sign in.')).toBeVisible({ timeout: 30000 });
-    await expect(page.locator('text=An error occurred while checking for duplicates')).toHaveCount(0);
-
-    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
-    await page.locator('button:has-text("matching")').click();
-    await scrobbleSelection(page);
-
-    await expect(page.locator('text=Sign in to Last.fm first, then press Scrobble again.')).toBeVisible({ timeout: 5000 });
-    await expect(page.locator('button:has-text("selected tracks")')).toBeVisible();
-    await page.waitForTimeout(1000);
-    expect(scrobbles).toEqual([]);
-  });
-
   test('a signed-in visitor starts at upload with their name shown', async ({ page }) => {
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
@@ -468,6 +461,117 @@ test.describe('Scrobble Page - Authentication Step', () => {
     await expect(page.locator('text=/already used or has expired/i')).toBeVisible({ timeout: 10000 });
     // Recovery affordance points back at the Last.fm authorize flow.
     await expect(page.locator('a:has-text("Authorize again")')).toHaveAttribute('href', /last\.fm\/api\/auth/);
+  });
+});
+
+test.describe('Signing in after choosing', () => {
+  // Every `track.scrobble` sent, by track name.
+  async function recordScrobbleRequests(page: Page): Promise<string[]> {
+    const scrobbles: string[] = [];
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+      await route.fallback();
+    });
+    return scrobbles;
+  }
+
+  async function chooseAll(page: Page): Promise<number> {
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('button:has-text("matching")').click();
+    const label = await page.locator('button:has-text("selected tracks")').innerText();
+    return Number((label.match(/(\d+) selected tracks/i) || [])[1]);
+  }
+
+  test('a signed-out visitor chooses tracks, signs in, and lands ready to send', async ({ page }) => {
+    await interceptLastFm(page);
+    const scrobbles = await recordScrobbleRequests(page);
+    // Holds the token exchange back, so the moment between landing and being
+    // signed in can be looked at.
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
+        await new Promise((resolve) => { setTimeout(resolve, 3000); });
+      }
+      await route.fallback();
+    });
+    await routeLastFmSignIn(page);
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    const selected = await chooseAll(page);
+    expect(selected).toBeGreaterThan(0);
+    await scrobbleSelection(page);
+
+    // The selection waiting to be sent is not "a previous session". Looked at
+    // once the saved state has been read, while the exchange is still held.
+    await expect(page.locator('text=Signing in to Last.fm…')).toBeVisible({ timeout: 10000 });
+    await page.waitForTimeout(1500);
+    // Point-in-time, not retried: the banner would be gone once restored.
+    expect(await page.locator('text=Signing in to Last.fm…').isVisible()).toBe(true);
+    expect(await page.locator('text=Resume previous session').count()).toBe(0);
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page).toHaveURL(/\/#\/scrobble$/);
+    const scrobbleButton = page.getByRole('button', { name: 'Scrobble', exact: true });
+    await expect(scrobbleButton).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(`text=${selected} tracks ready to scrobble`)).toBeVisible();
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    const saved = await readSavedState(page);
+    expect(saved).not.toBeNull();
+    expect(saved!.totalTracks).toBe(selected);
+    expect(saved!.completedIndices).toEqual([]);
+    expect(scrobbles).toEqual([]);
+
+    await scrobbleButton.click();
+    await expect(page.locator('text=Finished scrobbling >> visible=true')).toBeVisible({ timeout: 60000 });
+    expect(scrobbles).toHaveLength(selected);
+  });
+
+  test('the duplicate check waits for sign-in and then skips plays already on Last.fm', async ({ page }) => {
+    const library = await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    // Recent plays, so none is re-tagged: the duplicate check skips those.
+    const startSec = Math.floor(Date.now() / 1000) - 86400;
+    const names = ['Alpha', 'Bravo', 'Charlie', 'Delta'];
+    const uts = (i: number) => startSec + i * 600;
+    library.add({
+      track: 'Alpha', artist: 'Band', album: '', uts: uts(0),
+    });
+    library.add({
+      track: 'Charlie', artist: 'Band', album: '', uts: uts(2),
+    });
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': JSON.stringify(
+        names.map((name, i) => play(name, 'Band', new Date(uts(i) * 1000).toISOString())),
+      ),
+    }));
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    // Nothing to read the history with yet, so no error either.
+    await expect(page.locator('text=Duplicates will be checked after you sign in.')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('text=An error occurred while checking for duplicates')).toHaveCount(0);
+    expect(await chooseAll(page)).toBe(4);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Skipped 2 that are already on Last.fm.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    const saved = await readSavedState(page);
+    expect(saved!.totalTracks).toBe(2);
+    expect(saved!.originalTotalTracks).toBe(2);
+    expect(saved!.tracks.map((t: { track: string }) => t.track).sort()).toEqual(['Bravo', 'Delta']);
   });
 });
 
@@ -3192,34 +3296,6 @@ test.describe('Re-tagged old plays', () => {
 });
 
 test.describe('Import robustness', () => {
-  // Builds a ZIP in-memory so each test can decide exactly how the history
-  // files are damaged, without checking another binary fixture into the repo.
-  async function makeZip(files: Record<string, string>): Promise<Buffer> {
-    const zip = new JSZip();
-    for (const [name, content] of Object.entries(files)) {
-      zip.file(`Spotify Extended Streaming History/${name}`, content);
-    }
-    return zip.generateAsync({ type: 'nodebuffer' });
-  }
-
-  function play(track: string, artist: string, ts: string) {
-    return {
-      ts,
-      master_metadata_track_name: track,
-      master_metadata_album_artist_name: artist,
-      master_metadata_album_album_name: 'An Album',
-      ms_played: 300000,
-    };
-  }
-
-  async function uploadZip(page: Page, buffer: Buffer) {
-    await page.locator('.drop-zone input[type="file"]').setInputFiles({
-      name: 'my_spotify_data.zip',
-      mimeType: 'application/zip',
-      buffer,
-    });
-  }
-
   test('one malformed history file does not throw away the whole import', async ({ page }) => {
     await goToUploadStep(page);
 
@@ -3727,14 +3803,13 @@ test.describe('Invalid session key', () => {
     expect(await readSavedState(page)).toEqual(seeded);
 
     // The banner's button goes to Last.fm's authorize page; back from it, the
-    // same progress is offered again.
+    // same progress resumes by itself, ready to send.
     await routeLastFmSignIn(page);
     await signIn.click();
     await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
-    await expect(page.locator('.upload-step')).toBeVisible();
+    await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('text=Sign in to Last.fm first')).toHaveCount(0);
-    await page.getByRole('button', { name: 'Resume', exact: true }).click();
-    await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    expect(scrobbled).toHaveLength(0);
   });
 
   test('a run with no session key stops on the first track without using it up', async ({ page }) => {

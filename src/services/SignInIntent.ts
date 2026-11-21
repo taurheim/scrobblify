@@ -19,13 +19,11 @@ export type SignInIntent =
 
 const KEY = 'scrobblify.signInIntent';
 
-export function takeSignInIntent(): SignInIntent | null {
+function parseIntent(raw: string | null): SignInIntent | null {
+  if (!raw) {
+    return null;
+  }
   try {
-    const raw = sessionStorage.getItem(KEY);
-    sessionStorage.removeItem(KEY);
-    if (!raw) {
-      return null;
-    }
     const parsed = JSON.parse(raw);
     if (parsed && (parsed.kind === 'resume' || parsed.kind === 'reconnect')) {
       return { kind: parsed.kind };
@@ -33,7 +31,27 @@ export function takeSignInIntent(): SignInIntent | null {
     if (parsed && parsed.kind === 'send' && typeof parsed.importId === 'string') {
       return { kind: 'send', importId: parsed.importId, checkDuplicates: parsed.checkDuplicates === true };
     }
+  } catch {
+    // Not ours, or damaged: no intent.
+  }
+  return null;
+}
+
+/** Reads and forgets the intent, so it is acted on once. */
+export function takeSignInIntent(): SignInIntent | null {
+  try {
+    const raw = sessionStorage.getItem(KEY);
+    sessionStorage.removeItem(KEY);
+    return parseIntent(raw);
+  } catch {
     return null;
+  }
+}
+
+/** Reads the intent without forgetting it. */
+export function peekSignInIntent(): SignInIntent | null {
+  try {
+    return parseIntent(sessionStorage.getItem(KEY));
   } catch {
     return null;
   }
