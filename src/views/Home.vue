@@ -170,8 +170,8 @@ export default defineComponent({
       this.gettingExport = true;
     },
     // Resumes the saved progress either way: not signed in as its owner, sign
-    // in first; signed in, /scrobble's sign-in handler picks the same intent
-    // up on mount, so there's no second "Resume" click.
+    // in first; signed in, an in-app intent that /scrobble's sign-in handler
+    // picks up on mount, so there's no second "Resume" click.
     continueSaved() {
       const r = this.returning;
       if (r.kind === 'saved' && !r.signedIn) {

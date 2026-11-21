@@ -37,8 +37,10 @@ export default defineComponent({
   emits: {
     /**
      * Signed in. `fresh` says whether this load arrived with a callback
-     * `?token=`, not whether exchanging it worked: if the exchange fails while
-     * a key is stored, the stored key is kept and this still says `true`.
+     * `?token=`, i.e. came back from Last.fm, not whether exchanging it
+     * worked: if the exchange fails while a key is stored, the stored key is
+     * kept and this still says `true`. It decides which sign-in intents the
+     * page may act on (`takeSignInIntent`).
      */
     complete: (payload: { fresh: boolean }) => typeof payload.fresh === 'boolean',
     /** Exchanging a callback token (or reading the stored session) failed. */

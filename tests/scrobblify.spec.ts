@@ -285,6 +285,47 @@ test.describe('Home Page', () => {
     expect(events.filter((e) => e.name === 'sign_in_started')).toEqual([]);
   });
 
+  // What `startSignIn` leaves in sessionStorage, for a trip to Last.fm.
+  async function leaveSignInIntent(page: Page, ageMs: number) {
+    await page.evaluate((age) => sessionStorage.setItem('scrobblify.signInIntent', JSON.stringify({
+      kind: 'resume', inApp: false, createdAt: Date.now() - age,
+    })), ageMs);
+  }
+
+  test('an abandoned sign-in does not resume on a later visit that is already signed in', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, SAVED);
+    // Continue sent the user to Last.fm, and they came back with Back instead.
+    await leaveSignInIntent(page, 0);
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    // Consumed and ignored, rather than acted on by this unrelated visit.
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('scrobblify.signInIntent'))).toBeNull();
+    await page.waitForTimeout(1000);
+    await expect(page.locator('text=Resume previous session?')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeHidden();
+  });
+
+  test('a sign-in intent older than an hour is ignored on the way back from Last.fm', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await seedSavedState(page, SAVED);
+    await leaveSignInIntent(page, 61 * 60 * 1000);
+    await page.goto('about:blank');
+    await page.goto('/#/scrobble?token=fresh-token');
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('scrobblify.signInIntent'))).toBeNull();
+    await page.waitForTimeout(1000);
+    await expect(page.locator('text=Resume previous session?')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeHidden();
+  });
+
   test('"Not you?" on saved progress signs out and shows the first visit, keeping the progress', async ({ page }) => {
     await page.goto('/#/');
     await mockLastFmAuth(page);

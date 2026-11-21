@@ -826,6 +826,10 @@ export default defineComponent({
     }
   },
   beforeUnmount() {
+    // Not reactive. Sign-in work still awaiting (`onAuthenticated`) checks it
+    // after every await, so a page the user has left doesn't act or consume
+    // the intent.
+    (this as any)._unmounted = true;
     if (this.onPageShow) {
       window.removeEventListener('pageshow', this.onPageShow);
     }
@@ -2546,9 +2550,14 @@ export default defineComponent({
      * whether stored or just exchanged from a callback token. That can land
      * while `mounted` is still awaiting, or after the user has already acted
      * (pressed Resume, say), so this never moves the stepper: the user stays
-     * wherever they are.
+     * wherever they are. `fresh`: this load came back from Last.fm with a
+     * token, which decides which sign-in intents it may act on.
      */
-    async onAuthenticated() {
+    async onAuthenticated(payload?: { fresh?: boolean }) {
+      if ((this as any)._unmounted) {
+        return;
+      }
+      const fresh = !!(payload && payload.fresh);
       this.signedIn = true;
       // Signed in now, so a resume held back for want of a key can go ahead.
       this.resumeSignInMessage = '';
@@ -2581,21 +2590,33 @@ export default defineComponent({
         Raised again because the mount's own check, when it ran, lowered it.
       */
       await (this as any)._mountSettled;
+      if ((this as any)._unmounted) {
+        return;
+      }
       this.authorityPending = true;
       // Leaves local records as they were. The gate stays shut on an
       // unanswered question unless `mayScrobbleWithoutAuthority` allows it.
       await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+      if ((this as any)._unmounted) {
+        return;
+      }
       // Only once the server has answered, so nothing carried on from before
       // the Last.fm round trip can start ahead of the check.
-      await this.continueSignInIntent();
+      await this.continueSignInIntent(fresh);
     },
     /**
      * Carries on with whatever sent this browser to Last.fm (`SignInIntent`).
-     * Runs only once the server-authority check has answered.
+     * Runs only once the server-authority check has answered. An intent
+     * recorded before a trip to Last.fm is acted on only on a `fresh` return,
+     * one recorded in-app only without one, and neither after an hour: an
+     * abandoned sign-in must not steer a later, unrelated visit.
      */
-    async continueSignInIntent() {
+    async continueSignInIntent(fresh: boolean) {
       try {
-        const intent = takeSignInIntent();
+        if ((this as any)._unmounted) {
+          return;
+        }
+        const intent = takeSignInIntent(fresh);
         if (!intent || intent.kind === 'reconnect') {
           return;
         }
@@ -2612,12 +2633,15 @@ export default defineComponent({
           return;
         }
         const state = await this.stateManager.loadState().catch(() => null);
-        if (!isUnsentSelection(state, intent.importId)) {
+        if ((this as any)._unmounted || !isUnsentSelection(state, intent.importId)) {
           return;
         }
         const ready = intent.checkDuplicates
           ? await this.dropQueuedDuplicates(state as ScrobbleState)
           : state;
+        if ((this as any)._unmounted) {
+          return;
+        }
         if (ready && this.currentStep <= 2) {
           this.restoreFromState(ready, 'sign_in');
         } else if (!this.ownershipBlocked && !this.authorityUnknown) {
@@ -2642,7 +2666,8 @@ export default defineComponent({
      * names counts; any other saved progress is offered as usual.
      */
     async holdSelectionAwaitingSignIn() {
-      const intent = peekSignInIntent();
+      // Only called on a return with a token, so only a Last.fm intent applies.
+      const intent = peekSignInIntent(true);
       if (!intent || intent.kind !== 'send') {
         return;
       }
@@ -2659,12 +2684,13 @@ export default defineComponent({
      */
     async dropQueuedDuplicates(state: ScrobbleState): Promise<ScrobbleState | null> {
       const id = state.importId || '';
+      const gone = () => !!(this as any)._unmounted;
       const stillOurs = async (): Promise<boolean> => {
         try {
-          return isUnsentSelection(await this.stateManager.loadState(), id);
+          return isUnsentSelection(await this.stateManager.loadState(), id) && !gone();
         } catch (e) {
           // Can't tell; the in-memory copy is all there is to go on.
-          return true;
+          return !gone();
         }
       };
       this.checkingDuplicates = true;
@@ -2678,8 +2704,8 @@ export default defineComponent({
           trackError('scrobblify.deferredDuplicates', e);
           checkError = e;
         }
-        // The user started something else while it ran.
-        if (this.currentStep > 2) {
+        // The user started something else while it ran, or left the page.
+        if (this.currentStep > 2 || gone()) {
           return null;
         }
         if (!checked || checked.duplicateCount === 0) {
@@ -2730,7 +2756,7 @@ export default defineComponent({
           trackError('scrobblify.deferredDuplicates', e);
           wrote = true;
         }
-        if (!wrote) {
+        if (!wrote || gone()) {
           return null;
         }
         this.skippedDuplicates = duplicateCount;
