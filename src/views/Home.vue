@@ -86,17 +86,16 @@ import LastFm from '@/api/LastFm';
 import HomeGetExport from '@/components/home/HomeGetExport.vue';
 import HomeReturning from '@/components/home/HomeReturning.vue';
 import StateManager from '@/services/StateManager';
-import { detectReturning, ReturningState, sameUser } from '@/services/ReturningVisitor';
+import {
+  detectReturning, HOME_DISMISSED_KEY, ReturningState, sameUser,
+} from '@/services/ReturningVisitor';
 import { resetUser, trackEvent } from '@/services/Analytics';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
 
-// Per tab, so a dismissed card stays dismissed when the visitor comes back to Home.
-const DISMISSED_KEY = 'scrobblify.home.dismissedReturning';
-
 function readDismissed(): boolean {
   try {
-    return sessionStorage.getItem(DISMISSED_KEY) === '1';
+    return sessionStorage.getItem(HOME_DISMISSED_KEY) === '1';
   } catch {
     return false;
   }
@@ -104,7 +103,7 @@ function readDismissed(): boolean {
 
 function writeDismissed() {
   try {
-    sessionStorage.setItem(DISMISSED_KEY, '1');
+    sessionStorage.setItem(HOME_DISMISSED_KEY, '1');
   } catch {
     // Private modes can refuse storage; the in-component flag still holds.
   }
@@ -127,6 +126,9 @@ export default defineComponent({
     this.dismissedReturning = readDismissed();
     await this.refreshReturning();
   },
+  beforeUnmount() {
+    this.$store.commit('setShowingServerJob', false);
+  },
   methods: {
     async refreshReturning() {
       const api = this.$store.state.lfmApi as LastFm;
@@ -136,6 +138,7 @@ export default defineComponent({
         api.loadStoredUser();
         this.returning = await detectReturning(api, this.stateManager);
         const r = this.returning;
+        this.$store.commit('setShowingServerJob', r.kind === 'server_job' && !this.dismissedReturning);
         if (r.kind !== 'none' && !this.dismissedReturning) {
           let state: string = r.kind;
           if (r.kind === 'saved') {
@@ -145,6 +148,7 @@ export default defineComponent({
         }
       } catch {
         this.returning = { kind: 'none' };
+        this.$store.commit('setShowingServerJob', false);
       } finally {
         this.ready = true;
       }
@@ -179,6 +183,7 @@ export default defineComponent({
       }
       writeDismissed();
       this.dismissedReturning = true;
+      this.$store.commit('setShowingServerJob', false);
     },
   },
 });

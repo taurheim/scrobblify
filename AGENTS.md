@@ -150,8 +150,10 @@ remembered username, saved progress (welcomed under the progress's own
 `userName`), or a live job it handed over. "Not you?" on the card signs out
 (`user_logged_out`) only when the card was about the stored user, never deletes
 saved progress, and hides the card for the rest of the tab (`sessionStorage`
-`scrobblify.home.dismissedReturning`). Until sign-in moves after choosing,
-every Home button opens `/scrobble`. Home reads the stored user itself
+`scrobblify.home.dismissedReturning`; a fresh Last.fm sign-in, one that
+exchanged a token, clears it). Until sign-in moves after choosing, every Home
+button that moves on (Start, Continue, Start over, Upload Spotify zip,
+Re-connect) opens `/scrobble`. Home reads the stored user itself
 (`LastFm.loadStoredUser()`), since only `/scrobble`'s sign-in step runs
 `init()`.
 
@@ -214,9 +216,12 @@ them. The gate and the confirmation use `backgroundCanFinish` (fed by
 `backgroundTrackLimit`, the capacity probe's `maxTracks`, 0 when the offer is
 off). The stop reasons and the paused panel use `canOfferBackground`, since the
 offer sits right under them. The Complete step uses `backgroundTrackLimit > 0`.
-Home and About no longer have background-specific copy (About's "Where does
-my data go?" answer mentions the background service to everyone); outside
-`/scrobble` the only beta surface is the header's BETA tag.
+Home's welcome-back card shows a live server job ("Scrobbling in the
+background!") to any browser that handed it over, whatever its beta status,
+and the header shows the BETA tag while it does (`showingServerJob` in the
+store), besides the opt-in and flag. Otherwise Home and About have no
+background-specific copy (About's "Where does my data go?" answer mentions the
+background service to everyone).
 
 Gate telemetry, since 2026-11-16: `large_history_gate_shown` and
 `large_history_gate_accepted` carry `re_tagged_count`, `estimated_days` and
@@ -790,24 +795,29 @@ forces it (non-production builds only). `background_offer_shown` carries
 `created()`), so an invite link works on any page (in dev's hash mode, editing
 only the hash doesn't reload, so it applies on the next load), and shows a
 **BETA** tag in the header whenever `isBackgroundEnabled()` (re-read on
-`onFeatureFlags`). The old "switched on for this browser — Switch it off"
+`onFeatureFlags`), or while Home shows this user's live server job
+(`showingServerJob`). The old "switched on for this browser — Switch it off"
 banner is gone; `?beta=0` still opts out. Only the explicit opt-in counts in
 `mayScrobbleWithoutAuthority`'s outage rule, so it doesn't depend on flag-load
 timing. All of this is independent of `VUE_APP_BACKGROUND_API`, which
 only says whether the build *can* reach a worker.
 
 `scrobblify.background.handedOverImport` (localStorage) holds JSON
-`{ importId, username, originalTotal? }` for the queue this browser last handed over: written
-in `completeHandoff` when a handover goes live, cleared after a confirmed
-take-back, when a newer handover's import id or user is unknown (so it never
-names an older one), or when Home sees the job ended or unknown to the worker.
+`{ importId, username, originalTotal? }` for the queue this browser last handed
+over (`originalTotal` is the import's `originalTotalTracks`). It is written in
+`completeHandoff` when a handover goes live, and cleared after a confirmed
+take-back; when a handover has no import id or user (so it never names an
+older one); when `completeHandoff` finds no local state while the handoff is
+active (its import id can't be known); and when Home sees the job ended or
+unknown to the worker.
 Home uses it, only for the same Last.fm user (case-insensitive) and only while
 the job is live, to show progress through the public `/scrobblify/import/:id`
 route; a signed-out or on-hold job gets the plain card. That route counts only
-the tracks the worker was handed, so Home shows the whole import as
-`originalTotal - (totalTracks - scrobbledCount)` of `originalTotal` (the
-import's `originalTotalTracks`); a record without it (older ones) falls back to
-the server's own numbers. It is display-only and
+the tracks the worker was handed, so `overallProgress`
+(`src/services/ReturningVisitor.ts`) shows the whole import as
+`originalTotal - (totalTracks - scrobbledCount)` of `originalTotal`; plays this
+browser gave up on before the handover count as done there. A record without
+`originalTotal` (older ones) falls back to the server's own numbers. It is display-only and
 deliberately **not** handover evidence.
 
 Two functions in `src/services/BackgroundScrobbling.ts`, and the split is

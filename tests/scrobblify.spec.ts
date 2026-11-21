@@ -262,6 +262,21 @@ test.describe('Home Page', () => {
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBeNull();
   });
 
+  test('a fresh Last.fm sign-in brings back a card dismissed with "Not you?"', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await page.reload();
+    await page.locator('.returning-card button:has-text("Not you?")').click();
+    await expect(page.locator('.home-card')).toHaveCount(2);
+
+    await page.goto('/#/scrobble?token=fresh-token');
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).not.toBeNull();
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('scrobblify.home.dismissedReturning'))).toBeNull();
+    await page.goto('/#/');
+    await expect(page.locator('.returning-card')).toBeVisible();
+  });
+
   test('"Show me how" on the returning card opens the steps', async ({ page }) => {
     await page.goto('/#/');
     await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));

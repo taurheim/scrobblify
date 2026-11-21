@@ -7,7 +7,7 @@
       <div id="logo">
         <img src="./assets/logo.png" alt=""> scrobblify
         <v-chip
-          v-if="betaTag"
+          v-if="betaTag || $store.state.showingServerJob"
           class="beta-tag ml-1"
           size="x-small"
           color="deep-purple"

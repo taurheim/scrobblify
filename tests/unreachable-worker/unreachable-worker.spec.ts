@@ -474,11 +474,21 @@ test.describe('Home with a job on the server', () => {
     expect(paths.filter((p) => p.startsWith('/scrobblify/import/'))).toEqual([]);
   });
 
+  test('a live job shows the BETA tag to a browser outside the beta', async ({ page }) => {
+    await openHome(page, 'testuser', LIVE);
+    await expect(page.locator('.returning-card')).toContainText('Scrobbling in the background!');
+    expect(await page.evaluate(() => localStorage.getItem('scrobblify.background.beta'))).toBeNull();
+    await expect(page.locator('#logo .beta-tag')).toHaveText('BETA');
+    await page.locator('#nav a:has-text("About")').click();
+    await expect(page.locator('#logo .beta-tag')).toHaveCount(0);
+  });
+
   test('a finished job falls back to the plain welcome-back card and forgets the id', async ({ page }) => {
     await openHome(page, 'testuser', {
       ok: true, known: true, live: false, state: 'completed', cursor: 4000, scrobbledCount: 4000, totalTracks: 4000,
     });
     await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
+    await expect(page.locator('#logo .beta-tag')).toHaveCount(0);
     expect(await page.evaluate((key) => localStorage.getItem(key), RECORD_KEY)).toBeNull();
   });
 

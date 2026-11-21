@@ -9,6 +9,9 @@ export type ReturningState =
   | { kind: 'server_job'; username: string | null; done: number; total: number }
   | { kind: 'username_only'; username: string };
 
+// Per tab, so a dismissed card stays dismissed when the visitor comes back to Home.
+export const HOME_DISMISSED_KEY = 'scrobblify.home.dismissedReturning';
+
 // Job end states plus handoff end states (the import route can return a handoff row).
 const ENDED_STATES = ['completed', 'failed', 'cancelled', 'expired', 'reaped'];
 
@@ -32,6 +35,25 @@ export function progressPct(done: number, total: number): number {
 }
 
 /**
+ * Overall progress for an import partly scrobbled in this browser before it
+ * was handed over: the worker counts only the tracks it was handed. Plays this
+ * browser gave up on before the handover count as done here, unlike
+ * `originalSucceededCount`. Other browsers have no `originalTotal` and get the
+ * worker's own numbers.
+ */
+export function overallProgress(
+  originalTotal: number,
+  status: { totalTracks: number; scrobbledCount: number },
+): { done: number; total: number } {
+  if (originalTotal > 0 && originalTotal >= status.totalTracks) {
+    const remaining = status.totalTracks - status.scrobbledCount;
+    const done = Math.min(originalTotal, Math.max(0, originalTotal - remaining));
+    return { done, total: originalTotal };
+  }
+  return { done: status.scrobbledCount, total: status.totalTracks };
+}
+
+/**
  * Decides the Home state, most specific first: a job this browser handed to
  * the worker, then saved progress, then a remembered username.
  *
@@ -49,25 +71,14 @@ export async function detectReturning(
   /*
     Only a *live* job (sending, paused or stopped by errors, all of which keep
     their place) is shown as running. One that is signed out or on hold falls
-    through to the plain card; the status page on /scrobble explains it. A
+    through to the plain card; /scrobble's job banner explains it. A
     record the server doesn't know, or whose job has ended, is dropped.
   */
   const handedOver = background.handedOverImport(username);
   if (handedOver) {
     const status = await background.importStatus(handedOver.importId, RETURNING_STATUS_TIMEOUT_MS);
     if (status && status.live) {
-      // The worker counts only the tracks it was handed; show the whole import.
-      const { originalTotal } = handedOver;
-      if (originalTotal > 0 && originalTotal >= status.totalTracks) {
-        const remaining = status.totalTracks - status.scrobbledCount;
-        const done = Math.min(originalTotal, Math.max(0, originalTotal - remaining));
-        return {
-          kind: 'server_job', username, done, total: originalTotal,
-        };
-      }
-      return {
-        kind: 'server_job', username, done: status.scrobbledCount, total: status.totalTracks,
-      };
+      return { kind: 'server_job', username, ...overallProgress(handedOver.originalTotal, status) };
     }
     if (status && (!status.known || ENDED_STATES.includes(status.state || ''))) {
       background.clearHandedOverImport();

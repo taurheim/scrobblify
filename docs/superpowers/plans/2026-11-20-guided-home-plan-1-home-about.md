@@ -12,6 +12,8 @@
 
 **Copy:** every user-facing string below is final, from `docs/superpowers/specs/2026-11-20-guided-home-strings.md`. Do not reword. Strings that are blank there are deliberately not rendered.
 
+> **Note (after execution):** the code changed during review: a per-user handed-over import record carrying `originalTotal`, `overallProgress`, server jobs shown only while live, "Not you?" ownership rules and a `sessionStorage` dismissal, link-buttons for card actions, `LastFm.loadStoredUser`, and `showingServerJob` for the BETA tag. The snippets below are historical; the code and `AGENTS.md` are the source of truth. A Playwright test that drives a real mocked handover (asserting the stored record) is deferred to Plan 5.
+
 ---
 
 ## Before you start
