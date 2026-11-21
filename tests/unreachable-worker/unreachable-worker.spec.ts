@@ -379,3 +379,41 @@ test.describe('Offering background scrobbling', () => {
       .toBeVisible({ timeout: 30000 });
   });
 });
+
+test.describe('BETA tag', () => {
+  const TAG = '#logo .beta-tag';
+
+  test('an opted-in browser sees the BETA tag on every page', async ({ page }) => {
+    await page.goto('/?beta=1#/');
+    await expect(page.locator(TAG)).toHaveText('BETA');
+    await page.goto('/#/about');
+    await expect(page.locator(TAG)).toBeVisible();
+  });
+
+  test('the rollout flag shows the tag without the opt-in', async ({ page }) => {
+    await page.goto('/#/');
+    await page.evaluate(() => window.localStorage.setItem(
+      'scrobblify.flags',
+      JSON.stringify({ 'scrobblify-background-scrobbling': true }),
+    ));
+    await page.reload();
+    await expect(page.locator(TAG)).toBeVisible();
+  });
+
+  test('a browser outside the beta sees no tag and no beta banner', async ({ page }) => {
+    await page.goto('/#/');
+    await expect(page.locator('#logo')).toBeVisible();
+    await expect(page.locator(TAG)).toHaveCount(0);
+    await page.goto('/?beta=1#/scrobble');
+    await expect(page.locator(TAG)).toBeVisible();
+    await expect(page.locator('text=Background scrobbling (beta) is switched on')).toHaveCount(0);
+  });
+
+  test('?beta=0 removes the tag again', async ({ page }) => {
+    await page.goto('/?beta=1#/');
+    await expect(page.locator(TAG)).toBeVisible();
+    await page.goto('/?beta=0#/');
+    await expect(page.locator('#logo')).toBeVisible();
+    await expect(page.locator(TAG)).toHaveCount(0);
+  });
+});

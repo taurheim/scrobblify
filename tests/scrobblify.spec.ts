@@ -85,6 +85,12 @@ test.describe('Home Page', () => {
       /^([0-9a-f]{7}|dev) · Build (\d+|local)$/,
     );
   });
+
+  test('shows no BETA tag in a build without a worker, even with ?beta=1', async ({ page }) => {
+    await page.goto('/?beta=1#/');
+    await expect(page.locator('#logo')).toBeVisible();
+    await expect(page.locator('#logo .beta-tag')).toHaveCount(0);
+  });
 });
 
 test.describe('About Page', () => {
