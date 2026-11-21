@@ -156,12 +156,13 @@ test.describe('Home Page', () => {
     await expect(setup.locator('ol').last().locator('li')).toHaveCount(3);
     await expect(setup).toContainText('new Spotify listens get automatically scrobbled');
     await expect(setup).toContainText('Last.fm has a two week limit on scrobbling old tracks.');
+    await expect(setup.getByRole('link', { name: 'ListenBrainz', exact: true })).toHaveAttribute('href', 'https://listenbrainz.org/');
     await expect(setup).toContainText('Record Spotify Listening History');
     await expect(setup.locator('ol').last().locator('li').last()).toContainText('Once you have your ZIP file from Spotify');
     for (const href of [
       'https://www.last.fm/join',
       'https://www.last.fm/settings/applications',
-      'https://musicbrainz.org/register',
+      'https://listenbrainz.org/',
       'https://listenbrainz.org/login/',
       'https://listenbrainz.org/settings/music-services/details/',
       'https://listenbrainz.org/settings/import/',
