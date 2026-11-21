@@ -60,7 +60,7 @@ export default defineComponent({
     title(): string {
       const s = this.state;
       const name = s.kind === 'none' ? null : s.username;
-      return name ? `Welcome back, ${name}` : 'Welcome back';
+      return name ? `Scrobbling to ${name}` : 'Welcome back';
     },
     hasProgress(): boolean {
       return (this.state.kind === 'saved' || this.state.kind === 'server_job') && this.state.total > 0;

@@ -192,7 +192,7 @@ test.describe('Home Page', () => {
     await page.reload();
 
     const card = page.locator('.returning-card');
-    await expect(card.locator('.v-card-title')).toHaveText('Welcome back, testuser');
+    await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to testuser');
     await expect(card.locator('.returning-bar')).toContainText('3 / 5 · 60%');
     await expect(card.locator('.returning-links')).toHaveText(/^\s*Not you\?\s+·\s+Start over\s*$/);
     await expect(page.locator('.home-card')).toHaveCount(0);
@@ -238,7 +238,7 @@ test.describe('Home Page', () => {
     await page.reload();
 
     const card = page.locator('.returning-card');
-    await expect(card.locator('.v-card-title')).toHaveText('Welcome back, alice');
+    await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to alice');
     await card.locator('button:has-text("Not you?")').click();
     await expect(page.locator('.home-card')).toHaveCount(2);
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBe('testuser');
@@ -252,7 +252,7 @@ test.describe('Home Page', () => {
     await page.reload();
 
     const card = page.locator('.returning-card');
-    await expect(card.locator('.v-card-title')).toHaveText('Welcome back, testuser');
+    await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to testuser');
     await expect(card.locator('.returning-bar')).toHaveCount(0);
     await expect(card.locator('button:has-text("Upload Spotify zip")')).toBeVisible();
     await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'username_only' } });

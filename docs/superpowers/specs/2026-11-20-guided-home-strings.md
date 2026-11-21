@@ -53,7 +53,7 @@ progress-file conflict dialogs and the error dialog.
 
 | ID                                | When                          | Draft                         |
 | --------------------------------- | ----------------------------- | ----------------------------- |
-| `returning.title`                 | Any returning state           | Welcome back, {username}       |
+| `returning.title`                 | Any returning state           | Scrobbling to {username}       |
 | `returning.bar`                   | Has progress                  | {done} / {total} · {pct}%     |
 | `returning.continue`              | Saved progress, signed in     | Continue                      |
 | `returning.signIn`                | Saved progress, not signed in | Continue                      |
