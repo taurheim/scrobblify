@@ -993,3 +993,10 @@ CI is unaffected, since it starts from nothing and uses the default.
 Verify a regression test actually catches its bug with
 `git stash push -- <source file>`, re-run, `git stash pop`. A test that passes
 both ways is testing nothing.
+
+To compare against an older build (before/after screenshots, say), check it out
+with `git worktree add --detach <dir> <sha>` and serve it on its own port. If you
+link `node_modules` into it with a junction instead of installing, **delete the
+junction first** (`Remove-Item <dir>\node_modules`, which removes only the link)
+before `git worktree remove`: removing the worktree follows the junction and
+empties the real `node_modules`. `npm ci` restores it.
