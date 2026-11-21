@@ -172,6 +172,31 @@ form and also serves the two other entry points:
 The saved-progress prompt ("Resume saved progress / Start over", #102) still
 comes first; the server choice follows it.
 
+### The beta flag before sign-in
+
+The choice now comes before sign-in, but `isFeatureEnabled`
+(`src/services/Analytics.ts`) only honours the rollout flag once PostHog has
+identified the user by Last.fm username (#147). Without a change, a flag-only
+beta user would never see the server choice on a first import.
+
+So the flag is also honoured for an **anonymous** browser (PostHog's per-browser
+distinct id). Once the user signs in and is identified, the username decides, as
+today. A browser that has signed in before is already identified on load
+(PostHog keeps the identity), so this only changes behaviour for browsers that
+have never signed in.
+
+Consequences, accepted:
+
+- A brand-new user is bucketed per browser for their first offer; after sign-in
+  the username's bucket applies. The two can disagree, which affects only
+  whether the *offer* shows. A job already handed over is unaffected: recovery
+  paths use `isBackgroundConfigured()`, not the flag.
+- `background_offer_shown` `offer_source` gains `flag_anonymous`, so offers made
+  before identification can be told apart from `flag` and `opt_in`.
+
+`?beta=1` / `?beta=0` and the local `scrobblify.flags` override are unchanged.
+`AGENTS.md`'s beta-gate section is updated to match.
+
 ### Content
 
 Title and lede (`choice.*`), **Let Scrobblify scrobble for me**, "You'll need
@@ -318,8 +343,10 @@ Playwright (`tests/scrobblify.spec.ts`), using `tests/lastfmMock.js` and
   signs in to the browser app and resumes the selection after the redirect;
   the duplicate check runs after sign-in and shows the skipped count.
 - **Server choice:** shown for beta + room + ≥750; not shown for small, non-beta
-  or full; the over-60 warning appears above 60 days; "scrobble locally" runs
-  the tab path; the saved-progress prompt still comes first.
+  or full; shown before sign-in for a flagged browser that has never signed in
+  (via the local flag override); the over-60 warning appears above 60 days;
+  "scrobble locally" runs the tab path; the saved-progress prompt still comes
+  first.
 - **Status page:** every row of 6.2 renders its line and action against the mock
   worker, including each `dormantFrom`; no-session with and without a known
   import id; dormant + full re-checks and enables Reconnect.
@@ -337,8 +364,8 @@ Separate PRs, in order:
 
 1. BETA tag, About FAQ.
 2. Home (first visit, get-your-history, returning card).
-3. Sign-in after choosing (section 4). The riskiest change: it touches the
-   resume guards.
+3. Sign-in after choosing (section 4), and the anonymous beta-flag check. The
+   riskiest change: it touches the resume guards.
 4. Server choice dialog, over-60 warning, raised job limit.
 5. Status page, move-back explainer, `dormant_from`, reconnect-resumes,
    dormant re-check.
