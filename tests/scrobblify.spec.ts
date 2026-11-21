@@ -276,6 +276,28 @@ test.describe('About Page', () => {
     await expect(page.locator('body')).toContainText('Scrobblify');
   });
 
+  test('answers questions in a collapsible FAQ, with ListenBrainz one click away', async ({ page }) => {
+    const events = captureEvents(page);
+    await page.context().route('https://listenbrainz.org/**', (route) => route.fulfill({ status: 200, body: '' }));
+    await page.goto('/#/about');
+
+    await expect(page.locator('.about')).toContainText('buy me a coffee');
+    await expect(page.locator('.about-faq .v-expansion-panel')).toHaveCount(4);
+    const dates = page.locator('.about-faq .v-expansion-panel:has-text("Why do old plays get today\'s date?")');
+    await expect(dates.locator('.v-expansion-panel-text__wrapper')).toBeHidden();
+    await dates.locator('.v-expansion-panel-title').click();
+    await expect(dates).toContainText('Last.fm only accepts plays from the last two weeks');
+
+    const popup = page.waitForEvent('popup');
+    await dates.locator('a:has-text("ListenBrainz")').click();
+    await popup;
+    await expect.poll(() => events).toContainEqual({ name: 'listenbrainz_clicked', props: { source: 'about' } });
+
+    await expect(page.locator('.about h2:has-text("Who built Scrobblify?")')).toBeVisible();
+    await expect(page.locator('.about h2:has-text("Contribute")')).toBeVisible();
+    await expect(page.locator('text=Support Scrobblify')).toHaveCount(0);
+  });
+
   // A deleted chunk from an older build: the server answers with HTML (or 404).
   async function failAboutChunk(page: Page, failures: number) {
     const requests = { count: 0 };
@@ -293,7 +315,7 @@ test.describe('About Page', () => {
     const requests = await failAboutChunk(page, 1);
     await page.goto('/#/');
     await page.evaluate(() => { window.location.hash = '#/about'; });
-    await expect(page.locator('.about h1').first()).toHaveText('What is Scrobblify?', { timeout: 10000 });
+    await expect(page.locator('.about h1').first()).toHaveText('About', { timeout: 10000 });
     expect(requests.count).toBe(2);
   });
 
