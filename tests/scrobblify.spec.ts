@@ -26,7 +26,7 @@ test.beforeEach(async ({ context }) => {
   }));
 });
 
-// Navigate past auth (step 1 -> step 2) with mocked auth
+// Opens /scrobble already signed in, at the upload step
 async function goToUploadStep(page: Page): Promise<MockLibrary> {
   const library = await interceptLastFm(page);
   // Navigate first to establish origin for localStorage
@@ -369,6 +369,41 @@ test.describe('Scrobble Page - Authentication Step', () => {
     await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
   });
 
+  test('a signed-out selection is held for sign-in, not sent', async ({ page }) => {
+    const scrobbles: string[] = [];
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+      await route.fallback();
+    });
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    // No username to read the history with, so no "Couldn't find username" error.
+    await expect(page.locator('text=Duplicates will be checked after you sign in.')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('text=An error occurred while checking for duplicates')).toHaveCount(0);
+
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click();
+    await page.locator('button:has-text("matching")').click();
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=Sign in to Last.fm first, then press Scrobble again.')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('button:has-text("selected tracks")')).toBeVisible();
+    await page.waitForTimeout(1000);
+    expect(scrobbles).toEqual([]);
+  });
+
   test('a signed-in visitor starts at upload with their name shown', async ({ page }) => {
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
@@ -385,31 +420,26 @@ test.describe('Scrobble Page - Authentication Step', () => {
     // auth.getSession again — Last.fm rejects re-use with error 4 "Unauthorized
     // Token - This token has not been issued".
     let getSessionCount = 0;
+    await interceptLastFm(page);
     await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
       const params = new URLSearchParams(new URL(route.request().url()).search);
       if (params.get('method') === 'auth.getSession') {
         getSessionCount++;
-        await route.fulfill({
-          status: 403,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            error: 4,
-            message: 'Unauthorized Token - This token has not been issued.',
-          }),
-        });
-      } else {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
       }
+      await route.fallback();
     });
 
     await page.goto('/#/scrobble?token=single-use-token');
-    await expect.poll(() => getSessionCount, { timeout: 10000 }).toBe(1);
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    expect(getSessionCount).toBe(1);
 
-    // Revisit the callback URL with the same token still present.
+    // Revisit the callback URL with the same token still present. A real load:
+    // a hash-only change would reuse the page and never run init() again.
+    await page.goto('about:blank');
     await page.goto('/#/scrobble?token=single-use-token');
-    // Wait for init() to settle (the "signing in" spinner clears once the
-    // token exchange is skipped) rather than an arbitrary delay.
-    await expect(page.locator('text=Signing in to Last.fm')).toBeHidden({ timeout: 10000 });
+    // The header only shows once init() has settled, and a re-exchange would
+    // have been sent (and answered) before that.
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
     expect(getSessionCount).toBe(1);
   });
 
@@ -991,19 +1021,20 @@ test.describe('Session Resume', () => {
     // not against the shrunken remainder.
     await expect(page.locator('.overall-progress')).toContainText('3 of 5');
 
-    // Let the sign-in handler and the authority check settle before interacting.
-    await page.waitForTimeout(2500);
+    // Let the sign-in handler settle before interacting.
+    await expect(page.locator('text=Currently authenticated as')).toBeVisible({ timeout: 10000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
     await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
 
     expect(scrobbled).toEqual(['Track 4', 'Track 5']);
   });
 
-  test('resuming immediately is not undone by the delayed auth redirect', async ({ page }) => {
+  test('resuming immediately is not undone by the sign-in authority check', async ({ page }) => {
     // Regression: AuthenticateStep used to emit `complete` on a 2s setTimeout,
     // and resuming inside that window jumped to the scrobble step and then got
     // dragged back to the upload step, losing the resumed session. The emit is
-    // immediate now, but `onAuthenticated` must still never move the stepper.
+    // immediate now, and `onAuthenticated` runs the authority check once the
+    // mount settles, but it must still never move the stepper.
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
@@ -1014,7 +1045,7 @@ test.describe('Session Resume', () => {
     await page.getByRole('button', { name: 'Resume', exact: true }).click();
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
 
-    // Give a late auth emit time to land, then confirm we're still on the scrobble step.
+    // Give the sign-in handler's check time to land, then confirm we're still on the scrobble step.
     await page.waitForTimeout(4000);
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
     await expect(page.locator('.upload-step')).toBeHidden();

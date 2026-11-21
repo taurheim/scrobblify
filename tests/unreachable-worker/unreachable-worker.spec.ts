@@ -228,6 +228,108 @@ test.describe('Importing a progress file', () => {
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeHidden();
   });
 });
+
+test.describe('Signing in while the page mounts', () => {
+  // Writes saved progress straight into IndexedDB, as `StateManager.saveState` would.
+  async function seedSavedState(page: Page, state: Record<string, unknown>) {
+    await page.evaluate((saved) => new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains('scrobbleState')) {
+          request.result.createObjectStore('scrobbleState');
+        }
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction('scrobbleState', 'readwrite');
+        tx.objectStore('scrobbleState').put(saved, 'current');
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+      };
+      request.onerror = () => reject(request.error);
+    }), state);
+  }
+
+  /*
+    A stored session makes the sign-in handler emit before this page's own
+    `mounted` has finished, and its authority check used to run alongside the
+    mount's. The first answer ("nothing running") lowered `authorityPending`
+    while the second question was still out, so Resume was live for the whole
+    of a request whose answer was "a job is running". The checks now run one
+    after the other, each with Resume held back.
+  */
+  test('Resume stays held back while the second authority check is out', async ({ page }) => {
+    const scrobbles: string[] = [];
+    let liveCalls = 0;
+    let secondCallArrived = (): void => undefined;
+    const secondCall = new Promise<void>((resolve) => { secondCallArrived = resolve; });
+    let releaseSecondCall = (): void => undefined;
+    const released = new Promise<void>((resolve) => { releaseSecondCall = resolve; });
+
+    await interceptLastFm(page);
+    await page.route(WORKER, async (route: Route) => {
+      const { pathname } = new URL(route.request().url());
+      const reply = (body: unknown) => route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify(body),
+      });
+      if (pathname === '/scrobblify/job/live') {
+        liveCalls += 1;
+        if (liveCalls === 1) {
+          await reply({ ok: true, live: false });
+          return;
+        }
+        secondCallArrived();
+        // Answered well inside the client's fall-through timeout.
+        await released;
+        await reply({ ok: true, live: true });
+        return;
+      }
+      if (pathname.startsWith('/scrobblify/import/')) {
+        await reply({ ok: true, known: false, live: false });
+        return;
+      }
+      await route.abort('internetdisconnected');
+    });
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, {
+      userName: 'testuser',
+      totalTracks: 5,
+      completedIndices: [0, 1, 2],
+      failedIndices: [],
+      tracks: [1, 2, 3, 4, 5].map((n) => ({
+        track: `Track ${n}`, artist: `Artist ${n}`, album: `Album ${n}`, timestamp: Date.UTC(2024, 0, n),
+      })),
+      originalTotalTracks: 5,
+      originalSucceededCount: 3,
+      importId: 'b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6',
+      savedAt: new Date().toISOString(),
+    });
+    await page.reload();
+
+    await secondCall;
+    // Long enough for a render that was going to show Resume to have shown it.
+    await page.waitForTimeout(500);
+    expect(await page.locator('text=Resume previous session?').count()).toBe(0);
+    releaseSecondCall();
+
+    await expect(page.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Resume previous session?')).toHaveCount(0);
+    expect(scrobbles).toEqual([]);
+  });
+});
 test.describe('Offering background scrobbling', () => {
   // A worker that would say yes to everything, so only the opt-in stands
   // between a large import and the offer.

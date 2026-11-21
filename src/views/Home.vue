@@ -133,7 +133,7 @@ export default defineComponent({
     async refreshReturning() {
       const api = this.$store.state.lfmApi as LastFm;
       try {
-        // Only /scrobble's sign-in step runs init(), so a visit that starts
+        // Only /scrobble's sign-in handler runs init(), so a visit that starts
         // here has to read the stored user itself.
         api.loadStoredUser();
         this.returning = await detectReturning(api, this.stateManager);

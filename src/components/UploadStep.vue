@@ -114,6 +114,7 @@
 import { defineComponent } from 'vue';
 import JSZip from 'jszip';
 import Scrobblify from '@/scrobblify';
+import LastFm from '@/api/LastFm';
 import SpotifyListen from '@/models/SpotifyListen';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import LargeHistoryGate from '@/components/LargeHistoryGate.vue';
@@ -464,6 +465,10 @@ export default defineComponent({
       if (!this.checkDuplicates) {
         toBeScrobbled = validData;
         this.logs.push(`Skipping duplicate check — ${validData.length} tracks ready.`);
+      } else if (!(this.$store.state.lfmApi as LastFm).isAuthenticated()) {
+        // Reading the history needs a username, which only signing in gives.
+        toBeScrobbled = validData;
+        this.logs.push('Duplicates will be checked after you sign in.');
       } else {
         // Bulk-fetch Last.fm history and filter duplicates locally
         this.stepProgress = 0;

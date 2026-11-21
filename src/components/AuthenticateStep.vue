@@ -36,8 +36,9 @@ export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
   emits: {
     /**
-     * Signed in, either already (`fresh: false`) or by exchanging the
-     * callback's `?token=` just now (`fresh: true`).
+     * Signed in. `fresh` says whether this load arrived with a callback
+     * `?token=`, not whether exchanging it worked: if the exchange fails while
+     * a key is stored, the stored key is kept and this still says `true`.
      */
     complete: (payload: { fresh: boolean }) => typeof payload.fresh === 'boolean',
   },

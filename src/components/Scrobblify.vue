@@ -131,11 +131,15 @@
       <!--
         Resuming needs a session key to scrobble with. Without one, every track
         used to fail in a burst and be saved as done, so the resume is held here
-        instead, with the saved progress left untouched.
+        instead, with the saved progress left untouched. A fresh selection made
+        while signed out is held here too, on the select step.
       -->
       <template v-else-if="banner === 'signIn'">
         <div><strong>{{ resumeSignInMessage }}</strong></div>
-        <div class="mt-1">Your saved progress is kept, and nothing has been scrobbled yet.</div>
+        <div v-if="hasResumableState" class="mt-1">
+          Your saved progress is kept, and nothing has been scrobbled yet.
+        </div>
+        <div v-else class="mt-1">Nothing has been scrobbled yet.</div>
         <div class="mt-2">
           <v-btn color="primary" @click="signInToResume">Sign in to Last.fm</v-btn>
         </div>
@@ -444,7 +448,8 @@ export default defineComponent({
       /**
        * Whether the header shows who is signed in. A flag, because the store's
        * `LastFm` isn't reactive: set when the sign-in handler confirms a
-       * session, cleared by "Not you?".
+       * session, cleared by "Not you?". Stays set when a run's rejected key is
+       * cleared (`clearSessionKey()`); that stop shows its own sign-in link.
        */
       signedIn: false,
       hasResumableState: false,
@@ -560,204 +565,220 @@ export default defineComponent({
       onVisibilityChange: null as (() => void) | null,
     };
   },
+  created() {
+    // Settles once `mounted` has, however it exits. `onAuthenticated` awaits
+    // it: the sign-in handler mounts (and can emit) before this component's
+    // own async `mounted` is done. Not reactive; nothing renders from it.
+    (this as any)._mountSettled = new Promise<void>((resolve) => {
+      (this as any)._resolveMountSettled = resolve;
+    });
+  },
   async mounted() {
-    trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
-
-    // Ordering matters. A handoff coming back from Last.fm must be finished
-    // before anything reads local state, because the upload derives its bytes
-    // from that state and completing the handoff is what clears it.
-    //
-    // A re-authentication return is consumed first, and only for its token: it
-    // owns no handoff and must not be mistaken for one.
-    const reauthed = background.consumeReauthFragment();
-
-    const resumed = await this.resumeHandoffIfReturning();
-    if (resumed) {
-      return;
-    }
-
-    await this.refreshBackgroundJob();
-
-    /*
-      Ownership is settled before resumability is ever assigned. `mounted` is
-      async, so every `await` below is a point at which Vue can render; setting
-      `hasResumableState = true` first and checking ownership afterwards would
-      put a Resume button on screen for the whole duration of a status request,
-      which is exactly the window in which the server may own the queue.
-    */
-    const unresolved = background.getOwnershipUnresolved();
-    const owner = background.queueOwner();
-    if (unresolved) {
-      // A handover this browser started and could not finish. Whether it took
-      // effect is exactly what is unknown, so it counts as one having happened.
-      this.sawServerOwnership = true;
-    }
-
     try {
-      await this.exposeSavedStateUnlessStale('mounted', !!unresolved || !!owner);
-    } catch (e) {
-      // IndexedDB not available — not critical, just skip resume
-    }
+      trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
 
-    /*
-      A tab opened after another tab took the queue has no message to receive,
-      so the durable record is read here as well as listened for.
+      // Ordering matters. A handoff coming back from Last.fm must be finished
+      // before anything reads local state, because the upload derives its bytes
+      // from that state and completing the handoff is what clears it.
+      //
+      // A re-authentication return is consumed first, and only for its token: it
+      // owns no handoff and must not be mistaken for one.
+      const reauthed = background.consumeReauthFragment();
 
-      A `server` record is reconciled rather than obeyed forever. Jobs run for
-      weeks and then finish; without this the flag that stopped every tab
-      during the import would keep stopping them long after the worker was
-      done, and there would be no way back.
-    */
-    if (owner) {
-      this.ownershipBlocked = true;
-      // Read from the durable record rather than from a broadcast this tab was
-      // never here to receive. Same meaning either way: a queue of ours has
-      // left, so nothing this tab later holds may be released without the disk
-      // agreeing it is current.
-      this.sawServerOwnership = true;
-      await this.reconcileQueueOwner(owner);
-    }
+      const resumed = await this.resumeHandoffIfReturning();
+      if (resumed) {
+        return;
+      }
 
-    /*
-      The authority check, after the local records have had their say so it can
-      correct them in either direction.
+      await this.refreshBackgroundJob();
 
-      Deliberately not conditional on finding a local record: a browser with no
-      record is the case this exists for. It is also deliberately awaited
-      before the resume button can appear — `hasResumableState` above may
-      already be true, and offering Resume while the question is open is
-      offering the one action that starts duplicate scrobbling. `authorityPending`
-      covers the same window in the template, since `mounted` renders at every
-      await it makes.
-    */
-    await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+      /*
+        Ownership is settled before resumability is ever assigned. `mounted` is
+        async, so every `await` below is a point at which Vue can render; setting
+        `hasResumableState = true` first and checking ownership afterwards would
+        put a Resume button on screen for the whole duration of a status request,
+        which is exactly the window in which the server may own the queue.
+      */
+      const unresolved = background.getOwnershipUnresolved();
+      const owner = background.queueOwner();
+      if (unresolved) {
+        // A handover this browser started and could not finish. Whether it took
+        // effect is exactly what is unknown, so it counts as one having happened.
+        this.sawServerOwnership = true;
+      }
 
-    this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
-      this.ownershipBlocked = next !== null;
-      const step = this.$refs.scrobbleStep as any;
-      if (next) {
-        this.hasResumableState = false;
+      try {
+        await this.exposeSavedStateUnlessStale('mounted', !!unresolved || !!owner);
+      } catch (e) {
+        // IndexedDB not available — not critical, just skip resume
+      }
+
+      /*
+        A tab opened after another tab took the queue has no message to receive,
+        so the durable record is read here as well as listened for.
+
+        A `server` record is reconciled rather than obeyed forever. Jobs run for
+        weeks and then finish; without this the flag that stopped every tab
+        during the import would keep stopping them long after the worker was
+        done, and there would be no way back.
+      */
+      if (owner) {
+        this.ownershipBlocked = true;
+        // Read from the durable record rather than from a broadcast this tab was
+        // never here to receive. Same meaning either way: a queue of ours has
+        // left, so nothing this tab later holds may be released without the disk
+        // agreeing it is current.
+        this.sawServerOwnership = true;
+        await this.reconcileQueueOwner(owner);
+      }
+
+      /*
+        The authority check, after the local records have had their say so it can
+        correct them in either direction.
+
+        Deliberately not conditional on finding a local record: a browser with no
+        record is the case this exists for. It is also deliberately awaited
+        before the resume button can appear — `hasResumableState` above may
+        already be true, and offering Resume while the question is open is
+        offering the one action that starts duplicate scrobbling. `authorityPending`
+        covers the same window in the template, since `mounted` renders at every
+        await it makes. Raised again here rather than trusted from `data()`:
+        nothing else should have lowered it by now (`onAuthenticated` waits for
+        this mount to settle), but if anything did, Resume would be live for
+        the whole request.
+      */
+      this.authorityPending = true;
+      await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+
+      this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
+        this.ownershipBlocked = next !== null;
+        const step = this.$refs.scrobbleStep as any;
+        if (next) {
+          this.hasResumableState = false;
+          this.sawServerOwnership = true;
+          if (step && step.haltForHandoff) {
+            // Deliberately not awaited: this is an event handler, and the halt
+            // resolves only once the in-flight batch finishes.
+            Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
+          }
+        } else {
+          /*
+            Ownership was released, so whatever stopped this tab is over — for
+            the tab that ended it. Not necessarily for this one.
+
+            A take-back ends ownership by cancelling the job, and the tracks it
+            rescued go to *disk*. Every sibling tab is still holding the queue it
+            had before the handover in memory, most of which the worker has since
+            scrobbled. Releasing the halt on the strength of the broadcast alone
+            lets any of them press Resume and replay all of it.
+
+            So the release is earned, not granted: `revalidateAfterRelease` asks
+            whether this tab's own queue is still the queue, and only then lets
+            the loop run again.
+          */
+          Promise.resolve(this.revalidateAfterRelease()).catch(() => {
+            // Unanswerable. The halt stays, which is the safe direction.
+          });
+        }
+      });
+
+      // Registered so other tabs can tell how many siblings a freeze must wait
+      // for. Without a roster, "everyone has stopped" is not observable and a
+      // freezing tab can only guess at a timeout.
+      this.releaseTabRoster = background.joinTabRoster();
+
+      /*
+        This tab answers other tabs' freeze requests. Handing over is decided in
+        one tab and binds them all, and the decision is made *before* the queue
+        is snapshotted — so this must stop scrobbling and persist what it has
+        before acknowledging, or its just-sent tracks are captured in the
+        sibling's upload and scrobbled a second time by the worker.
+      */
+      this.releaseFreezeResponder = background.respondToFreezeRequests(async () => {
+        const step = this.$refs.scrobbleStep as any;
+        // A sibling is preparing to hand this queue over, so from here on this
+        // tab's copy may be superseded whether or not the attempt succeeds.
         this.sawServerOwnership = true;
         if (step && step.haltForHandoff) {
-          // Deliberately not awaited: this is an event handler, and the halt
-          // resolves only once the in-flight batch finishes.
-          Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
-        }
-      } else {
-        /*
-          Ownership was released, so whatever stopped this tab is over — for
-          the tab that ended it. Not necessarily for this one.
-
-          A take-back ends ownership by cancelling the job, and the tracks it
-          rescued go to *disk*. Every sibling tab is still holding the queue it
-          had before the handover in memory, most of which the worker has since
-          scrobbled. Releasing the halt on the strength of the broadcast alone
-          lets any of them press Resume and replay all of it.
-
-          So the release is earned, not granted: `revalidateAfterRelease` asks
-          whether this tab's own queue is still the queue, and only then lets
-          the loop run again.
-        */
-        Promise.resolve(this.revalidateAfterRelease()).catch(() => {
-          // Unanswerable. The halt stays, which is the safe direction.
-        });
-      }
-    });
-
-    // Registered so other tabs can tell how many siblings a freeze must wait
-    // for. Without a roster, "everyone has stopped" is not observable and a
-    // freezing tab can only guess at a timeout.
-    this.releaseTabRoster = background.joinTabRoster();
-
-    /*
-      This tab answers other tabs' freeze requests. Handing over is decided in
-      one tab and binds them all, and the decision is made *before* the queue
-      is snapshotted — so this must stop scrobbling and persist what it has
-      before acknowledging, or its just-sent tracks are captured in the
-      sibling's upload and scrobbled a second time by the worker.
-    */
-    this.releaseFreezeResponder = background.respondToFreezeRequests(async () => {
-      const step = this.$refs.scrobbleStep as any;
-      // A sibling is preparing to hand this queue over, so from here on this
-      // tab's copy may be superseded whether or not the attempt succeeds.
-      this.sawServerOwnership = true;
-      if (step && step.haltForHandoff) {
-        /*
-          The boolean is load-bearing. `haltForHandoff` returns false when the
-          loop was still running after its polling budget — which is exactly
-          the in-flight Last.fm request case — and answering "stopped" then
-          would let the sibling upload a queue this tab is still sending from.
-        */
-        if (!await step.haltForHandoff()) {
-          return false;
-        }
-        /*
-          Persisted here, synchronously with the acknowledgement, rather than
-          via the usual `auto-save` event: that only emits, and the freezing
-          tab re-reads IndexedDB the moment this resolves. An unawaited save
-          would not have landed.
-
-          `saveStateIfAhead` rather than `saveState` because several tabs
-          persist at once during a freeze and a plain put is last-writer-wins;
-          the slowest snapshot would otherwise erase the furthest progress.
-        */
-        try {
-          const snapshot = step.progressSnapshot();
-          if (snapshot) {
-            await this.stateManager.saveStateIfAhead(this.buildState(snapshot));
+          /*
+            The boolean is load-bearing. `haltForHandoff` returns false when the
+            loop was still running after its polling budget — which is exactly
+            the in-flight Last.fm request case — and answering "stopped" then
+            would let the sibling upload a queue this tab is still sending from.
+          */
+          if (!await step.haltForHandoff()) {
+            return false;
           }
-        } catch (e) {
-          trackError('background.freezePersist', e);
-          return false;
+          /*
+            Persisted here, synchronously with the acknowledgement, rather than
+            via the usual `auto-save` event: that only emits, and the freezing
+            tab re-reads IndexedDB the moment this resolves. An unawaited save
+            would not have landed.
+
+            `saveStateIfAhead` rather than `saveState` because several tabs
+            persist at once during a freeze and a plain put is last-writer-wins;
+            the slowest snapshot would otherwise erase the furthest progress.
+          */
+          try {
+            const snapshot = step.progressSnapshot();
+            if (snapshot) {
+              await this.stateManager.saveStateIfAhead(this.buildState(snapshot));
+            }
+          } catch (e) {
+            trackError('background.freezePersist', e);
+            return false;
+          }
         }
-      }
-      this.hasResumableState = false;
-      this.ownershipBlocked = true;
-      return true;
-    });
+        this.hasResumableState = false;
+        this.ownershipBlocked = true;
+        return true;
+      });
 
-    if (unresolved) {
-      await this.resolveOwnership(unresolved);
+      if (unresolved) {
+        await this.resolveOwnership(unresolved);
+      }
+      if (reauthed) {
+        trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
+      } else if (new URLSearchParams(window.location.search).get('signin') === 'failed') {
+        this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
+        this.showReauth = true;
+        this.stripQuery();
+        trackEvent('background_reauth_failed');
+      }
+      this.probeBackgroundAvailability();
+      // The rollout flag can change after mount: flags load asynchronously, and
+      // it only counts once signing in has identified the user.
+      this.releaseFlagListener = onFeatureFlags(() => {
+        if (!background.isBackgroundEnabled()) {
+          this.backgroundProbed = false;
+          this.backgroundAvailable = false;
+          this.backgroundMaxTracks = 0;
+        } else if (!this.backgroundProbed) {
+          this.probeBackgroundAvailability();
+        }
+      });
+
+      /*
+        Back-forward cache recovery.
+
+        Handing over navigates this tab to Last.fm with `backgroundBusy` left set
+        and the scrobble loop halted, deliberately: it stops the dialog being
+        submitted twice while the redirect is in flight. If the user then presses
+        Back instead of authorising, the browser may restore this exact page from
+        the bfcache — same JavaScript state, no `mounted()`, no reload — leaving a
+        permanently busy screen with a stopped loop and no way out but a refresh.
+
+        `pageshow` with `persisted` is the only event that fires in that case.
+      */
+      this.onPageShow = (event: PageTransitionEvent) => {
+        if (event.persisted) {
+          this.recoverFromBfcache();
+        }
+      };
+      window.addEventListener('pageshow', this.onPageShow);
+    } finally {
+      (this as any)._resolveMountSettled();
     }
-    if (reauthed) {
-      trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
-    } else if (new URLSearchParams(window.location.search).get('signin') === 'failed') {
-      this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
-      this.showReauth = true;
-      this.stripQuery();
-      trackEvent('background_reauth_failed');
-    }
-    this.probeBackgroundAvailability();
-    // The rollout flag can change after mount: flags load asynchronously, and
-    // it only counts once signing in has identified the user.
-    this.releaseFlagListener = onFeatureFlags(() => {
-      if (!background.isBackgroundEnabled()) {
-        this.backgroundProbed = false;
-        this.backgroundAvailable = false;
-        this.backgroundMaxTracks = 0;
-      } else if (!this.backgroundProbed) {
-        this.probeBackgroundAvailability();
-      }
-    });
-
-    /*
-      Back-forward cache recovery.
-
-      Handing over navigates this tab to Last.fm with `backgroundBusy` left set
-      and the scrobble loop halted, deliberately: it stops the dialog being
-      submitted twice while the redirect is in flight. If the user then presses
-      Back instead of authorising, the browser may restore this exact page from
-      the bfcache — same JavaScript state, no `mounted()`, no reload — leaving a
-      permanently busy screen with a stopped loop and no way out but a refresh.
-
-      `pageshow` with `persisted` is the only event that fires in that case.
-    */
-    this.onPageShow = (event: PageTransitionEvent) => {
-      if (event.persisted) {
-        this.recoverFromBfcache();
-      }
-    };
-    window.addEventListener('pageshow', this.onPageShow);
   },
   beforeUnmount() {
     if (this.onPageShow) {
@@ -2488,12 +2509,28 @@ export default defineComponent({
         exactly the browser holding no local record of a handover, so skipping
         the check here would leave the case it was built for uncovered.
 
-        `authorityPending` is raised *synchronously*, before the await inside
-        the check can yield. The user can act while the sign-in settles (Resume
-        may already be on screen), so leaving the flag down until the request
-        resolved would leave Resume live across exactly the window the check
-        is meant to cover.
+        `authorityPending` is raised *synchronously*, before anything here can
+        yield. The user can act while the sign-in settles (Resume may already
+        be on screen), so leaving the flag down until the request resolved
+        would leave Resume live across exactly the window the check is meant
+        to cover.
       */
+      this.authorityPending = true;
+      /*
+        With a stored session this runs before `mounted` has finished: the
+        child's `mounted` runs first, and `mounted` here awaits the handoff
+        return and the job status before its own check. Running alongside it
+        would read local state while a handoff return is still uploading it,
+        and lower `authorityPending` under the mount's own check. So wait for
+        the mount, then ask.
+
+        When a handoff return ends `mounted` early, the mount never asked: the
+        job is live on the server, or whether it started is unknown. The check
+        below asks `/job/live`, and a live job blocks here exactly as it would
+        have there; the same check used to run after the old 2-second delay.
+        Raised again because the mount's own check, when it ran, lowered it.
+      */
+      await (this as any)._mountSettled;
       this.authorityPending = true;
       // Leaves local records as they were. The gate stays shut on an
       // unanswered question unless `mayScrobbleWithoutAuthority` allows it.
@@ -2539,6 +2576,12 @@ export default defineComponent({
       trackEvent('user_logged_out');
     },
     onSelectionComplete() {
+      // Nothing to send with yet. The selection stays on screen; the saved
+      // progress, if any, is untouched.
+      if (!(this.$store.state.lfmApi as LastFm).isAuthenticated()) {
+        this.resumeSignInMessage = 'Sign in to Last.fm first, then press Scrobble again.';
+        return;
+      }
       // The user chose to start over, so the saved progress is no longer on
       // offer; this run's first save replaces it.
       this.hasResumableState = false;
