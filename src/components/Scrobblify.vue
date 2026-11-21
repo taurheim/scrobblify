@@ -170,7 +170,7 @@
       so only while that happens or if it fails. Signing in starts from
       wherever it is needed, through `startSignIn`.
     -->
-    <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
+    <authenticate-step v-on:complete="onAuthenticated" v-on:failed="onAuthFailed"></authenticate-step>
 
     <!-- The duplicate check a signed-out user asked for, run after sign-in. -->
     <div v-if="checkingDuplicates" class="d-flex justify-center align-center mb-4 checking-duplicates">
@@ -422,6 +422,18 @@ const STEPPER_ITEMS = [
   { value: 5, title: 'Complete' },
 ];
 
+/**
+ * Whether `state` is the selection saved before signing in, untouched since:
+ * import `importId`, nothing sent. An empty id identifies nothing.
+ */
+function isUnsentSelection(state: ScrobbleState | null, importId: string): boolean {
+  return !!state && !!importId && (state.importId || '') === importId
+    && state.completedIndices.length === 0
+    && !(state.originalSucceededCount > 0)
+    && !(state.pendingVerification && state.pendingVerification.length > 0)
+    && !state.pendingReTagTimestampSec;
+}
+
 interface ProgressSnapshot {
   scrobbledTracks: number;
   originalTotalTracks: number;
@@ -567,6 +579,8 @@ export default defineComponent({
        * until `continueSignInIntent` has dealt with it.
        */
       heldForSignIn: false,
+      /** This load's token exchange failed (AuthenticateStep's `failed`). */
+      signInFailed: false,
       /** The deferred duplicate check is running. */
       checkingDuplicates: false,
       /** Plays it dropped; shown until the user starts sending. */
@@ -2591,16 +2605,29 @@ export default defineComponent({
           return;
         }
         const state = await this.stateManager.loadState().catch(() => null);
-        if (!state || (state.importId || '') !== intent.importId || state.completedIndices.length > 0) {
+        if (!isUnsentSelection(state, intent.importId)) {
           return;
         }
-        const ready = intent.checkDuplicates ? await this.dropQueuedDuplicates(state) : state;
-        if (ready) {
+        const ready = intent.checkDuplicates
+          ? await this.dropQueuedDuplicates(state as ScrobbleState)
+          : state;
+        if (ready && this.currentStep <= 2) {
           this.restoreFromState(ready, 'sign_in');
+        } else if (!this.ownershipBlocked && !this.authorityUnknown) {
+          // Whatever is saved now, if anything, is offered as usual.
+          await this.exposeSavedStateUnlessStale(
+            'sign_in',
+            !!background.getOwnershipUnresolved() || !!background.queueOwner(),
+          );
         }
       } finally {
         this.heldForSignIn = false;
       }
+    },
+    /** The token exchange failed, so nothing will carry the selection on. */
+    onAuthFailed() {
+      this.signInFailed = true;
+      this.heldForSignIn = false;
     },
     /**
      * On the way back from Last.fm with a selection to send: keeps the resume
@@ -2613,27 +2640,65 @@ export default defineComponent({
         return;
       }
       const state = await this.stateManager.loadState().catch(() => null);
-      this.heldForSignIn = !!state && (state.importId || '') === intent.importId;
+      // The exchange can fail before this mount gets here.
+      this.heldForSignIn = !this.signInFailed && isUnsentSelection(state, intent.importId);
     },
     /**
      * The duplicate check a signed-out user asked for, on the queue they chose.
-     * Returns the queue to send, or null when every play was already on
-     * Last.fm. If the check fails, the queue is sent unfiltered, as the upload
-     * step does.
+     * Returns the queue to send, or null to restore nothing: every play was
+     * already on Last.fm, the user has moved on, or the saved selection is no
+     * longer this one (another tab). If the check itself fails, the queue is
+     * sent unfiltered, as the upload step does.
      */
     async dropQueuedDuplicates(state: ScrobbleState): Promise<ScrobbleState | null> {
+      const id = state.importId || '';
+      const stillOurs = async (): Promise<boolean> => {
+        try {
+          return isUnsentSelection(await this.stateManager.loadState(), id);
+        } catch (e) {
+          // Can't tell; the in-memory copy is all there is to go on.
+          return true;
+        }
+      };
       this.checkingDuplicates = true;
+      let checked: { unique: Scrobble[]; duplicateCount: number } | null = null;
+      let checkError: unknown = null;
       try {
-        const queue = StateManager.deserializeScrobbles(state.tracks);
-        const { unique, duplicateCount } = await new Scrobblify(this.$store.state.lfmApi as LastFm)
-          .filterQueuedDuplicates(queue);
-        if (duplicateCount === 0) {
+        try {
+          checked = await new Scrobblify(this.$store.state.lfmApi as LastFm)
+            .filterQueuedDuplicates(StateManager.deserializeScrobbles(state.tracks));
+        } catch (e) {
+          trackError('scrobblify.deferredDuplicates', e);
+          checkError = e;
+        }
+        // The user started something else while it ran.
+        if (this.currentStep > 2) {
+          return null;
+        }
+        if (!checked || checked.duplicateCount === 0) {
+          if (!(await stillOurs())) {
+            return null;
+          }
+          if (checkError) {
+            this.errorMessage = 'An error occurred while checking for duplicates. Proceeding with all tracks.';
+            this.errorDetails = (checkError as Error).message || String(checkError);
+            this.showError = true;
+          }
           return state;
         }
+        const { unique, duplicateCount } = checked;
         if (unique.length === 0) {
-          await this.persist(() => this.stateManager.clearState());
-          this.hasResumableState = false;
-          this.skippedDuplicates = duplicateCount;
+          try {
+            const { removed } = await this.persist(() => this.stateManager.clearStateIfMatching(
+              (saved) => isUnsentSelection(saved, id),
+            ));
+            if (removed) {
+              this.hasResumableState = false;
+              this.skippedDuplicates = duplicateCount;
+            }
+          } catch (e) {
+            trackError('scrobblify.deferredDuplicates', e);
+          }
           return null;
         }
         const filtered: ScrobbleState = {
@@ -2642,12 +2707,27 @@ export default defineComponent({
           totalTracks: unique.length,
           originalTotalTracks: unique.length,
         };
-        await this.persist(() => this.stateManager.saveState(filtered));
+        if (!(await stillOurs())) {
+          return null;
+        }
+        let wrote = false;
+        try {
+          // Refuses a different import and anything further along.
+          wrote = await this.persist(() => this.stateManager.saveStateIfAhead(filtered));
+        } catch (e) {
+          // A failed write leaves the disk as it was; checkpoints save the
+          // filtered queue later. A different import is not ours to send.
+          if (!(await stillOurs())) {
+            return null;
+          }
+          trackError('scrobblify.deferredDuplicates', e);
+          wrote = true;
+        }
+        if (!wrote) {
+          return null;
+        }
         this.skippedDuplicates = duplicateCount;
         return filtered;
-      } catch (e) {
-        trackError('scrobblify.deferredDuplicates', e);
-        return state;
       } finally {
         this.checkingDuplicates = false;
       }
@@ -2691,6 +2771,41 @@ export default defineComponent({
       */
       const api = this.$store.state.lfmApi as LastFm;
       if (!api.isAuthenticated()) {
+        /*
+          This save replaces whatever progress is saved here, and the
+          confirmation only asks about saved progress `savedProgress` knows of.
+          That is null whenever the resume prompt is withheld (an unanswered or
+          blocked authority check, a live job) or out of date (another tab
+          saved since), so the disk is asked too (#102).
+        */
+        if (this.sendingBlocked) {
+          this.backgroundNotice = background.isBetaOptedIn()
+            ? 'Hold on — still checking whether an import is already running on the server for your account.'
+            : 'Hold on, still getting ready. Try again in a moment.';
+          return;
+        }
+        if (!this.savedProgress) {
+          let saved: ScrobbleState | null = null;
+          try {
+            saved = await this.stateManager.loadState();
+          } catch (e) {
+            // Unreadable, so there is nothing it could be replacing that a
+            // resume could reach either.
+          }
+          const newId = (this.$store.state.importId as string) || '';
+          if (saved && (!newId || (saved.importId || '') !== newId)) {
+            this.errorMessage = 'You have saved progress that would be replaced. '
+              + 'Go back and choose Resume or Start over.';
+            this.errorDetails = '';
+            this.showError = true;
+            // So the next press of Scrobble asks about it.
+            await this.exposeSavedStateUnlessStale(
+              'send_refused',
+              !!background.getOwnershipUnresolved() || !!background.queueOwner(),
+            );
+            return;
+          }
+        }
         const snapshot: ProgressSnapshot = {
           scrobbledTracks: 0,
           originalTotalTracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
@@ -3047,9 +3162,9 @@ export default defineComponent({
      * could land *after* the completion's clear and resurrect a finished
      * import as a resumable one.
      */
-    persist(write: () => Promise<void>): Promise<void> {
+    persist<T>(write: () => Promise<T>): Promise<T> {
       const self = this as any;
-      const previous: Promise<void> = self._persistQueue || Promise.resolve();
+      const previous: Promise<unknown> = self._persistQueue || Promise.resolve();
       const next = previous.catch(() => undefined).then(write);
       self._persistQueue = next;
       return next;

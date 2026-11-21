@@ -492,11 +492,13 @@ test.describe('Signing in after choosing', () => {
   test('a signed-out visitor chooses tracks, signs in, and lands ready to send', async ({ page }) => {
     await interceptLastFm(page);
     const scrobbles = await recordScrobbleRequests(page);
-    // Holds the token exchange back, so the moment between landing and being
-    // signed in can be looked at.
+    // Holds the token exchange back until the test has looked at the moment
+    // between landing and being signed in.
+    let releaseExchange!: () => void;
+    const exchangeGate = new Promise<void>((resolve) => { releaseExchange = resolve; });
     await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
       if (new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
-        await new Promise((resolve) => { setTimeout(resolve, 3000); });
+        await exchangeGate;
       }
       await route.fallback();
     });
@@ -512,12 +514,16 @@ test.describe('Signing in after choosing', () => {
     await scrobbleSelection(page);
 
     // The selection waiting to be sent is not "a previous session". Looked at
-    // once the saved state has been read, while the exchange is still held.
+    // once the page has read the saved state and nothing but the hold keeps
+    // the resume prompt off it, while the exchange is still held.
     await expect(page.locator('text=Signing in to Last.fm…')).toBeVisible({ timeout: 10000 });
-    await page.waitForTimeout(1500);
-    // Point-in-time, not retried: the banner would be gone once restored.
-    expect(await page.locator('text=Signing in to Last.fm…').isVisible()).toBe(true);
-    expect(await page.locator('text=Resume previous session').count()).toBe(0);
+    await expect.poll(() => page.evaluate(() => {
+      let inst = (document.querySelector('.auth-handler') as any).__vueParentComponent;
+      while (inst && !(inst.data && 'heldForSignIn' in inst.data)) { inst = inst.parent; }
+      return inst && inst.data.heldForSignIn && inst.data.hasResumableState && !inst.data.authorityPending;
+    }), { timeout: 10000 }).toBe(true);
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    releaseExchange();
 
     await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
     await expect(page).toHaveURL(/\/#\/scrobble$/);
@@ -571,7 +577,177 @@ test.describe('Signing in after choosing', () => {
     const saved = await readSavedState(page);
     expect(saved!.totalTracks).toBe(2);
     expect(saved!.originalTotalTracks).toBe(2);
-    expect(saved!.tracks.map((t: { track: string }) => t.track).sort()).toEqual(['Bravo', 'Delta']);
+    expect(saved!.tracks.map((t: { track: string }) => t.track)).toEqual(['Bravo', 'Delta']);
+  });
+
+  // Plays in a fresh ZIP, all recent so none is re-tagged unless asked.
+  async function uploadPlays(page: Page, names: string[], uts: (i: number) => number) {
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': JSON.stringify(
+        names.map((name, i) => play(name, 'Band', new Date(uts(i) * 1000).toISOString())),
+      ),
+    }));
+  }
+
+  test('when every chosen play is already on Last.fm, nothing is restored and the selection is dropped', async ({ page }) => {
+    const library = await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    const startSec = Math.floor(Date.now() / 1000) - 86400;
+    const names = ['Alpha', 'Bravo'];
+    const uts = (i: number) => startSec + i * 600;
+    names.forEach((track, i) => library.add({
+      track, artist: 'Band', album: '', uts: uts(i),
+    }));
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadPlays(page, names, uts);
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    expect(await chooseAll(page)).toBe(2);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Skipped 2 that are already on Last.fm.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.upload-step')).toBeVisible();
+    await expect(page.locator('text=tracks ready to scrobble')).toBeHidden();
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    expect(await readSavedState(page)).toBeNull();
+  });
+
+  test('re-tagged plays are not checked against the history after sign-in', async ({ page }) => {
+    const library = await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    // Real plays at the very seconds re-tagging is about to give these, which
+    // would match if re-tagged plays were checked.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const names = ['Alpha', 'Bravo', 'Charlie'];
+    names.forEach((track, i) => library.add({
+      track, artist: 'Band', album: '', uts: nowSec - i,
+    }));
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadPlays(page, names, (i) => Date.UTC(2024, 0, i + 1) / 1000);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await expect(page.locator('text=Duplicates will be checked after you sign in.')).toBeVisible({ timeout: 30000 });
+    expect(await chooseAll(page)).toBe(3);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=3 tracks ready to scrobble')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.skipped-duplicates')).toHaveCount(0);
+    expect((await readSavedState(page))!.totalTracks).toBe(3);
+  });
+
+  test('a failed duplicate check after sign-in says so and keeps every play', async ({ page }) => {
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    const startSec = Math.floor(Date.now() / 1000) - 86400;
+    const names = ['Alpha', 'Bravo'];
+    const uts = (i: number) => startSec + i * 600;
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadPlays(page, names, uts);
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    expect(await chooseAll(page)).toBe(2);
+    // Only from here on: the history can't be read once signed in.
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (new URL(route.request().url()).searchParams.get('method') === 'user.getrecenttracks') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 8, message: 'Operation failed' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=An error occurred while checking for duplicates. Proceeding with all tracks.'))
+      .toBeVisible({ timeout: 15000 });
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    expect((await readSavedState(page))!.totalTracks).toBe(2);
+  });
+
+  test('a sign-in that fails offers the held selection as saved progress', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 4, message: 'Unauthorized Token - This token has not been issued' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    await routeLastFmSignIn(page);
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    expect(await chooseAll(page)).toBeGreaterThan(0);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=Your sign-in link was already used or has expired.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Resume previous session')).toBeVisible({ timeout: 10000 });
+  });
+
+  test('a signed-out selection never replaces saved progress it did not ask about', async ({ page }) => {
+    await interceptLastFm(page);
+    const signInRequests: string[] = [];
+    page.on('request', (request) => {
+      if (request.url().startsWith('https://www.last.fm/api/auth')) {
+        signInRequests.push(request.url());
+      }
+    });
+    await routeLastFmSignIn(page);
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    expect(await chooseAll(page)).toBeGreaterThan(0);
+
+    // Another tab saves progress after this one loaded, so this one's
+    // confirmation knows nothing about it.
+    const other = {
+      userName: 'testuser',
+      importId: 'other-tab-import',
+      totalTracks: 5,
+      completedIndices: [0, 1],
+      failedIndices: [],
+      tracks: Array.from({ length: 5 }, (_, i) => ({
+        track: `Track ${i + 1}`, artist: `Artist ${i + 1}`, album: '', timestamp: Date.UTC(2024, 0, i + 1),
+      })),
+      originalTotalTracks: 5,
+      originalSucceededCount: 2,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+    };
+    await seedSavedState(page, other);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=You have saved progress that would be replaced.')).toBeVisible({ timeout: 5000 });
+    expect(await readSavedState(page)).toEqual(other);
+    expect(signInRequests).toEqual([]);
+    await expect(page).toHaveURL(/localhost/);
+
+    // Asked about next time.
+    await page.getByRole('button', { name: 'OK', exact: true }).click();
+    await page.locator('button:has-text("selected tracks")').click();
+    await expect(page.locator('.scrobble-confirm button:has-text("Resume saved progress")')).toBeVisible();
   });
 });
 

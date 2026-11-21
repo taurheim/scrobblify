@@ -133,7 +133,7 @@ Errors arrive two ways: a filterable `scrobblify_error` event (properties:
 | Auth | `auth.init`, `auth.strip_token_url` |
 | Scrobbling | `scrobble.repeatedFailures` |
 | Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load), `scrobblify.onDownloadProgress`, `scrobblify.saveBeforeSignIn` (a signed-out selection couldn't be saved before the Last.fm redirect) |
-| Sign-in | `scrobblify.deferredDuplicates` (the duplicate check deferred to after sign-in failed; the queue is sent unfiltered) |
+| Sign-in | `scrobblify.deferredDuplicates` (the duplicate check deferred to after sign-in failed, and the queue is sent unfiltered; or saving its result failed, and the filtered queue is sent from memory) |
 | Uncaught | `vue.errorHandler`, `window.onerror`, `unhandledrejection` |
 
 Last.fm failures are normalized to `Last.fm API error <code> (HTTP <status>)`
@@ -186,7 +186,11 @@ of "Start scrobbling". It emits `saved_progress_prompt_shown` and
 `saved_total_succeeded`, `saved_original_total_tracks` and `selected_count`.
 Shown minus choices is cancels. Since 2026-11-16; earlier `scrobble_started`
 at `total_succeeded = 0` after higher progress for the same
-`original_total_tracks` is this bug. Importing an *older progress file* over
+`original_total_tracks` is this bug. A signed-out send saves the selection
+*before* its first send (to survive the Last.fm redirect), so it also checks
+the disk: it refuses while sending is withheld, and refuses saved progress the
+dialog didn't ask about (withheld prompt, another tab) with "Go back and choose
+Resume or Start over". Importing an *older progress file* over
 newer saved progress is the next paragraph (#124).
 
 **An imported progress file never silently loses or repeats progress** (#124).

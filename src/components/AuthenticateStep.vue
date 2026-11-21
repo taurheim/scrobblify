@@ -41,6 +41,8 @@ export default defineComponent({
      * a key is stored, the stored key is kept and this still says `true`.
      */
     complete: (payload: { fresh: boolean }) => typeof payload.fresh === 'boolean',
+    /** Exchanging a callback token (or reading the stored session) failed. */
+    failed: () => true,
   },
   data() {
     return {
@@ -68,6 +70,7 @@ export default defineComponent({
     } catch (e) {
       this.$data.checkingAuth = false;
       trackError('auth.init', e);
+      this.$emit('failed');
       // A dead/expired token (already consumed, unauthorized, or expired) isn't a
       // failure the user can fix by retrying the same link — the only recovery is
       // to authorize again for a fresh token. Show a dedicated, non-alarming
