@@ -34,6 +34,13 @@ import { HOME_DISMISSED_KEY } from '@/services/ReturningVisitor';
 
 export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
+  props: {
+    /**
+     * The page shows its own "sign in again" prompt when the exchange fails,
+     * so this shows neither the expired-link prompt nor the error dialog.
+     */
+    quietFailure: { type: Boolean, default: false },
+  },
   emits: {
     /**
      * Signed in. `fresh` says whether this load arrived with a callback
@@ -79,10 +86,13 @@ export default defineComponent({
       // recovery prompt instead of the generic error dialog.
       if (LastFm.isAuthTokenError(e)) {
         trackEvent('auth_token_invalid');
-        this.tokenExpired = true;
+        this.tokenExpired = !this.quietFailure;
         return;
       }
       trackEvent('auth_failed');
+      if (this.quietFailure) {
+        return;
+      }
       this.errorMessage = 'Failed to authenticate with Last.fm. Please try again.';
       this.errorDetails = (e as Error).message || String(e);
       this.showError = true;
@@ -117,6 +127,10 @@ export default defineComponent({
       this.$emit('complete', { fresh: hadToken });
     } else {
       this.$data.checkingAuth = false;
+      if (hadToken) {
+        // Came back from Last.fm without a session: nothing will carry on.
+        this.$emit('failed');
+      }
     }
   },
 });

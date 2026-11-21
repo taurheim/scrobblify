@@ -596,6 +596,8 @@ test.describe('Signing in after choosing', () => {
       return inst && inst.data.heldForSignIn && inst.data.hasResumableState && !inst.data.authorityPending;
     }), { timeout: 10000 }).toBe(true);
     await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    // Not an empty Upload step either: the steps wait for where this is going.
+    await expect(page.locator('.upload-step')).toBeHidden();
     releaseExchange();
 
     await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
@@ -748,10 +750,11 @@ test.describe('Signing in after choosing', () => {
     expect((await readSavedState(page))!.totalTracks).toBe(2);
   });
 
-  test('a sign-in that fails offers the held selection as saved progress', async ({ page }) => {
+  test('a sign-in that fails offers the same trip again, and the retry lands ready to send', async ({ page }) => {
     await interceptLastFm(page);
+    let failExchange = true;
     await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
-      if (new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
+      if (failExchange && new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
@@ -767,11 +770,69 @@ test.describe('Signing in after choosing', () => {
     await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
     await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
     await page.locator('button:has-text("Find tracks")').click();
-    expect(await chooseAll(page)).toBeGreaterThan(0);
+    const selected = await chooseAll(page);
+    expect(selected).toBeGreaterThan(0);
     await scrobbleSelection(page);
 
-    await expect(page.locator('text=Your sign-in link was already used or has expired.')).toBeVisible({ timeout: 10000 });
-    await expect(page.locator('text=Resume previous session')).toBeVisible({ timeout: 10000 });
+    // One prompt, not the expired-link prompt and a resume prompt stacked.
+    await expect(page.locator('text=Sign-in didn\'t work.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Your selection is saved.')).toBeVisible();
+    await expect(page.locator('text=/already used or has expired/i')).toHaveCount(0);
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    await expect(page.locator('.upload-step')).toBeVisible();
+
+    failExchange = false;
+    await page.getByRole('button', { name: 'Sign in again' }).click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(`text=${selected} tracks ready to scrobble`)).toBeVisible();
+  });
+
+  test('a failed sign-in to resume offers to sign in again, then resumes', async ({ page }) => {
+    await interceptLastFm(page);
+    let failExchange = true;
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (failExchange && new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 11, message: 'Service Offline - This service is temporarily offline.' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    await routeLastFmSignIn(page);
+    await page.goto('/#/');
+    await seedSavedState(page, {
+      userName: 'testuser',
+      importId: 'resume-after-failed-sign-in',
+      totalTracks: 3,
+      completedIndices: [0],
+      failedIndices: [],
+      tracks: ['One', 'Two', 'Three'].map((track, i) => ({
+        track, artist: 'Band', album: '', timestamp: Date.UTC(2024, 0, 1) + i * 60000,
+      })),
+      originalTotalTracks: 3,
+      originalSucceededCount: 1,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+    });
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await page.reload();
+    await page.getByRole('button', { name: 'Continue' }).click({ timeout: 10000 });
+
+    await expect(page.locator('text=Sign-in didn\'t work.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Your saved progress is kept.')).toBeVisible();
+    await expect(page.locator('text=Something went wrong')).toHaveCount(0);
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+
+    failExchange = false;
+    await page.getByRole('button', { name: 'Sign in again' }).click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 15000 });
   });
 
   test('a signed-out selection never replaces saved progress it did not ask about', async ({ page }) => {

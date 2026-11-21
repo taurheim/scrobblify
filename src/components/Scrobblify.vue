@@ -13,7 +13,7 @@
     <v-alert
       v-if="banner"
       :type="bannerType"
-      :prominent="banner === 'job' || banner === 'signIn' || banner === 'resume'"
+      :prominent="banner === 'job' || banner === 'signIn' || banner === 'retry' || banner === 'resume'"
       class="mb-4"
     >
       <div v-if="showBackgroundNotice" :class="{ 'mb-3': banner !== 'notice' }">
@@ -144,6 +144,15 @@
         </div>
       </template>
 
+      <template v-else-if="banner === 'retry'">
+        <div><strong>Sign-in didn't work.</strong></div>
+        <div v-if="signInRetryNote === 'selection'" class="mt-1">Your selection is saved.</div>
+        <div v-else-if="signInRetryNote === 'progress'" class="mt-1">Your saved progress is kept.</div>
+        <div class="mt-2">
+          <v-btn color="primary" @click="retrySignIn">Sign in again</v-btn>
+        </div>
+      </template>
+
       <template v-else-if="banner === 'resume'">
         <div>
           <strong>Resume previous session?</strong>
@@ -170,7 +179,20 @@
       so only while that happens or if it fails. Signing in starts from
       wherever it is needed, through `startSignIn`.
     -->
-    <authenticate-step v-on:complete="onAuthenticated" v-on:failed="onAuthFailed"></authenticate-step>
+    <authenticate-step
+      :quiet-failure="settlingSignIn"
+      v-on:complete="onAuthenticated"
+      v-on:failed="onAuthFailed"
+    ></authenticate-step>
+
+    <!-- Signed in, and still on the way to wherever the trip to Last.fm was for. -->
+    <div
+      v-if="settlingSignIn && signedIn && !checkingDuplicates"
+      class="d-flex justify-center align-center mb-4 settling-sign-in"
+    >
+      <v-progress-circular indeterminate color="primary" size="24" class="mr-2" aria-label="Signing in" />
+      Signing in to Last.fm…
+    </div>
 
     <!-- The duplicate check a signed-out user asked for, run after sign-in. -->
     <div v-if="checkingDuplicates" class="d-flex justify-center align-center mb-4 checking-duplicates">
@@ -181,7 +203,7 @@
       Skipped {{ skippedDuplicates }} that are already on Last.fm.
     </v-alert>
 
-    <v-stepper v-model="currentStep">
+    <v-stepper v-show="!settlingSignIn" v-model="currentStep">
       <v-stepper-header>
         <!--
           `value` keeps the old step numbers (2 upload … 5 complete) so
@@ -333,7 +355,9 @@ import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
-import { peekSignInIntent, startSignIn, takeSignInIntent } from '@/services/SignInIntent';
+import {
+  peekSignInIntent, SignInPurpose, startSignIn, takeSignInIntent,
+} from '@/services/SignInIntent';
 import RateLimitTracker from '@/services/RateLimitTracker';
 import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import ErrorDialog from '@/components/ErrorDialog.vue';
@@ -432,6 +456,15 @@ function isUnsentSelection(state: ScrobbleState | null, importId: string): boole
     && !(state.originalSucceededCount > 0)
     && !(state.pendingVerification && state.pendingVerification.length > 0)
     && !state.pendingReTagTimestampSec;
+}
+
+/** This load came back from Last.fm (`token`) to send or resume something. */
+function returningToCarryOn(query: Record<string, unknown>): boolean {
+  if (!query.token) {
+    return false;
+  }
+  const intent = peekSignInIntent(true);
+  return !!intent && (intent.kind === 'send' || intent.kind === 'resume');
 }
 
 interface ProgressSnapshot {
@@ -588,6 +621,19 @@ export default defineComponent({
        * until `continueSignInIntent` has dealt with it.
        */
       heldForSignIn: false,
+      /**
+       * Back from Last.fm to send or resume something: the steps stay hidden
+       * behind one spinner line until `continueSignInIntent` has moved to
+       * where the user is going, rather than flashing an empty Upload step.
+       * Set before the first render, since the token is in the URL by then.
+       */
+      settlingSignIn: returningToCarryOn(this.$route.query),
+      /**
+       * That trip came back without a session: what to sign in for again, and
+       * what the prompt says is safe (`selection`, `progress`, or nothing).
+       */
+      signInRetry: null as SignInPurpose | null,
+      signInRetryNote: '' as '' | 'selection' | 'progress',
       /** This load's token exchange failed (AuthenticateStep's `failed`). */
       signInFailed: false,
       /** The deferred duplicate check is running. */
@@ -945,18 +991,22 @@ export default defineComponent({
      *   job    — a server-side job outranks local progress: offering Resume
      *            beside it would invite sending the tracks it is sending.
      *   signIn — a resume was held back for want of a Last.fm session.
+     *   retry  — a trip to Last.fm to send or resume came back without a
+     *            session; it offers the same trip again. Above `resume`
+     *            because it is about the same saved progress.
      *   resume — saved progress; never while anything might own the queue.
      *   notice — `backgroundNotice` on its own. Below the resume prompt
      *            because a notice that leaves Resume available is a "nothing
      *            happened" report (a handoff that didn't go through), and the
      *            prompt is what the user acts on; it shows as its first line.
      */
-    banner(): 'outage' | 'job' | 'signIn' | 'resume' | 'notice' | null {
+    banner(): 'outage' | 'job' | 'signIn' | 'retry' | 'resume' | 'notice' | null {
       if (this.authorityUnknown) { return 'outage'; }
       if (this.backgroundJob) { return 'job'; }
       if (this.resumeSignInMessage) { return 'signIn'; }
-      if (this.hasResumableState && !this.heldForSignIn && this.currentStep <= 2 && !this.ownershipBlocked
-        && !this.authorityPending) {
+      if (this.signInRetry && this.currentStep <= 2) { return 'retry'; }
+      if (this.hasResumableState && !this.heldForSignIn && !this.settlingSignIn && this.currentStep <= 2
+        && !this.ownershipBlocked && !this.authorityPending) {
         return 'resume';
       }
       if (this.showBackgroundNotice) { return 'notice'; }
@@ -2656,12 +2706,45 @@ export default defineComponent({
         }
       } finally {
         this.heldForSignIn = false;
+        this.settlingSignIn = false;
       }
     },
-    /** The token exchange failed, so nothing will carry the selection on. */
-    onAuthFailed() {
+    /**
+     * The token exchange failed, so nothing will carry the selection on. When
+     * the trip was to send or resume, the page offers the same trip again in
+     * one banner (AuthenticateStep's own prompts are off, `quietFailure`).
+     */
+    async onAuthFailed() {
       this.signInFailed = true;
       this.heldForSignIn = false;
+      if (!this.settlingSignIn) {
+        return;
+      }
+      try {
+        const intent = takeSignInIntent(true);
+        let retry: SignInPurpose = { kind: 'reconnect' };
+        let note: '' | 'selection' | 'progress' = '';
+        if (intent && intent.kind === 'send') {
+          const state = await this.stateManager.loadState().catch(() => null);
+          if (isUnsentSelection(state, intent.importId)) {
+            retry = { kind: 'send', importId: intent.importId, checkDuplicates: intent.checkDuplicates };
+            note = 'selection';
+          }
+        } else if (intent && intent.kind === 'resume') {
+          retry = { kind: 'resume' };
+          note = 'progress';
+        }
+        this.signInRetry = retry;
+        this.signInRetryNote = note;
+      } finally {
+        this.settlingSignIn = false;
+      }
+    },
+    /** The retry banner's button: the same trip to Last.fm again. */
+    retrySignIn() {
+      if (this.signInRetry) {
+        startSignIn(this.$store.state.lfmApi as LastFm, this.signInRetry);
+      }
     },
     /**
      * On the way back from Last.fm with a selection to send: keeps the resume

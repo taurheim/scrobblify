@@ -237,6 +237,10 @@ New strings shipped with sign-in after choosing (PR 3). Placeholder copy; rewrit
 | `signin.dupes.body` | Same, some plays were skipped; shown until the run starts (reuses the ID above; `{skipped}` is the count) | Skipped {skipped} that are already on Last.fm. |
 | `signin.dupes.failed` | Same, the check failed and everything will be sent (error dialog; same text as the upload step's) | An error occurred while checking for duplicates. Proceeding with all tracks. |
 | `signin.banner.nothingSent` | Sign-in banner when this browser has no saved progress (a progress file was refused for want of a session) | Nothing has been scrobbled yet. |
+| `signin.retry.title` | Back from Last.fm to send or resume, and the sign-in failed (expired link or a Last.fm error) | Sign-in didn't work. |
+| `signin.retry.selection` | Same, a selection was waiting to be sent | Your selection is saved. |
+| `signin.retry.progress` | Same, saved progress was being resumed | Your saved progress is kept. |
+| `signin.retry.button` | Same, starts the same sign-in again | Sign in again |
 | `send.replaceRefused` | "Start scrobbling" while signed out, and saved progress the confirmation didn't ask about would be replaced (error dialog) | You have saved progress that would be replaced. Go back and choose Resume or Start over. |
 | `send.saveFailed` | "Start scrobbling" while signed out, and the selection couldn't be saved before going to Last.fm (error dialog) | Couldn't save your selection before signing in. |
 

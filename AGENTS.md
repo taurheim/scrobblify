@@ -458,6 +458,17 @@ completed or pending), and only while the user is still on Upload. While coming
 back, `heldForSignIn` keeps the resume prompt off that selection; a failed
 exchange (`failed`, `signInFailed`) releases it as ordinary saved progress.
 
+A return from Last.fm for a `send` or `resume` intent hides the stepper
+(`settlingSignIn`, set before the first render) behind one "Signing in to
+Last.fm…" line (then "Checking for plays already on Last.fm…" if asked) until
+`continueSignInIntent` has moved on, so an empty Upload step never flashes
+first. If the exchange fails on such a return, `AuthenticateStep` stays quiet
+(`quietFailure`: no expired-link prompt, no error dialog) and the page shows
+one `retry` banner, "Sign-in didn't work." with **Sign in again**, which starts
+the same intent over (a `send` only while its selection is still unsent,
+otherwise `reconnect`). It outranks the resume prompt, which would offer the
+same saved progress. A return with no such intent keeps the old prompts.
+
 A signed-out send saves the selection to IndexedDB as an **ordinary
 `ScrobbleState` with 0 completed** before redirecting (a failed save reports
 `scrobblify.saveBeforeSignIn`, shows "Couldn't save your selection before
