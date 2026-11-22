@@ -9,7 +9,7 @@
  */
 import {
   Sql, JobRow, readControl, countCommittedSlots, unresolvedSeconds,
-  REPEATABLE_HANDOFF_WINDOW_SECONDS, SLOT_AVAILABLE_SQL,
+  REPEATABLE_HANDOFF_WINDOW_SECONDS, SLOT_AVAILABLE_SQL, TERMINAL_HANDOFF_STATES,
 } from './store';
 import {
   BlobStore, uploadChunk, deleteJobBlobs, readChunkFor, CHUNK_TRACKS,
@@ -678,27 +678,43 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       the same id and better numbers, and counting both would let the older,
       emptier handoff row win the ordering.
 
+      So are jobless handoffs that have ended (`failed`, `reaped`): one that
+      never got past Last.fm can never become a job, and chunks are only
+      accepted once the callback has created one, so the worker never had the
+      queue. Counting them blocked a user's saved selection for good after
+      pressing Back on the authorise page (#162).
+
+      A jobless handoff still in flight (`issued`, `exchanging`) does count: it
+      may yet produce a job, which then sends. It answers `pending: true`, so
+      the browser that preflighted it, and only knows it abandoned it, can
+      tell "on its way" from "handed over". Not when a job row carries the id
+      as well: that queue was handed over at some point either way.
+
       Ordering prefers a live row, then the most recent. Re-handing a queue
       back and forth creates one row per attempt, and it is the current one
       that decides whether the browser may send.
     */
+    const ended = TERMINAL_HANDOFF_STATES.map(() => '?').join(', ');
     const row = await env.sql.first<{
       state: string; is_live: number; cursor: number;
-      scrobbled_count: number; total_tracks: number; created_at: number;
+      scrobbled_count: number; total_tracks: number; created_at: number; pending: number;
     }>(
       `SELECT state AS state,
               CASE WHEN live_username IS NULL THEN 0 ELSE 1 END AS is_live,
               cursor AS cursor, scrobbled_count AS scrobbled_count,
-              total_tracks AS total_tracks, created_at AS created_at
+              total_tracks AS total_tracks, created_at AS created_at,
+              0 AS pending
          FROM jobs WHERE import_id = ?
        UNION ALL
        SELECT state,
               CASE WHEN live_username IS NULL THEN 0 ELSE 1 END,
-              0, 0, track_count, created_at
-         FROM handoffs WHERE import_id = ? AND job_id IS NULL
+              0, 0, track_count, created_at,
+              CASE WHEN EXISTS (SELECT 1 FROM jobs WHERE import_id = ?) THEN 0 ELSE 1 END
+         FROM handoffs
+        WHERE import_id = ? AND job_id IS NULL AND state NOT IN (${ended})
        ORDER BY is_live DESC, created_at DESC
        LIMIT 1`,
-      [importId, importId],
+      [importId, importId, importId, ...TERMINAL_HANDOFF_STATES],
     );
     if (!row) {
       return json(env, { ok: true, known: false, live: false });
@@ -711,6 +727,7 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       cursor: Number(row.cursor),
       scrobbledCount: Number(row.scrobbled_count),
       totalTracks: Number(row.total_tracks),
+      ...(Number(row.pending) === 1 ? { pending: true } : {}),
     });
   }
 

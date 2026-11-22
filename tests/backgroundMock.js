@@ -57,6 +57,8 @@ const CORS = {
 
 /** States in which the worker has definitively stopped sending. */
 const TERMINAL = ['completed', 'failed', 'cancelled'];
+/** Handoff states that may still produce a job (`HandoffState` in worker/src/store.ts). */
+const IN_FLIGHT_HANDOFF = ['issued', 'exchanging'];
 /** States waiting on the user, which carry an inactivity deadline. */
 const PARKED = ['paused', 'needs_reauth', 'needs_attention', 'dormant'];
 /** States whose Last.fm key is gone, so only a reconnect can revive them. */
@@ -230,6 +232,9 @@ function createMockWorker(options = {}) {
     rate: options.rate || 40,
     tickSeconds: options.tickSeconds || 20,
     capacityAvailable: options.capacityAvailable !== false,
+    // A reason makes every handoff's authorisation fail with it, as a denial
+    // or a refused callback does (`?handoff=failed&reason=…`).
+    authoriseFail: options.authoriseFail || '',
     handoffs: new Map(),
     imports: new Map(),
     job: null,
@@ -337,6 +342,26 @@ function createMockWorker(options = {}) {
   function handleImport(importId) {
     const rec = world.imports.get(importId);
     if (!rec) {
+      /*
+        The real worker also counts a jobless handoff still on its way
+        (preflighted, not yet authorised) and says it is only `pending`; one
+        that has failed never had the queue (#162). A named one holds the
+        user's `live_username`, so it reads as live.
+      */
+      const inFlight = [...world.handoffs.values()].reverse().find((h) => h.importId === importId
+        && !h.jobId && IN_FLIGHT_HANDOFF.includes(h.state || 'issued'));
+      if (inFlight) {
+        return json({
+          ok: true,
+          known: true,
+          live: !!inFlight.named,
+          state: inFlight.state || 'issued',
+          cursor: 0,
+          scrobbledCount: 0,
+          totalTracks: inFlight.trackCount,
+          pending: true,
+        });
+      }
       return json({
         ok: true, known: false, live: false, cursor: 0, scrobbledCount: 0, totalTracks: 0,
       });
@@ -362,10 +387,21 @@ function createMockWorker(options = {}) {
     if (!named && isLive()) {
       // The real worker only learns who an anonymous handoff belongs to at the
       // callback, so it accepts the preflight and fails the return.
+      const refusedId = `h-${hex(16)}`;
+      world.handoffs.set(refusedId, {
+        state: 'issued',
+        named: false,
+        username: '',
+        trackCount: Number(body.trackCount) || 0,
+        importId: String(body.importId || ''),
+        chunksSeen: new Set(),
+        session: '',
+        jobId: '',
+      });
       return json({
         ok: true,
-        handoffId: `h-${hex(16)}`,
-        authoriseUrl: `${appOrigin}/mock-auth?fail=already_live`,
+        handoffId: refusedId,
+        authoriseUrl: `${appOrigin}/mock-auth?fail=already_live&handoff=${refusedId}`,
       });
     }
     if (isLive()) {
@@ -374,6 +410,8 @@ function createMockWorker(options = {}) {
     const handoffId = `h-${hex(16)}`;
     const session = `s-${hex(24)}`;
     world.handoffs.set(handoffId, {
+      state: 'issued',
+      named: !!named,
       username: named || lastFmUser,
       trackCount: Number(body.trackCount) || 0,
       importId: String(body.importId || ''),
@@ -383,6 +421,14 @@ function createMockWorker(options = {}) {
     });
     if (verbose) {
       console.log(`[worker-mock] preflight: ${body.trackCount} tracks, handoff ${handoffId}`);
+    }
+    if (world.authoriseFail) {
+      // Last.fm (or the callback) refuses this one: see `authorise`.
+      return json({
+        ok: true,
+        handoffId,
+        authoriseUrl: `${appOrigin}/mock-auth?handoff=${handoffId}&fail=${encodeURIComponent(world.authoriseFail)}`,
+      });
     }
     // Points at the shim rather than Last.fm. See the header.
     const adopted = named ? '' : `&user=${encodeURIComponent(lastFmUser)}`;
@@ -400,6 +446,7 @@ function createMockWorker(options = {}) {
     }
     if (!rec.jobId) {
       rec.jobId = `j-${hex(16)}`;
+      rec.state = 'active';
       world.job = {
         id: rec.jobId,
         username: rec.username,
@@ -602,8 +649,22 @@ function createMockWorker(options = {}) {
     return json({ ok: false, reason: 'not_found' }, 404);
   }
 
+  /**
+   * The `/mock-auth` shim page for a URL's query, standing in for Last.fm and
+   * the worker's callback. A `fail` return fails the handoff it names, as the
+   * real callback does, so it no longer counts in `/import/:id`.
+   */
+  function authorise(searchParams) {
+    const fail = searchParams.get('fail') || '';
+    const rec = world.handoffs.get(searchParams.get('handoff') || '');
+    if (fail && rec && !rec.jobId) {
+      rec.state = 'failed';
+    }
+    return shimFromQuery(searchParams);
+  }
+
   return {
-    world, handle, apiOrigin, appOrigin,
+    world, handle, authorise, apiOrigin, appOrigin,
   };
 }
 
@@ -642,7 +703,7 @@ async function interceptBackgroundWorker(page, options = {}) {
     await route.fulfill({
       status: 200,
       contentType: 'text/html; charset=utf-8',
-      body: shimFromQuery(url.searchParams),
+      body: mock.authorise(url.searchParams),
     });
   });
 

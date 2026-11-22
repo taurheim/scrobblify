@@ -320,9 +320,57 @@ async function main() {
     )).json();
     check('an in-flight handoff with no job yet is known and live',
       pending.known === true && pending.live === true, pending);
+    check('and says it is only on its way', pending.pending === true, pending);
 
     check('the id is the credential, so it says nothing about who owns it',
       pending.username === undefined && pending.jobId === undefined, Object.keys(pending));
+
+    /*
+      A handoff that ended without a job (Back on Last.fm's page, a denial, a
+      failed exchange, the reaper) never had the queue. Counting it blocked
+      the user's saved selection for good (#162).
+    */
+    for (const state of ['failed', 'reaped']) {
+      const id = `ended-${state}-import-0123456789`;
+      // eslint-disable-next-line no-await-in-loop
+      await sql.run(
+        `INSERT INTO handoffs (id, state, username, live_username, payload_digest,
+            track_count, chunk_count, declared_bytes, algorithm_version, import_id,
+            created_at, updated_at, expires_at)
+         VALUES (?, ?, 'other', NULL, 'd', 5000, 1, 10, ?, ?, ?, ?, ?)`,
+        [`h-${state}`, state, ALGORITHM_VERSION, id, NOW, NOW, NOW + 3600],
+      );
+      // eslint-disable-next-line no-await-in-loop
+      const ended: any = await (await handleRequest(env, req(`/scrobblify/import/${id}`))).json();
+      check(`a ${state} handoff that never got a job is not known`,
+        ended.known === false && ended.live === false, ended);
+    }
+
+    // Once a handoff has a job, the job answers: handed over, not pending.
+    const WITH_JOB = 'with-job-import-0123456789';
+    const handedJob = await seedJob(sql, blobs, 'third', { importId: WITH_JOB, total: 900 });
+    await sql.run(
+      `INSERT INTO handoffs (id, state, username, live_username, payload_digest,
+          track_count, chunk_count, declared_bytes, algorithm_version, import_id, job_id,
+          created_at, updated_at, expires_at)
+       VALUES ('h-job', 'active', 'third', NULL, 'd', 900, 1, 10, ?, ?, ?, ?, ?, ?)`,
+      [ALGORITHM_VERSION, WITH_JOB, handedJob, NOW, NOW, NOW + 3600],
+    );
+    const withJob: any = await (await handleRequest(env, req(`/scrobblify/import/${WITH_JOB}`))).json();
+    check('a handoff with a job is known', withJob.known === true, withJob);
+    check('and not pending', withJob.pending === undefined, withJob);
+
+    // A new attempt in flight for a queue a job already had is handed over too.
+    await sql.run(
+      `INSERT INTO handoffs (id, state, username, live_username, payload_digest,
+          track_count, chunk_count, declared_bytes, algorithm_version, import_id,
+          created_at, updated_at, expires_at)
+       VALUES ('h-again', 'issued', 'fourth', 'fourth', 'd', 900, 1, 10, ?, ?, ?, ?, ?)`,
+      [ALGORITHM_VERSION, WITH_JOB, NOW + 1, NOW + 1, NOW + 3600],
+    );
+    const reissued: any = await (await handleRequest(env, req(`/scrobblify/import/${WITH_JOB}`))).json();
+    check('an in-flight attempt for a queue a job had is not pending',
+      reissued.known === true && reissued.pending === undefined, reissued);
   }
 
   console.log('\n-- preflight --');

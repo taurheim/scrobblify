@@ -5,7 +5,7 @@ import path from 'path';
 import JSZip from 'jszip';
 import { interceptLastFm, mockLastFmAuth, routeLastFmSignIn } from '../lastfmMock';
 import {
-  interceptBackgroundWorker, MockWorker, MAX_TRACKS, shimHtml,
+  interceptBackgroundWorker, MockWorker, MAX_TRACKS,
 } from '../backgroundMock';
 
 /*
@@ -1260,6 +1260,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     await expect(page.locator('text=A handover')).toHaveCount(0);
     await expect(page.locator('text=on hold')).toHaveCount(0);
     await expect(page.locator('text=refresh your connection')).toHaveCount(0);
+    await expect(page.getByText(/handed over/)).toHaveCount(0);
     expect(await page.evaluate((key) => localStorage.getItem(key), OWNER_KEY)).toBeNull();
   }
 
@@ -1293,31 +1294,60 @@ test.describe('Choosing the server in the confirm dialog', () => {
     expect(scrobbles).toEqual([]);
   });
 
-  test('going back from Last.fm without approving keeps the selection, after a refresh too', async ({ page, baseURL }) => {
-    const { scrobbles } = await openWithWorker(page, baseURL);
-    // Last.fm's page, where the user changes their mind. Registered after the
-    // mock: later routes win.
-    await page.route(`${new URL(baseURL || 'http://localhost:8471').origin}/mock-auth*`, (route: Route) => route.fulfill({
-      status: 200,
-      contentType: 'text/html; charset=utf-8',
-      body: '<!doctype html><title>Last.fm</title><h1>Allow access?</h1>',
-    }));
-    const dialog = await chooseRecentPlays(page, 800);
-    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
-    await expect(page.locator('h1:has-text("Allow access?")')).toBeVisible({ timeout: 15000 });
+  /*
+    Nobody approved it, so the worker still counts the handoff as on its way
+    (`pending`) until it is reaped an hour later, as the mock does too (#162).
+    Signed in, the page load then also asks about the queue by its user.
+  */
+  for (const signedIn of [false, true]) {
+    test(`going back from Last.fm without approving keeps the selection, after a refresh too (${signedIn ? 'signed in' : 'signed out'})`, async ({ page, baseURL }) => {
+      const { scrobbles, preflights, mock } = await openWithWorker(page, baseURL, { signedIn });
+      // Last.fm's page, where the user changes their mind. Registered after the
+      // mock: later routes win.
+      await page.route(`${new URL(baseURL || 'http://localhost:8471').origin}/mock-auth*`, (route: Route) => route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: '<!doctype html><title>Last.fm</title><h1>Allow access?</h1>',
+      }));
+      const dialog = await chooseRecentPlays(page, 800);
+      await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+      await expect(page.locator('h1:has-text("Allow access?")')).toBeVisible({ timeout: 15000 });
+      expect(preflights).toHaveLength(1);
+      const importId = String(preflights[0].importId || '');
+      const lookup = JSON.parse(mock.handle('GET', `/scrobblify/import/${importId}`, new URLSearchParams(), '').body);
+      expect(lookup).toMatchObject({ known: true, pending: true });
 
-    await page.goBack();
-    await expectSelectionOffered(page);
-    await page.reload();
-    await expectSelectionOffered(page);
-    // The abandoned handoff can't come back into this browser.
-    expect(await page.evaluate((key) => localStorage.getItem(key), PREFLIGHTED_KEY)).toBeNull();
-    expect(scrobbles).toEqual([]);
-  });
+      await page.goBack();
+      await expectSelectionOffered(page);
+      await page.reload();
+      await expectSelectionOffered(page);
+      // The abandoned handoff can't come back into this browser.
+      expect(await page.evaluate((key) => localStorage.getItem(key), PREFLIGHTED_KEY)).toBeNull();
+      if (!signedIn) {
+        // Signing in afterwards asks about the queue too, and gets the same answer.
+        await mockLastFmAuth(page);
+        await page.reload();
+        await expectSelectionOffered(page);
+      }
+      expect(scrobbles).toEqual([]);
+    });
+  }
 
   test('a page restored from the back-forward cache asks about the queue, not a session', async ({ page, baseURL }) => {
-    await openWithWorker(page, baseURL, {
-      saved: { ...SAVED, importId: 'f1f2f3f4f5f6f7f8f9f0e1e2e3e4e5e6' },
+    const importId = 'f1f2f3f4f5f6f7f8f9f0e1e2e3e4e5e6';
+    const { mock } = await openWithWorker(page, baseURL, {
+      saved: { ...SAVED, importId },
+    });
+    // Still waiting at the worker for an approval that never came.
+    mock.world.handoffs.set('h-mine', {
+      state: 'issued',
+      named: false,
+      username: '',
+      trackCount: 5,
+      importId,
+      chunksSeen: new Set(),
+      session: '',
+      jobId: '',
     });
     await expect(page.locator(RESUME_PROMPT)).toBeVisible({ timeout: 10000 });
     // The page as it was when it left for Last.fm: frozen for the handoff it
@@ -1339,26 +1369,33 @@ test.describe('Choosing the server in the confirm dialog', () => {
     expect(await page.evaluate((key) => localStorage.getItem(key), PREFLIGHTED_KEY)).toBeNull();
     await page.reload();
     await expectSelectionOffered(page);
-  });
-
-  test('a handover Last.fm refuses leaves nothing frozen and the selection on offer (#160)', async ({ page, baseURL }) => {
-    const { scrobbles } = await openWithWorker(page, baseURL);
-    await page.route(`${new URL(baseURL || 'http://localhost:8471').origin}/mock-auth*`, (route: Route) => route.fulfill({
-      status: 200,
-      contentType: 'text/html; charset=utf-8',
-      body: shimHtml('', '', '', 'denied'),
-    }));
-    const dialog = await chooseRecentPlays(page, 800);
-    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
-
-    await expect(page.locator('text=Last.fm didn\'t complete the handoff')).toBeVisible({ timeout: 15000 });
-    await expectSelectionOffered(page);
-    // The return's URL is stripped down to the bare path, which is Home.
-    await page.goto('/#/scrobble');
+    // Signed in, the load asks about the queue by its user as well.
+    await mockLastFmAuth(page);
     await page.reload();
     await expectSelectionOffered(page);
-    expect(scrobbles).toEqual([]);
   });
+
+  for (const signedIn of [false, true]) {
+    test(`a handover Last.fm refuses leaves nothing frozen and the selection on offer (#160, ${signedIn ? 'signed in' : 'signed out'})`, async ({ page, baseURL }) => {
+      const { scrobbles, preflights, mock } = await openWithWorker(page, baseURL, {
+        signedIn, worker: { authoriseFail: 'denied' },
+      });
+      const dialog = await chooseRecentPlays(page, 800);
+      await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+
+      await expect(page.locator('text=Last.fm didn\'t complete the handoff')).toBeVisible({ timeout: 15000 });
+      await expectSelectionOffered(page);
+      // The failed handoff never had the queue.
+      const importId = String(preflights[0].importId || '');
+      const lookup = JSON.parse(mock.handle('GET', `/scrobblify/import/${importId}`, new URLSearchParams(), '').body);
+      expect(lookup.known).toBe(false);
+      // The return's URL is stripped down to the bare path, which is Home.
+      await page.goto('/#/scrobble');
+      await page.reload();
+      await expectSelectionOffered(page);
+      expect(scrobbles).toEqual([]);
+    });
+  }
 
   /*
     The real worker names the account that authorised in the return fragment.

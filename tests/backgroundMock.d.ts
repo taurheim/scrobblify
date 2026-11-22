@@ -11,12 +11,15 @@ export interface MockWorkerOptions {
   capacityAvailable?: boolean;
   rate?: number;
   tickSeconds?: number;
+  /** Every handoff's authorisation fails with this reason. */
+  authoriseFail?: string;
 }
 
 export interface MockWorld {
   rate: number;
   tickSeconds: number;
   capacityAvailable: boolean;
+  authoriseFail: string;
   handoffs: Map<string, Record<string, unknown>>;
   imports: Map<string, Record<string, unknown>>;
   job: Record<string, unknown> | null;
@@ -32,6 +35,8 @@ export interface MockWorkerResponse {
 export interface MockWorker {
   world: MockWorld;
   handle(method: string, path: string, query: URLSearchParams, bodyText: string): MockWorkerResponse;
+  /** The `/mock-auth` shim page; a `fail` fails the handoff it names. */
+  authorise(searchParams: URLSearchParams): string;
   apiOrigin: string;
   appOrigin: string;
 }

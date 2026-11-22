@@ -1068,21 +1068,42 @@ handover is starting in another tab…", then "…on hold", for good):
   handoff this browser preflighted, and forgets that preflight (#160).
 - Back from Last.fm without approving (a reload, or a bfcache restore), with no
   worker session: `ownHandoffWasTaken` asks `/scrobblify/import/:id` about the
-  saved queue. `known: false` releases the freeze the same way and offers the
-  saved selection again; `known: true` blocks as a handed-over queue, with the
-  worker sign-in; no answer changes nothing. Only for the browser's own
-  preflighted freeze, and before the 3-minute freshness rule, since the tab
-  that set it is the one that came back. Forgetting the preflight is what makes
-  this safe: approving that handoff later gets a return this browser refuses,
-  so the queue is never uploaded.
+  saved queue. `known: false`, or `known: true, pending: true` (the worker
+  still holds this very handoff, unapproved, until it reaps it an hour later),
+  releases the freeze the same way and offers the saved selection again; any
+  other `known: true` blocks as a handed-over queue, with the worker sign-in;
+  no answer changes nothing. Only for the browser's own preflighted freeze,
+  and before the 3-minute freshness rule, since the tab that set it is the
+  one that came back. Forgetting the preflight is what makes this safe:
+  approving that handoff later gets a return this browser refuses, so the
+  queue is never uploaded.
 - A handover from the confirm dialog that fails before leaving (full,
   preflight failed, …) offers the saved selection again, so the next Scrobble
   asks Resume / Start over instead of refusing to replace "saved progress"
   that is the same selection with a fresh import id (#102's check).
 
-The real worker's `/import/:id` also counts handoff rows that never produced a
-job, so in production a never-authorised handoff still answers `known: true`
-and blocks the queue (#162); the mock does not model those rows.
+**`/import/:id` counts a handoff only while it can still become a job**
+(#162). Jobless handoffs that ended (`failed`, `reaped`: Back or a denial on
+Last.fm, a failed exchange, the reaper) are left out, since chunks are only
+accepted once the callback has made a job. A jobless one still in flight
+(`issued`, `exchanging`) answers `known: true` with `pending: true` (not when a
+job row carries the id too). `importStatus` exposes it, and every check but one
+treats it like any other `known: true` (a handover may be on its way from
+another tab or device): Home's welcome-back card (`detectReturning`, which only
+reads `live` and `state`), the page-load authority check and the progress-file
+check (both through `queueWasHandedOver`). The exception is the queue whose own
+pending handoff this browser abandoned: releasing that freeze records the
+import id (`scrobblify.background.abandonedImport`, cleared by the next
+preflight), and `queueWasHandedOver` waives `pending` answers for it, so
+signing in to Last.fm after coming back doesn't block the selection anyway.
+Before this fix, every never-approved handoff blocked its queue for good. The
+mock worker records handoffs at preflight (`pending`), fails them on a shim
+`fail` return (`authoriseFail` option, and the anonymous `already_live`
+refusal) and gives them a job at finalize. It does not model `/job/live`
+counting a *named* unapproved handoff as live (it holds `live_username` until
+reaped), which still blocks a signed-in browser for up to an hour (#164).
+Approving the abandoned handoff later anyway still leaves a job row that makes
+the queue `known` for good (#165).
 
 ### The job card refreshes itself
 

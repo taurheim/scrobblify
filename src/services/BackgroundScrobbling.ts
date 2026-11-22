@@ -32,6 +32,11 @@ const HANDOFF_STORAGE_KEY = 'scrobblify.background.handoff';
  */
 const PREFLIGHTED_STORAGE_KEY = 'scrobblify.background.preflighted';
 /**
+ * The import whose handoff this browser abandoned (Back from Last.fm) while the
+ * worker still counted that handoff as on its way: see `recordAbandonedImport`.
+ */
+const ABANDONED_IMPORT_STORAGE_KEY = 'scrobblify.background.abandonedImport';
+/**
  * Set when we know a handoff happened but not whether the server took
  * ownership. Kept out of `clearSession` on purpose: losing the session token
  * makes the uncertainty worse, not better.
@@ -1436,6 +1441,48 @@ export function preflightedHandoff(): string | null {
 }
 
 /**
+ * Records that the handoff this browser abandoned for `importId` was, when
+ * last asked, still on its way at the worker (`pending`: preflighted, never
+ * authorised), so later `pending` answers about that queue are about it.
+ *
+ * Its preflight is forgotten with its freeze, so this browser refuses its
+ * return and it can never upload. Until the worker reaps it (an hour), it
+ * still answers `known: true, pending: true`, which every other check reads
+ * as handed over: without this, signing in to Last.fm after coming back
+ * blocked the saved selection anyway (#162). A new preflight forgets it.
+ */
+export function recordAbandonedImport(importId: string): void {
+  if (!importId) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(ABANDONED_IMPORT_STORAGE_KEY, importId);
+  } catch {
+    // Unrecorded: the next check blocks until the worker reaps the handoff.
+  }
+}
+
+/** Whether `importId` is the queue whose own pending handoff this browser abandoned. */
+export function isAbandonedImport(importId: string): boolean {
+  if (!importId) {
+    return false;
+  }
+  try {
+    return window.localStorage.getItem(ABANDONED_IMPORT_STORAGE_KEY) === importId;
+  } catch {
+    return false;
+  }
+}
+
+function forgetAbandonedImport(): void {
+  try {
+    window.localStorage.removeItem(ABANDONED_IMPORT_STORAGE_KEY);
+  } catch {
+    // A leftover record only ever waives `pending` answers about that queue.
+  }
+}
+
+/**
  * Lifts the freeze this browser set for the handoff it last preflighted, once
  * that handoff is known never to start: the worker refused it at its callback
  * (any `?handoff=failed`), or the user came back without approving it and the
@@ -1451,9 +1498,12 @@ export function preflightedHandoff(): string | null {
  * `expected`: only if the freeze is still exactly this one, and still names
  * the preflight on record; a newer attempt's freeze and preflight are left be.
  *
+ * `pendingImportId`: the queue the worker still answered `pending` about for
+ * this handoff, recorded once it is released (`recordAbandonedImport`).
+ *
  * Returns whether a freeze was lifted.
  */
-export function releaseAbandonedHandoff(expected?: QueueOwner): boolean {
+export function releaseAbandonedHandoff(expected?: QueueOwner, pendingImportId = ''): boolean {
   let preflighted: string | null = null;
   try {
     preflighted = window.localStorage.getItem(PREFLIGHTED_STORAGE_KEY);
@@ -1468,7 +1518,11 @@ export function releaseAbandonedHandoff(expected?: QueueOwner): boolean {
   if (!preflighted || !owner || owner.owner !== 'freezing' || owner.id !== preflighted) {
     return false;
   }
-  return releaseQueueOwnerIfSame(owner);
+  if (!releaseQueueOwnerIfSame(owner)) {
+    return false;
+  }
+  recordAbandonedImport(pendingImportId);
+  return true;
 }
 
 /** Whether `owner` is the freeze for the handoff this browser preflighted. */
@@ -2197,6 +2251,12 @@ export async function liveJobForUsername(
 export interface ImportStatus {
   known: boolean;
   live: boolean;
+  /**
+   * Known only through a handoff still on its way (preflighted, not yet
+   * authorised): no job has had the queue. Everyone but the browser that
+   * abandoned that handoff treats it as handed over.
+   */
+  pending: boolean;
   state?: string;
   /** Contiguous terminal prefix the worker reached. Safe to skip; nothing else is. */
   cursor: number;
@@ -2246,6 +2306,7 @@ export async function importStatus(
     return {
       known: body.known,
       live: body.live === true,
+      pending: body.known === true && body.pending === true,
       state: typeof body.state === 'string' ? body.state : undefined,
       cursor: Number(body.cursor) || 0,
       scrobbledCount: Number(body.scrobbledCount) || 0,
@@ -2475,6 +2536,8 @@ export async function preflight(
       trackError('background.recordPreflight', e);
       return null;
     }
+    // A new attempt is on its way, and its own answers are not to be waived.
+    forgetAbandonedImport();
     return { handoffId: body.handoffId, authoriseUrl: body.authoriseUrl };
   } catch (e) {
     trackError('background.preflight', e);

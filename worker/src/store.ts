@@ -97,8 +97,11 @@ export type HandoffState =
   | 'failed'
   | 'reaped';
 
+/** `active` has handed its queue to a job; `failed` and `reaped` never will. */
+export const TERMINAL_HANDOFF_STATES: readonly HandoffState[] = ['active', 'failed', 'reaped'];
+
 export function isTerminalHandoffState(state: HandoffState): boolean {
-  return state === 'active' || state === 'failed' || state === 'reaped';
+  return TERMINAL_HANDOFF_STATES.includes(state);
 }
 
 export interface JobRow {

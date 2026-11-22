@@ -1409,13 +1409,25 @@ export default defineComponent({
       if (!status) {
         return null;
       }
+      return this.handedOverByStatus(importId, status);
+    },
+
+    /**
+     * `queueWasHandedOver`'s decision on an answer.
+     *
+     * A `pending` answer (a handoff on its way, no job yet) blocks like any
+     * other `known`: another tab or device may be about to hand this queue
+     * over. Except for the queue whose own pending handoff this browser
+     * abandoned (`recordAbandonedImport`), which can never upload.
+     */
+    handedOverByStatus(importId: string, status: background.ImportStatus): boolean {
       /*
         `known` is the whole answer, and `live` is deliberately ignored here.
         The dangerous case is precisely a handover that is *no longer* live:
         the tracks were sent, the marker is gone, and only this record
         remembers it happened.
       */
-      if (!status.known) {
+      if (!status.known || (status.pending && background.isAbandonedImport(importId))) {
         return false;
       }
       this.handedOverProgress = status.totalTracks
@@ -1668,14 +1680,14 @@ export default defineComponent({
           `ownHandoffWasTaken`. Before the freshness check, because the tab
           that set it is this one, back from Last.fm, not a sibling mid-attempt.
         */
-        const taken = await this.ownHandoffWasTaken(owner);
-        if (taken === false && background.releaseAbandonedHandoff(owner)) {
+        const own = await this.ownHandoffWasTaken(owner);
+        if (own.taken === false && background.releaseAbandonedHandoff(owner, own.pendingImportId)) {
           this.ownershipBlocked = false;
           await this.exposeSavedStateUnlessStale('handoff_not_taken');
           trackEvent('background_freeze_released', { reason: 'handoff_not_taken' });
           return;
         }
-        if (taken === true) {
+        if (own.taken === true) {
           await this.blockForHandedOverQueue();
           return;
         }
@@ -1745,14 +1757,24 @@ export default defineComponent({
      * import id was minted before the preflight and only reaches a job at the
      * callback, so "not known" means it never did. A late approval can't
      * change that once the freeze is released: the preflight record goes with
-     * it, so its return is refused.
+     * it, so its return is refused (though the job it makes still marks the
+     * queue known, #165).
      *
-     * null when unanswered, or when the freeze isn't this browser's own
-     * preflighted handoff, which only its tab may settle.
+     * Known only as `pending` (a handoff on its way, no job) is this handoff,
+     * still waiting at the worker for an approval that will now be refused,
+     * so it is not taken either. `pendingImportId` then names the queue, for
+     * `releaseAbandonedHandoff` to record, so later checks of it don't read
+     * the same answer as handed over (#162).
+     *
+     * `taken` is null when unanswered, or when the freeze isn't this browser's
+     * own preflighted handoff, which only its tab may settle.
      */
-    async ownHandoffWasTaken(owner: background.QueueOwner | null): Promise<boolean | null> {
+    async ownHandoffWasTaken(
+      owner: background.QueueOwner | null,
+    ): Promise<{ taken: boolean | null; pendingImportId: string }> {
+      const unsettled = { taken: null, pendingImportId: '' };
       if (!background.isOwnHandoffFreeze(owner) || background.getSession()) {
-        return null;
+        return unsettled;
       }
       let importId = '';
       try {
@@ -1764,9 +1786,16 @@ export default defineComponent({
       if (!importId) {
         // The handoff saved an identified queue before preflighting, so
         // without one this isn't the queue the freeze is about.
-        return null;
+        return unsettled;
       }
-      return this.queueWasHandedOver(importId);
+      const status = await background.importStatus(importId);
+      if (!status) {
+        return unsettled;
+      }
+      if (status.pending) {
+        return { taken: false, pendingImportId: importId };
+      }
+      return { taken: this.handedOverByStatus(importId, status), pendingImportId: '' };
     },
 
     /**
@@ -2092,13 +2121,16 @@ export default defineComponent({
       // Captured before the round-trip, like every release below that follows one.
       const observed = background.queueOwner();
       let owned: boolean | null;
+      let pendingImportId = '';
       if (marker) {
         owned = await background.resolveOwnershipMarker(marker);
       } else if (pendingId) {
         owned = await background.isHandoffActive(pendingId);
       } else if (!background.getSession()) {
         // Nothing to ask about the job with; the queue can still be asked about.
-        owned = await this.ownHandoffWasTaken(observed);
+        const own = await this.ownHandoffWasTaken(observed);
+        owned = own.taken;
+        pendingImportId = own.pendingImportId;
       } else {
         owned = await background.hasLiveJob();
       }
@@ -2147,7 +2179,8 @@ export default defineComponent({
       // Scoped: this tab's own freeze, or a `server` record we have just
       // disproved. A freeze another tab is actively holding stays. With no
       // pending handoff, this tab's freeze names the one it preflighted.
-      const releasedOwn = !pendingId && !!observed && background.releaseAbandonedHandoff(observed);
+      const releasedOwn = !pendingId && !!observed
+        && background.releaseAbandonedHandoff(observed, pendingImportId);
       if (!releasedOwn) {
         background.releaseQueueOwnerIfUnclaimed(pendingId || '');
       }
