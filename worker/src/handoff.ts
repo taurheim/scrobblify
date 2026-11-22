@@ -47,10 +47,7 @@ const MAX_EXCHANGE_ATTEMPTS = 3;
  */
 export const ALGORITHM_VERSION = 1;
 
-/**
- * 60-day credential TTL. A job still running when it passes parks in
- * `needs_reauth` until the user signs in again.
- */
+/** 60-day credential TTL; admission control refuses jobs that cannot finish. */
 export const CREDENTIAL_TTL_SECONDS = 60 * 86400;
 
 export interface HandoffRow {
@@ -105,21 +102,18 @@ export type PreflightResult =
 export const TRACKS_PER_DAY = importBudget(0);
 
 /**
- * The largest import one job accepts: the most plays whose upload fits
- * `MAX_JOB_COMPRESSED_BYTES` with 10% headroom, worst case.
+ * The largest import one job accepts: what finishes inside the credential's
+ * 60-day life.
  *
- * Measured 2026-11-21 by test/jobsize.test.ts: 89,000 plays, every one distinct
- * (seeded random 24/40/40-character artist/track/album, all re-tagged), gzip to
- * 7,152,650 bytes in the client's chunk format, about 80 KB per 1,000. Real
- * histories repeat plays and compress far better.
- *
- * It used to be `TRACKS_PER_DAY * 60`, refusing anything that could not finish
- * inside the credential's 60-day life. That turned away imports the storage
- * could hold; a job that outlives its credential now parks in `needs_reauth`
- * and the client warns, before the handover, that the user will have to sign
- * in again.
+ * The blob store would hold more. test/jobsize.test.ts measures the worst-case
+ * upload (every play distinct) at about 80 KB per 1,000 plays, so 89,000 fit
+ * `MAX_JOB_COMPRESSED_BYTES` with 10% headroom. The limit stays here because
+ * other costs grow with job size and are not bounded yet: a take-back's export
+ * exceeds Workers Free's 50 D1 queries past ~21,000 tracks left (#158), and
+ * settled batch rows fill the main database (#159). Raise it once both are
+ * fixed; the client already warns about imports longer than 60 days.
  */
-export const MAX_TRACKS_PER_JOB = 89_000;
+export const MAX_TRACKS_PER_JOB = TRACKS_PER_DAY * 60;
 
 /**
  * Step 0: commit what we expect *before* redirecting.

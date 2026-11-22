@@ -167,7 +167,7 @@ async function main() {
   check('a second tab is refused', !dup.ok && (dup as any).reason === 'already_live', dup);
 
   const huge = await preflight(sql, req('bob', MAX_TRACKS_PER_JOB + 1), SIGNING_KEY, CALLBACK, NOW);
-  check('admission control rejects jobs over the storage bound',
+  check('admission control rejects unfinishable jobs',
     !huge.ok && (huge as any).reason === 'too_large', huge);
   const empty = await preflight(sql, req('bob', 0), SIGNING_KEY, CALLBACK, NOW);
   check('rejects an empty job', !empty.ok);

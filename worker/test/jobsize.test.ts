@@ -1,8 +1,8 @@
 /**
- * `MAX_TRACKS_PER_JOB` is the largest import whose upload fits
- * `MAX_JOB_COMPRESSED_BYTES`, measured worst case: every play distinct, so gzip
- * finds no repeats to exploit. Real histories are mostly repeat plays and
- * compress far better.
+ * `MAX_TRACKS_PER_JOB`'s upload must fit `MAX_JOB_COMPRESSED_BYTES`, measured
+ * worst case: every play distinct, so gzip finds no repeats to exploit. Real
+ * histories are mostly repeat plays and compress far better. (The limit is set
+ * lower than this would allow; see its comment.)
  *
  * Plays are encoded exactly as the client's `encodeChunk`
  * (src/services/BackgroundScrobbling.ts) and chunked by `CHUNK_TRACKS`. Each

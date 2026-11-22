@@ -42,9 +42,9 @@ const CHUNK_TRACKS = 1000;
 // "Should finish within a day" — the status card would contradict the offer
 // dialog the user had just read.
 const WORKER_TRACKS_PER_DAY = 700;
-// `MAX_TRACKS_PER_JOB` in worker/src/handoff.ts: the largest worst-case upload
-// that fits the worker's per-job storage cap.
-const MAX_TRACKS = 89000;
+// `MAX_TRACKS_PER_JOB` in worker/src/handoff.ts (700 a day for 60 days). A test
+// can raise it with the `maxTracks` option.
+const MAX_TRACKS = 42000;
 
 const CORS = {
   // Safe as a wildcard: the session travels in an Authorization header, not a
@@ -329,7 +329,7 @@ function createMockWorker(options = {}) {
       used: isLive() ? 1 : 0,
       capacity: 50,
       minTracks: MIN_TRACKS,
-      maxTracks: MAX_TRACKS,
+      maxTracks: options.maxTracks || MAX_TRACKS,
       chunkTracks: CHUNK_TRACKS,
     });
   }
