@@ -1400,6 +1400,38 @@ export function freezeAttemptIsFresh(record: QueueOwner, nowMs = Date.now()): bo
 }
 
 /**
+ * How long the worker waits for a handoff to be approved: its state token
+ * expires and the reaper fails it after this. Mirrors `HANDOFF_TTL_SECONDS` in
+ * `worker/src/handoff.ts`; keep the two equal.
+ */
+export const HANDOFF_TTL_SECONDS = 60 * 60;
+
+/**
+ * Added to the TTL: clock skew between browser and worker, and the reaper's
+ * five-minute tick. The attempt is minted before the preflight, so it is
+ * never younger than the handoff it names.
+ */
+const HANDOFF_EXPIRY_MARGIN_MS = 5 * 60 * 1000;
+
+/**
+ * Whether a `freezing` record's handoff can no longer be approved: its attempt
+ * is older than the worker's handoff TTL, plus a margin. Any tab may then
+ * settle it by its queue, since a sibling still at Last.fm can't approve it
+ * any more (#168). No usable timestamp, or one from the future, reads as not
+ * expired.
+ */
+export function freezeHandoffHasExpired(record: QueueOwner, nowMs = Date.now()): boolean {
+  if (!record.attempt) {
+    return false;
+  }
+  const mintedAt = Number(record.attempt.split('.')[0]);
+  if (!Number.isFinite(mintedAt)) {
+    return false;
+  }
+  return nowMs - mintedAt >= HANDOFF_TTL_SECONDS * 1000 + HANDOFF_EXPIRY_MARGIN_MS;
+}
+
+/**
  * Clears ownership only if it is still exactly the record the caller examined.
  *
  * Every release here follows an `await` on a network round-trip, and the

@@ -1718,7 +1718,8 @@ export default defineComponent({
           about by its queue: see `ownHandoffWasTaken`. Before the freshness
           check, because the tab that set it is this one, not a sibling
           mid-attempt. In any other tab it is a sibling's, maybe still at
-          Last.fm, and the rules below apply.
+          Last.fm, and the rules below apply, until it is too old to be
+          approved and is asked about by its queue as well (#168).
         */
         const own = await this.ownHandoffWasTaken(owner);
         const settled = own.taken === false
@@ -1764,7 +1765,17 @@ export default defineComponent({
         if (active === true) {
           background.setQueueOwner({ owner: 'server', id: owner.id });
         }
-        this.backgroundNotice = 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until we can tell whether it took effect. Please refresh in a few minutes.';
+        /*
+          A sibling's handoff this browser has no session to ask about is only
+          settled once it expires (`ownHandoffWasTaken`), so refreshing sooner
+          changes nothing unless that tab finishes.
+        */
+        const waitsForExpiry = active === null && !background.getSession()
+          && background.isOwnHandoffFreeze(owner) && !background.isThisTabsHandoffFreeze(owner)
+          && !background.freezeHandoffHasExpired(owner);
+        this.backgroundNotice = waitsForExpiry
+          ? 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until it does. If that tab was closed, the handover expires within the hour: refresh then.'
+          : 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until we can tell whether it took effect. Please refresh in a few minutes.';
         return;
       }
 
@@ -1812,13 +1823,23 @@ export default defineComponent({
      *
      * `taken` is null when unanswered, or when the freeze isn't this tab's
      * own preflighted handoff (`isThisTabsHandoffFreeze`), which only this
-     * tab may settle.
+     * tab may settle while it can still be approved.
+     *
+     * Another tab's (closed at Last.fm, say) is settled too once it can't be
+     * approved any more (`freezeHandoffHasExpired`), or its freeze would hold
+     * every later tab for good (#168). Only a queue the worker doesn't know
+     * releases it then: a jobless `pending` this late is a handoff not yet
+     * reaped, so it is still waited on, and `releaseOwnHandoff` withdraws
+     * nothing for it.
      */
     async ownHandoffWasTaken(
       owner: background.QueueOwner | null,
     ): Promise<{ taken: boolean | null; pendingImportId: string }> {
       const unsettled = { taken: null, pendingImportId: '' };
-      if (!background.isThisTabsHandoffFreeze(owner) || background.getSession()) {
+      const thisTabs = background.isThisTabsHandoffFreeze(owner);
+      const expired = !thisTabs && background.isOwnHandoffFreeze(owner)
+        && background.freezeHandoffHasExpired(owner as background.QueueOwner);
+      if ((!thisTabs && !expired) || background.getSession()) {
         return unsettled;
       }
       let importId = '';
@@ -1838,7 +1859,7 @@ export default defineComponent({
         return unsettled;
       }
       if (status.pending) {
-        return { taken: false, pendingImportId: importId };
+        return thisTabs ? { taken: false, pendingImportId: importId } : unsettled;
       }
       return { taken: this.handedOverByStatus(importId, status), pendingImportId: '' };
     },
@@ -1853,11 +1874,18 @@ export default defineComponent({
      * while the user was away), and the freeze lifts, or it would never lift;
      * still on its way (approved, say, its return coming) or unanswered, it
      * stays (`in_flight`).
+     *
+     * Another tab's expired handoff is only released: it can't be approved
+     * any more, so there is nothing to withdraw, and the queue check has just
+     * said it never got a job.
      */
     async releaseOwnHandoff(
       owner: background.QueueOwner,
       pendingImportId: string,
     ): Promise<'released' | 'not_released' | 'taken' | 'in_flight'> {
+      if (!background.isThisTabsHandoffFreeze(owner)) {
+        return background.releaseAbandonedHandoff(owner) ? 'released' : 'not_released';
+      }
       const released = await background.abandonOwnHandoff(owner, pendingImportId);
       if (released !== null) {
         return released ? 'released' : 'not_released';

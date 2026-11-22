@@ -1476,6 +1476,38 @@ test.describe('Choosing the server in the confirm dialog', () => {
   }
 
   /*
+    Another tab of the same browser, served by the same mock worker. Counts
+    the handoff withdrawals it sends.
+  */
+  async function openOtherTab(page: Page, mock: MockWorker) {
+    const other = await page.context().newPage();
+    const opened = { other, withdrawals: 0 };
+    await interceptLastFm(other);
+    await other.route('http://background.invalid/**', async (route: Route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname.endsWith('/abandon')) {
+        opened.withdrawals += 1;
+      }
+      await route.fulfill(mock.handle(
+        route.request().method(),
+        url.pathname.replace(/\/+$/, ''),
+        url.searchParams,
+        route.request().postData() || '',
+      ));
+    });
+    return opened;
+  }
+
+  // Backdates the freeze's attempt token, as if the handover began `ageMs` ago.
+  async function ageFreeze(page: Page, ageMs: number) {
+    await page.evaluate(([ownerKey, age]) => {
+      const owner = JSON.parse(localStorage.getItem(ownerKey as string) || 'null');
+      owner.attempt = `${Date.now() - (age as number)}.aged`;
+      localStorage.setItem(ownerKey as string, JSON.stringify(owner));
+    }, [OWNER_KEY, ageMs]);
+  }
+
+  /*
     The preflight record is in localStorage, so every tab sees the freeze as
     this browser's own handoff. Only the tab that left for Last.fm may settle
     it by its queue; another tab loading meanwhile abandoned the handoff, and
@@ -1485,17 +1517,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     const { mock, scrobbles } = await openWithWorker(page, baseURL);
     const { handoffId, handoff, approve } = await waitAtLastFm(page, baseURL, mock);
 
-    const other = await page.context().newPage();
-    await interceptLastFm(other);
-    await other.route('http://background.invalid/**', async (route: Route) => {
-      const url = new URL(route.request().url());
-      await route.fulfill(mock.handle(
-        route.request().method(),
-        url.pathname.replace(/\/+$/, ''),
-        url.searchParams,
-        route.request().postData() || '',
-      ));
-    });
+    const { other } = await openOtherTab(page, mock);
     await other.goto('/#/scrobble');
     await expect(other.locator('text=A handover is starting in another tab')).toBeVisible({ timeout: 15000 });
     await expect(other.locator(RESUME_PROMPT)).toHaveCount(0);
@@ -1509,6 +1531,51 @@ test.describe('Choosing the server in the confirm dialog', () => {
     await approve();
     await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
     expect(mock.world.job).toMatchObject({ importId: handoff.importId });
+    expect(scrobbles).toEqual([]);
+  });
+
+  /*
+    The tab that left for Last.fm was closed there. Once the handoff can no
+    longer be approved (the worker's hour, plus a margin), any tab settles the
+    freeze by its queue; before that every later tab was on hold for good
+    (#168). Nothing is withdrawn: there is nothing left to approve.
+  */
+  test('another tab releases a handover that expired at Last.fm', async ({ page, baseURL }) => {
+    const { mock } = await openWithWorker(page, baseURL);
+    const { handoff } = await waitAtLastFm(page, baseURL, mock);
+    await ageFreeze(page, 66 * 60 * 1000);
+    await page.close();
+    handoff.state = 'failed';
+    handoff.failureReason = 'reaped';
+
+    const opened = await openOtherTab(page, mock);
+    await opened.other.goto('/#/scrobble');
+    await expectSelectionOffered(opened.other);
+    expect((await handoffRecords(opened.other)).preflighted).toBeNull();
+    expect(opened.withdrawals).toBe(0);
+  });
+
+  test('another tab still waits on a handover at Last.fm that can still be approved', async ({ page, baseURL }) => {
+    const { mock, scrobbles } = await openWithWorker(page, baseURL);
+    const { handoffId, handoff, approve } = await waitAtLastFm(page, baseURL, mock);
+    // Past the 3-minute freshness rule, well inside the worker's hour.
+    await ageFreeze(page, 20 * 60 * 1000);
+
+    const opened = await openOtherTab(page, mock);
+    await opened.other.goto('/#/scrobble');
+    await expect(opened.other.locator('text=If that tab was closed, the handover expires within the hour'))
+      .toBeVisible({ timeout: 15000 });
+    await expect(opened.other.locator(RESUME_PROMPT)).toHaveCount(0);
+    expect(opened.withdrawals).toBe(0);
+    expect(handoff.state).toBe('issued');
+    expect(await handoffRecords(opened.other)).toMatchObject({
+      owner: { owner: 'freezing', id: handoffId },
+      preflighted: handoffId,
+    });
+    await opened.other.close();
+
+    await approve();
+    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
     expect(scrobbles).toEqual([]);
   });
 

@@ -259,6 +259,7 @@ copy; rewrite in place.
 | --- | --- | --- |
 | `notice.alreadyLive` | Back from a handover chosen signed out, and the Last.fm account that approved it already has an import on the server | You already have an import running on Scrobblify. |
 | `notice.alreadyLive.button` | Same; signs in to the server to show that import | Sign in to see it |
+| `notice.otherTabHandover.expiring` | `/scrobble`, another tab of this browser left for Last.fm to hand over more than 3 minutes ago and hasn't come back (no server sign-in to ask with); replaces "…Please refresh in a few minutes." until the handover is an hour old | A handover started in another tab and didn't finish, so scrobbling here is on hold until it does. If that tab was closed, the handover expires within the hour: refresh then. |
 | `choice.cancel` | Server choice in the "Scrobble N tracks?" dialog, closes it | Cancel |
 | `confirm.laterBackground` | "Scrobble N tracks?" without the choice, re-dated plays left for later days, and the rest would fit the server | You don't have to wait for it: choose "Scrobble the rest for me" when it stops, and Scrobblify's server will send them for you, even with this tab closed. |
 | `confirm.todayBackground` | Same dialog, more than today's share selected, and the rest would fit the server | You can then choose "Scrobble the rest for me" and Scrobblify's server will send the rest for you, even with this tab closed. |

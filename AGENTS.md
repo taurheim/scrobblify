@@ -1241,7 +1241,8 @@ handover is starting in another tab…", then "…on hold", for good):
   same-tab round trip and Back), and before the 3-minute freshness rule, since
   that tab is the one that came back. The localStorage record is every tab's,
   so without that a tab loading while another waited at Last.fm abandoned its
-  handoff, and the approval then failed; other tabs get the freshness rules.
+  handoff, and the approval then failed; other tabs get the freshness rules
+  until it expires (next bullet).
   Released only when the withdrawal is confirmed (`abandoned: true`) or
   unanswered: `abandoned: false` means the handoff got past waiting (approved
   since the queue was asked, say), so both records stay and the queue is asked
@@ -1249,6 +1250,17 @@ handover is starting in another tab…", then "…on hold", for good):
   reaped while away) releases, still on its way holds. Forgetting the preflight is what makes this safe even if the
   withdrawal goes unanswered: approving that handoff later gets a return this
   browser refuses, so the queue is never uploaded.
+- Another tab's freeze (its tab closed at Last.fm, say) is settled by the
+  queue too once it can't be approved any more (#168): its attempt token is
+  older than the worker's handoff TTL plus 5 minutes (`freezeHandoffHasExpired`;
+  the client's `HANDOFF_TTL_SECONDS` mirrors the worker's). Then `known: false`
+  releases (`background_freeze_released` `reason: handoff_not_taken`), a job
+  blocks, and `pending` (not yet reaped) or no answer keeps "…on hold… Please
+  refresh in a few minutes." Nothing is withdrawn from such a tab. Before the
+  hour is up, a tab that can't ask (no worker session) says the handover
+  "expires within the hour: refresh then", since an earlier refresh changes
+  nothing unless the other tab finishes. Before this, those tabs stayed on hold
+  for good.
 - A handover from the confirm dialog that fails before leaving (full,
   preflight failed, a halt or freeze failing: `startBackgroundHandoff`
   resolves false) offers the saved selection again, so the next Scrobble
