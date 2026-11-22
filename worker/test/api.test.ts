@@ -371,6 +371,40 @@ async function main() {
     check('malformed JSON is a 400, not a 500', badBody.status === 400);
   }
 
+  console.log('\n-- preflight without a username --');
+  {
+    const sql = freshSql();
+    const env = makeEnv(sql, new MemoryBlobs(), {
+      getSession: async () => ({ sessionKey: 'sk', username: 'Listener Name' }),
+    });
+    const send = (extra: Record<string, unknown>) => handleRequest(env, req('/scrobblify/handoff/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000, ...extra,
+      }),
+    }));
+    const res = await send({});
+    const body: any = await res.json();
+    check('a preflight with no username is accepted', res.status === 200 && body.ok === true, body);
+    check('so is a blank one', (await send({ username: '' })).status === 200);
+    check('a username that is not a string is a 400', (await send({ username: 42 })).status === 400);
+
+    const state = new URL(new URL(body.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+    const cb = await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    );
+    const location = new URL(cb.headers.get('Location')!);
+    check('the callback succeeds', cb.status === 302
+      && location.searchParams.get('handoff') === 'ok', location.toString());
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    check('and tells the browser who signed in',
+      fragment.get('user') === 'Listener Name', location.hash);
+    check('with a session for that user',
+      (await handleRequest(env, req(`/scrobblify/handoff/${body.handoffId}`, {
+        token: fragment.get('session')!,
+      }))).status === 200);
+  }
+
   console.log('\n-- the import id survives preflight --');
   {
     const sql = freshSql();

@@ -202,6 +202,7 @@ async function main() {
     db3, lastfm as any, { state: p3.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
   );
   check('exchange succeeds', cb.ok);
+  check('the result names the Last.fm user', (cb as any).username === 'Alice', cb);
   check('case difference in username is tolerated', cb.ok);
   const job = await db3.first<any>('SELECT * FROM jobs WHERE id = ?', [(cb as any).jobId]);
   check('job created in pending, not active', job.state === 'pending');
@@ -340,6 +341,110 @@ async function main() {
   const survivor = await db8.first<any>('SELECT * FROM jobs WHERE id = ?', [cb8.jobId]);
   check('a late reaper cannot kill an active job', survivor.state === 'active', survivor.state);
   check('a late reaper cannot destroy a live credential', survivor.session_key_ct !== null);
+
+  console.log('\n-- a handoff without a username --');
+  {
+    /*
+      The handover is chosen before the browser has signed in to Last.fm, so
+      it may have no username to commit to. The slot is reserved all the same,
+      and the account is whichever one Last.fm says authorised.
+    */
+    const anon = freshDb();
+    const a1 = await preflight(anon, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    check('an anonymous preflight succeeds', a1.ok, a1);
+    const row = await anon.first<any>('SELECT * FROM handoffs WHERE id = ?', [a1.handoffId]);
+    check('its row has no username yet', row.username === '', row.username);
+    check('and holds no account lock', row.live_username === null, row.live_username);
+    const a2 = await preflight(anon, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    check('a second anonymous preflight is not refused as already live', a2.ok, a2);
+
+    const full = freshDb();
+    await full.run('UPDATE control SET max_concurrent_jobs = 1 WHERE id = 1');
+    await preflight(full, req('alice'), SIGNING_KEY, CALLBACK, NOW);
+    const refused = await preflight(full, req(''), SIGNING_KEY, CALLBACK, NOW);
+    check('an anonymous preflight still respects capacity',
+      !refused.ok && (refused as any).reason === 'at_capacity', refused);
+
+    const adopt = freshDb();
+    const p = await preflight(adopt, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    const cbAnon = await handleCallback(
+      adopt, new FakeLastFm('Alice') as any,
+      { state: p.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    ) as any;
+    check('the callback succeeds', cbAnon.ok, cbAnon);
+    check('and reports Last.fm\'s spelling of the user', cbAnon.username === 'Alice', cbAnon);
+    const adopted = await adopt.first<any>('SELECT * FROM handoffs WHERE id = ?', [p.handoffId]);
+    check('the handoff adopts the Last.fm user',
+      adopted.username === 'alice' && adopted.live_username === 'alice', adopted);
+    const adoptedJob = await adopt.first<any>('SELECT * FROM jobs WHERE id = ?', [cbAnon.jobId]);
+    check('and so does its job',
+      adoptedJob.username === 'alice' && adoptedJob.live_username === 'alice', adoptedJob);
+    const replayAnon = await handleCallback(
+      adopt, new FakeLastFm('Alice') as any,
+      { state: p.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    ) as any;
+    check('a replay reports the adopted user',
+      replayAnon.ok && replayAnon.alreadyDone && replayAnon.username === 'alice', replayAnon);
+
+    // The per-user check could not run at preflight, so it runs here.
+    const busy = freshDb();
+    const live = await preflight(busy, req('alice', 10), SIGNING_KEY, CALLBACK, NOW) as any;
+    const liveCb = await handleCallback(
+      busy, new FakeLastFm('alice') as any,
+      { state: live.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    ) as any;
+    const pb = await preflight(busy, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    const second = await handleCallback(
+      busy, new FakeLastFm('ALICE') as any,
+      { state: pb.state, token: 'tok2' }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check('a user who already has a job is refused',
+      !second.ok && (second as any).reason === 'already_live', second);
+    const failedRow = await busy.first<any>('SELECT * FROM handoffs WHERE id = ?', [pb.handoffId]);
+    check('that handoff is failed',
+      failedRow.state === 'failed' && failedRow.failure_reason === 'already_live', failedRow);
+    check('and holds no lock', failedRow.live_username === null && failedRow.job_id === null, failedRow);
+    const jobs = await busy.all<any>('SELECT id FROM jobs');
+    check('no second job is created', jobs.length === 1 && jobs[0].id === liveCb.jobId, jobs);
+    const keys = await busy.all<any>('SELECT id FROM jobs WHERE session_key_ct IS NOT NULL');
+    check('and no second credential is stored', keys.length === 1, keys);
+
+    // A sign-in re-attaching a parked job between the check and the adoption.
+    const raceDb = new DatabaseSync(':memory:');
+    raceDb.exec(schemaSql());
+    const racing = new NodeSql(raceDb);
+    const pr = await preflight(racing, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    const origRun = racing.run.bind(racing);
+    racing.run = async (query: string, params: unknown[] = []) => {
+      if (query.includes('SET username = ?, live_username = ?')) {
+        raceDb.prepare(
+          `INSERT INTO jobs (id, username, live_username, state, algorithm_version, total_tracks,
+              created_at, updated_at, credential_expires_at)
+           VALUES ('reattached', 'alice', 'alice', 'paused', 1, 10, ?, ?, ?)`,
+        ).run(NOW, NOW, NOW + 86400);
+      }
+      return origRun(query, params);
+    };
+    const raced = await handleCallback(
+      racing, new FakeLastFm('alice') as any,
+      { state: pr.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check('a job that takes the account mid-adoption still refuses the handoff',
+      !raced.ok && (raced as any).reason === 'already_live', raced);
+    const racedRow = await racing.first<any>('SELECT * FROM handoffs WHERE id = ?', [pr.handoffId]);
+    check('and the handoff is not left mid-flight',
+      racedRow.state === 'failed' && racedRow.live_username === null, racedRow);
+
+    // A named handoff keeps its own check.
+    const named = freshDb();
+    const pn = await preflight(named, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
+    const wrong = await handleCallback(
+      named, new FakeLastFm('mallory') as any,
+      { state: pn.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check('a named handoff still refuses another account',
+      !wrong.ok && (wrong as any).reason === 'username_mismatch', wrong);
+  }
 
   console.log('\n-- misc --');
   check('sha256 is stable', (await sha256Hex(new TextEncoder().encode('abc')))

@@ -385,7 +385,8 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
   // ---- step 0: preflight, before the redirect ----
   if (path === '/scrobblify/handoff/preflight' && request.method === 'POST') {
     const body = await readJson(request);
-    if (!body || typeof body.username !== 'string' || typeof body.payloadDigest !== 'string') {
+    if (!body || (body.username !== undefined && typeof body.username !== 'string')
+      || typeof body.payloadDigest !== 'string') {
       return json(env, { ok: false, reason: 'bad_request' }, 400);
     }
     if (Number(body.trackCount) < MIN_TRACKS_FOR_BACKGROUND) {
@@ -394,7 +395,9 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     const result = await preflight(
       env.sql,
       {
-        username: body.username,
+        // Absent when the handover was chosen before signing in to Last.fm;
+        // the callback then adopts the account that authorised.
+        username: typeof body.username === 'string' ? body.username : '',
         payloadDigest: body.payloadDigest,
         trackCount: Number(body.trackCount),
         chunkCount: Number(body.chunkCount),
@@ -526,8 +529,9 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
 
     // The session is issued for the username on the handoff row, which
     // `handleCallback` has already checked against what `auth.getSession`
-    // returned. Trusting anything else here would hand one account a session
-    // for another's job.
+    // returned (or, for a handoff preflighted without one, adopted from it).
+    // Trusting anything else here would hand one account a session for
+    // another's job.
     const row = await env.sql.first<HandoffRow>(
       'SELECT * FROM handoffs WHERE id = ?', [result.handoffId],
     );
@@ -544,7 +548,8 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     const session = await issueSession(row.username, env.signingKey, nowSec);
     target.searchParams.set('handoff', 'ok');
     target.searchParams.set('job', result.jobId);
-    target.hash = `session=${encodeURIComponent(session)}&handoff=${encodeURIComponent(result.handoffId)}`;
+    target.hash = `session=${encodeURIComponent(session)}&handoff=${encodeURIComponent(result.handoffId)}`
+      + `&user=${encodeURIComponent(result.username)}`;
     return Response.redirect(target.toString(), 302);
   }
 

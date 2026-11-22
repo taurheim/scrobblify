@@ -748,16 +748,24 @@ export async function reserveSlot(
   ttlSeconds: number,
   maxConcurrent: number,
 ): Promise<{ ok: true } | { ok: false; reason: 'at_capacity' | 'already_live' }> {
-  const live = await sql.first<{ n: number }>(
-    'SELECT COUNT(*) AS n FROM handoffs WHERE live_username = ?',
-    [handoff.username],
-  );
-  const liveJob = await sql.first<{ n: number }>(
-    'SELECT COUNT(*) AS n FROM jobs WHERE live_username = ?',
-    [handoff.username],
-  );
-  if ((live && Number(live.n) > 0) || (liveJob && Number(liveJob.n) > 0)) {
-    return { ok: false, reason: 'already_live' };
+  /*
+    A handoff chosen before the browser signed in has no username to lock.
+    Its per-user check happens at the callback, once Last.fm says who it is,
+    and until then it holds a capacity slot but no account.
+  */
+  const anonymous = handoff.username === '';
+  if (!anonymous) {
+    const live = await sql.first<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM handoffs WHERE live_username = ?',
+      [handoff.username],
+    );
+    const liveJob = await sql.first<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM jobs WHERE live_username = ?',
+      [handoff.username],
+    );
+    if ((live && Number(live.n) > 0) || (liveJob && Number(liveJob.n) > 0)) {
+      return { ok: false, reason: 'already_live' };
+    }
   }
 
   const used = await countCommittedSlots(sql);
@@ -775,7 +783,7 @@ export async function reserveSlot(
       [
         handoff.id,
         handoff.username,
-        handoff.username,
+        anonymous ? null : handoff.username,
         handoff.payloadDigest,
         handoff.trackCount,
         handoff.chunkCount,
