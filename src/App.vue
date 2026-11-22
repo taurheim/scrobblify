@@ -19,6 +19,19 @@
       <router-link to="/about">About</router-link>
     </div>
     <v-alert
+      v-if="betaTag"
+      id="beta-banner"
+      type="info"
+      variant="tonal"
+      density="compact"
+      class="mx-auto mb-4 flex-0-0"
+      max-width="720"
+    >
+      You're trying the scrobblify beta. Something not working, or have a suggestion?
+      Email <a href="mailto:niko@savas.ca">niko@savas.ca</a>.
+      <a :href="betaOffHref">Switch it off</a>
+    </v-alert>
+    <v-alert
       v-if="showUpdateBanner"
       id="update-available"
       type="info"
@@ -201,6 +214,27 @@ export default defineComponent({
     },
     showUpdateBanner(): boolean {
       return this.buildCheck === 'stale' && !this.$store.state.scrobbleRunActive;
+    },
+
+    /**
+     * An opt-out link for the current page.
+     *
+     * Built from `location` rather than the router because the parameter lives
+     * in the real query string in both routing modes — outside production the
+     * router runs in hash mode, where `$route` owns only what follows the `#`.
+     */
+    betaOffHref(): string {
+      // `location` isn't reactive; reading the route recomputes this after in-app navigation.
+      if (!this.$route) {
+        return '?beta=0';
+      }
+      try {
+        const params = new URLSearchParams(window.location.search);
+        params.set('beta', '0');
+        return `${window.location.pathname}?${params.toString()}${window.location.hash}`;
+      } catch (e) {
+        return '?beta=0';
+      }
     },
   },
   created() {

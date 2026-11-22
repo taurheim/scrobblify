@@ -11,7 +11,7 @@
     <home-returning
       v-else-if="returning.kind !== 'none' && !dismissedReturning"
       :state="returning"
-      @continue="openScrobble"
+      @continue="continueSaved"
       @start-over="openScrobble"
       @upload="openScrobble"
       @not-you="notYou"
@@ -90,6 +90,7 @@ import {
   detectReturning, HOME_DISMISSED_KEY, ReturningState, sameUser,
 } from '@/services/ReturningVisitor';
 import { resetUser, trackEvent } from '@/services/Analytics';
+import { setSignInIntent, startSignIn } from '@/services/SignInIntent';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
 
@@ -133,7 +134,7 @@ export default defineComponent({
     async refreshReturning() {
       const api = this.$store.state.lfmApi as LastFm;
       try {
-        // Only /scrobble's sign-in step runs init(), so a visit that starts
+        // Only /scrobble's sign-in handler runs init(), so a visit that starts
         // here has to read the stored user itself.
         api.loadStoredUser();
         this.returning = await detectReturning(api, this.stateManager);
@@ -155,14 +156,32 @@ export default defineComponent({
     },
     go(choice: HomeChoice) {
       trackEvent('home_choice', { choice });
+      const api = this.$store.state.lfmApi as LastFm;
+      // "Re-connect to last.fm" signs in first; /scrobble's job or resume
+      // banner takes it from there.
+      if (choice === 'resume' && !api.isAuthenticated()) {
+        startSignIn(api, { kind: 'reconnect' });
+        return;
+      }
       this.$router.push('/scrobble');
     },
     showGetExport() {
       trackEvent('home_choice', { choice: 'get_export' });
       this.gettingExport = true;
     },
-    // Until sign-in moves after choosing (Plan 3), /scrobble's own sign-in
-    // step and resume banner take it from here.
+    // Resumes the saved progress either way: not signed in as its owner, sign
+    // in first; signed in, an in-app intent that /scrobble's sign-in handler
+    // picks up on mount, so there's no second "Resume" click.
+    continueSaved() {
+      const r = this.returning;
+      if (r.kind === 'saved' && !r.signedIn) {
+        startSignIn(this.$store.state.lfmApi as LastFm, { kind: 'resume' });
+        return;
+      }
+      setSignInIntent({ kind: 'resume' });
+      this.openScrobble();
+    },
+    // /scrobble's resume banner, or its upload step, takes it from here.
     openScrobble() {
       this.$router.push('/scrobble');
     },

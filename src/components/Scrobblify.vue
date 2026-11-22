@@ -1,6 +1,6 @@
 <template>
   <div class="scrobblify">
-    <div v-if="currentStep > 1">
+    <div v-if="signedIn">
       Currently authenticated as: {{ this.$store.state.lfmApi.userName }}.
       <a role="button" tabindex="0" @click="clearToken" @keydown.enter="clearToken">Not you?</a>
     </div>
@@ -13,7 +13,7 @@
     <v-alert
       v-if="banner"
       :type="bannerType"
-      :prominent="banner === 'job' || banner === 'signIn' || banner === 'resume'"
+      :prominent="banner === 'job' || banner === 'signIn' || banner === 'retry' || banner === 'resume'"
       class="mb-4"
     >
       <div v-if="showBackgroundNotice" :class="{ 'mb-3': banner !== 'notice' }">
@@ -135,9 +135,21 @@
       -->
       <template v-else-if="banner === 'signIn'">
         <div><strong>{{ resumeSignInMessage }}</strong></div>
-        <div class="mt-1">Your saved progress is kept, and nothing has been scrobbled yet.</div>
+        <div v-if="hasResumableState" class="mt-1">
+          Your saved progress is kept, and nothing has been scrobbled yet.
+        </div>
+        <div v-else class="mt-1">Nothing has been scrobbled yet.</div>
         <div class="mt-2">
-          <v-btn color="primary" :href="authorizeUrl">Sign in to Last.fm</v-btn>
+          <v-btn color="primary" @click="signInToResume">Sign in to Last.fm</v-btn>
+        </div>
+      </template>
+
+      <template v-else-if="banner === 'retry'">
+        <div><strong>Sign-in didn't work.</strong></div>
+        <div v-if="signInRetryNote === 'selection'" class="mt-1">Your selection is saved.</div>
+        <div v-else-if="signInRetryNote === 'progress'" class="mt-1">Your saved progress is kept.</div>
+        <div class="mt-2">
+          <v-btn color="primary" @click="retrySignIn">Sign in again</v-btn>
         </div>
       </template>
 
@@ -162,23 +174,55 @@
       </template>
     </v-alert>
 
-    <v-stepper v-model="currentStep">
+    <!--
+      Not a step: it exchanges a `?token=` coming back from Last.fm, and says
+      so only while that happens or if it fails. Signing in starts from
+      wherever it is needed, through `startSignIn`.
+    -->
+    <authenticate-step
+      :quiet-failure="settlingSignIn"
+      v-on:complete="onAuthenticated"
+      v-on:failed="onAuthFailed"
+    ></authenticate-step>
+
+    <!-- Signed in, and still on the way to wherever the trip to Last.fm was for. -->
+    <div
+      v-if="settlingSignIn && signedIn && !checkingDuplicates"
+      class="d-flex justify-center align-center mb-4 settling-sign-in"
+    >
+      <v-progress-circular indeterminate color="primary" size="24" class="mr-2" aria-label="Signing in" />
+      Signing in to Last.fm…
+    </div>
+
+    <!-- The duplicate check a signed-out user asked for, run after sign-in. -->
+    <div v-if="checkingDuplicates" class="d-flex justify-center align-center mb-4 checking-duplicates">
+      <v-progress-circular indeterminate color="primary" size="24" class="mr-2" aria-label="Checking for duplicates" />
+      Checking for plays already on Last.fm…
+    </div>
+    <v-alert v-if="skippedDuplicates > 0" type="info" class="mb-4 skipped-duplicates">
+      Skipped {{ skippedDuplicates }} that are already on Last.fm.
+    </v-alert>
+
+    <v-stepper v-show="!settlingSignIn" v-model="currentStep">
       <v-stepper-header>
-        <v-stepper-item
-          color="primary" :complete="currentStep > 1" :value="1" title="Authenticate with last.fm"
-        />
-        <v-divider></v-divider>
-        <v-stepper-item
-          color="primary" :complete="currentStep > 2" :value="2" title="Upload your spotify play history"
-        />
-        <v-divider></v-divider>
-        <v-stepper-item
-          color="primary" :complete="currentStep > 3" :value="3" title="Choose which tracks to scrobble"
-        />
-        <v-divider></v-divider>
-        <v-stepper-item color="primary" :complete="currentStep > 4" :value="4" title="Scrobble!" />
-        <v-divider></v-divider>
-        <v-stepper-item color="primary" :value="5" title="Complete" />
+        <!--
+          `value` keeps the old step numbers (2 upload … 5 complete) so
+          `step_viewed` stays comparable; the badge counts from 1 on screen.
+        -->
+        <template v-for="(item, i) in stepperItems" :key="item.value">
+          <v-divider v-if="i > 0"></v-divider>
+          <v-stepper-item
+            color="primary"
+            :complete="item.value < 5 && currentStep > item.value"
+            :value="item.value"
+            :title="item.title"
+          >
+            <template #icon="{ hasCompleted }">
+              <v-icon v-if="hasCompleted" icon="$complete"></v-icon>
+              <template v-else>{{ i + 1 }}</template>
+            </template>
+          </v-stepper-item>
+        </template>
       </v-stepper-header>
       <!--
         Every step is `eager` so all of them mount up front, as they did under
@@ -186,9 +230,6 @@
         expect to already be listening when an earlier step finishes.
       -->
       <v-stepper-window>
-        <v-stepper-window-item :value="1" eager>
-          <authenticate-step v-on:complete="onAuthenticated"></authenticate-step>
-        </v-stepper-window-item>
         <v-stepper-window-item :value="2" eager>
           <upload-step
             :background-track-limit="backgroundTrackLimit"
@@ -314,6 +355,9 @@ import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
+import {
+  peekSignInIntent, SignInPurpose, startSignIn, takeSignInIntent,
+} from '@/services/SignInIntent';
 import RateLimitTracker from '@/services/RateLimitTracker';
 import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import ErrorDialog from '@/components/ErrorDialog.vue';
@@ -394,6 +438,35 @@ const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sig
  */
 const NEEDS_WORKER_NOTICES = [SESSION_EXPIRED_NOTICE, REAUTH_UNREACHABLE_NOTICE];
 
+/** The stepper's steps. Signing in isn't one, so they start at 2. */
+const STEPPER_ITEMS = [
+  { value: 2, title: 'Upload your spotify play history' },
+  { value: 3, title: 'Choose which tracks to scrobble' },
+  { value: 4, title: 'Scrobble!' },
+  { value: 5, title: 'Complete' },
+];
+
+/**
+ * Whether `state` is the selection saved before signing in, untouched since:
+ * import `importId`, nothing sent. An empty id identifies nothing.
+ */
+function isUnsentSelection(state: ScrobbleState | null, importId: string): boolean {
+  return !!state && !!importId && (state.importId || '') === importId
+    && state.completedIndices.length === 0
+    && !(state.originalSucceededCount > 0)
+    && !(state.pendingVerification && state.pendingVerification.length > 0)
+    && !state.pendingReTagTimestampSec;
+}
+
+/** This load came back from Last.fm (`token`) to send or resume something. */
+function returningToCarryOn(query: Record<string, unknown>): boolean {
+  if (!query.token) {
+    return false;
+  }
+  const intent = peekSignInIntent(true);
+  return !!intent && (intent.kind === 'send' || intent.kind === 'resume');
+}
+
 interface ProgressSnapshot {
   scrobbledTracks: number;
   originalTotalTracks: number;
@@ -422,7 +495,16 @@ export default defineComponent({
   },
   data() {
     return {
-      currentStep: 1,
+      // Step numbers start at 2 (upload): signing in is no longer a step, and
+      // keeping the old numbers keeps `step_viewed` comparable.
+      currentStep: 2,
+      /**
+       * Whether the header shows who is signed in. A flag, because the store's
+       * `LastFm` isn't reactive: set when the sign-in handler confirms a
+       * session, cleared by "Not you?". Stays set when a run's rejected key is
+       * cleared (`clearSessionKey()`); that stop shows its own sign-in link.
+       */
+      signedIn: false,
       hasResumableState: false,
       // What the saved progress amounts to, for the select step to warn with
       // before a fresh run replaces it. Follows `hasResumableState`.
@@ -450,6 +532,8 @@ export default defineComponent({
       pendingSnapshot: null as ProgressSnapshot | null,
       /** State to hand off, when the offer came from a resume rather than a live queue. */
       pendingState: null as ScrobbleState | null,
+      /** `entry_point` of the open offer, for its decline and opt-in events. */
+      pendingEntryPoint: 'resume',
       /** Retained so the listener can be removed again. Not reactive state. */
       onPageShow: null as ((event: PageTransitionEvent) => void) | null,
       /** Teardown for the cross-tab ownership subscription. Not reactive. */
@@ -524,6 +608,38 @@ export default defineComponent({
        */
       reauthFixNow: false,
       resumeSignInMessage: '',
+      /**
+       * What the sign-in banner's button signs in for. Only a refused resume of
+       * this browser's saved progress should resume it afterwards; a refused
+       * progress file must not, or the button would resume a *different*
+       * import the user may just have declined (#153).
+       */
+      resumeSignInIntent: 'resume' as 'resume' | 'reconnect',
+      /**
+       * The saved progress is the selection this browser went to Last.fm to
+       * send, not an earlier session, so the resume prompt leaves it alone
+       * until `continueSignInIntent` has dealt with it.
+       */
+      heldForSignIn: false,
+      /**
+       * Back from Last.fm to send or resume something: the steps stay hidden
+       * behind one spinner line until `continueSignInIntent` has moved to
+       * where the user is going, rather than flashing an empty Upload step.
+       * Set before the first render, since the token is in the URL by then.
+       */
+      settlingSignIn: returningToCarryOn(this.$route.query),
+      /**
+       * That trip came back without a session: what to sign in for again, and
+       * what the prompt says is safe (`selection`, `progress`, or nothing).
+       */
+      signInRetry: null as SignInPurpose | null,
+      signInRetryNote: '' as '' | 'selection' | 'progress',
+      /** This load's token exchange failed (AuthenticateStep's `failed`). */
+      signInFailed: false,
+      /** The deferred duplicate check is running. */
+      checkingDuplicates: false,
+      /** Plays it dropped; shown until the user starts sending. */
+      skippedDuplicates: 0,
       /** Wall clock for the job card's countdown; ticks only while a job is active. */
       nowSec: Math.floor(Date.now() / 1000),
       /** When the job card last heard from the server, for "Last checked". */
@@ -536,206 +652,232 @@ export default defineComponent({
       onVisibilityChange: null as (() => void) | null,
     };
   },
+  created() {
+    // Settles once `mounted` has, however it exits. `onAuthenticated` awaits
+    // it: the sign-in handler mounts (and can emit) before this component's
+    // own async `mounted` is done. Not reactive; nothing renders from it.
+    (this as any)._mountSettled = new Promise<void>((resolve) => {
+      (this as any)._resolveMountSettled = resolve;
+    });
+  },
   async mounted() {
-    trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
-
-    // Ordering matters. A handoff coming back from Last.fm must be finished
-    // before anything reads local state, because the upload derives its bytes
-    // from that state and completing the handoff is what clears it.
-    //
-    // A re-authentication return is consumed first, and only for its token: it
-    // owns no handoff and must not be mistaken for one.
-    const reauthed = background.consumeReauthFragment();
-
-    const resumed = await this.resumeHandoffIfReturning();
-    if (resumed) {
-      return;
-    }
-
-    await this.refreshBackgroundJob();
-
-    /*
-      Ownership is settled before resumability is ever assigned. `mounted` is
-      async, so every `await` below is a point at which Vue can render; setting
-      `hasResumableState = true` first and checking ownership afterwards would
-      put a Resume button on screen for the whole duration of a status request,
-      which is exactly the window in which the server may own the queue.
-    */
-    const unresolved = background.getOwnershipUnresolved();
-    const owner = background.queueOwner();
-    if (unresolved) {
-      // A handover this browser started and could not finish. Whether it took
-      // effect is exactly what is unknown, so it counts as one having happened.
-      this.sawServerOwnership = true;
-    }
-
+    // Read before anything awaits: the sign-in handler strips the token from
+    // the URL once it has tried it.
+    const returningFromSignIn = !!this.$route.query.token;
     try {
-      await this.exposeSavedStateUnlessStale('mounted', !!unresolved || !!owner);
-    } catch (e) {
-      // IndexedDB not available — not critical, just skip resume
-    }
+      trackEvent('step_viewed', { step: this.currentStep, step_name: this.stepName(this.currentStep) });
 
-    /*
-      A tab opened after another tab took the queue has no message to receive,
-      so the durable record is read here as well as listened for.
+      // Ordering matters. A handoff coming back from Last.fm must be finished
+      // before anything reads local state, because the upload derives its bytes
+      // from that state and completing the handoff is what clears it.
+      //
+      // A re-authentication return is consumed first, and only for its token: it
+      // owns no handoff and must not be mistaken for one.
+      const reauthed = background.consumeReauthFragment();
 
-      A `server` record is reconciled rather than obeyed forever. Jobs run for
-      weeks and then finish; without this the flag that stopped every tab
-      during the import would keep stopping them long after the worker was
-      done, and there would be no way back.
-    */
-    if (owner) {
-      this.ownershipBlocked = true;
-      // Read from the durable record rather than from a broadcast this tab was
-      // never here to receive. Same meaning either way: a queue of ours has
-      // left, so nothing this tab later holds may be released without the disk
-      // agreeing it is current.
-      this.sawServerOwnership = true;
-      await this.reconcileQueueOwner(owner);
-    }
+      const resumed = await this.resumeHandoffIfReturning();
+      if (resumed) {
+        return;
+      }
 
-    /*
-      The authority check, after the local records have had their say so it can
-      correct them in either direction.
+      await this.refreshBackgroundJob();
 
-      Deliberately not conditional on finding a local record: a browser with no
-      record is the case this exists for. It is also deliberately awaited
-      before the resume button can appear — `hasResumableState` above may
-      already be true, and offering Resume while the question is open is
-      offering the one action that starts duplicate scrobbling. `authorityPending`
-      covers the same window in the template, since `mounted` renders at every
-      await it makes.
-    */
-    await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+      /*
+        Ownership is settled before resumability is ever assigned. `mounted` is
+        async, so every `await` below is a point at which Vue can render; setting
+        `hasResumableState = true` first and checking ownership afterwards would
+        put a Resume button on screen for the whole duration of a status request,
+        which is exactly the window in which the server may own the queue.
+      */
+      const unresolved = background.getOwnershipUnresolved();
+      const owner = background.queueOwner();
+      if (unresolved) {
+        // A handover this browser started and could not finish. Whether it took
+        // effect is exactly what is unknown, so it counts as one having happened.
+        this.sawServerOwnership = true;
+      }
 
-    this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
-      this.ownershipBlocked = next !== null;
-      const step = this.$refs.scrobbleStep as any;
-      if (next) {
-        this.hasResumableState = false;
+      try {
+        if (returningFromSignIn) {
+          await this.holdSelectionAwaitingSignIn();
+        }
+        await this.exposeSavedStateUnlessStale('mounted', !!unresolved || !!owner);
+      } catch (e) {
+        // IndexedDB not available — not critical, just skip resume
+      }
+
+      /*
+        A tab opened after another tab took the queue has no message to receive,
+        so the durable record is read here as well as listened for.
+
+        A `server` record is reconciled rather than obeyed forever. Jobs run for
+        weeks and then finish; without this the flag that stopped every tab
+        during the import would keep stopping them long after the worker was
+        done, and there would be no way back.
+      */
+      if (owner) {
+        this.ownershipBlocked = true;
+        // Read from the durable record rather than from a broadcast this tab was
+        // never here to receive. Same meaning either way: a queue of ours has
+        // left, so nothing this tab later holds may be released without the disk
+        // agreeing it is current.
+        this.sawServerOwnership = true;
+        await this.reconcileQueueOwner(owner);
+      }
+
+      /*
+        The authority check, after the local records have had their say so it can
+        correct them in either direction.
+
+        Deliberately not conditional on finding a local record: a browser with no
+        record is the case this exists for. It is also deliberately awaited
+        before the resume button can appear — `hasResumableState` above may
+        already be true, and offering Resume while the question is open is
+        offering the one action that starts duplicate scrobbling. `authorityPending`
+        covers the same window in the template, since `mounted` renders at every
+        await it makes. Raised again here rather than trusted from `data()`:
+        nothing else should have lowered it by now (`onAuthenticated` waits for
+        this mount to settle), but if anything did, Resume would be live for
+        the whole request.
+      */
+      this.authorityPending = true;
+      await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+
+      this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
+        this.ownershipBlocked = next !== null;
+        const step = this.$refs.scrobbleStep as any;
+        if (next) {
+          this.hasResumableState = false;
+          this.sawServerOwnership = true;
+          if (step && step.haltForHandoff) {
+            // Deliberately not awaited: this is an event handler, and the halt
+            // resolves only once the in-flight batch finishes.
+            Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
+          }
+        } else {
+          /*
+            Ownership was released, so whatever stopped this tab is over — for
+            the tab that ended it. Not necessarily for this one.
+
+            A take-back ends ownership by cancelling the job, and the tracks it
+            rescued go to *disk*. Every sibling tab is still holding the queue it
+            had before the handover in memory, most of which the worker has since
+            scrobbled. Releasing the halt on the strength of the broadcast alone
+            lets any of them press Resume and replay all of it.
+
+            So the release is earned, not granted: `revalidateAfterRelease` asks
+            whether this tab's own queue is still the queue, and only then lets
+            the loop run again.
+          */
+          Promise.resolve(this.revalidateAfterRelease()).catch(() => {
+            // Unanswerable. The halt stays, which is the safe direction.
+          });
+        }
+      });
+
+      // Registered so other tabs can tell how many siblings a freeze must wait
+      // for. Without a roster, "everyone has stopped" is not observable and a
+      // freezing tab can only guess at a timeout.
+      this.releaseTabRoster = background.joinTabRoster();
+
+      /*
+        This tab answers other tabs' freeze requests. Handing over is decided in
+        one tab and binds them all, and the decision is made *before* the queue
+        is snapshotted — so this must stop scrobbling and persist what it has
+        before acknowledging, or its just-sent tracks are captured in the
+        sibling's upload and scrobbled a second time by the worker.
+      */
+      this.releaseFreezeResponder = background.respondToFreezeRequests(async () => {
+        const step = this.$refs.scrobbleStep as any;
+        // A sibling is preparing to hand this queue over, so from here on this
+        // tab's copy may be superseded whether or not the attempt succeeds.
         this.sawServerOwnership = true;
         if (step && step.haltForHandoff) {
-          // Deliberately not awaited: this is an event handler, and the halt
-          // resolves only once the in-flight batch finishes.
-          Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
-        }
-      } else {
-        /*
-          Ownership was released, so whatever stopped this tab is over — for
-          the tab that ended it. Not necessarily for this one.
-
-          A take-back ends ownership by cancelling the job, and the tracks it
-          rescued go to *disk*. Every sibling tab is still holding the queue it
-          had before the handover in memory, most of which the worker has since
-          scrobbled. Releasing the halt on the strength of the broadcast alone
-          lets any of them press Resume and replay all of it.
-
-          So the release is earned, not granted: `revalidateAfterRelease` asks
-          whether this tab's own queue is still the queue, and only then lets
-          the loop run again.
-        */
-        Promise.resolve(this.revalidateAfterRelease()).catch(() => {
-          // Unanswerable. The halt stays, which is the safe direction.
-        });
-      }
-    });
-
-    // Registered so other tabs can tell how many siblings a freeze must wait
-    // for. Without a roster, "everyone has stopped" is not observable and a
-    // freezing tab can only guess at a timeout.
-    this.releaseTabRoster = background.joinTabRoster();
-
-    /*
-      This tab answers other tabs' freeze requests. Handing over is decided in
-      one tab and binds them all, and the decision is made *before* the queue
-      is snapshotted — so this must stop scrobbling and persist what it has
-      before acknowledging, or its just-sent tracks are captured in the
-      sibling's upload and scrobbled a second time by the worker.
-    */
-    this.releaseFreezeResponder = background.respondToFreezeRequests(async () => {
-      const step = this.$refs.scrobbleStep as any;
-      // A sibling is preparing to hand this queue over, so from here on this
-      // tab's copy may be superseded whether or not the attempt succeeds.
-      this.sawServerOwnership = true;
-      if (step && step.haltForHandoff) {
-        /*
-          The boolean is load-bearing. `haltForHandoff` returns false when the
-          loop was still running after its polling budget — which is exactly
-          the in-flight Last.fm request case — and answering "stopped" then
-          would let the sibling upload a queue this tab is still sending from.
-        */
-        if (!await step.haltForHandoff()) {
-          return false;
-        }
-        /*
-          Persisted here, synchronously with the acknowledgement, rather than
-          via the usual `auto-save` event: that only emits, and the freezing
-          tab re-reads IndexedDB the moment this resolves. An unawaited save
-          would not have landed.
-
-          `saveStateIfAhead` rather than `saveState` because several tabs
-          persist at once during a freeze and a plain put is last-writer-wins;
-          the slowest snapshot would otherwise erase the furthest progress.
-        */
-        try {
-          const snapshot = step.progressSnapshot();
-          if (snapshot) {
-            await this.stateManager.saveStateIfAhead(this.buildState(snapshot));
+          /*
+            The boolean is load-bearing. `haltForHandoff` returns false when the
+            loop was still running after its polling budget — which is exactly
+            the in-flight Last.fm request case — and answering "stopped" then
+            would let the sibling upload a queue this tab is still sending from.
+          */
+          if (!await step.haltForHandoff()) {
+            return false;
           }
-        } catch (e) {
-          trackError('background.freezePersist', e);
-          return false;
+          /*
+            Persisted here, synchronously with the acknowledgement, rather than
+            via the usual `auto-save` event: that only emits, and the freezing
+            tab re-reads IndexedDB the moment this resolves. An unawaited save
+            would not have landed.
+
+            `saveStateIfAhead` rather than `saveState` because several tabs
+            persist at once during a freeze and a plain put is last-writer-wins;
+            the slowest snapshot would otherwise erase the furthest progress.
+          */
+          try {
+            const snapshot = step.progressSnapshot();
+            if (snapshot) {
+              await this.stateManager.saveStateIfAhead(this.buildState(snapshot));
+            }
+          } catch (e) {
+            trackError('background.freezePersist', e);
+            return false;
+          }
         }
-      }
-      this.hasResumableState = false;
-      this.ownershipBlocked = true;
-      return true;
-    });
+        this.hasResumableState = false;
+        this.ownershipBlocked = true;
+        return true;
+      });
 
-    if (unresolved) {
-      await this.resolveOwnership(unresolved);
+      if (unresolved) {
+        await this.resolveOwnership(unresolved);
+      }
+      if (reauthed) {
+        trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
+      } else if (new URLSearchParams(window.location.search).get('signin') === 'failed') {
+        this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
+        this.showReauth = true;
+        this.stripQuery();
+        trackEvent('background_reauth_failed');
+      }
+      this.probeBackgroundAvailability();
+      // The rollout flag can change after mount: flags load asynchronously,
+      // and signing in identifies the user, after which the username decides.
+      this.releaseFlagListener = onFeatureFlags(() => {
+        if (!background.isBackgroundEnabled()) {
+          this.backgroundProbed = false;
+          this.backgroundAvailable = false;
+          this.backgroundMaxTracks = 0;
+        } else if (!this.backgroundProbed) {
+          this.probeBackgroundAvailability();
+        }
+      });
+
+      /*
+        Back-forward cache recovery.
+
+        Handing over navigates this tab to Last.fm with `backgroundBusy` left set
+        and the scrobble loop halted, deliberately: it stops the dialog being
+        submitted twice while the redirect is in flight. If the user then presses
+        Back instead of authorising, the browser may restore this exact page from
+        the bfcache — same JavaScript state, no `mounted()`, no reload — leaving a
+        permanently busy screen with a stopped loop and no way out but a refresh.
+
+        `pageshow` with `persisted` is the only event that fires in that case.
+      */
+      this.onPageShow = (event: PageTransitionEvent) => {
+        if (event.persisted) {
+          this.recoverFromBfcache();
+        }
+      };
+      window.addEventListener('pageshow', this.onPageShow);
+    } finally {
+      (this as any)._resolveMountSettled();
     }
-    if (reauthed) {
-      trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
-    } else if (new URLSearchParams(window.location.search).get('signin') === 'failed') {
-      this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
-      this.showReauth = true;
-      this.stripQuery();
-      trackEvent('background_reauth_failed');
-    }
-    this.probeBackgroundAvailability();
-    // The rollout flag can change after mount: flags load asynchronously, and
-    // it only counts once signing in has identified the user.
-    this.releaseFlagListener = onFeatureFlags(() => {
-      if (!background.isBackgroundEnabled()) {
-        this.backgroundProbed = false;
-        this.backgroundAvailable = false;
-        this.backgroundMaxTracks = 0;
-      } else if (!this.backgroundProbed) {
-        this.probeBackgroundAvailability();
-      }
-    });
-
-    /*
-      Back-forward cache recovery.
-
-      Handing over navigates this tab to Last.fm with `backgroundBusy` left set
-      and the scrobble loop halted, deliberately: it stops the dialog being
-      submitted twice while the redirect is in flight. If the user then presses
-      Back instead of authorising, the browser may restore this exact page from
-      the bfcache — same JavaScript state, no `mounted()`, no reload — leaving a
-      permanently busy screen with a stopped loop and no way out but a refresh.
-
-      `pageshow` with `persisted` is the only event that fires in that case.
-    */
-    this.onPageShow = (event: PageTransitionEvent) => {
-      if (event.persisted) {
-        this.recoverFromBfcache();
-      }
-    };
-    window.addEventListener('pageshow', this.onPageShow);
   },
   beforeUnmount() {
+    // Not reactive. Sign-in work still awaiting (`onAuthenticated`) checks it
+    // after every await, so a page the user has left doesn't act or consume
+    // the intent.
+    (this as any)._unmounted = true;
     if (this.onPageShow) {
       window.removeEventListener('pageshow', this.onPageShow);
     }
@@ -762,6 +904,11 @@ export default defineComponent({
   watch: {
     currentStep(step: number) {
       trackEvent('step_viewed', { step, step_name: this.stepName(step) });
+    },
+    '$store.state.scrobbleRunActive': function onRunActive(active: boolean) {
+      if (active) {
+        this.skippedDuplicates = 0;
+      }
     },
     async hasResumableState(resumable: boolean) {
       if (!resumable) {
@@ -806,6 +953,9 @@ export default defineComponent({
     },
   },
   computed: {
+    stepperItems(): { value: number; title: string }[] {
+      return STEPPER_ITEMS;
+    },
     /*
       Largest queue the background offer could take right now, or 0 when it
       won't be offered. The upload and select steps use it to say "the server
@@ -816,9 +966,6 @@ export default defineComponent({
       return this.backgroundAvailable && !this.backgroundJob && background.canCompress()
         ? this.backgroundMaxTracks
         : 0;
-    },
-    authorizeUrl(): string {
-      return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
     /*
       Whether this browser is allowed to send at all.
@@ -844,18 +991,22 @@ export default defineComponent({
      *   job    — a server-side job outranks local progress: offering Resume
      *            beside it would invite sending the tracks it is sending.
      *   signIn — a resume was held back for want of a Last.fm session.
+     *   retry  — a trip to Last.fm to send or resume came back without a
+     *            session; it offers the same trip again. Above `resume`
+     *            because it is about the same saved progress.
      *   resume — saved progress; never while anything might own the queue.
      *   notice — `backgroundNotice` on its own. Below the resume prompt
      *            because a notice that leaves Resume available is a "nothing
      *            happened" report (a handoff that didn't go through), and the
      *            prompt is what the user acts on; it shows as its first line.
      */
-    banner(): 'outage' | 'job' | 'signIn' | 'resume' | 'notice' | null {
+    banner(): 'outage' | 'job' | 'signIn' | 'retry' | 'resume' | 'notice' | null {
       if (this.authorityUnknown) { return 'outage'; }
       if (this.backgroundJob) { return 'job'; }
       if (this.resumeSignInMessage) { return 'signIn'; }
-      if (this.hasResumableState && this.currentStep <= 2 && !this.ownershipBlocked
-        && !this.authorityPending) {
+      if (this.signInRetry && this.currentStep <= 2) { return 'retry'; }
+      if (this.hasResumableState && !this.heldForSignIn && !this.settlingSignIn && this.currentStep <= 2
+        && !this.ownershipBlocked && !this.authorityPending) {
         return 'resume';
       }
       if (this.showBackgroundNotice) { return 'notice'; }
@@ -1716,6 +1867,7 @@ export default defineComponent({
       }
       this.pendingSnapshot = info;
       this.pendingState = null;
+      this.pendingEntryPoint = 'scrobble_step';
       this.backgroundRemaining = remaining;
       this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
@@ -1732,7 +1884,7 @@ export default defineComponent({
      */
     onBackgroundDeclined() {
       trackEvent('background_offer_declined', {
-        entry_point: this.pendingSnapshot ? 'scrobble_step' : 'resume',
+        entry_point: this.pendingEntryPoint,
         track_count: this.backgroundRemaining,
         all_re_tagged: this.backgroundAllReTagged,
       });
@@ -1774,7 +1926,7 @@ export default defineComponent({
       }
 
       const username = (this.$store.state.lfmApi as LastFm).getUserName() || state.userName || '';
-      const entryPoint = this.pendingSnapshot ? 'scrobble_step' : 'resume';
+      const entryPoint = this.pendingEntryPoint;
 
       // Recorded before the redirect. The saved state is destroyed once the
       // server takes ownership, and it is the only place this lineage lives.
@@ -2447,19 +2599,21 @@ export default defineComponent({
     },
 
     /**
-     * AuthenticateStep confirms an existing session and then emits `complete`
-     * on a 2 second delay (so the "Checking for authentication..." spinner is
-     * readable). The user can act inside that window — most importantly they can
-     * hit "Resume", which jumps straight to the scrobble step. Advancing
-     * unconditionally would then yank them back to the upload step a moment
-     * later, losing the resumed session. Only ever move *forward* off step 1.
+     * AuthenticateStep emits `complete` as soon as it has confirmed a session,
+     * whether stored or just exchanged from a callback token. That can land
+     * while `mounted` is still awaiting, or after the user has already acted
+     * (pressed Resume, say), so this never moves the stepper: the user stays
+     * wherever they are. `fresh`: this load came back from Last.fm with a
+     * token, which decides which sign-in intents it may act on.
      */
-    onAuthenticated() {
+    async onAuthenticated(payload?: { fresh?: boolean }) {
+      if ((this as any)._unmounted) {
+        return;
+      }
+      const fresh = !!(payload && payload.fresh);
+      this.signedIn = true;
       // Signed in now, so a resume held back for want of a key can go ahead.
       this.resumeSignInMessage = '';
-      if (this.currentStep === 1) {
-        this.currentStep = 2;
-      }
       /*
         The username is only knowable now, so for a browser that arrived
         without one — cleared storage, a new device, a fresh profile — this is
@@ -2467,16 +2621,242 @@ export default defineComponent({
         exactly the browser holding no local record of a handover, so skipping
         the check here would leave the case it was built for uncovered.
 
-        `authorityPending` is raised *synchronously*, before the await inside
-        the check can yield. This component deliberately supports the user
-        pressing Resume during the two-second authentication transition, so
-        leaving the flag down until the request resolved would leave Resume
-        live across exactly the window the check is meant to cover.
+        `authorityPending` is raised *synchronously*, before anything here can
+        yield. The user can act while the sign-in settles (Resume may already
+        be on screen), so leaving the flag down until the request resolved
+        would leave Resume live across exactly the window the check is meant
+        to cover.
       */
+      this.authorityPending = true;
+      /*
+        With a stored session this runs before `mounted` has finished: the
+        child's `mounted` runs first, and `mounted` here awaits the handoff
+        return and the job status before its own check. Running alongside it
+        would read local state while a handoff return is still uploading it,
+        and lower `authorityPending` under the mount's own check. So wait for
+        the mount, then ask.
+
+        When a handoff return ends `mounted` early, the mount never asked: the
+        job is live on the server, or whether it started is unknown. The check
+        below asks `/job/live`, and a live job blocks here exactly as it would
+        have there; the same check used to run after the old 2-second delay.
+        Raised again because the mount's own check, when it ran, lowered it.
+      */
+      await (this as any)._mountSettled;
+      if ((this as any)._unmounted) {
+        return;
+      }
       this.authorityPending = true;
       // Leaves local records as they were. The gate stays shut on an
       // unanswered question unless `mayScrobbleWithoutAuthority` allows it.
-      this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+      await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
+      if ((this as any)._unmounted) {
+        return;
+      }
+      // Only once the server has answered, so nothing carried on from before
+      // the Last.fm round trip can start ahead of the check.
+      await this.continueSignInIntent(fresh);
+    },
+    /**
+     * Carries on with whatever sent this browser to Last.fm (`SignInIntent`).
+     * Runs only once the server-authority check has answered. An intent
+     * recorded before a trip to Last.fm is acted on only on a `fresh` return,
+     * one recorded in-app only without one, and neither after an hour: an
+     * abandoned sign-in must not steer a later, unrelated visit.
+     */
+    async continueSignInIntent(fresh: boolean) {
+      try {
+        if ((this as any)._unmounted) {
+          return;
+        }
+        const intent = takeSignInIntent(fresh);
+        if (!intent || intent.kind === 'reconnect') {
+          return;
+        }
+        if (intent.kind === 'resume') {
+          // `resumeFromSaved` refuses by itself while sending is withheld.
+          if (this.hasResumableState) {
+            await this.resumeFromSaved();
+          }
+          return;
+        }
+        // A job on the server, or no answer about one: the selection stays
+        // saved, and the resume prompt offers it once sending is allowed.
+        if (this.ownershipBlocked || this.authorityUnknown) {
+          return;
+        }
+        const state = await this.stateManager.loadState().catch(() => null);
+        if ((this as any)._unmounted || !isUnsentSelection(state, intent.importId)) {
+          return;
+        }
+        const ready = intent.checkDuplicates
+          ? await this.dropQueuedDuplicates(state as ScrobbleState)
+          : state;
+        if ((this as any)._unmounted) {
+          return;
+        }
+        if (ready && this.currentStep <= 2) {
+          this.restoreFromState(ready, 'sign_in');
+        } else if (!this.ownershipBlocked && !this.authorityUnknown) {
+          // Whatever is saved now, if anything, is offered as usual.
+          await this.exposeSavedStateUnlessStale(
+            'sign_in',
+            !!background.getOwnershipUnresolved() || !!background.queueOwner(),
+          );
+        }
+      } finally {
+        this.heldForSignIn = false;
+        this.settlingSignIn = false;
+      }
+    },
+    /**
+     * The token exchange failed, so nothing will carry the selection on. When
+     * the trip was to send or resume, the page offers the same trip again in
+     * one banner (AuthenticateStep's own prompts are off, `quietFailure`).
+     */
+    async onAuthFailed() {
+      this.signInFailed = true;
+      this.heldForSignIn = false;
+      if (!this.settlingSignIn) {
+        return;
+      }
+      try {
+        const intent = takeSignInIntent(true);
+        let retry: SignInPurpose = { kind: 'reconnect' };
+        let note: '' | 'selection' | 'progress' = '';
+        if (intent && intent.kind === 'send') {
+          const state = await this.stateManager.loadState().catch(() => null);
+          if (isUnsentSelection(state, intent.importId)) {
+            retry = { kind: 'send', importId: intent.importId, checkDuplicates: intent.checkDuplicates };
+            note = 'selection';
+          }
+        } else if (intent && intent.kind === 'resume') {
+          retry = { kind: 'resume' };
+          note = 'progress';
+        }
+        this.signInRetry = retry;
+        this.signInRetryNote = note;
+      } finally {
+        this.settlingSignIn = false;
+      }
+    },
+    /** The retry banner's button: the same trip to Last.fm again. */
+    retrySignIn() {
+      if (this.signInRetry) {
+        startSignIn(this.$store.state.lfmApi as LastFm, this.signInRetry);
+      }
+    },
+    /**
+     * On the way back from Last.fm with a selection to send: keeps the resume
+     * prompt off it (see `heldForSignIn`). Only the saved selection the intent
+     * names counts; any other saved progress is offered as usual.
+     */
+    async holdSelectionAwaitingSignIn() {
+      // Only called on a return with a token, so only a Last.fm intent applies.
+      const intent = peekSignInIntent(true);
+      if (!intent || intent.kind !== 'send') {
+        return;
+      }
+      const state = await this.stateManager.loadState().catch(() => null);
+      // The exchange can fail before this mount gets here.
+      this.heldForSignIn = !this.signInFailed && isUnsentSelection(state, intent.importId);
+    },
+    /**
+     * The duplicate check a signed-out user asked for, on the queue they chose.
+     * Returns the queue to send, or null to restore nothing: every play was
+     * already on Last.fm, the user has moved on, or the saved selection is no
+     * longer this one (another tab). If the check itself fails, the queue is
+     * sent unfiltered, as the upload step does.
+     */
+    async dropQueuedDuplicates(state: ScrobbleState): Promise<ScrobbleState | null> {
+      const id = state.importId || '';
+      const gone = () => !!(this as any)._unmounted;
+      const stillOurs = async (): Promise<boolean> => {
+        try {
+          return isUnsentSelection(await this.stateManager.loadState(), id) && !gone();
+        } catch (e) {
+          // Can't tell; the in-memory copy is all there is to go on.
+          return !gone();
+        }
+      };
+      this.checkingDuplicates = true;
+      let checked: { unique: Scrobble[]; duplicateCount: number } | null = null;
+      let checkError: unknown = null;
+      try {
+        try {
+          checked = await new Scrobblify(this.$store.state.lfmApi as LastFm)
+            .filterQueuedDuplicates(StateManager.deserializeScrobbles(state.tracks));
+        } catch (e) {
+          trackError('scrobblify.deferredDuplicates', e);
+          checkError = e;
+        }
+        // The user started something else while it ran, or left the page.
+        if (this.currentStep > 2 || gone()) {
+          return null;
+        }
+        if (!checked || checked.duplicateCount === 0) {
+          if (!(await stillOurs())) {
+            return null;
+          }
+          if (checkError) {
+            this.errorMessage = 'An error occurred while checking for duplicates. Proceeding with all tracks.';
+            this.errorDetails = (checkError as Error).message || String(checkError);
+            this.showError = true;
+          }
+          return state;
+        }
+        const { unique, duplicateCount } = checked;
+        if (unique.length === 0) {
+          try {
+            const { removed } = await this.persist(() => this.stateManager.clearStateIfMatching(
+              (saved) => isUnsentSelection(saved, id),
+            ));
+            if (removed) {
+              this.hasResumableState = false;
+              this.skippedDuplicates = duplicateCount;
+            }
+          } catch (e) {
+            trackError('scrobblify.deferredDuplicates', e);
+          }
+          return null;
+        }
+        const filtered: ScrobbleState = {
+          ...state,
+          tracks: StateManager.serializeScrobbles(unique),
+          totalTracks: unique.length,
+          originalTotalTracks: unique.length,
+        };
+        if (!(await stillOurs())) {
+          return null;
+        }
+        let wrote = false;
+        try {
+          // Refuses a different import and anything further along.
+          wrote = await this.persist(() => this.stateManager.saveStateIfAhead(filtered));
+        } catch (e) {
+          // A failed write leaves the disk as it was; checkpoints save the
+          // filtered queue later. A different import is not ours to send.
+          if (!(await stillOurs())) {
+            return null;
+          }
+          trackError('scrobblify.deferredDuplicates', e);
+          wrote = true;
+        }
+        if (!wrote || gone()) {
+          return null;
+        }
+        this.skippedDuplicates = duplicateCount;
+        return filtered;
+      } finally {
+        this.checkingDuplicates = false;
+      }
+    },
+    /**
+     * The sign-in banner's button: sign in, then resume the saved progress if
+     * that was what was refused; otherwise just come back signed in.
+     */
+    signInToResume() {
+      startSignIn(this.$store.state.lfmApi as LastFm, { kind: this.resumeSignInIntent });
     },
     /**
      * `state.totalTracks` is only the tracks left to do, so on its own it makes
@@ -2498,12 +2878,82 @@ export default defineComponent({
     },
     clearToken() {
       const api = this.$store.state.lfmApi as LastFm;
-      this.currentStep = 1;
+      this.currentStep = 2;
+      this.signedIn = false;
       api.clearUser();
       resetUser();
       trackEvent('user_logged_out');
     },
-    onSelectionComplete() {
+    async onSelectionComplete() {
+      /*
+        Nothing to send with yet, so sign in first. The selection is saved as
+        ordinary progress (nothing sent) because nothing in memory survives
+        the trip to Last.fm; `continueSignInIntent` restores it afterwards. An
+        abandoned sign-in leaves it as saved progress for next time.
+      */
+      const api = this.$store.state.lfmApi as LastFm;
+      if (!api.isAuthenticated()) {
+        /*
+          This save replaces whatever progress is saved here, and the
+          confirmation only asks about saved progress `savedProgress` knows of.
+          That is null whenever the resume prompt is withheld (an unanswered or
+          blocked authority check, a live job) or out of date (another tab
+          saved since), so the disk is asked too (#102).
+        */
+        if (this.sendingBlocked) {
+          this.backgroundNotice = background.isBetaOptedIn()
+            ? 'Hold on — still checking whether an import is already running on the server for your account.'
+            : 'Hold on, still getting ready. Try again in a moment.';
+          return;
+        }
+        if (!this.savedProgress) {
+          let saved: ScrobbleState | null = null;
+          try {
+            saved = await this.stateManager.loadState();
+          } catch (e) {
+            // Unreadable, so there is nothing it could be replacing that a
+            // resume could reach either.
+          }
+          const newId = (this.$store.state.importId as string) || '';
+          if (saved && (!newId || (saved.importId || '') !== newId)) {
+            this.errorMessage = 'You have saved progress that would be replaced. '
+              + 'Go back and choose Resume or Start over.';
+            this.errorDetails = '';
+            this.showError = true;
+            // So the next press of Scrobble asks about it.
+            await this.exposeSavedStateUnlessStale(
+              'send_refused',
+              !!background.getOwnershipUnresolved() || !!background.queueOwner(),
+            );
+            return;
+          }
+        }
+        const snapshot: ProgressSnapshot = {
+          scrobbledTracks: 0,
+          originalTotalTracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
+          originalSucceededCount: 0,
+          pendingVerification: [],
+          sendTimestamps: [],
+          lastReTagTimestampSec: this.$store.state.reTagCursorSec as number,
+          burstCount: 0,
+          dailyCount: 0,
+        };
+        try {
+          const state = this.buildState(snapshot);
+          await this.persist(() => this.stateManager.saveState(state));
+          startSignIn(api, {
+            kind: 'send',
+            importId: state.importId || '',
+            checkDuplicates: this.$store.state.deferredDuplicateCheck as boolean,
+          });
+        } catch (e) {
+          trackError('scrobblify.saveBeforeSignIn', e);
+          this.errorMessage = "Couldn't save your selection before signing in.";
+          this.errorDetails = (e as Error).message || String(e);
+          this.showError = true;
+        }
+        return;
+      }
       // The user chose to start over, so the saved progress is no longer on
       // offer; this run's first save replaces it.
       this.hasResumableState = false;
@@ -2676,7 +3126,7 @@ export default defineComponent({
       // `clearSessionKey()` keeps it after Last.fm rejects a key. Resuming then
       // sent every track unsigned, and the failures were saved as completed.
       // Nothing is written here, so the saved state survives the sign-in
-      // redirect and the banner offers it again afterwards.
+      // redirect; the sign-in banner below carries the user on from here.
       if (!api.isAuthenticated()) {
         trackEvent('session_resume_blocked', { source, reason: 'not_authenticated' });
         // Only the saved-state resume survives the redirect; a file has to be
@@ -2684,14 +3134,23 @@ export default defineComponent({
         this.resumeSignInMessage = source === 'saved'
           ? 'Sign in to Last.fm first, then choose Resume.'
           : 'Sign in to Last.fm first, then import your progress file again.';
-        this.currentStep = 1;
+        this.resumeSignInIntent = source === 'saved' ? 'resume' : 'reconnect';
         return;
       }
-      trackEvent('session_resumed', this.resumeProps(state, source));
       if (state.userName && api.getUserName() && api.getUserName() !== state.userName) {
         this.errorMessage = `This saved state is for Last.fm user "${state.userName}" but you are logged in as "${api.getUserName()}". Please log in as the correct user.`;
         this.showError = true;
         return;
+      }
+      // A selection coming back from sign-in is not a resume, so it stays out
+      // of the resume funnel.
+      if (source === 'sign_in') {
+        trackEvent('selection_resumed_after_sign_in', {
+          track_count: state.totalTracks,
+          duplicates_skipped: this.skippedDuplicates,
+        });
+      } else {
+        trackEvent('session_resumed', this.resumeProps(state, source));
       }
 
       this.restoreRateLimitWindow(state, api.getUserName() || state.userName || null);
@@ -2756,8 +3215,9 @@ export default defineComponent({
 
       // A resume of this size is the clearest signal that the browser is the
       // wrong place to be doing this: the user has already come back at least
-      // once and still has weeks of it ahead.
-      this.offerBackgroundForState(state, 'resume');
+      // once and still has weeks of it ahead. A selection back from sign-in
+      // is reported apart from resumes.
+      this.offerBackgroundForState(state, source === 'sign_in' ? 'sign_in' : 'resume');
     },
 
     /**
@@ -2781,6 +3241,7 @@ export default defineComponent({
       // completed/failed index sets.
       this.pendingSnapshot = null;
       this.pendingState = state;
+      this.pendingEntryPoint = entryPoint;
       this.backgroundRemaining = remaining;
       this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
@@ -2826,9 +3287,9 @@ export default defineComponent({
      * could land *after* the completion's clear and resurrect a finished
      * import as a resumable one.
      */
-    persist(write: () => Promise<void>): Promise<void> {
+    persist<T>(write: () => Promise<T>): Promise<T> {
       const self = this as any;
-      const previous: Promise<void> = self._persistQueue || Promise.resolve();
+      const previous: Promise<unknown> = self._persistQueue || Promise.resolve();
       const next = previous.catch(() => undefined).then(write);
       self._persistQueue = next;
       return next;
@@ -2866,9 +3327,21 @@ export default defineComponent({
       for (let i = 0; i < info.scrobbledTracks; i++) {
         completedIndices.push(i);
       }
+      /*
+        Whose queue this is. A selection made signed out belongs to whoever
+        signs in for it, not to a username `clearSessionKey()` left behind, so
+        it is stamped with none (a later sign-in as someone else would
+        otherwise be refused as the wrong user). A queue on Send or later was
+        reached signed in, so it keeps its name even after a rejected key
+        cleared the session, as the saves after `session_invalid` do.
+        `enforceServerAuthority` loses nothing: it reads the stored username
+        before falling back to the saved one, and that is the same leftover.
+      */
+      const api = this.$store.state.lfmApi as LastFm;
+      const userName = api.isAuthenticated() || this.currentStep >= 4 ? api.getUserName() || '' : '';
 
       return {
-        userName: (this.$store.state.lfmApi as LastFm).getUserName() || '',
+        userName,
         totalTracks: tracks.length,
         completedIndices,
         failedIndices,

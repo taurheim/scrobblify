@@ -9,7 +9,9 @@
  * The one exception is `finalizeHandoff`, whose failure mode is genuinely
  * dangerous — see `HandoffOutcome`.
  */
-import { isFeatureEnabled, trackError, trackEvent } from '@/services/Analytics';
+import {
+  isFeatureEnabled, isIdentified, trackError, trackEvent,
+} from '@/services/Analytics';
 import type { FailedTrackDetail } from '@/services/StateManager';
 
 /**
@@ -159,16 +161,21 @@ export function isBetaOptedOut(): boolean {
  * string on a handoff return, and the trip out to Last.fm and back arrives on
  * a callback URL that never carried the parameter. A per-load flag would
  * therefore switch itself off precisely when a handoff came back, stranding a
- * user whose tracks are already uploaded.
+ * user whose tracks are already uploaded. `flag_anonymous` is the flag
+ * answering for a browser PostHog hasn't identified yet (before sign-in), whose
+ * bucket can differ from the one its Last.fm username lands in.
  */
-export function backgroundOfferSource(): 'opt_in' | 'flag' | null {
+export function backgroundOfferSource(): 'opt_in' | 'flag' | 'flag_anonymous' | null {
   if (!isBackgroundConfigured() || isBetaOptedOut()) {
     return null;
   }
   if (isBetaOptedIn()) {
     return 'opt_in';
   }
-  return isFeatureEnabled(BACKGROUND_FLAG) ? 'flag' : null;
+  if (!isFeatureEnabled(BACKGROUND_FLAG)) {
+    return null;
+  }
+  return isIdentified() ? 'flag' : 'flag_anonymous';
 }
 
 export function isBackgroundEnabled(): boolean {

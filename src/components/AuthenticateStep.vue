@@ -1,15 +1,11 @@
 <template>
-  <div>
-    <h1>Authorize the Scrobblify application with last.fm</h1>
-    <a :href="authorizeUrl">Click here to authorize</a>
-
-    <div v-if="checkingAuth">
-      <v-progress-circular indeterminate color="primary">
-      </v-progress-circular>
-      Checking for authentication...
+  <div class="auth-handler">
+    <div v-if="checkingAuth && hadToken" class="d-flex justify-center align-center mb-4">
+      <v-progress-circular indeterminate color="primary" size="24" class="mr-2" aria-label="Signing in" />
+      Signing in to Last.fm…
     </div>
 
-    <v-alert v-if="tokenExpired" type="warning" prominent class="mt-4">
+    <v-alert v-if="tokenExpired" type="warning" prominent class="mb-4">
       <div>
         <strong>Your sign-in link was already used or has expired.</strong>
       </div>
@@ -38,10 +34,30 @@ import { HOME_DISMISSED_KEY } from '@/services/ReturningVisitor';
 
 export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
-  emits: ['complete'],
+  props: {
+    /**
+     * The page shows its own "sign in again" prompt when the exchange fails,
+     * so this shows neither the expired-link prompt nor the error dialog.
+     */
+    quietFailure: { type: Boolean, default: false },
+  },
+  emits: {
+    /**
+     * Signed in. `fresh` says whether this load arrived with a callback
+     * `?token=`, i.e. came back from Last.fm, not whether exchanging it
+     * worked: if the exchange fails while a key is stored, the stored key is
+     * kept and this still says `true`. It decides which sign-in intents the
+     * page may act on (`takeSignInIntent`).
+     */
+    complete: (payload: { fresh: boolean }) => typeof payload.fresh === 'boolean',
+    /** Exchanging a callback token (or reading the stored session) failed. */
+    failed: () => true,
+  },
   data() {
     return {
       checkingAuth: false,
+      /** Whether this load arrived with a callback `?token=` to exchange. */
+      hadToken: false,
       tokenExpired: false,
       showError: false,
       errorMessage: '',
@@ -53,30 +69,32 @@ export default defineComponent({
       return (this.$store.state.lfmApi as LastFm).getAuthorizeUrl();
     },
   },
-  methods: {
-    finishStep() {
-      this.$emit('complete');
-    },
-  },
   async mounted() {
+    this.hadToken = !!this.$route.query.token;
+    const { hadToken } = this;
+    // Read now: the parent may stop passing it once it hears `failed`.
+    const quiet = this.quietFailure;
     this.$data.checkingAuth = true;
     const api = this.$store.state.lfmApi as LastFm;
-    const hadToken = !!this.$route.query.token;
     try {
       await api.init(this.$route.query);
     } catch (e) {
       this.$data.checkingAuth = false;
       trackError('auth.init', e);
+      this.$emit('failed');
       // A dead/expired token (already consumed, unauthorized, or expired) isn't a
       // failure the user can fix by retrying the same link — the only recovery is
       // to authorize again for a fresh token. Show a dedicated, non-alarming
       // recovery prompt instead of the generic error dialog.
       if (LastFm.isAuthTokenError(e)) {
         trackEvent('auth_token_invalid');
-        this.tokenExpired = true;
+        this.tokenExpired = !quiet;
         return;
       }
       trackEvent('auth_failed');
+      if (quiet) {
+        return;
+      }
       this.errorMessage = 'Failed to authenticate with Last.fm. Please try again.';
       this.errorDetails = (e as Error).message || String(e);
       this.showError = true;
@@ -107,11 +125,14 @@ export default defineComponent({
           // Storage refused; the card just stays hidden for this tab.
         }
       }
-      setTimeout(() => {
-        this.$emit('complete');
-      }, 2000);
+      this.$data.checkingAuth = false;
+      this.$emit('complete', { fresh: hadToken });
     } else {
       this.$data.checkingAuth = false;
+      if (hadToken) {
+        // Came back from Last.fm without a session: nothing will carry on.
+        this.$emit('failed');
+      }
     }
   },
 });

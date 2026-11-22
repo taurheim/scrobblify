@@ -118,8 +118,9 @@ function banner() {
   console.log('  remote-controlled window. Look for the MOCK MODE banner; if it');
   console.log('  is not there, you are not mocked.');
   console.log('');
-  console.log('  "Click here to authorize" goes to the mock and signs you in as');
-  console.log('  "testuser". All Last.fm calls return canned data.');
+  console.log('  You sign in when you start scrobbling: Last.fm\'s sign-in goes to');
+  console.log('  the mock and signs you in as "testuser". All Last.fm calls');
+  console.log('  return canned data.');
   if (HIDDEN_PROFILE) {
     console.log('  testuser hides their recent listening: unsigned history reads');
     console.log('  are refused with error 17.');

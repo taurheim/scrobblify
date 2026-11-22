@@ -3,7 +3,7 @@ import {
 } from '@playwright/test';
 import path from 'path';
 import JSZip from 'jszip';
-import { interceptLastFm, mockLastFmAuth } from '../lastfmMock';
+import { interceptLastFm, mockLastFmAuth, routeLastFmSignIn } from '../lastfmMock';
 
 /*
   Runs only under `playwright.unreachable-worker.config.ts`, which compiles in
@@ -228,6 +228,195 @@ test.describe('Importing a progress file', () => {
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeHidden();
   });
 });
+
+test.describe('Signing in while the page mounts', () => {
+  // Writes saved progress straight into IndexedDB, as `StateManager.saveState` would.
+  async function seedSavedState(page: Page, state: Record<string, unknown>) {
+    await page.evaluate((saved) => new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains('scrobbleState')) {
+          request.result.createObjectStore('scrobbleState');
+        }
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction('scrobbleState', 'readwrite');
+        tx.objectStore('scrobbleState').put(saved, 'current');
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+      };
+      request.onerror = () => reject(request.error);
+    }), state);
+  }
+
+  /*
+    A stored session makes the sign-in handler emit before this page's own
+    `mounted` has finished, and its authority check used to run alongside the
+    mount's. The first answer ("nothing running") lowered `authorityPending`
+    while the second question was still out, so Resume was live for the whole
+    of a request whose answer was "a job is running". The checks now run one
+    after the other, each with Resume held back.
+  */
+  test('Resume stays held back while the second authority check is out', async ({ page }) => {
+    const scrobbles: string[] = [];
+    let liveCalls = 0;
+    let secondCallArrived = (): void => undefined;
+    const secondCall = new Promise<void>((resolve) => { secondCallArrived = resolve; });
+    let releaseSecondCall = (): void => undefined;
+    const released = new Promise<void>((resolve) => { releaseSecondCall = resolve; });
+
+    await interceptLastFm(page);
+    await page.route(WORKER, async (route: Route) => {
+      const { pathname } = new URL(route.request().url());
+      const reply = (body: unknown) => route.fulfill({
+        status: 200, contentType: 'application/json', body: JSON.stringify(body),
+      });
+      if (pathname === '/scrobblify/job/live') {
+        liveCalls += 1;
+        if (liveCalls === 1) {
+          await reply({ ok: true, live: false });
+          return;
+        }
+        secondCallArrived();
+        // Answered well inside the client's fall-through timeout.
+        await released;
+        await reply({ ok: true, live: true });
+        return;
+      }
+      if (pathname.startsWith('/scrobblify/import/')) {
+        await reply({ ok: true, known: false, live: false });
+        return;
+      }
+      await route.abort('internetdisconnected');
+    });
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, {
+      userName: 'testuser',
+      totalTracks: 5,
+      completedIndices: [0, 1, 2],
+      failedIndices: [],
+      tracks: [1, 2, 3, 4, 5].map((n) => ({
+        track: `Track ${n}`, artist: `Artist ${n}`, album: `Album ${n}`, timestamp: Date.UTC(2024, 0, n),
+      })),
+      originalTotalTracks: 5,
+      originalSucceededCount: 3,
+      importId: 'b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6',
+      savedAt: new Date().toISOString(),
+    });
+    await page.reload();
+
+    await secondCall;
+    // Long enough for a render that was going to show Resume to have shown it.
+    await page.waitForTimeout(500);
+    expect(await page.locator('text=Resume previous session?').count()).toBe(0);
+    releaseSecondCall();
+
+    await expect(page.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Resume previous session?')).toHaveCount(0);
+    expect(scrobbles).toEqual([]);
+  });
+});
+
+test.describe('Signing in after choosing', () => {
+  async function readSavedState(page: Page): Promise<Record<string, any> | null> {
+    return page.evaluate(() => new Promise<Record<string, any> | null>((resolve, reject) => {
+      const request = indexedDB.open('scrobblify', 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains('scrobbleState')) {
+          request.result.createObjectStore('scrobbleState');
+        }
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const req = db.transaction('scrobbleState', 'readonly').objectStore('scrobbleState').get('current');
+        req.onsuccess = () => { db.close(); resolve(req.result || null); };
+        req.onerror = () => { db.close(); reject(req.error); };
+      };
+      request.onerror = () => reject(request.error);
+    }));
+  }
+
+  /*
+    Spec 4.5: someone whose import is running on the server uploads it again
+    on a browser that has never seen them. Nothing in it says "handed over",
+    and the username only arrives with the sign-in that now comes after
+    choosing, so the server's answer to that sign-in is all that stops a
+    second copy of the queue going out.
+  */
+  test('a fresh browser that chooses and signs in while a job is live sends nothing', async ({ page }) => {
+    const scrobbles: string[] = [];
+    const workerCalls: string[] = [];
+    const worker: Record<string, unknown> = {
+      '/scrobblify/job/live': { ok: true, live: true },
+      '/scrobblify/import/': { ok: true, known: false, live: false },
+      '/scrobblify/capacity': {
+        available: true, used: 0, capacity: 100, minTracks: 750, maxTracks: 200000, chunkTracks: 5000,
+      },
+    };
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    await page.route(WORKER, async (route: Route) => {
+      const { pathname } = new URL(route.request().url());
+      workerCalls.push(pathname);
+      const match = Object.keys(worker).find((prefix) => pathname.startsWith(prefix));
+      if (!match) {
+        await route.abort('internetdisconnected');
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(worker[match]) });
+    });
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+      await route.fallback();
+    });
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('button:has-text("matching")').click({ timeout: 5000 });
+    await page.locator('button:has-text("selected tracks")').click();
+    await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 10000 });
+    // Long enough for a send that was going to happen to have happened.
+    await page.waitForTimeout(3000);
+    expect(scrobbles).toEqual([]);
+    expect(workerCalls).toContain('/scrobblify/job/live');
+    await expect(page.locator('text=Resume previous session?')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeHidden();
+    // Kept, untouched, for when the server lets go of the import.
+    const saved = await readSavedState(page);
+    expect(saved).not.toBeNull();
+    expect(saved!.completedIndices).toEqual([]);
+    expect(saved!.totalTracks).toBeGreaterThan(0);
+    expect(saved!.totalTracks).toBe(saved!.originalTotalTracks);
+  });
+});
 test.describe('Offering background scrobbling', () => {
   // A worker that would say yes to everything, so only the opt-in stands
   // between a large import and the offer.
@@ -398,14 +587,35 @@ test.describe('BETA tag', () => {
     await expect(page.locator(TAG)).toBeVisible();
   });
 
-  test('a browser outside the beta sees no tag; opting in shows the tag but no banner', async ({ page }) => {
+  test('a browser outside the beta sees no tag or banner; opting in shows both', async ({ page }) => {
     await page.goto('/#/');
     await expect(page.locator('#logo')).toBeVisible();
     await expect(page.locator(TAG)).toHaveCount(0);
+    await expect(page.locator('#beta-banner')).toHaveCount(0);
     await page.goto('/?beta=1#/scrobble');
     await expect(page.locator('.scrobblify')).toBeVisible({ timeout: 10000 });
     await expect(page.locator(TAG)).toBeVisible();
-    await expect(page.locator('text=Background scrobbling (beta) is switched on')).toHaveCount(0);
+    await expect(page.locator('#beta-banner')).toBeVisible();
+    await expect(page.locator('#beta-banner')).toContainText('niko@savas.ca');
+  });
+
+  test('the beta banner shows on Home and About too, and Switch it off opts out', async ({ page }) => {
+    await page.goto('/?beta=1#/');
+    await expect(page.locator('#beta-banner')).toBeVisible();
+    // v-alert is `flex: 1 1` in v-app's full-height column, so it can stretch or collapse.
+    const { height } = (await page.locator('#beta-banner').boundingBox())!;
+    expect(height).toBeGreaterThan(40);
+    expect(height).toBeLessThan(120);
+    await page.locator('#nav a:has-text("About")').click();
+    await expect(page).toHaveURL(/#\/about$/);
+    await expect(page.locator('#beta-banner')).toBeVisible();
+    await page.locator('#beta-banner a:has-text("Switch it off")').click();
+    await page.waitForURL(/\?beta=0#\/about$/);
+    await expect(page.locator('#logo')).toBeVisible();
+    await expect(page.locator('#beta-banner')).toHaveCount(0);
+    await expect(page.locator(TAG)).toHaveCount(0);
+    expect(await page.evaluate(() => window.localStorage.getItem('scrobblify.background.beta')))
+      .toBe('0');
   });
 
   test('?beta=0 removes the tag again', async ({ page }) => {

@@ -29,6 +29,7 @@ export interface RootState {
   importId: string;
   scrobbleRunActive: boolean;
   showingServerJob: boolean;
+  deferredDuplicateCheck: boolean;
 }
 
 export default createStore<RootState>({
@@ -133,6 +134,9 @@ export default createStore<RootState>({
     // True while a page is showing this user's background job, so the header
     // shows the BETA tag even without the opt-in or flag.
     showingServerJob: false,
+    // True when "Check for duplicates" was ticked while signed out, so the
+    // check runs on the chosen queue after sign-in instead.
+    deferredDuplicateCheck: false,
   },
   mutations: {
     setValidScrobbles(state, tracks: SpotifyListen[]) {
@@ -185,6 +189,9 @@ export default createStore<RootState>({
     },
     setShowingServerJob(state, on: boolean) {
       state.showingServerJob = on;
+    },
+    setDeferredDuplicateCheck(state, on: boolean) {
+      state.deferredDuplicateCheck = on;
     },
     trackScrobbled(state, count = 1) {
       state.tracksScrobbled += count;

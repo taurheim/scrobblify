@@ -4,6 +4,16 @@ import SpotifyListen from '@/models/SpotifyListen';
 import StringSimilarity from 'string-similarity';
 import store from '@/store';
 
+type DuplicateProgress = (message: string, pagesLoaded: number, totalPages: number) => void;
+
+/** What the duplicate filter needs to know about a play. */
+interface CheckedPlay {
+  track: string;
+  artist: string;
+  timeMs: number;
+  reTagged: boolean;
+}
+
 export default class Scrobblify {
   /*
     How much time around a given scrobble do we consider it a duplicate?
@@ -52,9 +62,39 @@ export default class Scrobblify {
    */
   public async filterDuplicates(
     listens: SpotifyListen[],
-    onProgress?: (message: string, pagesLoaded: number, totalPages: number) => void,
+    onProgress?: DuplicateProgress,
   ): Promise<{ unique: SpotifyListen[], duplicateCount: number }> {
-    if (listens.length === 0) {
+    return this.dropAlreadyScrobbled(listens, (listen) => ({
+      track: listen.trackName,
+      artist: listen.artistName,
+      timeMs: listen.listenDate.getTime(),
+      reTagged: listen.reTagged,
+    }), onProgress);
+  }
+
+  /**
+   * The same filter for a queue that has already been chosen: the duplicate
+   * check a signed-out user asked for, run once they have signed in. Keeps
+   * the queue's order.
+   */
+  public async filterQueuedDuplicates(
+    scrobbles: Scrobble[],
+    onProgress?: DuplicateProgress,
+  ): Promise<{ unique: Scrobble[], duplicateCount: number }> {
+    return this.dropAlreadyScrobbled(scrobbles, (scrobble) => ({
+      track: scrobble.track,
+      artist: scrobble.artist,
+      timeMs: scrobble.timestamp.getTime(),
+      reTagged: scrobble.reTagged,
+    }), onProgress);
+  }
+
+  private async dropAlreadyScrobbled<T>(
+    plays: T[],
+    describe: (play: T) => CheckedPlay,
+    onProgress?: DuplicateProgress,
+  ): Promise<{ unique: T[], duplicateCount: number }> {
+    if (plays.length === 0) {
       return { unique: [], duplicateCount: 0 };
     }
 
@@ -70,18 +110,19 @@ export default class Scrobblify {
     // Their true dates survive on `originalListenDate`, but checking against
     // those would mean fetching the user's entire Last.fm history back to the
     // start of the export — potentially years. So they are simply exempt.
-    const checkable = listens.filter((listen) => !listen.reTagged);
+    const described = plays.map(describe);
+    const checkable = described.filter((play) => !play.reTagged);
     if (checkable.length === 0) {
-      return { unique: listens, duplicateCount: 0 };
+      return { unique: plays, duplicateCount: 0 };
     }
 
     // Determine the date range of the Spotify data (with buffer).
     // Iterate rather than spreading into Math.min/Math.max, which overflows the
     // call stack for large histories (tens of thousands of listens).
-    let minTimestamp = checkable[0].listenDate.getTime();
+    let minTimestamp = checkable[0].timeMs;
     let maxTimestamp = minTimestamp;
-    for (const listen of checkable) {
-      const time = listen.listenDate.getTime();
+    for (const play of checkable) {
+      const time = play.timeMs;
       if (time < minTimestamp) {
         minTimestamp = time;
       }
@@ -123,23 +164,24 @@ export default class Scrobblify {
 
     // Filter locally
     let duplicateCount = 0;
-    const unique = listens.filter((listen) => {
-      if (listen.reTagged) {
+    const unique = plays.filter((_, i) => {
+      const play = described[i];
+      if (play.reTagged) {
         return true;
       }
-      const artistKey = listen.artistName.toLowerCase();
+      const artistKey = play.artist.toLowerCase();
       const candidates = scrobblesByArtist.get(artistKey);
       if (!candidates) {
         return true;
       }
 
-      const listenTime = listen.listenDate.getTime();
+      const listenTime = play.timeMs;
       const isDuplicate = candidates.some((existing) => {
         const timeDiff = Math.abs(existing.timestamp.getTime() - listenTime);
         if (timeDiff > this.CONFLICT_BUFFER_TIME_MS) {
           return false;
         }
-        const similarity = StringSimilarity.compareTwoStrings(listen.trackName, existing.track);
+        const similarity = StringSimilarity.compareTwoStrings(play.track, existing.track);
         return similarity > SAME_IF_COEFFICIENT_ABOVE;
       });
 

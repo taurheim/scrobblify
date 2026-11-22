@@ -39,6 +39,11 @@ they are; the change is structure and copy.
   status page). No popover.
 - The "Background scrobbling (beta) is switched on for this browser" banner is
   removed. `?beta=0` still opts out.
+- **Revised 2026-11-21:** a beta banner is back on every page for beta
+  browsers, now with a feedback line: "You're trying the scrobblify beta.
+  Something not working, or have a suggestion? Email niko@savas.ca." and
+  **Switch it off** (`?beta=0` on the current page). Strings `beta.banner` and
+  `beta.banner.off`. Shipped with PR 3 (Plan 2).
 
 ## 2. Home (`src/views/Home.vue`, rewritten)
 
@@ -70,6 +75,12 @@ server choice (section 5) *before* any sign-in, then signs in to whichever
 Last.fm application the chosen path needs (skipped if this browser already has
 it). This is how a user who started scrobbling locally and has since joined the
 beta is offered the server for the rest.
+
+For now (Plan 2), **Continue** without a browser session signs in to the
+browser application first and resumes the saved progress by itself on the way
+back (onto Send; the user presses Scrobble). Signed in as the progress's owner,
+it opens `/scrobble`, which resumes it directly, with no second Resume click.
+The server-choice resume entry point comes with Plan 3.
 
 "Not you?" clears the stored username (existing `clearToken` behaviour).
 "Start over" (saved-progress states) goes to the upload step; the existing
@@ -118,6 +129,15 @@ for **only the one it needs**.
 | "Already scrobbling on scrobblify?" | Worker first; see 4.4 |
 | Scrobble the rest locally (move back) | Browser application, only if this browser has none; see 6.3 |
 
+**For now (Plan 2), every path signs in to the browser application.** Signing
+in to the worker application alone needs worker changes:
+`/scrobblify/handoff/preflight` and `/scrobblify/auth/signin` both require a
+username today and check Last.fm's answer against it, and before a browser
+sign-in there is no username to send. Worker-only sign-in therefore moves to
+Plan 3 with the server-choice dialog. Until then beta users sign in to the
+browser application and get today's background offer afterwards, and a
+browser that already has a session never sees a sign-in.
+
 ### 4.2 Surviving the redirect
 
 The Last.fm redirect reloads the page. Before redirecting, the selected queue
@@ -125,11 +145,26 @@ is saved to IndexedDB (the same `ScrobbleState` the save/resume path uses, with
 the chosen path recorded), and restored on return. The handover already
 persists a queue before its redirect; the tab path gains the same.
 
+As built in Plan 2, the reason for the trip (send, resume or reconnect) is kept
+in sessionStorage (`src/services/SignInIntent.ts`) and acted on once the
+server-authority check (4.5) has answered. A sign-in the user abandons leaves
+the selection as ordinary saved progress, offered by the resume prompt next
+time.
+
 ### 4.3 Duplicate check moves after sign-in
 
 `filterDuplicates` needs the Last.fm username, so it runs after sign-in and
 before sending. If plays were skipped, a short screen says how many
 (`signin.dupes.*`); otherwise it goes straight on.
+
+**As built in Plan 2:** this applies only to a user who ticks "Check for
+duplicates" while signed out. A user already signed in (a stored session) is
+checked during upload, as before, and never signs in. For the signed-out user
+the upload step says the check will run after sign-in; on the way back the
+chosen queue is filtered while "Checking for plays already on Last.fm…"
+shows, and the skipped count is a single line above the stepper ("Skipped
+{n} that are already on Last.fm.") rather than its own screen. The user then
+lands on Send and presses **Scrobble**; nothing starts by itself.
 
 On the server path the browser has no Last.fm key of its own, so the check reads
 **unsigned**. A user who hides their recent listening (error 17) gets no
@@ -149,6 +184,12 @@ A local-progress branch would be unreachable and is deliberately absent.
 
 All the existing resume guards stay: `restoreFromState` still refuses without a
 browser session key, and `scrobblePlay` still throws `NotAuthenticatedError`.
+
+**For now (Plan 2) this is a browser sign-in**, because a worker-only sign-in
+isn't possible yet (see 4.1): "Re-connect to last.fm" signs in to the browser
+application and lands on `/scrobble`, where the existing job banner (live job)
+or resume banner takes over. Steps 1–3 above, and the "Nothing to resume"
+screen, come with Plan 3.
 
 ### 4.5 The server-authority check after the new sign-in
 

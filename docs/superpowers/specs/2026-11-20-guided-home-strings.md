@@ -220,3 +220,32 @@ status page or the steps.
 | `status.dormant.signedOut` | `dormant`, was signed out (day 60, or access revoked) before going on hold | Your sign-in to scrobblify expired. If you don't sign in before {date} we'll delete your progress from our servers (any tracks already scrobbled will stay on last.fm). |
 | `status.dormant.errors` | `dormant`, was stopped by repeated errors before going on hold | Scrobblify stopped after repeated errors. Please let me know at niko@savas.ca |
 | `status.newImport` | `completed` or `failed` job | Start a new import |
+
+## Added in Plan 2 (drafts)
+
+New strings shipped with sign-in after choosing (PR 3). Placeholder copy; rewrite in place.
+
+| ID | When | Draft |
+| --- | --- | --- |
+| `beta.banner` | Every page, beta browser (`isBackgroundEnabled()`) | You're trying the scrobblify beta. Something not working, or have a suggestion? Email niko@savas.ca. |
+| `beta.banner.off` | Same, link at the end of the banner | Switch it off |
+| `signin.signingIn` | `/scrobble`, back from Last.fm while the token is exchanged | Signing in to Last.fm… |
+| `signin.signingIn.label` | Same, screen-reader label of the spinner | Signing in |
+| `upload.dupesDeferred` | Upload log, "Check for duplicates" ticked while signed out | Duplicates will be checked after you sign in. |
+| `signin.checking.body` | Back from Last.fm with a selection, "Check for duplicates" ticked (spinner line above the steps; reuses the ID above) | Checking for plays already on Last.fm… |
+| `signin.checking.label` | Same, screen-reader label of the spinner | Checking for duplicates |
+| `signin.dupes.body` | Same, some plays were skipped; shown until the run starts (reuses the ID above; `{skipped}` is the count) | Skipped {skipped} that are already on Last.fm. |
+| `signin.dupes.failed` | Same, the check failed and everything will be sent (error dialog; same text as the upload step's) | An error occurred while checking for duplicates. Proceeding with all tracks. |
+| `signin.banner.nothingSent` | Sign-in banner when this browser has no saved progress (a progress file was refused for want of a session) | Nothing has been scrobbled yet. |
+| `signin.retry.title` | Back from Last.fm to send or resume, and the sign-in failed (expired link or a Last.fm error) | Sign-in didn't work. |
+| `signin.retry.selection` | Same, a selection was waiting to be sent | Your selection is saved. |
+| `signin.retry.progress` | Same, saved progress was being resumed | Your saved progress is kept. |
+| `signin.retry.button` | Same, starts the same sign-in again | Sign in again |
+| `send.replaceRefused` | "Start scrobbling" while signed out, and saved progress the confirmation didn't ask about would be replaced (error dialog) | You have saved progress that would be replaced. Go back and choose Resume or Start over. |
+| `send.saveFailed` | "Start scrobbling" while signed out, and the selection couldn't be saved before going to Last.fm (error dialog) | Couldn't save your selection before signing in. |
+
+Reused unchanged: `notice.holdOn` / `notice.holdOn.beta` (today's wording) also
+show when a signed-out "Start scrobbling" comes before the server check has
+answered. The existing sign-in banner line "Sign in to Last.fm first, then
+choose Resume." is now slightly off: after signing in from that banner the
+saved progress resumes by itself.

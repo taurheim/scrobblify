@@ -8,7 +8,7 @@ import LastFm from '../src/api/LastFm';
 import Scrobble from '../src/models/Scrobble';
 // Shared Last.fm mock, also used by the `npm run dev:mock` interactive script.
 import {
-  interceptLastFm, mockLastFmAuth, MockLibrary,
+  interceptLastFm, mockLastFmAuth, MockLibrary, routeLastFmSignIn,
 } from './lastfmMock';
 
 const FIXTURE_ZIP = path.resolve(__dirname, 'fixtures', 'test-spotify-data.zip');
@@ -26,7 +26,7 @@ test.beforeEach(async ({ context }) => {
   }));
 });
 
-// Navigate past auth (step 1 -> step 2) with mocked auth
+// Opens /scrobble already signed in, at the upload step
 async function goToUploadStep(page: Page): Promise<MockLibrary> {
   const library = await interceptLastFm(page);
   // Navigate first to establish origin for localStorage
@@ -44,6 +44,34 @@ async function goToUploadStep(page: Page): Promise<MockLibrary> {
 async function scrobbleSelection(page: Page) {
   await page.locator('button:has-text("selected tracks")').click();
   await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
+}
+
+// Builds a ZIP in-memory so each test can decide exactly what the history
+// files hold, without checking another binary fixture into the repo.
+async function makeZip(files: Record<string, string>): Promise<Buffer> {
+  const zip = new JSZip();
+  for (const [name, content] of Object.entries(files)) {
+    zip.file(`Spotify Extended Streaming History/${name}`, content);
+  }
+  return zip.generateAsync({ type: 'nodebuffer' });
+}
+
+function play(track: string, artist: string, ts: string) {
+  return {
+    ts,
+    master_metadata_track_name: track,
+    master_metadata_album_artist_name: artist,
+    master_metadata_album_album_name: 'An Album',
+    ms_played: 300000,
+  };
+}
+
+async function uploadZip(page: Page, buffer: Buffer) {
+  await page.locator('.drop-zone input[type="file"]').setInputFiles({
+    name: 'my_spotify_data.zip',
+    mimeType: 'application/zip',
+    buffer,
+  });
 }
 
 type Tracked = { name: string; props: Record<string, unknown> };
@@ -137,12 +165,32 @@ test.describe('Home Page', () => {
     await expect(page.locator('.home-card')).toHaveCount(2);
   });
 
-  test('"Re-connect to last.fm" opens the scrobble page', async ({ page }) => {
+  test('"Re-connect to last.fm" signs in and opens the scrobble page', async ({ page }) => {
     const events = captureEvents(page);
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
     await page.goto('/#/');
     await page.locator('button:has-text("Re-connect to last.fm")').click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page).toHaveURL(/\/#\/scrobble$/);
+    expect(events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
+    expect(events).toContainEqual({ name: 'sign_in_started', props: { intent: 'reconnect' } });
+  });
+
+  test('"Re-connect to last.fm" when already signed in just opens the scrobble page', async ({ page }) => {
+    const events = captureEvents(page);
+    await interceptLastFm(page);
+    await page.goto('/#/');
+    await mockLastFmAuth(page);
+    // Nothing saved, so a stored session alone shows the returning card;
+    // dismissed for the tab, which keeps the session.
+    await page.evaluate(() => sessionStorage.setItem('scrobblify.home.dismissedReturning', '1'));
+    await page.reload();
+    await page.locator('button:has-text("Re-connect to last.fm")').click();
     await expect(page).toHaveURL(/#\/scrobble/);
-    await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    expect(events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
+    expect(events.filter((e) => e.name === 'sign_in_started')).toEqual([]);
   });
 
   test('the export guide helps set up Last.fm while waiting, with ListenBrainz as an alternative', async ({ page }) => {
@@ -229,19 +277,85 @@ test.describe('Home Page', () => {
     await expect(card.locator('.returning-links')).toHaveText(/^\s*Not you\?\s+·\s+Start over\s*$/);
     await expect(page.locator('.home-card')).toHaveCount(0);
     await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'saved_signed_out' } });
+  });
 
-    await card.locator('button:has-text("Continue")').click();
-    await expect(page).toHaveURL(/#\/scrobble/);
+  test('Continue on saved progress while signed out signs in and resumes', async ({ page }) => {
+    const events = captureEvents(page);
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    await page.goto('/#/');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await seedSavedState(page, SAVED);
+    await page.reload();
+
+    await page.locator('.returning-card button:has-text("Continue")').click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page).toHaveURL(/\/#\/scrobble$/);
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    expect(events).toContainEqual({ name: 'sign_in_started', props: { intent: 'resume' } });
   });
 
   test('a signed-in visitor with saved progress is reported as such', async ({ page }) => {
     const events = captureEvents(page);
+    await interceptLastFm(page);
     await page.goto('/#/');
     await mockLastFmAuth(page);
     await seedSavedState(page, SAVED);
     await page.reload();
     await expect(page.locator('.returning-card')).toBeVisible();
     await expect.poll(() => events).toContainEqual({ name: 'home_returning_shown', props: { state: 'saved_signed_in' } });
+
+    // Already signed in: no Last.fm round trip, and it resumes without a
+    // second click on the resume prompt.
+    await page.locator('.returning-card button:has-text("Continue")').click();
+    await expect(page).toHaveURL(/#\/scrobble/);
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    expect(events.filter((e) => e.name === 'sign_in_started')).toEqual([]);
+  });
+
+  // What `startSignIn` leaves in sessionStorage, for a trip to Last.fm.
+  async function leaveSignInIntent(page: Page, ageMs: number) {
+    await page.evaluate((age) => sessionStorage.setItem('scrobblify.signInIntent', JSON.stringify({
+      kind: 'resume', inApp: false, createdAt: Date.now() - age,
+    })), ageMs);
+  }
+
+  test('an abandoned sign-in does not resume on a later visit that is already signed in', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, SAVED);
+    // Continue sent the user to Last.fm, and they came back with Back instead.
+    await leaveSignInIntent(page, 0);
+    await page.reload();
+
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    // Consumed and ignored, rather than acted on by this unrelated visit.
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('scrobblify.signInIntent'))).toBeNull();
+    await page.waitForTimeout(1000);
+    await expect(page.locator('text=Resume previous session?')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeHidden();
+  });
+
+  test('a sign-in intent older than an hour is ignored on the way back from Last.fm', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await seedSavedState(page, SAVED);
+    await leaveSignInIntent(page, 61 * 60 * 1000);
+    await page.goto('about:blank');
+    await page.goto('/#/scrobble?token=fresh-token');
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('scrobblify.signInIntent'))).toBeNull();
+    await page.waitForTimeout(1000);
+    await expect(page.locator('text=Resume previous session?')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeHidden();
   });
 
   test('"Not you?" on saved progress signs out and shows the first visit, keeping the progress', async ({ page }) => {
@@ -379,23 +493,22 @@ test.describe('About Page', () => {
 });
 
 test.describe('Scrobble Page - Authentication Step', () => {
-  test('shows authentication step by default', async ({ page }) => {
+  test('a signed-out visitor starts at upload, with no sign-in step', async ({ page }) => {
+    await interceptLastFm(page);
     await page.goto('/#/scrobble');
-    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Authenticate with last.fm')).toHaveCount(0);
+    await expect(page.locator('h1:has-text("Authorize")')).toHaveCount(0);
+    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
   });
 
-  test('shows Last.fm auth link', async ({ page }) => {
-    await page.goto('/#/scrobble');
-    await expect(page.locator('a[href*="last.fm/api/auth"]')).toBeVisible({ timeout: 5000 });
-  });
-
-  test('auto-advances when already authenticated', async ({ page }) => {
+  test('a signed-in visitor starts at upload with their name shown', async ({ page }) => {
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
     await page.reload();
-    // Should auto-advance past step 1 to the upload step
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible();
   });
 
   test('does not re-exchange a single-use token when the callback URL is revisited', async ({ page }) => {
@@ -405,31 +518,26 @@ test.describe('Scrobble Page - Authentication Step', () => {
     // auth.getSession again — Last.fm rejects re-use with error 4 "Unauthorized
     // Token - This token has not been issued".
     let getSessionCount = 0;
+    await interceptLastFm(page);
     await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
       const params = new URLSearchParams(new URL(route.request().url()).search);
       if (params.get('method') === 'auth.getSession') {
         getSessionCount++;
-        await route.fulfill({
-          status: 403,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            error: 4,
-            message: 'Unauthorized Token - This token has not been issued.',
-          }),
-        });
-      } else {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
       }
+      await route.fallback();
     });
 
     await page.goto('/#/scrobble?token=single-use-token');
-    await expect.poll(() => getSessionCount, { timeout: 10000 }).toBe(1);
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    expect(getSessionCount).toBe(1);
 
-    // Revisit the callback URL with the same token still present.
+    // Revisit the callback URL with the same token still present. A real load:
+    // a hash-only change would reuse the page and never run init() again.
+    await page.goto('about:blank');
     await page.goto('/#/scrobble?token=single-use-token');
-    // Wait for init() to settle (the "checking auth" spinner clears once the
-    // token exchange is skipped) rather than an arbitrary delay.
-    await expect(page.locator('text=Checking for authentication')).toBeHidden({ timeout: 10000 });
+    // The header only shows once init() has settled, and a re-exchange would
+    // have been sent (and answered) before that.
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
     expect(getSessionCount).toBe(1);
   });
 
@@ -458,6 +566,354 @@ test.describe('Scrobble Page - Authentication Step', () => {
     await expect(page.locator('text=/already used or has expired/i')).toBeVisible({ timeout: 10000 });
     // Recovery affordance points back at the Last.fm authorize flow.
     await expect(page.locator('a:has-text("Authorize again")')).toHaveAttribute('href', /last\.fm\/api\/auth/);
+  });
+});
+
+test.describe('Signing in after choosing', () => {
+  // Every `track.scrobble` sent, by track name.
+  async function recordScrobbleRequests(page: Page): Promise<string[]> {
+    const scrobbles: string[] = [];
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const params = new URLSearchParams(
+        route.request().method() === 'POST'
+          ? route.request().postData() || ''
+          : new URL(route.request().url()).search,
+      );
+      if (params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+      await route.fallback();
+    });
+    return scrobbles;
+  }
+
+  async function chooseAll(page: Page): Promise<number> {
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('button:has-text("matching")').click();
+    const label = await page.locator('button:has-text("selected tracks")').innerText();
+    return Number((label.match(/(\d+) selected tracks/i) || [])[1]);
+  }
+
+  test('a signed-out visitor chooses tracks, signs in, and lands ready to send', async ({ page }) => {
+    await interceptLastFm(page);
+    const scrobbles = await recordScrobbleRequests(page);
+    // Holds the token exchange back until the test has looked at the moment
+    // between landing and being signed in.
+    let releaseExchange!: () => void;
+    const exchangeGate = new Promise<void>((resolve) => { releaseExchange = resolve; });
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
+        await exchangeGate;
+      }
+      await route.fallback();
+    });
+    await routeLastFmSignIn(page);
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    const selected = await chooseAll(page);
+    expect(selected).toBeGreaterThan(0);
+    await scrobbleSelection(page);
+
+    // The selection waiting to be sent is not "a previous session". Looked at
+    // once the page has read the saved state and nothing but the hold keeps
+    // the resume prompt off it, while the exchange is still held.
+    await expect(page.locator('text=Signing in to Last.fm…')).toBeVisible({ timeout: 10000 });
+    await expect.poll(() => page.evaluate(() => {
+      let inst = (document.querySelector('.auth-handler') as any).__vueParentComponent;
+      while (inst && !(inst.data && 'heldForSignIn' in inst.data)) { inst = inst.parent; }
+      return inst && inst.data.heldForSignIn && inst.data.hasResumableState && !inst.data.authorityPending;
+    }), { timeout: 10000 }).toBe(true);
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    // Not an empty Upload step either: the steps wait for where this is going.
+    await expect(page.locator('.upload-step')).toBeHidden();
+    releaseExchange();
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page).toHaveURL(/\/#\/scrobble$/);
+    const scrobbleButton = page.getByRole('button', { name: 'Scrobble', exact: true });
+    await expect(scrobbleButton).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(`text=${selected} tracks ready to scrobble`)).toBeVisible();
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    const saved = await readSavedState(page);
+    expect(saved).not.toBeNull();
+    expect(saved!.totalTracks).toBe(selected);
+    expect(saved!.completedIndices).toEqual([]);
+    expect(scrobbles).toEqual([]);
+
+    await scrobbleButton.click();
+    await expect(page.locator('text=Finished scrobbling >> visible=true')).toBeVisible({ timeout: 60000 });
+    expect(scrobbles).toHaveLength(selected);
+  });
+
+  test('the duplicate check waits for sign-in and then skips plays already on Last.fm', async ({ page }) => {
+    const library = await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    // Recent plays, so none is re-tagged: the duplicate check skips those.
+    const startSec = Math.floor(Date.now() / 1000) - 86400;
+    const names = ['Alpha', 'Bravo', 'Charlie', 'Delta'];
+    const uts = (i: number) => startSec + i * 600;
+    library.add({
+      track: 'Alpha', artist: 'Band', album: '', uts: uts(0),
+    });
+    library.add({
+      track: 'Charlie', artist: 'Band', album: '', uts: uts(2),
+    });
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': JSON.stringify(
+        names.map((name, i) => play(name, 'Band', new Date(uts(i) * 1000).toISOString())),
+      ),
+    }));
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    // Nothing to read the history with yet, so no error either.
+    await expect(page.locator('text=Duplicates will be checked after you sign in.')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('text=An error occurred while checking for duplicates')).toHaveCount(0);
+    expect(await chooseAll(page)).toBe(4);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Skipped 2 that are already on Last.fm.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    const saved = await readSavedState(page);
+    expect(saved!.totalTracks).toBe(2);
+    expect(saved!.originalTotalTracks).toBe(2);
+    expect(saved!.tracks.map((t: { track: string }) => t.track)).toEqual(['Bravo', 'Delta']);
+  });
+
+  // Plays in a fresh ZIP, all recent so none is re-tagged unless asked.
+  async function uploadPlays(page: Page, names: string[], uts: (i: number) => number) {
+    await uploadZip(page, await makeZip({
+      'Streaming_History_Audio_2024_0.json': JSON.stringify(
+        names.map((name, i) => play(name, 'Band', new Date(uts(i) * 1000).toISOString())),
+      ),
+    }));
+  }
+
+  test('when every chosen play is already on Last.fm, nothing is restored and the selection is dropped', async ({ page }) => {
+    const library = await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    const startSec = Math.floor(Date.now() / 1000) - 86400;
+    const names = ['Alpha', 'Bravo'];
+    const uts = (i: number) => startSec + i * 600;
+    names.forEach((track, i) => library.add({
+      track, artist: 'Band', album: '', uts: uts(i),
+    }));
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadPlays(page, names, uts);
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    expect(await chooseAll(page)).toBe(2);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Skipped 2 that are already on Last.fm.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.upload-step')).toBeVisible();
+    await expect(page.locator('text=tracks ready to scrobble')).toBeHidden();
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    expect(await readSavedState(page)).toBeNull();
+  });
+
+  test('re-tagged plays are not checked against the history after sign-in', async ({ page }) => {
+    const library = await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    // Real plays at the very seconds re-tagging is about to give these, which
+    // would match if re-tagged plays were checked.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const names = ['Alpha', 'Bravo', 'Charlie'];
+    names.forEach((track, i) => library.add({
+      track, artist: 'Band', album: '', uts: nowSec - i,
+    }));
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadPlays(page, names, (i) => Date.UTC(2024, 0, i + 1) / 1000);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    await expect(page.locator('text=Duplicates will be checked after you sign in.')).toBeVisible({ timeout: 30000 });
+    expect(await chooseAll(page)).toBe(3);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=3 tracks ready to scrobble')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.skipped-duplicates')).toHaveCount(0);
+    expect((await readSavedState(page))!.totalTracks).toBe(3);
+  });
+
+  test('a failed duplicate check after sign-in says so and keeps every play', async ({ page }) => {
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    const startSec = Math.floor(Date.now() / 1000) - 86400;
+    const names = ['Alpha', 'Bravo'];
+    const uts = (i: number) => startSec + i * 600;
+
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await uploadPlays(page, names, uts);
+    await page.locator('label:has-text("Check for duplicates")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    expect(await chooseAll(page)).toBe(2);
+    // Only from here on: the history can't be read once signed in.
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (new URL(route.request().url()).searchParams.get('method') === 'user.getrecenttracks') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 8, message: 'Operation failed' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=An error occurred while checking for duplicates. Proceeding with all tracks.'))
+      .toBeVisible({ timeout: 15000 });
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
+    expect((await readSavedState(page))!.totalTracks).toBe(2);
+  });
+
+  test('a sign-in that fails offers the same trip again, and the retry lands ready to send', async ({ page }) => {
+    await interceptLastFm(page);
+    let failExchange = true;
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (failExchange && new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 4, message: 'Unauthorized Token - This token has not been issued' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    await routeLastFmSignIn(page);
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    const selected = await chooseAll(page);
+    expect(selected).toBeGreaterThan(0);
+    await scrobbleSelection(page);
+
+    // One prompt, not the expired-link prompt and a resume prompt stacked.
+    await expect(page.locator('text=Sign-in didn\'t work.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Your selection is saved.')).toBeVisible();
+    await expect(page.locator('text=/already used or has expired/i')).toHaveCount(0);
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+    await expect(page.locator('.upload-step')).toBeVisible();
+
+    failExchange = false;
+    await page.getByRole('button', { name: 'Sign in again' }).click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator(`text=${selected} tracks ready to scrobble`)).toBeVisible();
+  });
+
+  test('a failed sign-in to resume offers to sign in again, then resumes', async ({ page }) => {
+    await interceptLastFm(page);
+    let failExchange = true;
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      if (failExchange && new URL(route.request().url()).searchParams.get('method') === 'auth.getSession') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: 11, message: 'Service Offline - This service is temporarily offline.' }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    await routeLastFmSignIn(page);
+    await page.goto('/#/');
+    await seedSavedState(page, {
+      userName: 'testuser',
+      importId: 'resume-after-failed-sign-in',
+      totalTracks: 3,
+      completedIndices: [0],
+      failedIndices: [],
+      tracks: ['One', 'Two', 'Three'].map((track, i) => ({
+        track, artist: 'Band', album: '', timestamp: Date.UTC(2024, 0, 1) + i * 60000,
+      })),
+      originalTotalTracks: 3,
+      originalSucceededCount: 1,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+    });
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await page.reload();
+    await page.getByRole('button', { name: 'Continue' }).click({ timeout: 10000 });
+
+    await expect(page.locator('text=Sign-in didn\'t work.')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Your saved progress is kept.')).toBeVisible();
+    await expect(page.locator('text=Something went wrong')).toHaveCount(0);
+    await expect(page.locator('text=Resume previous session')).toHaveCount(0);
+
+    failExchange = false;
+    await page.getByRole('button', { name: 'Sign in again' }).click();
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 15000 });
+  });
+
+  test('a signed-out selection never replaces saved progress it did not ask about', async ({ page }) => {
+    await interceptLastFm(page);
+    const signInRequests: string[] = [];
+    page.on('request', (request) => {
+      if (request.url().startsWith('https://www.last.fm/api/auth')) {
+        signInRequests.push(request.url());
+      }
+    });
+    await routeLastFmSignIn(page);
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(FIXTURE_ZIP);
+    await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    await page.locator('button:has-text("Find tracks")').click();
+    expect(await chooseAll(page)).toBeGreaterThan(0);
+
+    // Another tab saves progress after this one loaded, so this one's
+    // confirmation knows nothing about it.
+    const other = {
+      userName: 'testuser',
+      importId: 'other-tab-import',
+      totalTracks: 5,
+      completedIndices: [0, 1],
+      failedIndices: [],
+      tracks: Array.from({ length: 5 }, (_, i) => ({
+        track: `Track ${i + 1}`, artist: `Artist ${i + 1}`, album: '', timestamp: Date.UTC(2024, 0, i + 1),
+      })),
+      originalTotalTracks: 5,
+      originalSucceededCount: 2,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+    };
+    await seedSavedState(page, other);
+    await scrobbleSelection(page);
+
+    await expect(page.locator('text=You have saved progress that would be replaced.')).toBeVisible({ timeout: 5000 });
+    expect(await readSavedState(page)).toEqual(other);
+    expect(signInRequests).toEqual([]);
+    await expect(page).toHaveURL(/localhost/);
+
+    // Asked about next time.
+    await page.getByRole('button', { name: 'OK', exact: true }).click();
+    await page.locator('button:has-text("selected tracks")').click();
+    await expect(page.locator('.scrobble-confirm button:has-text("Resume saved progress")')).toBeVisible();
   });
 });
 
@@ -1011,19 +1467,20 @@ test.describe('Session Resume', () => {
     // not against the shrunken remainder.
     await expect(page.locator('.overall-progress')).toContainText('3 of 5');
 
-    // Outlast AuthenticateStep's delayed `complete` emit before interacting, so
-    // the click can't race the stepper transition it used to trigger.
-    await page.waitForTimeout(2500);
+    // Let the sign-in handler settle before interacting.
+    await expect(page.locator('text=Currently authenticated as')).toBeVisible({ timeout: 10000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
     await expect(page.locator('text=Finished scrobbling')).toBeVisible({ timeout: 30000 });
 
     expect(scrobbled).toEqual(['Track 4', 'Track 5']);
   });
 
-  test('resuming immediately is not undone by the delayed auth redirect', async ({ page }) => {
-    // Regression: AuthenticateStep emits `complete` on a 2s setTimeout. Resuming
-    // inside that window used to jump to the scrobble step and then get dragged
-    // back to the upload step, silently losing the resumed session.
+  test('resuming immediately is not undone by the sign-in authority check', async ({ page }) => {
+    // Regression: AuthenticateStep used to emit `complete` on a 2s setTimeout,
+    // and resuming inside that window jumped to the scrobble step and then got
+    // dragged back to the upload step, losing the resumed session. The emit is
+    // immediate now, and `onAuthenticated` runs the authority check once the
+    // mount settles, but it must still never move the stepper.
     await interceptLastFm(page);
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
@@ -1034,7 +1491,7 @@ test.describe('Session Resume', () => {
     await page.getByRole('button', { name: 'Resume', exact: true }).click();
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
 
-    // Outlast the delayed auth emit, then confirm we're still on the scrobble step.
+    // Give the sign-in handler's check time to land, then confirm we're still on the scrobble step.
     await page.waitForTimeout(4000);
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible();
     await expect(page.locator('.upload-step')).toBeHidden();
@@ -2107,6 +2564,32 @@ test.describe('Session Resume', () => {
     await expect(page.locator('text=1 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   });
 
+  // #153: signing in from a refused *file* must not resume the other saved import.
+  test('signing in after a refused progress file does not resume the saved import instead', async ({ page }) => {
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    await page.goto('/#/scrobble');
+    await page.evaluate(() => localStorage.setItem('scrobblifyLfmUserName', 'testuser'));
+    await seedSavedState(page, buildState({ importId: 'aaaaaaaaaaaaaaaaaaaaaaaa' }));
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(buildState({
+        importId: 'bbbbbbbbbbbbbbbbbbbbbbbb', completedIndices: [0, 1, 2, 3], originalSucceededCount: 4,
+      }))),
+    });
+    await page.locator('.progress-file-conflict button:has-text("Use this file anyway")').click();
+    await expect(page.locator('text=then import your progress file again')).toBeVisible({ timeout: 5000 });
+
+    await page.getByRole('button', { name: 'Sign in to Last.fm' }).click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.upload-step')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeHidden();
+  });
+
   test('re-importing a progress file for a finished import warns first', async ({ page }) => {
     test.setTimeout(60000);
     const importId = 'cccccccccccccccccccccccc';
@@ -2743,8 +3226,10 @@ test.describe('Authentication - clearUser', () => {
     // Now click "Not you?" to log out
     await page.locator('text=Not you?').click();
 
-    // Should go back to step 1 (auth step)
-    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible({ timeout: 5000 });
+    // Signed out: the name goes, and the page stays on upload (there is no
+    // sign-in step to go back to).
+    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0, { timeout: 5000 });
+    await expect(page.locator('.upload-step')).toBeVisible();
 
     // Verify localStorage was cleared
     const authKey = await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'));
@@ -3179,34 +3664,6 @@ test.describe('Re-tagged old plays', () => {
 });
 
 test.describe('Import robustness', () => {
-  // Builds a ZIP in-memory so each test can decide exactly how the history
-  // files are damaged, without checking another binary fixture into the repo.
-  async function makeZip(files: Record<string, string>): Promise<Buffer> {
-    const zip = new JSZip();
-    for (const [name, content] of Object.entries(files)) {
-      zip.file(`Spotify Extended Streaming History/${name}`, content);
-    }
-    return zip.generateAsync({ type: 'nodebuffer' });
-  }
-
-  function play(track: string, artist: string, ts: string) {
-    return {
-      ts,
-      master_metadata_track_name: track,
-      master_metadata_album_artist_name: artist,
-      master_metadata_album_album_name: 'An Album',
-      ms_played: 300000,
-    };
-  }
-
-  async function uploadZip(page: Page, buffer: Buffer) {
-    await page.locator('.drop-zone input[type="file"]').setInputFiles({
-      name: 'my_spotify_data.zip',
-      mimeType: 'application/zip',
-      buffer,
-    });
-  }
-
   test('one malformed history file does not throw away the whole import', async ({ page }) => {
     await goToUploadStep(page);
 
@@ -3595,14 +4052,16 @@ test.describe('Invalid session key', () => {
     // ...and it must not be picked up again on the next visit.
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBeNull();
 
-    // Coming back later lands on sign-in, with the whole queue still waiting.
+    // Coming back later lands signed out on upload, with the whole queue still waiting.
     await page.reload();
-    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
     await expect(page.locator('text=Resume previous session?')).toBeVisible();
 
     // Returning from Last.fm's authorize page with a fresh token.
     await loadFresh(page, '/#/scrobble?token=fresh-token');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    // Upload shows at once; the name shows once the token has been exchanged.
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
     await page.getByRole('button', { name: 'Resume', exact: true }).click();
     await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
     await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
@@ -3633,7 +4092,8 @@ test.describe('Invalid session key', () => {
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
     await loadFresh(page, '/#/scrobble?token=fresh-token');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    // Upload shows at once; the name shows once the token has been exchanged.
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
 
     expect(getSessionRequests).toHaveLength(1);
     // The old key must not ride along on (and be signed into) the exchange.
@@ -3658,7 +4118,7 @@ test.describe('Invalid session key', () => {
     await page.goto('/#/scrobble');
     await mockLastFmAuth(page);
     await loadFresh(page, '/#/scrobble?token=already-used-token');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('text=/already used or has expired/i')).toBeHidden();
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'))).toBe('fake-session-key');
   });
@@ -3701,21 +4161,23 @@ test.describe('Invalid session key', () => {
     await page.getByRole('button', { name: 'Resume', exact: true }).click();
 
     await expect(page.locator('text=Sign in to Last.fm first, then choose Resume.')).toBeVisible({ timeout: 5000 });
-    await expect(page.getByRole('link', { name: 'Sign in to Last.fm', exact: true }))
-      .toHaveAttribute('href', /last\.fm\/api\/auth/);
-    await expect(page.locator('h1:has-text("Authorize")')).toBeVisible();
+    const signIn = page.getByRole('button', { name: 'Sign in to Last.fm', exact: true });
+    await expect(signIn).toBeVisible();
+    await expect(page.locator('.upload-step')).toBeVisible();
     await expect(page.locator('text=12 tracks ready to scrobble')).toBeHidden();
 
     await page.waitForTimeout(1000);
     expect(scrobbled).toHaveLength(0);
     expect(await readSavedState(page)).toEqual(seeded);
 
-    // Back from Last.fm's authorize page, the same progress is offered again.
-    await loadFresh(page, '/#/scrobble?token=fresh-token');
-    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    // The banner's button goes to Last.fm's authorize page; back from it, the
+    // same progress resumes by itself, ready to send.
+    await routeLastFmSignIn(page);
+    await signIn.click();
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('text=Sign in to Last.fm first')).toHaveCount(0);
-    await page.getByRole('button', { name: 'Resume', exact: true }).click();
-    await expect(page.locator('text=12 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    expect(scrobbled).toHaveLength(0);
   });
 
   test('a run with no session key stops on the first track without using it up', async ({ page }) => {
