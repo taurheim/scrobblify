@@ -159,6 +159,70 @@ test.describe('Background worker unreachable', () => {
   });
 });
 
+/*
+  #157: a handoff return is accepted only for the handoff this browser
+  preflighted. Anyone can preflight a handoff and send its Last.fm link to
+  someone else; the return then lands in the victim's browser.
+
+  In dev the router runs in hash mode, so a real return's `#session=…`
+  fragment would be taken for the route and never reach the Scrobble page.
+  The URL is rewritten in place instead, and the handler the page runs on
+  mount is called directly.
+*/
+test.describe('Returning from a handoff', () => {
+  async function returnWith(page: Page, fragment: string) {
+    return page.evaluate(async (hash) => {
+      window.history.replaceState(null, '', `${window.location.pathname}?handoff=ok&job=j-1#${hash}`);
+      let inst = (document.querySelector('.upload-step') as any).__vueParentComponent;
+      while (inst && !(inst.proxy && typeof inst.proxy.resumeHandoffIfReturning === 'function')) {
+        inst = inst.parent;
+      }
+      await inst.proxy.resumeHandoffIfReturning();
+      return {
+        href: window.location.href,
+        session: localStorage.getItem('scrobblify.background.session'),
+        pending: localStorage.getItem('scrobblify.background.handoff'),
+        preflighted: localStorage.getItem('scrobblify.background.preflighted'),
+      };
+    }, fragment);
+  }
+
+  test('a return for a handoff this browser did not start is ignored', async ({ page }) => {
+    await openUploadStep(page, 'refuse', {
+      'scrobblify.background.preflighted': 'h-mine',
+    });
+    const after = await returnWith(page, 'session=s-theirs&handoff=h-theirs&user=someone');
+    expect(after.href).not.toContain('session=');
+    expect(after.session).toBeNull();
+    expect(after.pending).toBeNull();
+    // Still waiting for its own return.
+    expect(after.preflighted).toBe('h-mine');
+  });
+
+  test('a return with no handoff preflighted here is ignored', async ({ page }) => {
+    await openUploadStep(page, 'refuse');
+    const after = await returnWith(page, 'session=s-theirs&handoff=h-theirs');
+    expect(after.href).not.toContain('session=');
+    expect(after.session).toBeNull();
+    expect(after.pending).toBeNull();
+  });
+
+  test('the return for this browser\'s own handoff is accepted, once', async ({ page }) => {
+    await openUploadStep(page, 'refuse', {
+      'scrobblify.background.preflighted': 'h-mine',
+    });
+    const after = await returnWith(page, 'session=s-mine&handoff=h-mine&user=testuser');
+    expect(after.href).not.toContain('session=');
+    expect(after.session).toBe('s-mine');
+    expect(after.pending).toBe('h-mine');
+    expect(after.preflighted).toBeNull();
+
+    // The same return again, say from history, is no longer this browser's.
+    const replayed = await returnWith(page, 'session=s-replayed&handoff=h-mine');
+    expect(replayed.session).toBe('s-mine');
+  });
+});
+
 test.describe('Importing a progress file', () => {
   const IMPORT_ID = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
   const IDLE = { ok: true, live: false };

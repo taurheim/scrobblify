@@ -27,6 +27,11 @@ const BETA_STORAGE_KEY = 'scrobblify.background.beta';
 const SESSION_STORAGE_KEY = 'scrobblify.background.session';
 const HANDOFF_STORAGE_KEY = 'scrobblify.background.handoff';
 /**
+ * The handoff this browser last preflighted, so a return from Last.fm can be
+ * told apart from one for a handoff someone else started (#157).
+ */
+const PREFLIGHTED_STORAGE_KEY = 'scrobblify.background.preflighted';
+/**
  * Set when we know a handoff happened but not whether the server took
  * ownership. Kept out of `clearSession` on purpose: losing the session token
  * makes the uncertainty worse, not better.
@@ -2367,6 +2372,14 @@ export function canCompress(): boolean {
  * Returns the URL to send the user to, or null if the worker declined. The
  * digest binds the payload we are about to upload; the worker records it and
  * can verify what arrives.
+ *
+ * An empty `username` is left out of the request: the worker then adopts
+ * whichever Last.fm account authorises, and names it in the return.
+ *
+ * The handoff id is recorded before returning, because the return is only
+ * accepted for a handoff this browser started. A browser that cannot record
+ * it gets null: its return would be refused anyway, after the user had
+ * already been through Last.fm.
  */
 export async function preflight(
   username: string,
@@ -2387,7 +2400,7 @@ export async function preflight(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        username,
+        ...(username ? { username } : {}),
         payloadDigest: digest,
         trackCount: tracks.length,
         chunkCount: Math.ceil(tracks.length / chunkTracks),
@@ -2401,6 +2414,12 @@ export async function preflight(
     });
     const body = await res.json();
     if (!res.ok || !body.ok) {
+      return null;
+    }
+    try {
+      window.localStorage.setItem(PREFLIGHTED_STORAGE_KEY, body.handoffId);
+    } catch (e) {
+      trackError('background.recordPreflight', e);
       return null;
     }
     return { handoffId: body.handoffId, authoriseUrl: body.authoriseUrl };
@@ -2632,8 +2651,18 @@ export function newExportClaim(): string {
  * to a server or written to an access log — and this token authorises reading
  * a complete listening history. Stripping it stops the token surviving in
  * browser history or being copied out of the address bar.
+ *
+ * Only a return for the handoff this browser preflighted is accepted (#157).
+ * Anyone can preflight a handoff and send its Last.fm link to someone else;
+ * without this, the victim's browser would store a session from that return
+ * and upload its own queue into the stranger's handoff. A foreign return is
+ * stripped and nothing is stored. The record is consumed on a match, so the
+ * same fragment cannot be replayed into this browser later.
+ *
+ * `user` is the Last.fm account that authorised, which a handoff started
+ * before signing in learns only here. Empty from workers that predate it.
  */
-export function consumeRedirectFragment(): { session: string; handoffId: string } | null {
+export function consumeRedirectFragment(): { session: string; handoffId: string; user: string } | null {
   try {
     const hash = window.location.hash.replace(/^#/, '');
     if (!hash) {
@@ -2645,10 +2674,25 @@ export function consumeRedirectFragment(): { session: string; handoffId: string 
     if (!session || !handoffId) {
       return null;
     }
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    let preflighted: string | null = null;
+    try {
+      preflighted = window.localStorage.getItem(PREFLIGHTED_STORAGE_KEY);
+    } catch {
+      preflighted = null;
+    }
+    if (!preflighted || preflighted !== handoffId) {
+      trackEvent('background_handoff_return_rejected');
+      return null;
+    }
+    try {
+      window.localStorage.removeItem(PREFLIGHTED_STORAGE_KEY);
+    } catch {
+      // Nothing to do; the next preflight overwrites it.
+    }
     setSession(session);
     setPendingHandoff(handoffId);
-    window.history.replaceState(null, '', window.location.pathname + window.location.search);
-    return { session, handoffId };
+    return { session, handoffId, user: params.get('user') || '' };
   } catch (e) {
     trackError('background.consumeRedirectFragment', e);
     return null;
@@ -2693,7 +2737,7 @@ export async function startReauth(username: string): Promise<string | null> {
     const res = await fetch(`${API_BASE}/scrobblify/auth/signin`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, nonce }),
+      body: JSON.stringify({ ...(username ? { username } : {}), nonce }),
     });
     const body = await res.json();
     if (!res.ok || !body.ok) {
@@ -2716,12 +2760,15 @@ export async function startReauth(username: string): Promise<string | null> {
  * The nonce is compared before the session is stored, and cleared either way:
  * a return this browser did not initiate is discarded, and a replayed one
  * cannot be used twice.
+ *
+ * Returns the Last.fm account that signed in (empty from workers that predate
+ * naming it), or null when there was no accepted return.
  */
-export function consumeReauthFragment(): boolean {
+export function consumeReauthFragment(): { user: string } | null {
   try {
     const params = new URLSearchParams(window.location.search);
     if (params.get('signin') !== 'ok') {
-      return false;
+      return null;
     }
     const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
     const session = hash.get('session');
@@ -2736,13 +2783,13 @@ export function consumeReauthFragment(): boolean {
     window.history.replaceState(null, '', window.location.pathname);
     if (!session || !returned || !expected || returned !== expected) {
       trackEvent('background_reauth_rejected');
-      return false;
+      return null;
     }
     setSession(session);
     sessionExpired = false;
-    return true;
+    return { user: hash.get('user') || '' };
   } catch (e) {
     trackError('background.consumeReauthFragment', e);
-    return false;
+    return null;
   }
 }

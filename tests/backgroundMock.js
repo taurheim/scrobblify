@@ -23,6 +23,8 @@
 //     is the route. The shim writes the same localStorage keys the fragment
 //     handler would and navigates back.
 
+const { MOCK_USER } = require('./lastfmMock');
+
 const DEFAULT_API_ORIGIN = 'http://localhost:8787';
 const DEFAULT_APP_ORIGIN = 'http://localhost:8080';
 
@@ -137,10 +139,33 @@ function syntheticTracks(count) {
  *
  * `location.replace` keeps it out of the back stack, so the user cannot reload
  * their way into re-authorising a handoff that is already done.
+ *
+ * `user` is the Last.fm account the real worker names in its fragment when
+ * the handoff or sign-in named none. It is remembered the way the app
+ * remembers a signed-out user (a name with no session key, as
+ * `LastFm.clearSessionKey` leaves it). `fail` stands in for a callback the
+ * real worker refuses: nothing is written and the app gets
+ * `?handoff=failed&reason=<fail>`.
  */
-function shimHtml(session, handoffId) {
+function shimHtml(session, handoffId, user = '', fail = '') {
+  if (fail) {
+    const failed = `/?handoff=failed&reason=${encodeURIComponent(fail)}#/scrobble`;
+    return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Mock Last.fm authorisation</title>
+<style>body{font:16px system-ui;margin:4rem auto;max-width:32rem;color:#222}</style></head>
+<body>
+<h1>Authorising&hellip;</h1>
+<p>Mock Last.fm approval failed. Returning to Scrobblify.</p>
+<script>
+  location.replace(${JSON.stringify(failed)});
+</script>
+</body></html>`;
+  }
   const setHandoff = handoffId
     ? `localStorage.setItem('scrobblify.background.handoff', ${JSON.stringify(handoffId)});`
+    : '';
+  const setUser = user
+    ? `localStorage.setItem('scrobblifyLfmUserName', ${JSON.stringify(user)});`
     : '';
   const back = handoffId
     ? `/?handoff=${encodeURIComponent(handoffId)}#/scrobble`
@@ -155,10 +180,23 @@ function shimHtml(session, handoffId) {
   try {
     localStorage.setItem('scrobblify.background.session', ${JSON.stringify(session)});
     ${setHandoff}
+    ${setUser}
   } catch (e) { /* the app reports the failure for us */ }
   location.replace(${JSON.stringify(back)});
 </script>
 </body></html>`;
+}
+
+/**
+ * Answers a shim URL the way both callers need, from its query.
+ */
+function shimFromQuery(searchParams) {
+  return shimHtml(
+    searchParams.get('session') || '',
+    searchParams.get('handoff') || '',
+    searchParams.get('user') || '',
+    searchParams.get('fail') || '',
+  );
 }
 
 /**
@@ -184,6 +222,9 @@ function createMockWorker(options = {}) {
   // localhost:8080 — the port the Playwright suite runs on.
   const appOrigin = options.appOrigin === undefined ? DEFAULT_APP_ORIGIN : options.appOrigin;
   const verbose = options.log !== false;
+  // The Last.fm account that "authorises" a handoff or sign-in that named
+  // none, as the real worker adopts it at the callback.
+  const lastFmUser = options.username || MOCK_USER;
 
   const world = {
     rate: options.rate || 40,
@@ -317,13 +358,23 @@ function createMockWorker(options = {}) {
     if (Number(body.trackCount) < MIN_TRACKS) {
       return json({ ok: false, reason: 'too_small' }, 400);
     }
+    const named = String(body.username || '');
+    if (!named && isLive()) {
+      // The real worker only learns who an anonymous handoff belongs to at the
+      // callback, so it accepts the preflight and fails the return.
+      return json({
+        ok: true,
+        handoffId: `h-${hex(16)}`,
+        authoriseUrl: `${appOrigin}/mock-auth?fail=already_live`,
+      });
+    }
     if (isLive()) {
       return json({ ok: false, reason: 'already_running' }, 409);
     }
     const handoffId = `h-${hex(16)}`;
     const session = `s-${hex(24)}`;
     world.handoffs.set(handoffId, {
-      username: String(body.username || ''),
+      username: named || lastFmUser,
       trackCount: Number(body.trackCount) || 0,
       importId: String(body.importId || ''),
       chunksSeen: new Set(),
@@ -334,10 +385,11 @@ function createMockWorker(options = {}) {
       console.log(`[worker-mock] preflight: ${body.trackCount} tracks, handoff ${handoffId}`);
     }
     // Points at the shim rather than Last.fm. See the header.
+    const adopted = named ? '' : `&user=${encodeURIComponent(lastFmUser)}`;
     return json({
       ok: true,
       handoffId,
-      authoriseUrl: `${appOrigin}/mock-auth?handoff=${handoffId}&session=${session}`,
+      authoriseUrl: `${appOrigin}/mock-auth?handoff=${handoffId}&session=${session}${adopted}`,
     });
   }
 
@@ -516,6 +568,9 @@ function createMockWorker(options = {}) {
     if (path === '/scrobblify/auth/signin' && method === 'POST') {
       const body = JSON.parse(bodyText || '{}');
       const nonce = encodeURIComponent(body.nonce || '');
+      // A sign-in that named nobody adopts whoever authorises, and the real
+      // worker names them in the return.
+      const adopted = body.username ? '' : `&user=${encodeURIComponent(lastFmUser)}`;
       // The real worker re-attaches in the sign-in *callback*; the shim has no
       // server side, so it happens here instead. Same outcome either way.
       const { job } = world;
@@ -524,7 +579,7 @@ function createMockWorker(options = {}) {
       }
       return json({
         ok: true,
-        authoriseUrl: `${appOrigin}/mock-auth?session=s-${hex(24)}&nonce=${nonce}`,
+        authoriseUrl: `${appOrigin}/mock-auth?session=s-${hex(24)}&nonce=${nonce}${adopted}`,
       });
     }
 
@@ -587,7 +642,7 @@ async function interceptBackgroundWorker(page, options = {}) {
     await route.fulfill({
       status: 200,
       contentType: 'text/html; charset=utf-8',
-      body: shimHtml(url.searchParams.get('session') || '', url.searchParams.get('handoff') || ''),
+      body: shimFromQuery(url.searchParams),
     });
   });
 
@@ -599,6 +654,7 @@ module.exports = {
   createMockWorker,
   setState,
   shimHtml,
+  shimFromQuery,
   MIN_TRACKS,
   DEFAULT_API_ORIGIN,
   DEFAULT_APP_ORIGIN,

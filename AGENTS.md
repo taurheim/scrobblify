@@ -1045,6 +1045,18 @@ would switch itself off exactly when a handoff came back. The parameter is
 read from the query string *and* the hash (dev runs the router in hash mode)
 and deliberately not stripped — see `consumeBetaParam`.
 
+**A handoff return is accepted only for a handoff this browser preflighted**
+(#157). `preflight` records the id in localStorage
+(`scrobblify.background.preflighted`) before the redirect, and
+`consumeRedirectFragment` strips a `#session=…&handoff=…` fragment naming any
+other id, stores nothing and emits `background_handoff_return_rejected`; a
+match consumes the record. Anyone can preflight a handoff and send its Last.fm
+link to someone else, so without this the victim's browser stored the
+stranger's session and uploaded its own queue into their handoff. The dev
+shim (`/mock-auth`) writes localStorage directly and never goes through the
+fragment, so `tests/unreachable-worker/` exercises the check by rewriting the
+URL and calling `resumeHandoffIfReturning`.
+
 ### The job card refreshes itself
 
 The scheduler only runs every five minutes (`TICK_INTERVAL_SECONDS`, which must
