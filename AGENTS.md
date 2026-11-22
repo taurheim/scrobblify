@@ -210,7 +210,7 @@ import budget (read from the library, as the loop does), then 700 per UTC day;
 see "Last.fm's daily cap". Cancelling it emits nothing. Since 2026-11-21 it
 carries `path`: `tab` (sent from this browser: "Start scrobbling", "Start
 over" without the server choice, or "scrobble locally") or `server` ("Let
-Scrobblify scrobble for me"; see "The server choice").
+Scrobblify scrobble for me (beta)"; see "The server choice").
 
 **A fresh run never replaces saved progress unasked** (#102). There is one
 saved-progress slot, and a fresh run's first save (checkpoint or stop)
@@ -465,10 +465,9 @@ before the authority check asks by name, and once the job and saved state
 have settled `reportWorkerLookup` takes the flag and emits
 `worker_lookup_result`: `job` (the job banner shows), `saved` (the resume
 prompt), `nothing`, or `failed` (refused, or no worker session; the "didn't
-work" notice is up). `nothing` shows the `nothing` banner, "Nothing to resume"
-with **Upload Spotify zip** (dismisses it) and "Have a progress file? Upload it
-here." (the hidden file input now sits outside the alert so either banner can
-open it); it clears when the user leaves Upload or imports a file.
+work" notice is up). `nothing` opens a dialog (`.nothing-to-resume`): "We
+weren't able to find an active scrobblify session for you." with a single
+**OK** that closes it and leaves the user on Upload.
 
 **An intent only steers the sign-in it was recorded for.** Each carries
 `inApp` (true from `setSignInIntent`, false from `startSignIn`) and `createdAt`
@@ -543,7 +542,7 @@ check fails, the queue is sent unfiltered with the upload step's error dialog;
 if only the write fails, the filtered queue is sent from memory and checkpoints
 save it. Both report `scrobblify.deferredDuplicates`. A signed-in user's check
 still runs during upload, as before. **The server path never runs the deferred
-check**: a signed-out user who chooses "Let Scrobblify scrobble for me" hands
+check**: a signed-out user who chooses "Let Scrobblify scrobble for me (beta)" hands
 over the queue unfiltered, because it is committed at preflight (its digest
 and count), before the worker's callback says who the user is. Re-dated plays,
 the bulk of a server-sized import, are exempt from the check anyway (see
@@ -1066,7 +1065,7 @@ duplicates are actually possible.
 
 **The page shows one banner at a time**, picked by the `banner` computed in
 `Scrobblify.vue`: outage, then a server job, then the Last.fm sign-in prompt,
-then the sign-in `retry`, then "Nothing to resume" (`nothing`), then the resume
+then the sign-in `retry`, then the resume
 prompt, then a `backgroundNotice` on its own. A
 `backgroundNotice` that isn't the banner shows as the winning
 banner's first line. While the worker is unreachable, notices that need the
@@ -1103,11 +1102,11 @@ arriving meanwhile doesn't swap it: `saved` when there is saved progress
 `backgroundCanFinish(trackCount, backgroundTrackLimit)` holds (beta, the
 server has room, no job listed, the browser can compress, at least 750 plays
 and no more than the worker's `maxTracks`), else `plain`, the old dialog.
-**Start over** goes on to `choice` when it would show. `choice` is titled "{n}
-plays" and holds `ServerChoice` (`src/components/ServerChoice.vue`): the days
+**Start over** goes on to `choice` when it would show. `choice` is titled
+"Scrobble {n} tracks?", like the plain dialog, and holds `ServerChoice` (`src/components/ServerChoice.vue`): the days
 at 700 a day, the "will not have the correct date" note when some selected
 plays are re-dated, the over-60-days warning, **Let Scrobblify scrobble for
-me**, **Details** and "or scrobble locally". Entering it emits
+me (beta)**, **Details** and "or scrobble locally". Entering it emits
 `background_offer_shown` (`entry_point: confirm`); "scrobble locally" emits
 `background_offer_declined` and carries on as the `tab` path (a Last.fm
 sign-in first when signed out). The server button emits `tracks_selected`
@@ -1200,6 +1199,27 @@ an anonymous preflight or sign-in and names it in the shim URL (`user=`, which
 the shim writes to `scrobblifyLfmUserName`). An anonymous preflight while a
 job is live gets a shim URL with `fail=already_live`, returning
 `?handoff=failed&reason=already_live` as the real callback would.
+
+**A confirmed handover lands on Home** (since 2026-11-22). The real worker
+redirects to `APP_URL` (`worker/wrangler.toml`,
+`https://savas.ca/scrobblify/scrobble`) as
+`?handoff=ok&job=…#session=…&handoff=…&user=…`; the production router (history
+mode, base `/scrobblify/`) routes that to `/scrobble`, whose `mounted` runs
+`resumeHandoffIfReturning` before anything else. The mock worker's shim
+returns to `/?handoff=<id>#/scrobble` with the session in localStorage
+instead (see `tests/backgroundMock.js`). Once `completeHandoff` answers
+`active` (the point that records the `server` queue owner and
+`handedOverImport`) and that record names the user this browser knows (the
+worker's name when it knew no one), the page `$router.replace`s to Home, whose
+welcome-back card shows "Scrobbling to {user}" / "Scrobbling remotely, it's
+safe to close this tab." `stripQuery` has already removed the query and
+fragment; dev's hash router keeps the load's query in its base but writes
+hash-only URLs, so it doesn't come back. Everything else stays on `/scrobble`
+as before: failures, `already_live`, an unresolved or unknown outcome, a
+take-back, and a handover recorded for someone other than the known user (or
+not recorded, e.g. no import id), where Home's card would be about the wrong
+thing. `/scrobble` afterwards still shows the job banner (Pause, Take my
+progress back).
 
 **A handoff return is accepted only for a handoff this browser preflighted**
 (#157). `preflight` records the id in localStorage

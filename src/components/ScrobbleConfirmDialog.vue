@@ -1,7 +1,7 @@
 <template>
   <v-dialog v-model="visible" max-width="620" scrollable>
     <v-card v-if="stage === 'choice'" class="scrobble-confirm text-left">
-      <v-card-title>{{ trackCount.toLocaleString() }} plays</v-card-title>
+      <v-card-title>Scrobble {{ trackCount.toLocaleString() }} tracks?</v-card-title>
       <v-card-text class="pt-2">
         <server-choice :count="trackCount" :show-date-note="hasReTagged" @server="chooseServer" @local="chooseLocal" />
       </v-card-text>

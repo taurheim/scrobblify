@@ -1,7 +1,7 @@
 <template>
   <v-dialog v-model="visible" max-width="520" scrollable>
     <v-card class="background-offer">
-      <v-card-title>{{ remaining.toLocaleString() }} plays</v-card-title>
+      <v-card-title>Scrobble {{ remaining.toLocaleString() }} tracks?</v-card-title>
       <v-card-text class="pt-2">
         <server-choice
           :count="remaining"

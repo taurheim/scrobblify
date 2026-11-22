@@ -153,23 +153,6 @@
         </div>
       </template>
 
-      <template v-else-if="banner === 'nothing'">
-        <div><strong>Nothing to resume</strong></div>
-        <div class="mt-1">Scrobblify isn't scrobbling anything for you, and this browser has no saved progress.</div>
-        <div class="mt-2">
-          <v-btn color="primary" @click="nothingToResume = false">Upload Spotify zip</v-btn>
-        </div>
-        <div class="mt-2">Have a progress file?
-          <a
-            role="button"
-            tabindex="0"
-            @click="importStateFile"
-            @keydown.enter="importStateFile"
-            @keydown.space.prevent="importStateFile"
-          >Upload it here</a>.
-        </div>
-      </template>
-
       <template v-else-if="banner === 'resume'">
         <div>
           <strong>Resume previous session?</strong>
@@ -180,17 +163,16 @@
           <v-btn variant="outlined" @click="importStateFile">Import from file</v-btn>
           <v-btn variant="text" color="error" @click="clearSavedState">Discard</v-btn>
         </div>
+        <input
+          ref="importFileInput"
+          type="file"
+          accept=".json"
+          aria-label="Import saved session file"
+          style="display: none"
+          @change="onImportFile"
+        >
       </template>
     </v-alert>
-    <!-- Outside the alert so either banner that offers a file can open it. -->
-    <input
-      ref="importFileInput"
-      type="file"
-      accept=".json"
-      aria-label="Import saved session file"
-      style="display: none"
-      @change="onImportFile"
-    >
 
     <!--
       Not a step: it exchanges a `?token=` coming back from Last.fm, and says
@@ -349,6 +331,15 @@
       </v-card>
     </v-dialog>
     <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
+    <v-dialog v-model="nothingToResume" max-width="420">
+      <v-card class="nothing-to-resume">
+        <v-card-text>We weren't able to find an active scrobblify session for you.</v-card-text>
+        <v-card-actions>
+          <v-spacer></v-spacer>
+          <v-btn color="primary" variant="flat" @click="nothingToResume = false">OK</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 <style>
@@ -666,7 +657,8 @@ export default defineComponent({
       signInFailed: false,
       /**
        * Home's "Re-connect" signed in to the worker, which holds nothing for
-       * this account, and this browser has nothing saved either.
+       * this account, and this browser has nothing saved either: the dialog
+       * that says so is open.
        */
       nothingToResume: false,
       /** The deferred duplicate check is running. */
@@ -946,9 +938,6 @@ export default defineComponent({
   watch: {
     currentStep(step: number) {
       trackEvent('step_viewed', { step, step_name: this.stepName(step) });
-      if (step !== 2) {
-        this.nothingToResume = false;
-      }
     },
     '$store.state.scrobbleRunActive': function onRunActive(active: boolean) {
       if (active) {
@@ -1039,19 +1028,17 @@ export default defineComponent({
      *   retry  — a trip to Last.fm to send or resume came back without a
      *            session; it offers the same trip again. Above `resume`
      *            because it is about the same saved progress.
-     *   nothing — Home's "Re-connect" found no job and nothing saved.
      *   resume — saved progress; never while anything might own the queue.
      *   notice — `backgroundNotice` on its own. Below the resume prompt
      *            because a notice that leaves Resume available is a "nothing
      *            happened" report (a handoff that didn't go through), and the
      *            prompt is what the user acts on; it shows as its first line.
      */
-    banner(): 'outage' | 'job' | 'signIn' | 'retry' | 'nothing' | 'resume' | 'notice' | null {
+    banner(): 'outage' | 'job' | 'signIn' | 'retry' | 'resume' | 'notice' | null {
       if (this.authorityUnknown) { return 'outage'; }
       if (this.backgroundJob) { return 'job'; }
       if (this.resumeSignInMessage) { return 'signIn'; }
       if (this.signInRetry && this.currentStep <= 2) { return 'retry'; }
-      if (this.nothingToResume && this.currentStep === 2) { return 'nothing'; }
       if (this.hasResumableState && !this.heldForSignIn && !this.settlingSignIn && this.currentStep <= 2
         && !this.ownershipBlocked && !this.authorityPending) {
         return 'resume';
@@ -1062,7 +1049,6 @@ export default defineComponent({
     bannerType(): string {
       switch (this.banner) {
         case 'job': return this.jobAlertType;
-        case 'nothing':
         case 'resume': return 'info';
         default: return 'warning';
       }
@@ -2331,8 +2317,8 @@ export default defineComponent({
     /**
      * The return from Home's "Re-connect" sign-in to the worker: says what it
      * found. A job shows its own banner and saved progress the resume prompt;
-     * with neither, "Nothing to resume" says so rather than leaving a bare
-     * upload step. On the mock worker's shim the name arrives in localStorage
+     * with neither, a dialog says so rather than leaving a bare upload step.
+     * On the mock worker's shim the name arrives in localStorage
      * instead of the fragment, so it is already remembered.
      */
     reportWorkerLookup(signInRefused: boolean) {
@@ -2422,6 +2408,18 @@ export default defineComponent({
       if (result.outcome.status === 'active') {
         this.backgroundNotice = '';
         this.hasResumableState = false;
+        /*
+          Home's welcome-back card says the job is running and that the tab can
+          be closed, which is all there is to do now. Only when it can show
+          this job: a handover recorded for someone other than the user this
+          browser knows (or not recorded at all) would get a card about the
+          wrong thing, so it stays here with the job banner.
+        */
+        const api = this.$store.state.lfmApi as LastFm;
+        if (background.handedOverImport(api.getUserName())) {
+          await this.$router.replace({ name: 'home' }).catch(() => undefined);
+          return true;
+        }
         await this.refreshBackgroundJob();
         return true;
       }
@@ -3348,7 +3346,6 @@ export default defineComponent({
      * saved state — which a new device or browser never does.
      */
     async importProgressFile(file: File, source: string) {
-      this.nothingToResume = false;
       try {
         const state = await this.stateManager.importFromFile(file);
         if (!(await this.importedQueueMaySend(state))) {

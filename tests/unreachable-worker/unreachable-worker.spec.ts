@@ -511,7 +511,7 @@ test.describe('Offering background scrobbling', () => {
       available: true, used: 0, capacity: 100, minTracks: 750, maxTracks: 200000, chunkTracks: 5000,
     },
   };
-  const OFFER = 'text=Let Scrobblify scrobble for me >> visible=true';
+  const OFFER = 'text=Let Scrobblify scrobble for me (beta) >> visible=true';
 
   function largeProgressFile(reTagged: boolean | ((i: number) => boolean) = false, count = 3000) {
     const tracks = Array.from({ length: count }, (_, i) => ({
@@ -671,10 +671,10 @@ test.describe('Offering background scrobbling', () => {
 
     const dialog = page.locator('.background-offer');
     await expect(dialog).toBeVisible();
-    await expect(dialog.locator('.v-card-title')).toHaveText('3,000 plays');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 3,000 tracks?');
     await expect(dialog).toContainText('This will take 5 days to scrobble.');
     await expect(dialog).toContainText('will not have the correct date');
-    await expect(dialog.locator('button:has-text("Let Scrobblify scrobble for me")')).toBeVisible();
+    await expect(dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")')).toBeVisible();
     await expect(dialog.locator('.choice-over60')).toHaveCount(0);
   });
 
@@ -727,7 +727,7 @@ test.describe('Offering background scrobbling', () => {
 
     const dialog = page.locator('.background-offer');
     await expect(dialog).toBeVisible({ timeout: 30000 });
-    await expect(dialog.locator('.v-card-title')).toHaveText('42,001 plays');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 42,001 tracks?');
     await expect(dialog).toContainText('This will take 61 days to scrobble.');
     await expect(dialog.locator('.choice-over60')).toContainText('more than 60 days of scrobbling');
   });
@@ -739,7 +739,7 @@ test.describe('Offering background scrobbling', () => {
 
     const dialog = page.locator('.background-offer');
     await expect(dialog).toBeVisible({ timeout: 30000 });
-    await expect(dialog.locator('.v-card-title')).toHaveText('41,000 plays');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 41,000 tracks?');
     await expect(dialog).toContainText('This will take 59 days to scrobble.');
     await expect(dialog.locator('.choice-over60')).toHaveCount(0);
   });
@@ -968,7 +968,7 @@ test.describe('Home with a job on the server', () => {
 
 test.describe('"Already scrobbling on scrobblify?" with a worker', () => {
   const JOB_BANNER = 'text=Scrobblify is finishing your import in the background.';
-  const NOTHING = 'text=Nothing to resume';
+  const NOTHING = "text=We weren't able to find an active scrobblify session for you.";
 
   /*
     A fresh browser, not in the beta, on Home. `lastFmSignIns` counts trips
@@ -1029,19 +1029,18 @@ test.describe('"Already scrobbling on scrobblify?" with a worker', () => {
     const { lastFmSignIns } = await openHome(page, baseURL);
     await page.locator('button:has-text("Re-connect to last.fm")').click();
 
-    const banner = page.locator('.scrobblify > .v-alert');
-    await expect(banner.locator(NOTHING)).toBeVisible({ timeout: 20000 });
-    await expect(banner).toContainText("Scrobblify isn't scrobbling anything for you, and this browser has no saved progress.");
+    const dialog = page.locator('.v-dialog .nothing-to-resume');
+    await expect(dialog).toBeVisible({ timeout: 20000 });
+    await expect(dialog.locator('.v-card-text')).toHaveText("We weren't able to find an active scrobblify session for you.");
+    await expect(dialog.locator('button')).toHaveCount(1);
+    await expect(page.locator('.scrobblify > .v-alert')).toHaveCount(0);
     expect(lastFmSignIns).toEqual([]);
     await expect.poll(() => events).toContainEqual({ name: 'worker_lookup_result', props: { result: 'nothing' } });
 
-    const chooser = page.waitForEvent('filechooser');
-    await banner.locator('a:has-text("Upload it here")').click();
-    expect((await chooser).isMultiple()).toBe(false);
-
-    await banner.locator('button:has-text("Upload Spotify zip")').click();
-    await expect(page.locator(NOTHING)).toHaveCount(0);
+    await dialog.locator('button:has-text("OK")').click();
+    await expect(dialog).toBeHidden();
     await expect(page.locator('.upload-step')).toBeVisible();
+    await expect(page).toHaveURL(/#\/scrobble/);
   });
 
   test('a worker that refuses the sign-in falls back to the browser\'s Last.fm sign-in', async ({ page, baseURL }) => {
@@ -1060,6 +1059,18 @@ test.describe('"Already scrobbling on scrobblify?" with a worker', () => {
 test.describe('Choosing the server in the confirm dialog', () => {
   const JOB_BANNER = 'text=Scrobblify is finishing your import in the background.';
   const HANDED_OVER_KEY = 'scrobblify.background.handedOverImport';
+
+  /*
+    Where a confirmed handover lands: Home, with nothing left of the return's
+    URL, and the welcome-back card showing the job running.
+  */
+  async function expectHomeShowsJob(page: Page, user = 'testuser') {
+    const card = page.locator('.returning-card');
+    await expect(card).toContainText("Scrobbling remotely, it's safe to close this tab.", { timeout: 20000 });
+    await expect(card.locator('.v-card-title')).toHaveText(`Scrobbling to ${user}`);
+    await expect(page).toHaveURL(/\/#\/$/);
+    await expect(page.locator('.upload-step')).toHaveCount(0);
+  }
 
   type Opened = {
     scrobbles: string[];
@@ -1205,15 +1216,16 @@ test.describe('Choosing the server in the confirm dialog', () => {
     const { scrobbles, preflights } = await openWithWorker(page, baseURL);
     const dialog = await chooseRecentPlays(page, 800);
 
-    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
     await expect(dialog.locator('.scrobble-estimate')).toHaveCount(0);
     await expect(dialog.locator('.choice-dates')).toHaveCount(0);
     await expect(dialog.locator('button:has-text("Start scrobbling")')).toHaveCount(0);
     await expect.poll(() => events.filter((e) => e.name === 'background_offer_shown').map((e) => e.props))
       .toContainEqual(expect.objectContaining({ entry_point: 'confirm', track_count: 800 }));
-    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
 
-    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    // Handed over: Home's welcome-back card, under the name the worker gave.
+    await expectHomeShowsJob(page);
     expect(preflights).toHaveLength(1);
     expect(preflights[0]).not.toHaveProperty('username');
     const stored = await page.evaluate((key) => ({
@@ -1225,14 +1237,23 @@ test.describe('Choosing the server in the confirm dialog', () => {
     expect(stored.key).toBeNull();
     expect(JSON.parse(stored.handedOver || '{}')).toMatchObject({ username: 'testuser', originalTotal: 800 });
     expect(scrobbles).toEqual([]);
+
+    // /scrobble still has the job, with its controls.
+    await page.goto('/#/scrobble');
+    const jobBanner = page.locator('.scrobblify > .v-alert');
+    await expect(jobBanner.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expect(jobBanner.locator('button:has-text("Pause")')).toBeVisible();
+    await expect(jobBanner.locator('button:has-text("Take my progress back")')).toBeVisible();
     await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
+    await expect(page.locator('text=Resume previous session?')).toHaveCount(0);
+    expect(scrobbles).toEqual([]);
   });
 
   test('"scrobble locally" signs in to Last.fm here and lands ready to send', async ({ page, baseURL }) => {
     const events = captureEvents(page);
     const { scrobbles, preflights } = await openWithWorker(page, baseURL);
     const dialog = await chooseRecentPlays(page, 800);
-    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
     await dialog.locator('a:has-text("scrobble locally")').click();
 
     await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 15000 });
@@ -1251,7 +1272,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     const dialog = await chooseRecentPlays(page, 700);
     await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 700 tracks?');
     await expect(dialog.locator('button:has-text("Start scrobbling")')).toBeVisible();
-    await expect(dialog.locator('text=Let Scrobblify scrobble for me')).toHaveCount(0);
+    await expect(dialog.locator('text=Let Scrobblify scrobble for me (beta)')).toHaveCount(0);
   });
 
   test('outside the beta the dialog is the plain one', async ({ page, baseURL }) => {
@@ -1259,14 +1280,14 @@ test.describe('Choosing the server in the confirm dialog', () => {
     const dialog = await chooseRecentPlays(page, 800);
     await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
     await expect(dialog.locator('button:has-text("Start scrobbling")')).toBeVisible();
-    await expect(dialog.locator('text=Let Scrobblify scrobble for me')).toHaveCount(0);
+    await expect(dialog.locator('text=Let Scrobblify scrobble for me (beta)')).toHaveCount(0);
   });
 
   test('a full server gets the plain dialog', async ({ page, baseURL }) => {
     await openWithWorker(page, baseURL, { worker: { capacityAvailable: false } });
     const dialog = await chooseRecentPlays(page, 800);
     await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
-    await expect(dialog.locator('text=Let Scrobblify scrobble for me')).toHaveCount(0);
+    await expect(dialog.locator('text=Let Scrobblify scrobble for me (beta)')).toHaveCount(0);
   });
 
   test('saved progress is asked about first, and "Start over" goes on to the choice', async ({ page, baseURL }) => {
@@ -1275,21 +1296,21 @@ test.describe('Choosing the server in the confirm dialog', () => {
     const dialog = await chooseRecentPlays(page, 800);
 
     await expect(dialog.locator('.saved-progress-warning')).toContainText('3 of 5 tracks scrobbled');
-    await expect(dialog.locator('text=Let Scrobblify scrobble for me')).toHaveCount(0);
+    await expect(dialog.locator('text=Let Scrobblify scrobble for me (beta)')).toHaveCount(0);
     await dialog.locator('button:has-text("Start over")').click();
 
-    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
     await expect(dialog.locator('.saved-progress-warning')).toHaveCount(0);
-    await expect(dialog.locator('button:has-text("Let Scrobblify scrobble for me")')).toBeVisible();
+    await expect(dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")')).toBeVisible();
   });
 
   test('a signed-in user\'s handoff names them', async ({ page, baseURL }) => {
     const { scrobbles, preflights } = await openWithWorker(page, baseURL, { signedIn: true });
     const dialog = await chooseRecentPlays(page, 800);
-    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
-    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
 
-    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expectHomeShowsJob(page);
     expect(preflights).toHaveLength(1);
     expect(preflights[0]).toMatchObject({ username: 'testuser', trackCount: 800 });
     expect(scrobbles).toEqual([]);
@@ -1326,8 +1347,8 @@ test.describe('Choosing the server in the confirm dialog', () => {
     await page.reload();
     await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
     const dialog = await chooseRecentPlays(page, 800);
-    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
-    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
 
     await expect(page.locator('text=You already have an import running on Scrobblify.')).toBeVisible({ timeout: 20000 });
     const signIn = page.locator('button:has-text("Sign in to see it")');
@@ -1358,17 +1379,17 @@ test.describe('Choosing the server in the confirm dialog', () => {
   test('the date note shows when the selection has plays moved to today', async ({ page, baseURL }) => {
     await openWithWorker(page, baseURL);
     const dialog = await chooseRecentPlays(page, 800, { old: true });
-    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
     await expect(dialog.locator('.choice-dates')).toBeVisible();
   });
 
   test('a handover that fails before leaving can be tried again', async ({ page, baseURL }) => {
     const { mock, scrobbles, preflights } = await openWithWorker(page, baseURL);
     let dialog = await chooseRecentPlays(page, 800);
-    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
     // Full between the probe and the click.
     mock.world.capacityAvailable = false;
-    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
     await expect(page.locator('text=The background service is full right now')).toBeVisible({ timeout: 10000 });
     expect(preflights).toEqual([]);
 
@@ -1377,9 +1398,9 @@ test.describe('Choosing the server in the confirm dialog', () => {
     dialog = page.locator('.scrobble-confirm');
     await expect(dialog.locator('.saved-progress-warning')).toContainText('0 of 800 tracks scrobbled');
     await dialog.locator('button:has-text("Start over")').click();
-    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
 
-    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expectHomeShowsJob(page);
     await expect(page.locator('text=would be replaced')).toHaveCount(0);
     expect(preflights).toHaveLength(1);
     expect(scrobbles).toEqual([]);
@@ -1405,7 +1426,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
       // mock: later routes win.
       await page.route(`${origin}/mock-auth*`, lastFmPage);
       const dialog = await chooseRecentPlays(page, 800);
-      await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+      await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
       await expect(page.locator('h1:has-text("Allow access?")')).toBeVisible({ timeout: 15000 });
       expect(preflights).toHaveLength(1);
       const importId = String(preflights[0].importId || '');
@@ -1458,7 +1479,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     });
     await page.route(`${origin}/mock-auth*`, lastFmPage);
     const dialog = await chooseRecentPlays(page, 800);
-    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
     await expect(page.locator('h1:has-text("Allow access?")')).toBeVisible({ timeout: 15000 });
     const [handoffId, handoff] = [...mock.world.handoffs.entries()][0];
     const approve = async () => {
@@ -1529,7 +1550,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     await other.close();
 
     await approve();
-    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expectHomeShowsJob(page);
     expect(mock.world.job).toMatchObject({ importId: handoff.importId });
     expect(scrobbles).toEqual([]);
   });
@@ -1575,7 +1596,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     await opened.other.close();
 
     await approve();
-    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expectHomeShowsJob(page);
     expect(scrobbles).toEqual([]);
   });
 
@@ -1609,7 +1630,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     });
 
     await approve();
-    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expectHomeShowsJob(page);
     expect(scrobbles).toEqual([]);
   });
 
@@ -1678,7 +1699,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
         signedIn, worker: { authoriseFail: 'denied' },
       });
       const dialog = await chooseRecentPlays(page, 800);
-      await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+      await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
 
       await expect(page.locator('text=Last.fm didn\'t complete the handoff')).toBeVisible({ timeout: 15000 });
       await expectSelectionOffered(page);
@@ -1717,7 +1738,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
       });
       const after = await returnWith(page, 'session=s-mine&handoff=h-mine&user=testuser');
       expect(after.session).toBe('s-mine');
-      await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+      expect(mock.world.job).toMatchObject({ importId: IMPORT_ID });
       return page.evaluate((key) => ({
         user: localStorage.getItem('scrobblifyLfmUserName'),
         key: localStorage.getItem('scrobblifyLfmAuthKey'),
@@ -1725,15 +1746,20 @@ test.describe('Choosing the server in the confirm dialog', () => {
       }), HANDED_OVER_KEY);
     }
 
+    // The real worker's return (`?handoff=ok&job=…#session=…`) lands on Home too.
     test('is remembered by a browser that knew nobody', async ({ page, baseURL }) => {
       const stored = await openReturning(page, baseURL);
+      await expectHomeShowsJob(page);
       expect(stored.user).toBe('testuser');
       expect(stored.key).toBeNull();
       expect(stored.handedOver).toMatchObject({ importId: IMPORT_ID, username: 'testuser' });
     });
 
+    // Home would welcome the other user, so the job banner says it here instead.
     test('does not replace a different user this browser already knows', async ({ page, baseURL }) => {
       const stored = await openReturning(page, baseURL, { scrobblifyLfmUserName: 'someoneelse' });
+      await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+      await expect(page.locator('.returning-card')).toHaveCount(0);
       expect(stored.user).toBe('someoneelse');
       // The job is the account's that authorised it.
       expect(stored.handedOver).toMatchObject({ importId: IMPORT_ID, username: 'testuser' });
@@ -1767,7 +1793,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
           return;
         }
         expect(after.session).toBe(`s-${returning}`);
-        await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+        await expectHomeShowsJob(page);
         expect(mock.world.job).toMatchObject({ importId: IMPORT_ID });
         const stored = await page.evaluate(([ownerKey, handedOverKey]) => ({
           owner: JSON.parse(localStorage.getItem(ownerKey) || 'null'),

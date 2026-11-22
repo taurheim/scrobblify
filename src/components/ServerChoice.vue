@@ -13,7 +13,7 @@
       again to finish.
     </v-alert>
     <v-btn color="primary" size="large" block :loading="busy" @click="$emit('server')">
-      Let Scrobblify scrobble for me
+      Let Scrobblify scrobble for me (beta)
     </v-btn>
     <div class="choice-fine text-body-medium mt-2">
       You'll need to sign in
