@@ -2836,7 +2836,8 @@ export function newExportClaim(): string {
  * a complete listening history. Stripping it stops the token surviving in
  * browser history or being copied out of the address bar.
  *
- * Only a return for the handoff this browser preflighted is accepted (#157).
+ * Only a return for the handoff this browser preflighted (or, from an older
+ * build, froze its queue for) is accepted (#157).
  * Anyone can preflight a handoff and send its Last.fm link to someone else;
  * without this, the victim's browser would store a session from that return
  * and upload its own queue into the stranger's handoff. A foreign return is
@@ -2865,12 +2866,25 @@ export function consumeRedirectFragment(): { session: string; handoffId: string;
     } catch {
       preflighted = null;
     }
-    if (!preflighted || preflighted !== handoffId) {
+    /*
+      Builds before the server choice recorded only the freeze naming the
+      handoff, and the return is a fresh page load, so a handoff started in a
+      tab on such a build comes back to this one. The freeze is as much this
+      browser's own as `preflighted` (nobody else can write its localStorage).
+      Only needed for those handoffs: they expire within an hour, but old
+      builds keep running for days (see AGENTS.md), so this can go once no
+      events come from builds without `preflight()`'s record, roughly 2027-01.
+    */
+    const owner = queueOwner();
+    const frozenForIt = !!owner && owner.owner === 'freezing' && owner.id === handoffId;
+    if (preflighted !== handoffId && !frozenForIt) {
       trackEvent('background_handoff_return_rejected');
       return null;
     }
     try {
-      window.localStorage.removeItem(PREFLIGHTED_STORAGE_KEY);
+      if (preflighted === handoffId) {
+        window.localStorage.removeItem(PREFLIGHTED_STORAGE_KEY);
+      }
     } catch {
       // Nothing to do; the next preflight overwrites it.
     }

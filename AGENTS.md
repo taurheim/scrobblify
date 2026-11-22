@@ -1208,7 +1208,12 @@ job is live gets a shim URL with `fail=already_live`, returning
 other id, stores nothing and emits `background_handoff_return_rejected`; a
 match consumes the record. Anyone can preflight a handoff and send its Last.fm
 link to someone else, so without this the victim's browser stored the
-stranger's session and uploaded its own queue into their handoff. The dev
+stranger's session and uploaded its own queue into their handoff. A return is
+also accepted when the queue-owner record is the `freezing` one naming that
+handoff: builds before the server choice wrote only that, and a handoff
+started in a tab on one returns (a fresh load) to the current build, which
+used to strip it, store no session and leave the queue frozen. That fallback
+can go once those builds are gone (roughly 2027-01). The dev
 shim (`/mock-auth`) writes localStorage directly and never goes through the
 fragment, so `tests/unreachable-worker/` exercises the check by rewriting the
 URL and calling `resumeHandoffIfReturning`.

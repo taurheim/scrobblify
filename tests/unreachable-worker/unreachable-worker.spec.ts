@@ -1556,5 +1556,44 @@ test.describe('Choosing the server in the confirm dialog', () => {
       // The job is the account's that authorised it.
       expect(stored.handedOver).toMatchObject({ importId: IMPORT_ID, username: 'testuser' });
     });
+
+    /*
+      The build before this one recorded only the freeze naming the handoff,
+      not `preflighted`, and a return from Last.fm is a fresh page load, so a
+      handoff started on it comes back to this build.
+    */
+    for (const [returning, accepted] of [['h-mine', true], ['h-theirs', false]] as const) {
+      test(`a return to a handoff an older build started is ${accepted ? 'accepted by its freeze' : 'still refused for another handoff'}`, async ({ page, baseURL }) => {
+        const { mock } = await openWithWorker(page, baseURL, {
+          saved: { ...SAVED, importId: IMPORT_ID },
+          seed: { [OWNER_KEY]: JSON.stringify({ owner: 'freezing', id: 'h-mine', attempt: `${Date.now()}.t` }) },
+        });
+        mock.world.handoffs.set(returning, {
+          username: 'testuser',
+          trackCount: 2,
+          importId: IMPORT_ID,
+          chunksSeen: new Set(),
+          session: `s-${returning}`,
+          jobId: '',
+        });
+        const after = await returnWith(page, `session=s-${returning}&handoff=${returning}&user=testuser`);
+        expect(after.href).not.toContain('session=');
+        if (!accepted) {
+          expect(after.session).toBeNull();
+          expect(after.pending).toBeNull();
+          expect(mock.world.job).toBeNull();
+          return;
+        }
+        expect(after.session).toBe(`s-${returning}`);
+        await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+        expect(mock.world.job).toMatchObject({ importId: IMPORT_ID });
+        const stored = await page.evaluate(([ownerKey, handedOverKey]) => ({
+          owner: JSON.parse(localStorage.getItem(ownerKey) || 'null'),
+          handedOver: JSON.parse(localStorage.getItem(handedOverKey) || '{}'),
+        }), [OWNER_KEY, HANDED_OVER_KEY]);
+        expect(stored.owner).toMatchObject({ owner: 'server' });
+        expect(stored.handedOver).toMatchObject({ importId: IMPORT_ID });
+      });
+    }
   });
 });
