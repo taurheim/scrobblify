@@ -1018,10 +1018,11 @@ test.describe('"Already scrobbling on scrobblify?" with a worker', () => {
     await expect(page).toHaveURL(/#\/scrobble/);
     await expect(page.locator(NOTHING)).toHaveCount(0);
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBe('testuser');
-    expect(await page.evaluate(() => sessionStorage.getItem('scrobblify.background.lookup'))).toBeNull();
     expect(lastFmSignIns).toEqual([]);
     expect(events.map((e) => e.name)).toContain('worker_lookup_started');
     await expect.poll(() => events).toContainEqual({ name: 'worker_lookup_result', props: { result: 'job' } });
+    // The banner can render before mount takes the flag, so this is only certain once the lookup has reported.
+    expect(await page.evaluate(() => sessionStorage.getItem('scrobblify.background.lookup'))).toBeNull();
   });
 
   test('with no job and nothing saved, says there is nothing to resume', async ({ page, baseURL }) => {
