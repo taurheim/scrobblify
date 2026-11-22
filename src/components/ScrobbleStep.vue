@@ -83,7 +83,13 @@
         </div>
         <div v-if="canResume && autoSaved && canOfferBackground" class="mb-2 text-body-medium">
           Stopped. You can resume at any time, or
-          <a role="button" tabindex="0" @click="requestBackground" @keydown.enter="requestBackground">have
+          <a
+            role="button"
+            tabindex="0"
+            @click="requestBackground"
+            @keydown.enter="requestBackground"
+            @keydown.space.prevent="requestBackground"
+          >have
             scrobblify scrobble the rest for you</a>.
         </div>
         <div v-else-if="canResume && autoSaved" class="mb-2 text-body-medium">
@@ -359,13 +365,14 @@ export default defineComponent({
   components: { 'error-dialog': ErrorDialog },
   props: {
     /**
-     * Whether the parent has confirmed with the server that background mode is
-     * live and accepting jobs. Defaults to false so the offer stays hidden
-     * unless something has positively established otherwise.
+     * Largest queue the server would take now (its `maxTracks`), or 0 when the
+     * parent hasn't confirmed that background mode is live and accepting jobs.
+     * Defaults to 0 so the offer stays hidden unless something has positively
+     * established otherwise.
      */
-    backgroundAvailable: {
-      type: Boolean,
-      default: false,
+    backgroundTrackLimit: {
+      type: Number,
+      default: 0,
     },
     /**
      * Set while this browser has not established that it owns the queue.
@@ -667,16 +674,19 @@ export default defineComponent({
     /**
      * Whether to advertise background mode on the paused screen.
      *
-     * `backgroundAvailable` is the parent's live answer from the server, so an
-     * undeployed or full worker never advertises itself. `canCompress` is
-     * checked here too because the upload needs it, and discovering that after
-     * a redirect through Last.fm would strand the user.
+     * `backgroundTrackLimit` is the parent's live answer from the server, so an
+     * undeployed or full worker never advertises itself, and a queue over its
+     * limit (which the worker refuses as `too_large`) gets no button the
+     * parent would then ignore. `canCompress` is checked here too because the
+     * upload needs it, and discovering that after a redirect through Last.fm
+     * would strand the user.
      */
     canOfferBackground(): boolean {
-      return this.backgroundAvailable
+      return this.backgroundTrackLimit > 0
         && !this.handoffHalted
         && canCompress()
-        && this.tracksRemaining >= MIN_TRACKS_FOR_BACKGROUND;
+        && this.tracksRemaining >= MIN_TRACKS_FOR_BACKGROUND
+        && this.tracksRemaining <= this.backgroundTrackLimit;
     },
 
     // Transient countdowns count as running: the loop resumes by itself.

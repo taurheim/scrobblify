@@ -4,7 +4,7 @@ import {
 import path from 'path';
 import JSZip from 'jszip';
 import { interceptLastFm, mockLastFmAuth, routeLastFmSignIn } from '../lastfmMock';
-import { interceptBackgroundWorker, MockWorker } from '../backgroundMock';
+import { interceptBackgroundWorker, MockWorker, MAX_TRACKS } from '../backgroundMock';
 
 /*
   Runs only under `playwright.unreachable-worker.config.ts`, which compiles in
@@ -511,13 +511,13 @@ test.describe('Offering background scrobbling', () => {
   };
   const OFFER = 'text=Let Scrobblify scrobble for me >> visible=true';
 
-  function largeProgressFile(reTagged = false, count = 3000) {
+  function largeProgressFile(reTagged: boolean | ((i: number) => boolean) = false, count = 3000) {
     const tracks = Array.from({ length: count }, (_, i) => ({
       track: `Track ${i}`,
       artist: `Artist ${i % 50}`,
       album: `Album ${i % 50}`,
       timestamp: Date.UTC(2024, 0, 1) + i * 60000,
-      reTagged,
+      reTagged: typeof reTagged === 'function' ? reTagged(i) : reTagged,
     }));
     return {
       name: 'scrobblify-progress.json',
@@ -624,7 +624,7 @@ test.describe('Offering background scrobbling', () => {
   });
 
   // Today's UTC day already holds 700 plays, so the first re-tagged send stops for the day.
-  async function stopForTheDay(page: Page, declineResumeOffer = true) {
+  async function stopForTheDay(page: Page, declineResumeOffer = true, count = 3000) {
     await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
       const params = new URLSearchParams(new URL(route.request().url()).search);
       if (params.get('method') !== 'user.getrecenttracks') {
@@ -637,7 +637,7 @@ test.describe('Offering background scrobbling', () => {
         body: JSON.stringify({ recenttracks: { '@attr': { total: '700' }, track: [] } }),
       });
     });
-    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile(true));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile(true, count));
     if (declineResumeOffer) {
       await page.locator('a:has-text("scrobble locally") >> visible=true').click({ timeout: 15000 });
     }
@@ -690,6 +690,14 @@ test.describe('Offering background scrobbling', () => {
     await expect(details.nth(0)).toContainText('Only your username and tracks listened to are uploaded');
     await expect(details.nth(1)).toContainText('revoking access');
     await expect(details.nth(2)).toContainText('niko@savas.ca');
+
+    // A role="button" link works from the keyboard like a button: Space too.
+    const toggle = dialog.locator('a:has-text("Details")');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await toggle.focus();
+    await page.keyboard.press('Space');
+    await expect(dialog.locator('.choice-details')).toHaveCount(0);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   });
 
   test('"scrobble locally" closes the choice and records the decline', async ({ page }) => {
@@ -732,6 +740,48 @@ test.describe('Offering background scrobbling', () => {
     await expect(dialog.locator('.v-card-title')).toHaveText('41,000 plays');
     await expect(dialog).toContainText('This will take 59 days to scrobble.');
     await expect(dialog.locator('.choice-over60')).toHaveCount(0);
+  });
+
+  // The date note is for *some* re-dated plays, not only an all-re-dated queue.
+  test('a resume where only some plays are re-dated says their dates will change', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile((i) => i % 2 === 0));
+
+    const dialog = page.locator('.background-offer');
+    await expect(dialog).toBeVisible({ timeout: 30000 });
+    await expect(dialog.locator('.choice-dates')).toContainText('will not have the correct date');
+  });
+
+  test('a resume with no re-dated plays has no date note', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile(false));
+
+    const dialog = page.locator('.background-offer');
+    await expect(dialog).toBeVisible({ timeout: 30000 });
+    await expect(dialog.locator('.choice-dates')).toHaveCount(0);
+  });
+
+  // The worker refuses a queue over its limit as `too_large`, after the
+  // Last.fm sign-in, so neither the resume nor the stop screen may offer it.
+  test('a queue over the server\'s job limit is not offered', async ({ page }) => {
+    const events = captureEvents(page);
+    const { workerCalls } = await openUploadStep(page, {
+      ...WILLING_WORKER,
+      '/scrobblify/capacity': {
+        available: true, used: 0, capacity: 100, minTracks: 750, maxTracks: MAX_TRACKS, chunkTracks: 5000,
+      },
+    }, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await stopForTheDay(page, false, MAX_TRACKS + 1000);
+
+    await expect(page.locator('text=Your progress has been saved automatically >> visible=true')).toBeVisible();
+    await expect(page.locator('.background-offer')).toHaveCount(0);
+    await expect(page.locator('text=Scrobble the rest for me >> visible=true')).toHaveCount(0);
+    await expect(page.locator('text=have scrobblify scrobble the rest for you >> visible=true')).toHaveCount(0);
+    await expect(page.locator("text=hand the rest to Scrobblify's server below >> visible=true")).toHaveCount(0);
+    expect(events.filter((e) => e.name === 'background_offer_shown')).toEqual([]);
   });
 
   // #149: the server refuses a second handover while a job is listed, even a

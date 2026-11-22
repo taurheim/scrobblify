@@ -43,5 +43,6 @@ export function setState(job: Record<string, unknown>, state: string, nowMs: num
 export function shimHtml(session: string, handoffId: string, user?: string, fail?: string): string;
 export function shimFromQuery(searchParams: URLSearchParams): string;
 export const MIN_TRACKS: number;
+export const MAX_TRACKS: number;
 export const DEFAULT_API_ORIGIN: string;
 export const DEFAULT_APP_ORIGIN: string;

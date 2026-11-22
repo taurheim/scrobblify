@@ -248,7 +248,7 @@
         <v-stepper-window-item :value="4" eager>
           <scrobble-step
             ref="scrobbleStep"
-            :background-available="backgroundAvailable && !backgroundJob"
+            :background-track-limit="backgroundTrackLimit"
             :sending-blocked="sendingBlocked"
             :worker-unreachable="authorityUnknown"
             :persist-progress="onAutoSave"
@@ -1137,7 +1137,9 @@ export default defineComponent({
     canOfferBackground(remaining: number): boolean {
       return this.backgroundAvailable
         && !this.backgroundJob
-        && remaining >= LASTFM_DAILY_CAP;
+        && remaining >= LASTFM_DAILY_CAP
+        // The worker refuses a bigger queue as `too_large`, after the sign-in.
+        && remaining <= this.backgroundMaxTracks;
     },
 
     /**

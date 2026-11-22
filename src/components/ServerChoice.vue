@@ -17,7 +17,14 @@
     </v-btn>
     <div class="choice-fine text-body-medium mt-2">
       You'll need to sign in
-      <a role="button" tabindex="0" @click="details = !details" @keydown.enter="details = !details">Details</a>
+      <a
+        role="button"
+        tabindex="0"
+        :aria-expanded="details"
+        @click="details = !details"
+        @keydown.enter="details = !details"
+        @keydown.space.prevent="details = !details"
+      >Details</a>
     </div>
     <div v-if="details" class="choice-details text-body-medium mt-2">
       <p>Only your username and tracks listened to are uploaded, nothing else. Once the scrobbling
@@ -29,7 +36,8 @@
         <a href="mailto:niko@savas.ca?subject=Scrobblify%20background%20scrobbling">niko@savas.ca</a></p>
     </div>
     <div class="choice-tab text-center mt-4">
-      or <a role="button" tabindex="0" :aria-disabled="busy" @click="local" @keydown.enter="local">scrobble locally</a>
+      or <a role="button" tabindex="0" :aria-disabled="busy" @click="local" @keydown.enter="local"
+        @keydown.space.prevent="local">scrobble locally</a>
     </div>
   </div>
 </template>

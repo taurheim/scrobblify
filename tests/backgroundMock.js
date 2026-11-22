@@ -656,6 +656,7 @@ module.exports = {
   shimHtml,
   shimFromQuery,
   MIN_TRACKS,
+  MAX_TRACKS,
   DEFAULT_API_ORIGIN,
   DEFAULT_APP_ORIGIN,
 };
