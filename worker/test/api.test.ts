@@ -1133,6 +1133,55 @@ async function main() {
     check('preflight OPTIONS is answered without a token', preflightCors.status === 204);
   }
 
+  console.log('\n-- a sign-in without a username --');
+  {
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs, {
+      getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'Listener' }),
+    });
+    await seedJob(sql, blobs, 'listener');
+    const nonce = 'nonce-that-is-long-enough';
+    const signin = (body: Record<string, unknown>) => handleRequest(env, req('/scrobblify/auth/signin', {
+      method: 'POST', body: JSON.stringify({ nonce, ...body }),
+    }));
+
+    const res = await signin({});
+    const body: any = await res.json();
+    check('a sign-in with no username is accepted',
+      res.status === 200 && typeof body.authoriseUrl === 'string', body);
+    check('so is a blank one', (await signin({ username: '  ' })).status === 200);
+    check('a username that is not a string is a 400', (await signin({ username: 7 })).status === 400);
+
+    const state = new URL(new URL(body.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+    const cb = await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    );
+    const location = new URL(cb.headers.get('Location')!);
+    check('the callback signs in whoever authorised', cb.status === 302
+      && location.searchParams.get('signin') === 'ok', location.toString());
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    check('the nonce comes back', fragment.get('nonce') === nonce, location.hash);
+    check('and so does the user, as Last.fm spells it', fragment.get('user') === 'Listener', location.hash);
+    const job = await handleRequest(env, req('/scrobblify/job', { token: fragment.get('session')! }));
+    const jobBody: any = await job.json();
+    check('the session reaches that user\'s job', job.status === 200 && !!jobBody.job, jobBody);
+
+    // A named sign-in keeps its check.
+    const named = await signHandoffState(
+      {
+        h: '', exp: NOW + 600, k: 'signin', u: 'someone-else', n: nonce,
+      },
+      SIGNING,
+    );
+    const refused = await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(named)}&token=tok`),
+    );
+    check('a named sign-in by another account still fails',
+      new URL(refused.headers.get('Location')!).searchParams.get('signin') === 'failed',
+      refused.headers.get('Location'));
+  }
+
   console.log('\n-- signing in gives a re-auth job its credential back --');
   {
     /*

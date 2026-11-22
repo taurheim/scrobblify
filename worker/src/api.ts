@@ -433,9 +433,15 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
   // It reserves no slot and creates no job. The Last.fm session key its
   // callback receives is discarded, not stored: proving who you are is all
   // this flow needs.
+  //
+  // The username is optional. A browser that has not signed in to Last.fm yet
+  // has none to name, and its sign-in adopts whoever authorises. That is safe
+  // because the nonce binds the return to the browser that started it: the
+  // session goes to the person who authorised, and it reaches only their own
+  // job.
   if (path === '/scrobblify/auth/signin' && request.method === 'POST') {
     const body = await readJson(request);
-    if (!body || typeof body.username !== 'string' || !body.username.trim()) {
+    if (!body || (body.username !== undefined && typeof body.username !== 'string')) {
       return json(env, { ok: false, reason: 'bad_request' }, 400);
     }
     // The nonce binds the return to the browser that started it. Without it
@@ -449,7 +455,7 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         h: '',
         exp: nowSec + SIGNIN_TTL_SECONDS,
         k: 'signin',
-        u: normalizeUsername(body.username),
+        u: typeof body.username === 'string' ? normalizeUsername(body.username) : '',
         n: body.nonce,
       },
       env.signingKey,
@@ -478,14 +484,17 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         target.searchParams.set('signin', 'failed');
         return Response.redirect(target.toString(), 302);
       }
-      // The username is checked even though nothing is written: issuing a
+      // A named sign-in is checked even though nothing is written: issuing a
       // session for whoever happened to authorise would hand one account
-      // read access to another's job status.
-      if (!signinState.u || normalizeUsername(identity.username) !== signinState.u) {
+      // read access to another's job status. An anonymous one (no `u`) has
+      // nothing to check against and adopts the account that authorised; its
+      // nonce already ties the return to the browser that asked.
+      const signedIn = normalizeUsername(identity.username);
+      if (!signedIn || (signinState.u && signedIn !== signinState.u)) {
         target.searchParams.set('signin', 'failed');
         return Response.redirect(target.toString(), 302);
       }
-      const session = await issueSession(normalizeUsername(identity.username), env.signingKey, nowSec);
+      const session = await issueSession(signedIn, env.signingKey, nowSec);
       /*
         A job parked for re-authentication gets its write credential back here.
 
@@ -498,16 +507,19 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         taken back, which abandons any batch still in flight and risks
         duplicating it, or cancelled, which discards the queue.
 
-        Narrow by construction: the username on the state has already been
-        checked against what `auth.getSession` returned, so the key can only
-        ever be attached to its own owner's job.
+        Narrow by construction: the key is attached only to a job owned by
+        the account `auth.getSession` says it belongs to — the one checked
+        against the state's username, or adopted when it named none — so it
+        can only ever reach its own owner's job.
       */
-      await reattachCredential(env, normalizeUsername(identity.username), identity.sessionKey, nowSec);
+      await reattachCredential(env, signedIn, identity.sessionKey, nowSec);
       target.searchParams.set('signin', 'ok');
       // The nonce is echoed back so the initiating browser can prove this
       // return is its own. It travels in the fragment with the token, so it
-      // never reaches a server log.
-      target.hash = `session=${encodeURIComponent(session)}&nonce=${encodeURIComponent(signinState.n ?? '')}`;
+      // never reaches a server log. The user is Last.fm's spelling, for a
+      // browser that signed in without naming one.
+      target.hash = `session=${encodeURIComponent(session)}&nonce=${encodeURIComponent(signinState.n ?? '')}`
+        + `&user=${encodeURIComponent(identity.username)}`;
       return Response.redirect(target.toString(), 302);
     }
 
