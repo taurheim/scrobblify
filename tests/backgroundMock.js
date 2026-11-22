@@ -562,10 +562,31 @@ function createMockWorker(options = {}) {
     }
 
     // Public, and deliberately so — this is the one ownership question a
-    // browser that has lost its session can still ask.
+    // browser that has lost its session can still ask. A named handoff on its
+    // way holds its user's `live_username` from preflight, as in the real
+    // worker, so an unapproved one reads as live until withdrawn (#164).
     if (path === '/scrobblify/job/live' && method === 'GET') {
-      const username = query.get('username') || '';
-      return json({ ok: true, live: isSending() && world.job.username === username });
+      const username = (query.get('username') || '').trim().toLowerCase();
+      const handoffLive = [...world.handoffs.values()].some((h) => h.named && !h.jobId
+        && IN_FLIGHT_HANDOFF.includes(h.state || 'issued')
+        && String(h.username).toLowerCase() === username);
+      return json({
+        ok: true,
+        live: (isSending() && String(world.job.username).toLowerCase() === username) || handoffLive,
+      });
+    }
+
+    // Public: the browser coming back without approving has no session. Only
+    // a handoff nobody has approved yet can be withdrawn.
+    const abandonMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/abandon$/);
+    if (abandonMatch && method === 'POST') {
+      const rec = world.handoffs.get(abandonMatch[1]);
+      const abandoned = !!rec && !rec.jobId && !rec.approved && (rec.state || 'issued') === 'issued';
+      if (abandoned) {
+        rec.state = 'failed';
+        rec.failureReason = 'abandoned';
+      }
+      return json({ ok: true, abandoned });
     }
 
     // Public for the same reason, plus the import id *is* the credential.
@@ -652,13 +673,21 @@ function createMockWorker(options = {}) {
   /**
    * The `/mock-auth` shim page for a URL's query, standing in for Last.fm and
    * the worker's callback. A `fail` return fails the handoff it names, as the
-   * real callback does, so it no longer counts in `/import/:id`.
+   * real callback does, so it no longer counts in `/import/:id`. An approval
+   * of a handoff that has already failed (withdrawn, say) is refused the way
+   * the real callback refuses it, and makes no job (#165); any other approval
+   * puts it past withdrawing.
    */
   function authorise(searchParams) {
     const fail = searchParams.get('fail') || '';
     const rec = world.handoffs.get(searchParams.get('handoff') || '');
+    if (!fail && rec && rec.state === 'failed') {
+      return shimHtml('', '', '', rec.failureReason === 'abandoned' ? 'abandoned' : 'exchange_failed');
+    }
     if (fail && rec && !rec.jobId) {
       rec.state = 'failed';
+    } else if (rec) {
+      rec.approved = true;
     }
     return shimFromQuery(searchParams);
   }

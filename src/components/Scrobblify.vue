@@ -1681,7 +1681,7 @@ export default defineComponent({
           that set it is this one, back from Last.fm, not a sibling mid-attempt.
         */
         const own = await this.ownHandoffWasTaken(owner);
-        if (own.taken === false && background.releaseAbandonedHandoff(owner, own.pendingImportId)) {
+        if (own.taken === false && await background.abandonOwnHandoff(owner, own.pendingImportId)) {
           this.ownershipBlocked = false;
           await this.exposeSavedStateUnlessStale('handoff_not_taken');
           trackEvent('background_freeze_released', { reason: 'handoff_not_taken' });
@@ -1756,15 +1756,16 @@ export default defineComponent({
      * "unknown", and without a username nothing else is asked either. The
      * import id was minted before the preflight and only reaches a job at the
      * callback, so "not known" means it never did. A late approval can't
-     * change that once the freeze is released: the preflight record goes with
-     * it, so its return is refused (though the job it makes still marks the
-     * queue known, #165).
+     * change that once the freeze is released: the caller withdraws the
+     * handoff at the worker (`abandonOwnHandoff`), so its callback is refused
+     * and makes no job (#165), and the preflight record goes with the freeze,
+     * so a return is refused too.
      *
      * Known only as `pending` (a handoff on its way, no job) is this handoff,
      * still waiting at the worker for an approval that will now be refused,
      * so it is not taken either. `pendingImportId` then names the queue, for
-     * `releaseAbandonedHandoff` to record, so later checks of it don't read
-     * the same answer as handed over (#162).
+     * `releaseAbandonedHandoff` to record if the withdrawal goes unanswered,
+     * so later checks of it don't read the same answer as handed over (#162).
      *
      * `taken` is null when unanswered, or when the freeze isn't this browser's
      * own preflighted handoff, which only its tab may settle.
@@ -2178,9 +2179,10 @@ export default defineComponent({
       background.clearOwnershipUnresolved();
       // Scoped: this tab's own freeze, or a `server` record we have just
       // disproved. A freeze another tab is actively holding stays. With no
-      // pending handoff, this tab's freeze names the one it preflighted.
+      // pending handoff, this tab's freeze names the one it preflighted, which
+      // the worker is told to withdraw.
       const releasedOwn = !pendingId && !!observed
-        && background.releaseAbandonedHandoff(observed, pendingImportId);
+        && await background.abandonOwnHandoff(observed, pendingImportId);
       if (!releasedOwn) {
         background.releaseQueueOwnerIfUnclaimed(pendingId || '');
       }
@@ -2230,8 +2232,10 @@ export default defineComponent({
       if (handoffParam === 'failed') {
         const reason = params.get('reason') || 'callback';
         // The worker refused the handoff, so it can never start, and this
-        // browser has no session to ask about it with (#160).
-        background.releaseAbandonedHandoff();
+        // browser has no session to ask about it with (#160). Withdrawn as
+        // well, in case the refusal left it waiting (a return with no token);
+        // one the callback already failed just answers no.
+        await background.abandonOwnHandoff();
         if (reason === 'already_live') {
           this.backgroundNotice = ALREADY_LIVE_NOTICE;
           this.showReauth = true;

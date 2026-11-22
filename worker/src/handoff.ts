@@ -194,6 +194,8 @@ export type CallbackResult =
       | 'username_mismatch'
       | 'already_live'
       | 'exchange_failed'
+      /** The browser that preflighted it withdrew it (`abandonHandoff`). */
+      | 'abandoned'
       /** A replay of an exchanged handoff with a token other than the winner's. */
       | 'replay';
   };
@@ -250,7 +252,11 @@ export async function handleCallback(
     if (handoff.job_id) {
       return replayOutcome(handoff, tokenHash);
     }
-    return { ok: false, reason: handoff.state === 'failed' ? 'exchange_failed' : 'bad_state' };
+    // A failed handoff never becomes a job, whoever approves it later (#165).
+    if (handoff.state === 'failed') {
+      return { ok: false, reason: handoff.failure_reason === 'abandoned' ? 'abandoned' : 'exchange_failed' };
+    }
+    return { ok: false, reason: 'bad_state' };
   }
   if (handoff.expires_at <= nowSec) {
     await failHandoff(sql, handoff.id, 'expired', nowSec);
@@ -455,6 +461,29 @@ export async function failHandoff(
     });
   }
   await sql.batch(statements);
+}
+
+/**
+ * Withdraws a handoff nobody approved: the browser that preflighted it came
+ * back from Last.fm without authorising (Back, a closed tab, a denial).
+ *
+ * Until then it sat in `issued` for `HANDOFF_TTL_SECONDS`, holding the user's
+ * `live_username` (so `/job/live` said they had something running, #164) and a
+ * capacity slot, and approving that Last.fm page later still made a job for a
+ * queue the browser had taken back (#165).
+ *
+ * A compare-and-set from `issued` only. Anything later has been approved and
+ * may hold a credential or a job, which is `failHandoff`'s and the reaper's to
+ * end. An `issued` row never has a job: the job is created in the same batch
+ * that moves `exchanging` to `pending_upload`. Moving to `failed` clears
+ * `live_username`, which frees the slot and the per-user lock, and
+ * `handleCallback` refuses a failed handoff.
+ *
+ * Returns whether it was withdrawn; false for an unknown id or any state but
+ * `issued`.
+ */
+export async function abandonHandoff(sql: Sql, handoffId: string, nowSec: number): Promise<boolean> {
+  return transitionHandoff(sql, handoffId, 'issued', 'failed', nowSec, 'failure_reason = ?', ['abandoned']);
 }
 
 export type FinalizeResult =

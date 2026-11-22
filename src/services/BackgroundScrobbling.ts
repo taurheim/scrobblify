@@ -1446,10 +1446,12 @@ export function preflightedHandoff(): string | null {
  * authorised), so later `pending` answers about that queue are about it.
  *
  * Its preflight is forgotten with its freeze, so this browser refuses its
- * return and it can never upload. Until the worker reaps it (an hour), it
- * still answers `known: true, pending: true`, which every other check reads
- * as handed over: without this, signing in to Last.fm after coming back
- * blocked the saved selection anyway (#162). A new preflight forgets it.
+ * return and it can never upload. Normally the worker is told
+ * (`abandonOwnHandoff`) and stops counting it; when that goes unanswered it
+ * still answers `known: true, pending: true` until reaped (an hour), which
+ * every other check reads as handed over: without this, signing in to Last.fm
+ * after coming back blocked the saved selection anyway (#162). A new
+ * preflight forgets it.
  */
 export function recordAbandonedImport(importId: string): void {
   if (!importId) {
@@ -2175,6 +2177,13 @@ export const FALLTHROUGH_TIMEOUT_MS = 3000;
 /** Wider than a status check: an export carries the whole remaining queue. */
 const EXPORT_TIMEOUT_MS = 30000;
 
+/**
+ * Withdrawing an unapproved handoff is awaited on page load before the
+ * authority check, so it gets no longer than a browser outside the beta waits
+ * for that check.
+ */
+const ABANDON_TIMEOUT_MS = 3000;
+
 async function getWithTimeout(
   path: string,
   authorised: boolean,
@@ -2648,6 +2657,65 @@ export async function isHandoffActive(
   } catch {
     return null;
   }
+}
+
+/**
+ * Withdraws a handoff nobody approved (`POST /scrobblify/handoff/:id/abandon`),
+ * so the worker stops counting it as on its way: no `/job/live` for its user,
+ * no `pending` import, a free slot, and a refused callback if its Last.fm page
+ * is approved later. Only for this browser's own preflight (see
+ * `abandonOwnHandoff`).
+ *
+ * Unauthenticated, because a browser coming back without approving has no
+ * session. True when withdrawn; false when the worker had nothing to withdraw
+ * (unknown, already failed, or approved after all); null when unanswered.
+ * Best effort with a short timeout: an unanswered one leaves the handoff to
+ * the reaper, as before.
+ */
+export async function abandonHandoff(
+  handoffId: string,
+  timeoutMs = ABANDON_TIMEOUT_MS,
+): Promise<boolean | null> {
+  if (!handoffId || !isBackgroundConfigured()) {
+    return null;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${API_BASE}/scrobblify/handoff/${encodeURIComponent(handoffId)}/abandon`, {
+      method: 'POST',
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const body = await res.json();
+    return body && body.ok === true ? body.abandoned === true : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * `releaseAbandonedHandoff`, after first withdrawing the handoff at the worker
+ * (`abandonHandoff`), when it is this browser's own preflight. Unwithdrawn,
+ * an unapproved handoff kept the user live in `/job/live` for an hour, which
+ * blocked a signed-in browser (#164), and approving its Last.fm page later
+ * still made a job that marked the queue handed over for good (#165).
+ *
+ * `pendingImportId` is recorded (`recordAbandonedImport`) only when the
+ * worker didn't confirm the withdrawal: a withdrawn handoff no longer counts
+ * in `/import/:id`, so there is no `pending` answer left to waive. Unanswered
+ * (worker unreachable, or a worker too old to have the route) it still does,
+ * until reaped.
+ */
+export async function abandonOwnHandoff(expected?: QueueOwner, pendingImportId = ''): Promise<boolean> {
+  const own = preflightedHandoff();
+  const mine = expected ? isOwnHandoffFreeze(expected) : !!own;
+  const abandoned = own && mine ? await abandonHandoff(own) : null;
+  return releaseAbandonedHandoff(expected, abandoned === true ? '' : pendingImportId);
 }
 
 /**

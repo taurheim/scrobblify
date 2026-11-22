@@ -1295,20 +1295,24 @@ test.describe('Choosing the server in the confirm dialog', () => {
   });
 
   /*
-    Nobody approved it, so the worker still counts the handoff as on its way
-    (`pending`) until it is reaped an hour later, as the mock does too (#162).
-    Signed in, the page load then also asks about the queue by its user.
+    Nobody approved it, so the page withdraws it at the worker on the way back
+    (`abandonOwnHandoff`). Before that it stayed on its way (`pending`) until
+    reaped an hour later, and a named one kept its user live in `/job/live`,
+    which blocked the signed-in page load (#164). Approving the same Last.fm
+    page afterwards makes no job (#165).
   */
   for (const signedIn of [false, true]) {
     test(`going back from Last.fm without approving keeps the selection, after a refresh too (${signedIn ? 'signed in' : 'signed out'})`, async ({ page, baseURL }) => {
       const { scrobbles, preflights, mock } = await openWithWorker(page, baseURL, { signedIn });
-      // Last.fm's page, where the user changes their mind. Registered after the
-      // mock: later routes win.
-      await page.route(`${new URL(baseURL || 'http://localhost:8471').origin}/mock-auth*`, (route: Route) => route.fulfill({
+      const { origin } = new URL(baseURL || 'http://localhost:8471');
+      const lastFmPage = (route: Route) => route.fulfill({
         status: 200,
         contentType: 'text/html; charset=utf-8',
         body: '<!doctype html><title>Last.fm</title><h1>Allow access?</h1>',
-      }));
+      });
+      // Last.fm's page, where the user changes their mind. Registered after the
+      // mock: later routes win.
+      await page.route(`${origin}/mock-auth*`, lastFmPage);
       const dialog = await chooseRecentPlays(page, 800);
       await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
       await expect(page.locator('h1:has-text("Allow access?")')).toBeVisible({ timeout: 15000 });
@@ -1316,19 +1320,35 @@ test.describe('Choosing the server in the confirm dialog', () => {
       const importId = String(preflights[0].importId || '');
       const lookup = JSON.parse(mock.handle('GET', `/scrobblify/import/${importId}`, new URLSearchParams(), '').body);
       expect(lookup).toMatchObject({ known: true, pending: true });
+      const [handoffId, handoff] = [...mock.world.handoffs.entries()][0];
+      const liveQuery = new URLSearchParams({ username: 'testuser' });
+      const liveFor = () => JSON.parse(mock.handle('GET', '/scrobblify/job/live', liveQuery, '').body).live;
+      expect(liveFor()).toBe(signedIn);
 
       await page.goBack();
       await expectSelectionOffered(page);
+      expect(handoff).toMatchObject({ state: 'failed', failureReason: 'abandoned' });
+      expect(liveFor()).toBe(false);
       await page.reload();
       await expectSelectionOffered(page);
       // The abandoned handoff can't come back into this browser.
       expect(await page.evaluate((key) => localStorage.getItem(key), PREFLIGHTED_KEY)).toBeNull();
+      expect(await page.evaluate(() => localStorage.getItem('scrobblify.background.abandonedImport'))).toBeNull();
       if (!signedIn) {
         // Signing in afterwards asks about the queue too, and gets the same answer.
         await mockLastFmAuth(page);
         await page.reload();
         await expectSelectionOffered(page);
       }
+
+      // Approving that Last.fm page after all, from an old tab say.
+      await page.unroute(`${origin}/mock-auth*`, lastFmPage);
+      const adopted = signedIn ? '' : '&user=testuser';
+      await page.goto(`${origin}/mock-auth?handoff=${handoffId}&session=${handoff.session}${adopted}`);
+      await expect(page.locator('text=Last.fm didn\'t complete the handoff')).toBeVisible({ timeout: 15000 });
+      await expectSelectionOffered(page);
+      expect(mock.world.job).toBeNull();
+      expect(await page.evaluate(() => localStorage.getItem('scrobblify.background.session'))).toBeNull();
       expect(scrobbles).toEqual([]);
     });
   }
@@ -1338,17 +1358,19 @@ test.describe('Choosing the server in the confirm dialog', () => {
     const { mock } = await openWithWorker(page, baseURL, {
       saved: { ...SAVED, importId },
     });
-    // Still waiting at the worker for an approval that never came.
-    mock.world.handoffs.set('h-mine', {
+    // Still waiting at the worker for an approval that never came, holding
+    // its user live as a named one does (#164).
+    const handoff: Record<string, unknown> = {
       state: 'issued',
-      named: false,
-      username: '',
+      named: true,
+      username: 'testuser',
       trackCount: 5,
       importId,
       chunksSeen: new Set(),
       session: '',
       jobId: '',
-    });
+    };
+    mock.world.handoffs.set('h-mine', handoff);
     await expect(page.locator(RESUME_PROMPT)).toBeVisible({ timeout: 10000 });
     // The page as it was when it left for Last.fm: frozen for the handoff it
     // preflighted, busy, the selection saved but not on offer.
@@ -1367,6 +1389,8 @@ test.describe('Choosing the server in the confirm dialog', () => {
 
     await expectSelectionOffered(page);
     expect(await page.evaluate((key) => localStorage.getItem(key), PREFLIGHTED_KEY)).toBeNull();
+    // Withdrawn at the worker, so signing in below isn't blocked as live.
+    expect(handoff).toMatchObject({ state: 'failed', failureReason: 'abandoned' });
     await page.reload();
     await expectSelectionOffered(page);
     // Signed in, the load asks about the queue by its user as well.

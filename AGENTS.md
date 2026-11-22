@@ -1064,23 +1064,47 @@ came back any other way could never ask about it and stayed blocked ("A
 handover is starting in another tab…", then "…on hold", for good):
 
 - Any `?handoff=failed` return (denied, `exchange_failed`, `already_live`, …)
-  calls `releaseAbandonedHandoff()`, which lifts only a freeze naming the
-  handoff this browser preflighted, and forgets that preflight (#160).
+  calls `abandonOwnHandoff()`, which withdraws this browser's preflighted
+  handoff at the worker (below) and then `releaseAbandonedHandoff()`, which
+  lifts only a freeze naming that handoff, and forgets the preflight (#160).
 - Back from Last.fm without approving (a reload, or a bfcache restore), with no
   worker session: `ownHandoffWasTaken` asks `/scrobblify/import/:id` about the
   saved queue. `known: false`, or `known: true, pending: true` (the worker
-  still holds this very handoff, unapproved, until it reaps it an hour later),
-  releases the freeze the same way and offers the saved selection again; any
-  other `known: true` blocks as a handed-over queue, with the worker sign-in;
-  no answer changes nothing. Only for the browser's own preflighted freeze,
-  and before the 3-minute freshness rule, since the tab that set it is the
-  one that came back. Forgetting the preflight is what makes this safe:
-  approving that handoff later gets a return this browser refuses, so the
-  queue is never uploaded.
+  still holds this very handoff, unapproved), withdraws and releases it the
+  same way and offers the saved selection again; any other `known: true`
+  blocks as a handed-over queue, with the worker sign-in; no answer changes
+  nothing. Only for the browser's own preflighted freeze, and before the
+  3-minute freshness rule, since the tab that set it is the one that came
+  back. Forgetting the preflight is what makes this safe even if the
+  withdrawal goes unanswered: approving that handoff later gets a return this
+  browser refuses, so the queue is never uploaded.
 - A handover from the confirm dialog that fails before leaving (full,
   preflight failed, …) offers the saved selection again, so the next Scrobble
   asks Resume / Start over instead of refusing to replace "saved progress"
   that is the same selection with a fresh import id (#102's check).
+
+**A browser withdraws a handoff nobody approved** (#164, #165).
+`POST /scrobblify/handoff/:id/abandon` (`abandonHandoff` in
+`worker/src/handoff.ts`) moves a handoff from `issued` to `failed` with
+`failure_reason` `abandoned`, a compare-and-set from `issued` only, so an
+approved one (`exchanging` and later, the only states with a job or a
+credential) is never touched. It answers `{ ok: true, abandoned }`, `false`
+for any other state *and* for an unknown id (200, not 404, so it reveals no
+ids). It needs no session, since the browser coming back without approving
+never got one; the 128-bit random handoff id is the capability, and an
+`issued` handoff has nothing to steal, so the worst a holder of the id can do
+is cancel a pending approval. Failing it clears `live_username` (so
+`/job/live` stops answering live, and the capacity slot frees) and drops it
+from `/import/:id`; `handleCallback` refuses a failed handoff, so approving
+its Last.fm page later redirects `?handoff=failed&reason=abandoned` with no
+job and no stored credential (`background_handoff_failed` `reason:
+abandoned` counts these late approvals). Before this, an unapproved handoff stayed
+`issued` until reaped (`HANDOFF_TTL_SECONDS`, an hour): a named one kept its
+user live, so a signed-in browser coming Back was blocked as "still running
+on the server" (#164), and a late approval made a job that marked the queue
+handed over for good (#165). The client (`abandonOwnHandoff` →
+`abandonHandoff`, 3s timeout, best effort) only ever sends this browser's own
+preflighted id, and is awaited before the page-load authority check.
 
 **`/import/:id` counts a handoff only while it can still become a job**
 (#162). Jobless handoffs that ended (`failed`, `reaped`: Back or a denial on
@@ -1092,18 +1116,20 @@ treats it like any other `known: true` (a handover may be on its way from
 another tab or device): Home's welcome-back card (`detectReturning`, which only
 reads `live` and `state`), the page-load authority check and the progress-file
 check (both through `queueWasHandedOver`). The exception is the queue whose own
-pending handoff this browser abandoned: releasing that freeze records the
-import id (`scrobblify.background.abandonedImport`, cleared by the next
-preflight), and `queueWasHandedOver` waives `pending` answers for it, so
-signing in to Last.fm after coming back doesn't block the selection anyway.
-Before this fix, every never-approved handoff blocked its queue for good. The
-mock worker records handoffs at preflight (`pending`), fails them on a shim
-`fail` return (`authoriseFail` option, and the anonymous `already_live`
-refusal) and gives them a job at finalize. It does not model `/job/live`
-counting a *named* unapproved handoff as live (it holds `live_username` until
-reaped), which still blocks a signed-in browser for up to an hour (#164).
-Approving the abandoned handoff later anyway still leaves a job row that makes
-the queue `known` for good (#165).
+pending handoff this browser abandoned *without the worker confirming the
+withdrawal* (no answer, or a worker without the route): releasing that freeze
+then records the import id (`scrobblify.background.abandonedImport`, cleared
+by the next preflight), and `queueWasHandedOver` waives `pending` answers for
+it, so signing in to Last.fm after coming back doesn't block the selection
+anyway. A confirmed withdrawal records nothing, since the handoff no longer
+counts. Before #162, every never-approved handoff blocked its queue for good.
+The mock worker records handoffs at preflight (`pending`), fails them on a
+shim `fail` return (`authoriseFail` option, and the anonymous `already_live`
+refusal) or a withdrawal, refuses a shim approval of a failed one, counts a
+named in-flight handoff as live in `/job/live` as the real worker does, and
+gives them a job at finalize. An unanswered withdrawal still leaves the old
+behaviour: the user live in `/job/live` until reaped, and a late approval's
+job marking the queue `known` for good.
 
 ### The job card refreshes itself
 

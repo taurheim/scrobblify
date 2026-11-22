@@ -11,6 +11,7 @@ import {
   handleCallback,
   finalize,
   failHandoff,
+  abandonHandoff,
   reapExpiredHandoffs,
   MAX_TRACKS_PER_JOB,
 } from '../src/handoff';
@@ -338,6 +339,46 @@ async function main() {
   hrow = await db5.first<any>('SELECT * FROM handoffs WHERE id = ?', [p5.handoffId]);
   check('failed exchange releases the slot', hrow.live_username === null);
   check('failed exchange is not left mid-flight', hrow.state === 'failed');
+
+  console.log('\n-- abandon: a handoff nobody approved --');
+  {
+    const db = freshDb();
+    const p = await preflight(db, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
+    check('an issued handoff is abandoned', await abandonHandoff(db, p.handoffId, NOW + 5) === true);
+    const row = await db.first<any>('SELECT * FROM handoffs WHERE id = ?', [p.handoffId]);
+    check('it is failed as abandoned',
+      row.state === 'failed' && row.failure_reason === 'abandoned', row);
+    check('and holds no account lock', row.live_username === null, row.live_username);
+    check('a second abandon changes nothing', await abandonHandoff(db, p.handoffId, NOW + 6) === false);
+
+    // Approving the same Last.fm page afterwards (#165).
+    const lastfm = new FakeLastFm('alice');
+    const late = await handleCallback(
+      db, lastfm as any, { state: p.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW + 10,
+    );
+    check('a later approval is refused', !late.ok && (late as any).reason === 'abandoned', late);
+    check('without exchanging the token', lastfm.getSessionCalls === 0, lastfm.getSessionCalls);
+    check('and creates no job, so no credential', (await db.all('SELECT id FROM jobs')).length === 0);
+
+    const again = await preflight(db, req('alice'), SIGNING_KEY, CALLBACK, NOW + 20);
+    check('the user can hand over again at once', again.ok, again);
+
+    // Once approved, only the reaper or a failure may end it.
+    const db2 = freshDb();
+    const p2 = await preflight(db2, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
+    const cb2 = await handleCallback(
+      db2, new FakeLastFm('alice') as any, { state: p2.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    ) as any;
+    check('a handoff with a job is not abandoned', await abandonHandoff(db2, p2.handoffId, NOW) === false);
+    const kept = await db2.first<any>('SELECT * FROM handoffs WHERE id = ?', [p2.handoffId]);
+    const keptJob = await db2.first<any>('SELECT * FROM jobs WHERE id = ?', [cb2.jobId]);
+    check('it is left as it was',
+      kept.state === 'pending_upload' && kept.live_username === 'alice' && kept.failure_reason === null, kept);
+    check('and so is its job',
+      keptJob.state === 'pending' && keptJob.session_key_ct !== null, keptJob.state);
+
+    check('an unknown id is not abandoned', await abandonHandoff(db2, 'no-such-handoff', NOW) === false);
+  }
 
   console.log('\n-- finalize --');
   const db6 = freshDb();

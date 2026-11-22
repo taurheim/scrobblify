@@ -19,6 +19,7 @@ import {
   preflight,
   handleCallback,
   finalize,
+  abandonHandoff,
   reapExpiredHandoffs,
   HandoffRow,
   MAX_TRACKS_PER_JOB,
@@ -729,6 +730,34 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       totalTracks: Number(row.total_tracks),
       ...(Number(row.pending) === 1 ? { pending: true } : {}),
     });
+  }
+
+  /*
+    ---- withdrawing a handoff nobody approved, without a session ----
+
+    The browser that preflighted a handoff calls this when it comes back from
+    Last.fm without approving it (Back, a refused callback). Otherwise the
+    handoff stays `issued` until reaped an hour later, telling `/job/live` the
+    user has something running (#164), and an approval of the same Last.fm
+    page later still makes a job (#165).
+
+    Public because that browser has no session: one is only issued by a
+    successful callback, which is exactly what didn't happen. That is safe
+    because only an `issued` handoff can be withdrawn (`abandonHandoff`), and
+    an `issued` handoff has no job, no credential and no uploaded data, so the
+    most anyone holding its id can do is cancel an approval still pending. The
+    id is 128 random bits (`randomId`) and reaches only the browser that
+    preflighted it (and the authorise URL it was sent to), so it isn't
+    guessable.
+
+    Answers the same for an unknown id as for one past `issued`
+    (`abandoned: false`, 200), so it says nothing about which ids exist. A
+    guess costs one indexed read and writes no row.
+  */
+  const abandonMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/abandon$/);
+  if (abandonMatch && request.method === 'POST') {
+    const abandoned = await abandonHandoff(env.sql, abandonMatch[1], nowSec);
+    return json(env, { ok: true, abandoned });
   }
 
   // Everything below needs a session.

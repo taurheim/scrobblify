@@ -494,6 +494,81 @@ async function main() {
       }))).status === 200);
   }
 
+  console.log('\n-- abandoning a handoff nobody approved --');
+  {
+    const sql = freshSql();
+    let exchanges = 0;
+    const env = makeEnv(sql, new MemoryBlobs(), {
+      getSession: async () => {
+        exchanges += 1;
+        return { sessionKey: 'sk', username: 'Listener' };
+      },
+    });
+    const IMPORT = 'abandoned-import-0123456789';
+    const preflightFor = async () => (await handleRequest(env, req('/scrobblify/handoff/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: 'Listener', payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000,
+        importId: IMPORT,
+      }),
+    }))).json() as Promise<any>;
+    const isLive = async () => ((await (await handleRequest(
+      env, req('/scrobblify/job/live?username=listener'),
+    )).json()) as any).live;
+    const used = async () => ((await (await handleRequest(env, req('/scrobblify/capacity'))).json()) as any).used;
+    const abandon = (id: string) => handleRequest(env, req(`/scrobblify/handoff/${id}/abandon`, { method: 'POST' }));
+
+    const pre = await preflightFor();
+    check('before: the user reads as live', await isLive() === true);
+    check('before: the handoff holds a slot', await used() === 1);
+
+    const res = await abandon(pre.handoffId);
+    const body: any = await res.json();
+    check('abandon answers without a session', res.status === 200, res.status);
+    check('and says it was abandoned', body.ok === true && body.abandoned === true, body);
+    const row = await sql.first<any>('SELECT * FROM handoffs WHERE id = ?', [pre.handoffId]);
+    check('the handoff is failed as abandoned',
+      row.state === 'failed' && row.failure_reason === 'abandoned' && row.live_username === null, row);
+    check('the user no longer reads as live (#164)', await isLive() === false);
+    check('the slot is free again', await used() === 0);
+    const lookup: any = await (await handleRequest(env, req(`/scrobblify/import/${IMPORT}`))).json();
+    check('the queue is not known as handed over', lookup.known === false, lookup);
+
+    // Approving the same Last.fm page later (#165).
+    const state = new URL(new URL(pre.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+    const late = new URL((await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    )).headers.get('Location')!);
+    check('a later approval fails', late.searchParams.get('handoff') === 'failed'
+      && late.searchParams.get('reason') === 'abandoned', late.toString());
+    check('with no session', late.hash === '', late.hash);
+    check('without exchanging the token', exchanges === 0, exchanges);
+    check('and creates no job or credential', (await sql.all('SELECT id FROM jobs')).length === 0);
+    check('the queue is still not known', ((await (await handleRequest(
+      env, req(`/scrobblify/import/${IMPORT}`),
+    )).json()) as any).known === false);
+
+    check('abandoning it again says no',
+      ((await (await abandon(pre.handoffId)).json()) as any).abandoned === false);
+    const unknown = await abandon('no-such-handoff-0123456789');
+    check('an unknown id gets the same answer, not a 404',
+      unknown.status === 200 && ((await unknown.json()) as any).abandoned === false);
+
+    // An approved handoff is past withdrawing: it has a job and a credential.
+    const approved = await preflightFor();
+    const approvedState = new URL(new URL(approved.authoriseUrl).searchParams.get('cb')!)
+      .searchParams.get('state')!;
+    await handleRequest(env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(approvedState)}&token=tok`));
+    const refused: any = await (await abandon(approved.handoffId)).json();
+    check('a handoff with a job is not abandoned', refused.ok === true && refused.abandoned === false, refused);
+    const kept = await sql.first<any>('SELECT * FROM handoffs WHERE id = ?', [approved.handoffId]);
+    check('and is left as it was',
+      kept.state === 'pending_upload' && kept.job_id !== null && kept.live_username === 'listener', kept);
+    const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [kept.job_id]);
+    check('so is its job', job.state === 'pending' && job.session_key_ct !== null, job.state);
+    check('which still reads as live', await isLive() === true);
+  }
+
   console.log('\n-- the import id survives preflight --');
   {
     const sql = freshSql();
