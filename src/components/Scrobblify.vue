@@ -13,7 +13,7 @@
     <v-alert
       v-if="banner"
       :type="bannerType"
-      :prominent="banner === 'job' || banner === 'signIn' || banner === 'retry' || banner === 'resume'"
+      :prominent="!!banner && banner !== 'outage' && banner !== 'notice'"
       class="mb-4"
     >
       <div v-if="showBackgroundNotice" :class="{ 'mb-3': banner !== 'notice' }">
@@ -153,6 +153,23 @@
         </div>
       </template>
 
+      <template v-else-if="banner === 'nothing'">
+        <div><strong>Nothing to resume</strong></div>
+        <div class="mt-1">Scrobblify isn't scrobbling anything for you, and this browser has no saved progress.</div>
+        <div class="mt-2">
+          <v-btn color="primary" @click="nothingToResume = false">Upload Spotify zip</v-btn>
+        </div>
+        <div class="mt-2">Have a progress file?
+          <a
+            role="button"
+            tabindex="0"
+            @click="importStateFile"
+            @keydown.enter="importStateFile"
+            @keydown.space.prevent="importStateFile"
+          >Upload it here</a>.
+        </div>
+      </template>
+
       <template v-else-if="banner === 'resume'">
         <div>
           <strong>Resume previous session?</strong>
@@ -163,16 +180,17 @@
           <v-btn variant="outlined" @click="importStateFile">Import from file</v-btn>
           <v-btn variant="text" color="error" @click="clearSavedState">Discard</v-btn>
         </div>
-        <input
-          ref="importFileInput"
-          type="file"
-          accept=".json"
-          aria-label="Import saved session file"
-          style="display: none"
-          @change="onImportFile"
-        >
       </template>
     </v-alert>
+    <!-- Outside the alert so either banner that offers a file can open it. -->
+    <input
+      ref="importFileInput"
+      type="file"
+      accept=".json"
+      aria-label="Import saved session file"
+      style="display: none"
+      @change="onImportFile"
+    >
 
     <!--
       Not a step: it exchanges a `?token=` coming back from Last.fm, and says
@@ -646,6 +664,11 @@ export default defineComponent({
       signInRetryNote: '' as '' | 'selection' | 'progress',
       /** This load's token exchange failed (AuthenticateStep's `failed`). */
       signInFailed: false,
+      /**
+       * Home's "Re-connect" signed in to the worker, which holds nothing for
+       * this account, and this browser has nothing saved either.
+       */
+      nothingToResume: false,
       /** The deferred duplicate check is running. */
       checkingDuplicates: false,
       /** Plays it dropped; shown until the user starts sending. */
@@ -684,6 +707,11 @@ export default defineComponent({
       // A re-authentication return is consumed first, and only for its token: it
       // owns no handoff and must not be mistaken for one.
       const reauthed = background.consumeReauthFragment();
+      // Before anything asks about this account: the authority check below
+      // asks by name.
+      if (reauthed && background.isWorkerLookup()) {
+        this.rememberWorkerUser(reauthed.user);
+      }
 
       const resumed = await this.resumeHandoffIfReturning();
       if (resumed) {
@@ -840,13 +868,17 @@ export default defineComponent({
       if (unresolved) {
         await this.resolveOwnership(unresolved);
       }
+      const signInRefused = new URLSearchParams(window.location.search).get('signin') === 'failed';
       if (reauthed) {
         trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
-      } else if (new URLSearchParams(window.location.search).get('signin') === 'failed') {
+      } else if (signInRefused) {
         this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
         this.showReauth = true;
         this.stripQuery();
         trackEvent('background_reauth_failed');
+      }
+      if (background.takeWorkerLookup()) {
+        this.reportWorkerLookup(signInRefused);
       }
       this.probeBackgroundAvailability();
       // The rollout flag can change after mount: flags load asynchronously,
@@ -914,6 +946,9 @@ export default defineComponent({
   watch: {
     currentStep(step: number) {
       trackEvent('step_viewed', { step, step_name: this.stepName(step) });
+      if (step !== 2) {
+        this.nothingToResume = false;
+      }
     },
     '$store.state.scrobbleRunActive': function onRunActive(active: boolean) {
       if (active) {
@@ -1004,17 +1039,19 @@ export default defineComponent({
      *   retry  — a trip to Last.fm to send or resume came back without a
      *            session; it offers the same trip again. Above `resume`
      *            because it is about the same saved progress.
+     *   nothing — Home's "Re-connect" found no job and nothing saved.
      *   resume — saved progress; never while anything might own the queue.
      *   notice — `backgroundNotice` on its own. Below the resume prompt
      *            because a notice that leaves Resume available is a "nothing
      *            happened" report (a handoff that didn't go through), and the
      *            prompt is what the user acts on; it shows as its first line.
      */
-    banner(): 'outage' | 'job' | 'signIn' | 'retry' | 'resume' | 'notice' | null {
+    banner(): 'outage' | 'job' | 'signIn' | 'retry' | 'nothing' | 'resume' | 'notice' | null {
       if (this.authorityUnknown) { return 'outage'; }
       if (this.backgroundJob) { return 'job'; }
       if (this.resumeSignInMessage) { return 'signIn'; }
       if (this.signInRetry && this.currentStep <= 2) { return 'retry'; }
+      if (this.nothingToResume && this.currentStep === 2) { return 'nothing'; }
       if (this.hasResumableState && !this.heldForSignIn && !this.settlingSignIn && this.currentStep <= 2
         && !this.ownershipBlocked && !this.authorityPending) {
         return 'resume';
@@ -1025,6 +1062,7 @@ export default defineComponent({
     bannerType(): string {
       switch (this.banner) {
         case 'job': return this.jobAlertType;
+        case 'nothing':
         case 'resume': return 'info';
         default: return 'warning';
       }
@@ -2216,6 +2254,29 @@ export default defineComponent({
     },
 
     /**
+     * The return from Home's "Re-connect" sign-in to the worker: says what it
+     * found. A job shows its own banner and saved progress the resume prompt;
+     * with neither, "Nothing to resume" says so rather than leaving a bare
+     * upload step. On the mock worker's shim the name arrives in localStorage
+     * instead of the fragment, so it is already remembered.
+     */
+    reportWorkerLookup(signInRefused: boolean) {
+      let result: 'job' | 'saved' | 'nothing' | 'failed';
+      if (signInRefused || !background.getSession()) {
+        // The "didn't work" notice, if any, is already up.
+        result = 'failed';
+      } else if (this.backgroundJob) {
+        result = 'job';
+      } else if (this.hasResumableState) {
+        result = 'saved';
+      } else {
+        this.nothingToResume = true;
+        result = 'nothing';
+      }
+      trackEvent('worker_lookup_result', { result });
+    },
+
+    /**
      * Finishes a handoff that Last.fm has just redirected back to us.
      *
      * Returns true when this page load belongs to a handoff, in which case the
@@ -3210,6 +3271,7 @@ export default defineComponent({
      * saved state — which a new device or browser never does.
      */
     async importProgressFile(file: File, source: string) {
+      this.nothingToResume = false;
       try {
         const state = await this.stateManager.importFromFile(file);
         if (!(await this.importedQueueMaySend(state))) {

@@ -966,6 +966,97 @@ test.describe('Home with a job on the server', () => {
   });
 });
 
+test.describe('"Already scrobbling on scrobblify?" with a worker', () => {
+  const JOB_BANNER = 'text=Scrobblify is finishing your import in the background.';
+  const NOTHING = 'text=Nothing to resume';
+
+  /*
+    A fresh browser, not in the beta, on Home. `lastFmSignIns` counts trips
+    to the browser app's own Last.fm sign-in.
+  */
+  async function openHome(page: Page, baseURL: string | undefined) {
+    const lastFmSignIns: string[] = [];
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    const mock = await interceptBackgroundWorker(page, {
+      apiOrigin: 'http://background.invalid',
+      appOrigin: new URL(baseURL || 'http://localhost:8471').origin,
+      log: false,
+    });
+    page.on('request', (request) => {
+      if (request.url().startsWith('https://www.last.fm/api/auth/')) {
+        lastFmSignIns.push(request.url());
+      }
+    });
+    await page.goto('/#/');
+    return { mock, lastFmSignIns };
+  }
+
+  test('with a live job, signs in to the worker and lands on the job', async ({ page, baseURL }) => {
+    const events = captureEvents(page);
+    const { mock, lastFmSignIns } = await openHome(page, baseURL);
+    const nowMs = Date.now();
+    mock.world.job = {
+      id: 'j-live',
+      username: 'testuser',
+      importId: 'd1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6',
+      state: 'active',
+      reason: null,
+      totalTracks: 5000,
+      scrobbled: 0,
+      failed: 0,
+      waitingUntil: null,
+      createdAtMs: nowMs,
+      lastTickMs: nowMs,
+      completedAtMs: null,
+      inactivityDeadlineSec: null,
+      exportClaim: '',
+    };
+    await page.locator('button:has-text("Re-connect to last.fm")').click();
+
+    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expect(page).toHaveURL(/#\/scrobble/);
+    await expect(page.locator(NOTHING)).toHaveCount(0);
+    expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBe('testuser');
+    expect(await page.evaluate(() => sessionStorage.getItem('scrobblify.background.lookup'))).toBeNull();
+    expect(lastFmSignIns).toEqual([]);
+    expect(events.map((e) => e.name)).toContain('worker_lookup_started');
+    await expect.poll(() => events).toContainEqual({ name: 'worker_lookup_result', props: { result: 'job' } });
+  });
+
+  test('with no job and nothing saved, says there is nothing to resume', async ({ page, baseURL }) => {
+    const events = captureEvents(page);
+    const { lastFmSignIns } = await openHome(page, baseURL);
+    await page.locator('button:has-text("Re-connect to last.fm")').click();
+
+    const banner = page.locator('.scrobblify > .v-alert');
+    await expect(banner.locator(NOTHING)).toBeVisible({ timeout: 20000 });
+    await expect(banner).toContainText("Scrobblify isn't scrobbling anything for you, and this browser has no saved progress.");
+    expect(lastFmSignIns).toEqual([]);
+    await expect.poll(() => events).toContainEqual({ name: 'worker_lookup_result', props: { result: 'nothing' } });
+
+    const chooser = page.waitForEvent('filechooser');
+    await banner.locator('a:has-text("Upload it here")').click();
+    expect((await chooser).isMultiple()).toBe(false);
+
+    await banner.locator('button:has-text("Upload Spotify zip")').click();
+    await expect(page.locator(NOTHING)).toHaveCount(0);
+    await expect(page.locator('.upload-step')).toBeVisible();
+  });
+
+  test('a worker that refuses the sign-in falls back to the browser\'s Last.fm sign-in', async ({ page, baseURL }) => {
+    const { lastFmSignIns } = await openHome(page, baseURL);
+    // Registered after the mock: later routes get first refusal.
+    await page.route('http://background.invalid/scrobblify/auth/signin', (route: Route) => route.abort('internetdisconnected'));
+    await page.locator('button:has-text("Re-connect to last.fm")').click();
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 15000 });
+    expect(lastFmSignIns.length).toBe(1);
+    expect(await page.evaluate(() => sessionStorage.getItem('scrobblify.background.lookup'))).toBeNull();
+    await expect(page.locator(NOTHING)).toHaveCount(0);
+  });
+});
+
 test.describe('Choosing the server in the confirm dialog', () => {
   const JOB_BANNER = 'text=Scrobblify is finishing your import in the background.';
   const HANDED_OVER_KEY = 'scrobblify.background.handedOverImport';

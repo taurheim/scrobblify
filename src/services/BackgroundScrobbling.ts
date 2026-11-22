@@ -2977,3 +2977,37 @@ export function consumeReauthFragment(): { user: string } | null {
     return null;
   }
 }
+
+/**
+ * Marks a sign-in to the worker that Home's "Re-connect to last.fm" started
+ * to find out what the worker holds for this account. Per tab: `/scrobble`
+ * reads it once on return to say what it found.
+ */
+const WORKER_LOOKUP_KEY = 'scrobblify.background.lookup';
+
+export function setWorkerLookup(on: boolean): void {
+  try {
+    if (on) {
+      window.sessionStorage.setItem(WORKER_LOOKUP_KEY, '1');
+    } else {
+      window.sessionStorage.removeItem(WORKER_LOOKUP_KEY);
+    }
+  } catch {
+    // Storage refused: the return just shows /scrobble as it would anyway.
+  }
+}
+
+export function isWorkerLookup(): boolean {
+  try {
+    return window.sessionStorage.getItem(WORKER_LOOKUP_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/** Whether this page load is the return from such a sign-in. Clears it. */
+export function takeWorkerLookup(): boolean {
+  const on = isWorkerLookup();
+  setWorkerLookup(false);
+  return on;
+}
