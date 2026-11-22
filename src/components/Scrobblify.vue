@@ -1664,6 +1664,22 @@ export default defineComponent({
     async reconcileQueueOwner(owner: background.QueueOwner) {
       if (owner.owner === 'freezing') {
         /*
+          This browser's own handoff, asked about by its queue: see
+          `ownHandoffWasTaken`. Before the freshness check, because the tab
+          that set it is this one, back from Last.fm, not a sibling mid-attempt.
+        */
+        const taken = await this.ownHandoffWasTaken(owner);
+        if (taken === false && background.releaseAbandonedHandoff(owner)) {
+          this.ownershipBlocked = false;
+          await this.exposeSavedStateUnlessStale('handoff_not_taken');
+          trackEvent('background_freeze_released', { reason: 'handoff_not_taken' });
+          return;
+        }
+        if (taken === true) {
+          await this.blockForHandedOverQueue();
+          return;
+        }
+        /*
           A freeze that was written moments ago belongs to a tab that is still
           working through its handover. This runs on every load, including in a
           tab the user opened *during* that handover, and clearing the record
@@ -1715,6 +1731,42 @@ export default defineComponent({
         this.reauthLabelText = '';
         this.backgroundNotice = SESSION_EXPIRED_NOTICE;
       }
+    },
+
+    /**
+     * Whether the worker took the queue this browser froze for its own
+     * handoff, asked with the public import check, for a browser with no
+     * worker session to ask about the handoff itself.
+     *
+     * That is every browser that left for Last.fm and came back without
+     * approving (Back, a refresh after it): a session is only issued by a
+     * successful callback, so `isHandoffActive` and `hasLiveJob` can only say
+     * "unknown", and without a username nothing else is asked either. The
+     * import id was minted before the preflight and only reaches a job at the
+     * callback, so "not known" means it never did. A late approval can't
+     * change that once the freeze is released: the preflight record goes with
+     * it, so its return is refused.
+     *
+     * null when unanswered, or when the freeze isn't this browser's own
+     * preflighted handoff, which only its tab may settle.
+     */
+    async ownHandoffWasTaken(owner: background.QueueOwner | null): Promise<boolean | null> {
+      if (!background.isOwnHandoffFreeze(owner) || background.getSession()) {
+        return null;
+      }
+      let importId = '';
+      try {
+        const saved = await this.stateManager.loadState();
+        importId = (saved && saved.importId) || '';
+      } catch (e) {
+        // Unreadable: nothing to ask about.
+      }
+      if (!importId) {
+        // The handoff saved an identified queue before preflighting, so
+        // without one this isn't the queue the freeze is about.
+        return null;
+      }
+      return this.queueWasHandedOver(importId);
     },
 
     /**
@@ -1908,7 +1960,8 @@ export default defineComponent({
       });
     },
 
-    async startBackgroundHandoff() {
+    /** Resolves true when the tab is navigating to Last.fm, false when the handover didn't start. */
+    async startBackgroundHandoff(): Promise<boolean> {
       const step = this.$refs.scrobbleStep as any;
 
       // Halt the loop *before* anything else. The handoff uploads whatever is
@@ -1927,7 +1980,7 @@ export default defineComponent({
           step.releaseHandoffHalt();
           this.backgroundNotice = 'Couldn\'t pause this tab\'s scrobbling in time, so the handover was cancelled to avoid sending anything twice. Nothing has changed — try again in a moment.';
           trackEvent('background_handoff_failed', { reason: 'halt_timeout' });
-          return;
+          return false;
         }
       }
 
@@ -1940,7 +1993,7 @@ export default defineComponent({
         : this.pendingState;
       if (!state) {
         this.backgroundBusy = false;
-        return;
+        return false;
       }
 
       const username = (this.$store.state.lfmApi as LastFm).getUserName() || state.userName || '';
@@ -2001,9 +2054,11 @@ export default defineComponent({
         this.backgroundNotice = result.reason === 'at_capacity'
           ? 'The background service is full right now — it is limited during the beta. Your progress is saved; try again later or keep scrobbling in this tab.'
           : 'Couldn\'t hand this over to the background service. Your progress is saved and nothing has changed — keep scrobbling in this tab.';
+        return false;
       }
       // On success the tab is navigating to Last.fm; leave `busy` set so the
       // dialog cannot be double-submitted during the redirect.
+      return true;
     },
 
     /**
@@ -2034,11 +2089,16 @@ export default defineComponent({
       */
       const marker = background.getOwnershipUnresolved();
       const pendingId = background.getPendingHandoff();
+      // Captured before the round-trip, like every release below that follows one.
+      const observed = background.queueOwner();
       let owned: boolean | null;
       if (marker) {
         owned = await background.resolveOwnershipMarker(marker);
       } else if (pendingId) {
         owned = await background.isHandoffActive(pendingId);
+      } else if (!background.getSession()) {
+        // Nothing to ask about the job with; the queue can still be asked about.
+        owned = await this.ownHandoffWasTaken(observed);
       } else {
         owned = await background.hasLiveJob();
       }
@@ -2053,8 +2113,12 @@ export default defineComponent({
         }
         // Other tabs are told too. This path is reached from the bfcache, so
         // the freeze this tab set before redirecting may be all that is
-        // standing between a sibling and a live job.
-        background.setQueueOwner({ owner: 'server', id: fallbackId || '' });
+        // standing between a sibling and a live job. Unless it is still that
+        // freeze with nothing more known: it blocks just the same, and it
+        // names the handoff, so the next load can settle it by the queue.
+        if (owned === true || fallbackId || !background.isOwnHandoffFreeze(observed)) {
+          background.setQueueOwner({ owner: 'server', id: fallbackId || '' });
+        }
         this.backgroundBusy = false;
         this.showBackgroundOffer = false;
         this.hasResumableState = false;
@@ -2063,6 +2127,12 @@ export default defineComponent({
         this.backgroundNotice = owned === true
           ? 'Your import was handed over and is running on the server, so scrobbling in this tab is switched off.'
           : 'We couldn\'t check whether the background service took over your import, so scrobbling in this tab is on hold. Please refresh in a few minutes.';
+        if (owned === true && !this.backgroundJob) {
+          // Known only by its queue: signing in to the worker shows the job.
+          this.showReauth = true;
+          this.reauthFixNow = false;
+          this.reauthLabelText = '';
+        }
         trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore', resolved: String(owned) });
         return;
       }
@@ -2075,8 +2145,12 @@ export default defineComponent({
       background.clearPendingHandoff();
       background.clearOwnershipUnresolved();
       // Scoped: this tab's own freeze, or a `server` record we have just
-      // disproved. A freeze another tab is actively holding stays.
-      background.releaseQueueOwnerIfUnclaimed(pendingId || '');
+      // disproved. A freeze another tab is actively holding stays. With no
+      // pending handoff, this tab's freeze names the one it preflighted.
+      const releasedOwn = !pendingId && !!observed && background.releaseAbandonedHandoff(observed);
+      if (!releasedOwn) {
+        background.releaseQueueOwnerIfUnclaimed(pendingId || '');
+      }
       background.clearHandoffLineage();
 
       const step = this.$refs.scrobbleStep as any;
@@ -2085,6 +2159,10 @@ export default defineComponent({
       }
 
       this.backgroundNotice = 'The handover wasn\'t completed, so nothing was started. Your progress is still here — carry on in this tab, or try handing it over again.';
+      if (this.pendingEntryPoint === 'confirm') {
+        // The selection was saved for the trip, so it is what there is to carry on with.
+        await this.exposeSavedStateUnlessStale('bfcache_restore');
+      }
       trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore', resolved: 'false' });
     },
 
@@ -2118,10 +2196,10 @@ export default defineComponent({
 
       if (handoffParam === 'failed') {
         const reason = params.get('reason') || 'callback';
+        // The worker refused the handoff, so it can never start, and this
+        // browser has no session to ask about it with (#160).
+        background.releaseAbandonedHandoff();
         if (reason === 'already_live') {
-          // The worker refused the handoff, so it can never start, and this
-          // browser has no session to ask about it with.
-          background.releaseRefusedHandoff();
           this.backgroundNotice = ALREADY_LIVE_NOTICE;
           this.showReauth = true;
           this.reauthFixNow = false;
@@ -2139,8 +2217,11 @@ export default defineComponent({
       this.stripQuery();
       this.rememberWorkerUser((fragment && fragment.user) || '');
       // A handoff started before signing in learns its user only here (the
-      // mock worker's shim stores it before the page loads instead).
-      const workerUser = (this.$store.state.lfmApi as LastFm).getUserName() || '';
+      // mock worker's shim stores it before the page loads instead). The
+      // worker's name wins over a different one this browser knew: the job is
+      // the account's that authorised it.
+      const workerUser = (fragment && fragment.user)
+        || (this.$store.state.lfmApi as LastFm).getUserName() || '';
       if (!handoffId) {
         this.backgroundNotice = 'The handoff came back without a session, so nothing was started. Your progress is still saved here.';
         return false;
@@ -3015,7 +3096,18 @@ export default defineComponent({
         this.backgroundAllReTagged = list.every((t) => t.reTagged);
         // Saved, not on offer: on failure the resume prompt offers it again.
         this.hasResumableState = false;
-        await this.startBackgroundHandoff();
+        if (!await this.startBackgroundHandoff()) {
+          /*
+            Still here, so the saved selection is the user's to carry on with.
+            Offered again, so the next press of Scrobble asks about it (resume,
+            or start over and choose again) instead of refusing to replace what
+            it takes for someone else's saved progress (#102).
+          */
+          await this.exposeSavedStateUnlessStale(
+            'handoff_not_started',
+            !!background.getOwnershipUnresolved() || !!background.queueOwner(),
+          );
+        }
         return;
       }
       /*

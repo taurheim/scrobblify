@@ -1424,27 +1424,56 @@ export function releaseQueueOwnerIfSame(expected: QueueOwner): boolean {
 }
 
 /**
+ * The handoff this browser last preflighted and has not yet had back, if any.
+ * A return is accepted only for it (#157).
+ */
+export function preflightedHandoff(): string | null {
+  try {
+    return window.localStorage.getItem(PREFLIGHTED_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Lifts the freeze this browser set for the handoff it last preflighted, once
- * the worker has refused that handoff at its callback. Nothing else may: the
- * refusal carries no handoff id, so only the freeze naming this browser's own
- * preflight is known to be about it. Without a worker session the handoff
- * can't be asked about later, so the freeze would otherwise never lift.
+ * that handoff is known never to start: the worker refused it at its callback
+ * (any `?handoff=failed`), or the user came back without approving it and the
+ * worker has never taken the queue. Nothing else may: a refusal carries no
+ * handoff id, so only the freeze naming this browser's own preflight is known
+ * to be about it. Without a worker session the handoff can't be asked about
+ * later, so the freeze would otherwise never lift.
+ *
+ * The preflight record is forgotten too, so a late return for that handoff
+ * (approving it after all) is refused rather than uploading a queue this
+ * browser may by then be sending itself.
+ *
+ * `expected`: only if the freeze is still exactly this one, and still names
+ * the preflight on record; a newer attempt's freeze and preflight are left be.
  *
  * Returns whether a freeze was lifted.
  */
-export function releaseRefusedHandoff(): boolean {
+export function releaseAbandonedHandoff(expected?: QueueOwner): boolean {
   let preflighted: string | null = null;
   try {
     preflighted = window.localStorage.getItem(PREFLIGHTED_STORAGE_KEY);
+    if (expected && preflighted !== expected.id) {
+      return false;
+    }
     window.localStorage.removeItem(PREFLIGHTED_STORAGE_KEY);
   } catch {
     return false;
   }
-  const owner = queueOwner();
+  const owner = expected || queueOwner();
   if (!preflighted || !owner || owner.owner !== 'freezing' || owner.id !== preflighted) {
     return false;
   }
   return releaseQueueOwnerIfSame(owner);
+}
+
+/** Whether `owner` is the freeze for the handoff this browser preflighted. */
+export function isOwnHandoffFreeze(owner: QueueOwner | null): boolean {
+  return !!owner && owner.owner === 'freezing' && !!owner.id && owner.id === preflightedHandoff();
 }
 
 /**

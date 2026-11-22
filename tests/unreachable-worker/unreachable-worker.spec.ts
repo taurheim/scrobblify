@@ -4,7 +4,9 @@ import {
 import path from 'path';
 import JSZip from 'jszip';
 import { interceptLastFm, mockLastFmAuth, routeLastFmSignIn } from '../lastfmMock';
-import { interceptBackgroundWorker, MockWorker, MAX_TRACKS } from '../backgroundMock';
+import {
+  interceptBackgroundWorker, MockWorker, MAX_TRACKS, shimHtml,
+} from '../backgroundMock';
 
 /*
   Runs only under `playwright.unreachable-worker.config.ts`, which compiles in
@@ -187,24 +189,24 @@ test.describe('Background worker unreachable', () => {
   The URL is rewritten in place instead, and the handler the page runs on
   mount is called directly.
 */
-test.describe('Returning from a handoff', () => {
-  async function returnWith(page: Page, fragment: string) {
-    return page.evaluate(async (hash) => {
-      window.history.replaceState(null, '', `${window.location.pathname}?handoff=ok&job=j-1#${hash}`);
-      let inst = (document.querySelector('.upload-step') as any).__vueParentComponent;
-      while (inst && !(inst.proxy && typeof inst.proxy.resumeHandoffIfReturning === 'function')) {
-        inst = inst.parent;
-      }
-      await inst.proxy.resumeHandoffIfReturning();
-      return {
-        href: window.location.href,
-        session: localStorage.getItem('scrobblify.background.session'),
-        pending: localStorage.getItem('scrobblify.background.handoff'),
-        preflighted: localStorage.getItem('scrobblify.background.preflighted'),
-      };
-    }, fragment);
-  }
+async function returnWith(page: Page, fragment: string) {
+  return page.evaluate(async (hash) => {
+    window.history.replaceState(null, '', `${window.location.pathname}?handoff=ok&job=j-1#${hash}`);
+    let inst = (document.querySelector('.upload-step') as any).__vueParentComponent;
+    while (inst && !(inst.proxy && typeof inst.proxy.resumeHandoffIfReturning === 'function')) {
+      inst = inst.parent;
+    }
+    await inst.proxy.resumeHandoffIfReturning();
+    return {
+      href: window.location.href,
+      session: localStorage.getItem('scrobblify.background.session'),
+      pending: localStorage.getItem('scrobblify.background.handoff'),
+      preflighted: localStorage.getItem('scrobblify.background.preflighted'),
+    };
+  }, fragment);
+}
 
+test.describe('Returning from a handoff', () => {
   test('a return for a handoff this browser did not start is ignored', async ({ page }) => {
     await openUploadStep(page, 'refuse', {
       'scrobblify.background.preflighted': 'h-mine',
@@ -982,12 +984,14 @@ test.describe('Choosing the server in the confirm dialog', () => {
     page: Page,
     baseURL: string | undefined,
     {
-      beta = true, signedIn = false, worker = {}, saved = null,
+      beta = true, signedIn = false, worker = {}, saved = null, seed = {},
     }: {
       beta?: boolean;
       signedIn?: boolean;
       worker?: Record<string, unknown>;
       saved?: Record<string, unknown> | null;
+      /** localStorage entries written before the page that is tested loads. */
+      seed?: Record<string, string>;
     } = {},
   ): Promise<Opened> {
     const scrobbles: string[] = [];
@@ -1039,6 +1043,9 @@ test.describe('Choosing the server in the confirm dialog', () => {
         });
       }, saved);
     }
+    await page.evaluate((entries) => {
+      Object.entries(entries).forEach(([key, value]) => window.localStorage.setItem(key, value));
+    }, seed);
     await page.goto(beta ? '/?beta=1#/scrobble' : '/?beta=0#/scrobble');
     capacityAnswers = 0;
     await page.reload();
@@ -1051,9 +1058,10 @@ test.describe('Choosing the server in the confirm dialog', () => {
   }
 
   // Recent plays, so none is re-tagged and the large-history gate stays shut.
-  // A few distinct tracks, so validation looks up only those.
-  async function chooseRecentPlays(page: Page, count: number) {
-    const startMs = Date.now() - 3 * 86400 * 1000;
+  // A few distinct tracks, so validation looks up only those. `old`: plays
+  // from last year, moved to today ("Scrobble tracks older than 2 weeks").
+  async function chooseRecentPlays(page: Page, count: number, { old = false } = {}) {
+    const startMs = Date.now() - (old ? 400 : 3) * 86400 * 1000;
     const zip = new JSZip();
     zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024.json', JSON.stringify(
       Array.from({ length: count }, (_, i) => ({
@@ -1069,8 +1077,14 @@ test.describe('Choosing the server in the confirm dialog', () => {
       mimeType: 'application/zip',
       buffer: await zip.generateAsync({ type: 'nodebuffer' }),
     });
+    if (old) {
+      await page.locator('label:has-text("Scrobble tracks older than 2 weeks")').click();
+    }
     await page.locator('button:has-text("Find tracks")').click();
     await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    if (old) {
+      await page.locator('button:has-text("I understand, continue")').click({ timeout: 5000 });
+    }
     await page.locator('button:has-text("matching")').click({ timeout: 5000 });
     await page.locator(`button:has-text("Scrobble ${count} selected tracks")`).click();
     const dialog = page.locator('.scrobble-confirm');
@@ -1235,5 +1249,160 @@ test.describe('Choosing the server in the confirm dialog', () => {
     // With no username anywhere, signing in to the worker finds the job.
     await signIn.click();
     await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+  });
+
+  const OWNER_KEY = 'scrobblify.background.serverOwns';
+  const PREFLIGHTED_KEY = 'scrobblify.background.preflighted';
+  const RESUME_PROMPT = 'text=Resume previous session?';
+
+  async function expectSelectionOffered(page: Page) {
+    await expect(page.locator(RESUME_PROMPT)).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('text=A handover')).toHaveCount(0);
+    await expect(page.locator('text=on hold')).toHaveCount(0);
+    await expect(page.locator('text=refresh your connection')).toHaveCount(0);
+    expect(await page.evaluate((key) => localStorage.getItem(key), OWNER_KEY)).toBeNull();
+  }
+
+  test('the date note shows when the selection has plays moved to today', async ({ page, baseURL }) => {
+    await openWithWorker(page, baseURL);
+    const dialog = await chooseRecentPlays(page, 800, { old: true });
+    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await expect(dialog.locator('.choice-dates')).toBeVisible();
+  });
+
+  test('a handover that fails before leaving can be tried again', async ({ page, baseURL }) => {
+    const { mock, scrobbles, preflights } = await openWithWorker(page, baseURL);
+    let dialog = await chooseRecentPlays(page, 800);
+    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    // Full between the probe and the click.
+    mock.world.capacityAvailable = false;
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await expect(page.locator('text=The background service is full right now')).toBeVisible({ timeout: 10000 });
+    expect(preflights).toEqual([]);
+
+    mock.world.capacityAvailable = true;
+    await page.locator('button:has-text("Scrobble 800 selected tracks")').click();
+    dialog = page.locator('.scrobble-confirm');
+    await expect(dialog.locator('.saved-progress-warning')).toContainText('0 of 800 tracks scrobbled');
+    await dialog.locator('button:has-text("Start over")').click();
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+
+    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('text=would be replaced')).toHaveCount(0);
+    expect(preflights).toHaveLength(1);
+    expect(scrobbles).toEqual([]);
+  });
+
+  test('going back from Last.fm without approving keeps the selection, after a refresh too', async ({ page, baseURL }) => {
+    const { scrobbles } = await openWithWorker(page, baseURL);
+    // Last.fm's page, where the user changes their mind. Registered after the
+    // mock: later routes win.
+    await page.route(`${new URL(baseURL || 'http://localhost:8471').origin}/mock-auth*`, (route: Route) => route.fulfill({
+      status: 200,
+      contentType: 'text/html; charset=utf-8',
+      body: '<!doctype html><title>Last.fm</title><h1>Allow access?</h1>',
+    }));
+    const dialog = await chooseRecentPlays(page, 800);
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await expect(page.locator('h1:has-text("Allow access?")')).toBeVisible({ timeout: 15000 });
+
+    await page.goBack();
+    await expectSelectionOffered(page);
+    await page.reload();
+    await expectSelectionOffered(page);
+    // The abandoned handoff can't come back into this browser.
+    expect(await page.evaluate((key) => localStorage.getItem(key), PREFLIGHTED_KEY)).toBeNull();
+    expect(scrobbles).toEqual([]);
+  });
+
+  test('a page restored from the back-forward cache asks about the queue, not a session', async ({ page, baseURL }) => {
+    await openWithWorker(page, baseURL, {
+      saved: { ...SAVED, importId: 'f1f2f3f4f5f6f7f8f9f0e1e2e3e4e5e6' },
+    });
+    await expect(page.locator(RESUME_PROMPT)).toBeVisible({ timeout: 10000 });
+    // The page as it was when it left for Last.fm: frozen for the handoff it
+    // preflighted, busy, the selection saved but not on offer.
+    await page.evaluate(async ([ownerKey, preflightedKey]) => {
+      localStorage.setItem(preflightedKey, 'h-mine');
+      localStorage.setItem(ownerKey, JSON.stringify({ owner: 'freezing', id: 'h-mine', attempt: `${Date.now()}.t` }));
+      let inst = (document.querySelector('.upload-step') as any).__vueParentComponent;
+      while (inst && !(inst.proxy && typeof inst.proxy.recoverFromBfcache === 'function')) {
+        inst = inst.parent;
+      }
+      inst.proxy.backgroundBusy = true;
+      inst.proxy.pendingEntryPoint = 'confirm';
+      inst.proxy.hasResumableState = false;
+      await inst.proxy.recoverFromBfcache();
+    }, [OWNER_KEY, PREFLIGHTED_KEY]);
+
+    await expectSelectionOffered(page);
+    expect(await page.evaluate((key) => localStorage.getItem(key), PREFLIGHTED_KEY)).toBeNull();
+    await page.reload();
+    await expectSelectionOffered(page);
+  });
+
+  test('a handover Last.fm refuses leaves nothing frozen and the selection on offer (#160)', async ({ page, baseURL }) => {
+    const { scrobbles } = await openWithWorker(page, baseURL);
+    await page.route(`${new URL(baseURL || 'http://localhost:8471').origin}/mock-auth*`, (route: Route) => route.fulfill({
+      status: 200,
+      contentType: 'text/html; charset=utf-8',
+      body: shimHtml('', '', '', 'denied'),
+    }));
+    const dialog = await chooseRecentPlays(page, 800);
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+
+    await expect(page.locator('text=Last.fm didn\'t complete the handoff')).toBeVisible({ timeout: 15000 });
+    await expectSelectionOffered(page);
+    // The return's URL is stripped down to the bare path, which is Home.
+    await page.goto('/#/scrobble');
+    await page.reload();
+    await expectSelectionOffered(page);
+    expect(scrobbles).toEqual([]);
+  });
+
+  /*
+    The real worker names the account that authorised in the return fragment.
+    The mock's shim stores it itself, so this drives the fragment directly
+    (see "Returning from a handoff").
+  */
+  test.describe('the Last.fm user a handoff return names', () => {
+    const IMPORT_ID = 'c1c2c3c4c5c6c7c8c9c0e1e2e3e4e5e6';
+
+    async function openReturning(page: Page, baseURL: string | undefined, seed: Record<string, string> = {}) {
+      const { mock } = await openWithWorker(page, baseURL, {
+        saved: { ...SAVED, importId: IMPORT_ID },
+        seed: { [PREFLIGHTED_KEY]: 'h-mine', ...seed },
+      });
+      mock.world.handoffs.set('h-mine', {
+        username: 'testuser',
+        trackCount: 2,
+        importId: IMPORT_ID,
+        chunksSeen: new Set(),
+        session: 's-mine',
+        jobId: '',
+      });
+      const after = await returnWith(page, 'session=s-mine&handoff=h-mine&user=testuser');
+      expect(after.session).toBe('s-mine');
+      await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+      return page.evaluate((key) => ({
+        user: localStorage.getItem('scrobblifyLfmUserName'),
+        key: localStorage.getItem('scrobblifyLfmAuthKey'),
+        handedOver: JSON.parse(localStorage.getItem(key) || '{}'),
+      }), HANDED_OVER_KEY);
+    }
+
+    test('is remembered by a browser that knew nobody', async ({ page, baseURL }) => {
+      const stored = await openReturning(page, baseURL);
+      expect(stored.user).toBe('testuser');
+      expect(stored.key).toBeNull();
+      expect(stored.handedOver).toMatchObject({ importId: IMPORT_ID, username: 'testuser' });
+    });
+
+    test('does not replace a different user this browser already knows', async ({ page, baseURL }) => {
+      const stored = await openReturning(page, baseURL, { scrobblifyLfmUserName: 'someoneelse' });
+      expect(stored.user).toBe('someoneelse');
+      // The job is the account's that authorised it.
+      expect(stored.handedOver).toMatchObject({ importId: IMPORT_ID, username: 'testuser' });
+    });
   });
 });

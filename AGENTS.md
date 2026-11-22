@@ -1057,6 +1057,33 @@ shim (`/mock-auth`) writes localStorage directly and never goes through the
 fragment, so `tests/unreachable-worker/` exercises the check by rewriting the
 URL and calling `resumeHandoffIfReturning`.
 
+**A handoff that never reaches the worker unfreezes this browser.** Handing
+over writes a `freezing` queue-owner record naming the preflighted handoff, and
+a worker session only comes with a *successful* callback, so a browser that
+came back any other way could never ask about it and stayed blocked ("A
+handover is starting in another tab…", then "…on hold", for good):
+
+- Any `?handoff=failed` return (denied, `exchange_failed`, `already_live`, …)
+  calls `releaseAbandonedHandoff()`, which lifts only a freeze naming the
+  handoff this browser preflighted, and forgets that preflight (#160).
+- Back from Last.fm without approving (a reload, or a bfcache restore), with no
+  worker session: `ownHandoffWasTaken` asks `/scrobblify/import/:id` about the
+  saved queue. `known: false` releases the freeze the same way and offers the
+  saved selection again; `known: true` blocks as a handed-over queue, with the
+  worker sign-in; no answer changes nothing. Only for the browser's own
+  preflighted freeze, and before the 3-minute freshness rule, since the tab
+  that set it is the one that came back. Forgetting the preflight is what makes
+  this safe: approving that handoff later gets a return this browser refuses,
+  so the queue is never uploaded.
+- A handover from the confirm dialog that fails before leaving (full,
+  preflight failed, …) offers the saved selection again, so the next Scrobble
+  asks Resume / Start over instead of refusing to replace "saved progress"
+  that is the same selection with a fresh import id (#102's check).
+
+The real worker's `/import/:id` also counts handoff rows that never produced a
+job, so in production a never-authorised handoff still answers `known: true`
+and blocks the queue (#162); the mock does not model those rows.
+
 ### The job card refreshes itself
 
 The scheduler only runs every five minutes (`TICK_INTERVAL_SECONDS`, which must
