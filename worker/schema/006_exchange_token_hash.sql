@@ -1,0 +1,18 @@
+-- 006: a replayed callback must prove it is the same return.
+--
+-- Duplicate callbacks are routine (link scanners, prefetchers, a second tab),
+-- so a callback for a handoff that has already been exchanged answers with the
+-- winner's outcome, and the API turns that into a worker session. The state in
+-- the callback URL proves nothing about who is asking: it is in the authorise
+-- URL, so whoever preflighted holds it. Without a further check, an attacker
+-- who got a victim to approve their link could replay the callback with any
+-- token and be handed a session for the victim's account (#157).
+--
+-- The one thing only a genuine return carries is Last.fm's token. Its SHA-256
+-- is stored when the exchange is claimed, and a replay succeeds only if its
+-- token hashes to the same value. The hash, not the token: the token is
+-- single-use and spent by then, but there is no reason to keep it.
+--
+-- Nullable, deliberately. Rows claimed before this migration have no hash, and
+-- a replay of one fails closed: its user signs in again instead.
+ALTER TABLE handoffs ADD COLUMN exchange_token_hash TEXT;

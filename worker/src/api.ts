@@ -543,7 +543,8 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     // `handleCallback` has already checked against what `auth.getSession`
     // returned (or, for a handoff preflighted without one, adopted from it).
     // Trusting anything else here would hand one account a session for
-    // another's job.
+    // another's job. A replay only gets this far with the token that won the
+    // exchange; any other is a `replay` failure above, with no session (#157).
     const row = await env.sql.first<HandoffRow>(
       'SELECT * FROM handoffs WHERE id = ?', [result.handoffId],
     );

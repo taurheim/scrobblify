@@ -405,6 +405,47 @@ async function main() {
       }))).status === 200);
   }
 
+  console.log('\n-- a replayed callback gets a session only with the same token --');
+  for (const username of ['listener', undefined]) {
+    const label = username ? 'named' : 'anonymous';
+    const sql = freshSql();
+    const env = makeEnv(sql, new MemoryBlobs(), {
+      getSession: async () => ({ sessionKey: 'sk', username: 'Listener' }),
+    });
+    // eslint-disable-next-line no-await-in-loop
+    const pre: any = await (await handleRequest(env, req('/scrobblify/handoff/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        username, payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000,
+      }),
+    }))).json();
+    const state = new URL(new URL(pre.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+    const callback = async (token: string) => new URL((await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=${token}`),
+    )).headers.get('Location')!);
+
+    // eslint-disable-next-line no-await-in-loop
+    const first = await callback('tok');
+    check(`the first callback succeeds (${label})`, first.searchParams.get('handoff') === 'ok', first.toString());
+    // eslint-disable-next-line no-await-in-loop
+    const stolen = await callback('attacker-junk');
+    check(`a replay with another token is refused as a replay (${label})`,
+      stolen.searchParams.get('handoff') === 'failed'
+      && stolen.searchParams.get('reason') === 'replay', stolen.toString());
+    check(`and carries no session (${label})`, stolen.hash === '', stolen.hash);
+    // eslint-disable-next-line no-await-in-loop
+    const again = await callback('tok');
+    const fragment = new URLSearchParams(again.hash.slice(1));
+    check(`a replay with the same token still succeeds (${label})`,
+      again.searchParams.get('handoff') === 'ok'
+      && again.searchParams.get('job') === first.searchParams.get('job'), again.toString());
+    check(`with a working session (${label})`,
+      // eslint-disable-next-line no-await-in-loop
+      (await handleRequest(env, req(`/scrobblify/handoff/${pre.handoffId}`, {
+        token: fragment.get('session')!,
+      }))).status === 200);
+  }
+
   console.log('\n-- the import id survives preflight --');
   {
     const sql = freshSql();

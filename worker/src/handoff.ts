@@ -28,6 +28,7 @@ import {
   encryptCredential,
   normalizeUsername,
   randomId,
+  sha256Hex,
   signHandoffState,
   verifyHandoffState,
 } from './crypto';
@@ -61,6 +62,8 @@ export interface HandoffRow {
   algorithm_version: number;
   job_id: string | null;
   exchange_attempts: number;
+  /** SHA-256 of the Last.fm token that claimed the exchange; NULL before 006. */
+  exchange_token_hash: string | null;
   failure_reason: string | null;
   import_id: string | null;
   created_at: number;
@@ -184,7 +187,9 @@ export type CallbackResult =
       | 'expired'
       | 'username_mismatch'
       | 'already_live'
-      | 'exchange_failed';
+      | 'exchange_failed'
+      /** A replay of an exchanged handoff with a token other than the winner's. */
+      | 'replay';
   };
 
 /**
@@ -228,11 +233,16 @@ export async function handleCallback(
   // A replayed callback must return the winner's outcome rather than calling
   // auth.getSession a second time: the token is single-use and the second call
   // would fail, turning a successful handoff into a reported error.
+  //
+  // But only to the same return. The state is in the authorise URL, so whoever
+  // preflighted holds it, and the API answers this outcome with a session for
+  // the handoff's account. A link the victim approved would otherwise give its
+  // author that session for the price of any token (#157). Genuine duplicates
+  // carry the token Last.fm sent, so they still get through.
+  const tokenHash = await sha256Hex(new TextEncoder().encode(params.token));
   if (handoff.state !== 'issued') {
     if (handoff.job_id) {
-      return {
-        ok: true, handoffId: handoff.id, jobId: handoff.job_id, alreadyDone: true, username: handoff.username,
-      };
+      return replayOutcome(handoff, tokenHash);
     }
     return { ok: false, reason: handoff.state === 'failed' ? 'exchange_failed' : 'bad_state' };
   }
@@ -241,23 +251,23 @@ export async function handleCallback(
     return { ok: false, reason: 'expired' };
   }
 
-  // Claim the exchange. The loser of this CAS must not proceed.
+  // Claim the exchange, recording which token claimed it. The loser of this
+  // CAS must not proceed.
   const claimed = await transitionHandoff(
     sql,
     handoff.id,
     'issued',
     'exchanging',
     nowSec,
-    'exchange_attempts = exchange_attempts + 1',
+    'exchange_attempts = exchange_attempts + 1, exchange_token_hash = ?',
+    [tokenHash],
   );
   if (!claimed) {
     const current = await sql.first<HandoffRow>('SELECT * FROM handoffs WHERE id = ?', [
       handoff.id,
     ]);
     if (current && current.job_id) {
-      return {
-        ok: true, handoffId: current.id, jobId: current.job_id, alreadyDone: true, username: current.username,
-      };
+      return replayOutcome(current, tokenHash);
     }
     return { ok: false, reason: 'bad_state' };
   }
@@ -381,6 +391,25 @@ export async function handleCallback(
 
   return {
     ok: true, handoffId: handoff.id, jobId, alreadyDone: false, username: session.username,
+  };
+}
+
+/**
+ * The winner's outcome for a replayed callback, if it presented the winner's
+ * token.
+ *
+ * A row claimed before `exchange_token_hash` existed has no hash to compare
+ * against, so it fails closed: its user signs in again rather than anyone
+ * being handed a session on the strength of the state alone. Each callback
+ * hashes a single-use token once, so comparing digests leaks nothing a timing
+ * attack could use.
+ */
+function replayOutcome(handoff: HandoffRow, tokenHash: string): CallbackResult {
+  if (!handoff.job_id || !handoff.exchange_token_hash || handoff.exchange_token_hash !== tokenHash) {
+    return { ok: false, reason: 'replay' };
+  }
+  return {
+    ok: true, handoffId: handoff.id, jobId: handoff.job_id, alreadyDone: true, username: handoff.username,
   };
 }
 

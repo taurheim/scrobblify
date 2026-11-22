@@ -232,6 +232,82 @@ async function main() {
   const jobCount = await db3.all('SELECT id FROM jobs');
   check('replay did not create a second job', jobCount.length === 1, jobCount.length);
 
+  /*
+    The state is in the authorise URL, so whoever preflighted holds it. Once
+    the victim has approved, a replay with any token used to be answered with
+    the victim's job, and the API turned that into a session for their account.
+  */
+  console.log('\n-- callback: a replay with a different token --');
+  const handoffBefore = await db3.first<any>('SELECT * FROM handoffs WHERE id = ?', [p3.handoffId]);
+  const jobBefore = await db3.first<any>('SELECT * FROM jobs WHERE id = ?', [(cb as any).jobId]);
+  const stolen = await handleCallback(
+    db3, lastfm as any, { state: p3.state, token: 'attacker-junk' }, SIGNING_KEY, CRED_KEY, NOW + 5,
+  );
+  check('is refused as a replay', !stolen.ok && (stolen as any).reason === 'replay', stolen);
+  check('and does not call auth.getSession', lastfm.getSessionCalls === 1, lastfm.getSessionCalls);
+  check('and changes nothing on the handoff',
+    JSON.stringify(await db3.first<any>('SELECT * FROM handoffs WHERE id = ?', [p3.handoffId]))
+      === JSON.stringify(handoffBefore));
+  check('or on the job',
+    JSON.stringify(await db3.first<any>('SELECT * FROM jobs WHERE id = ?', [(cb as any).jobId]))
+      === JSON.stringify(jobBefore));
+  const sameAgain = await handleCallback(
+    db3, lastfm as any, { state: p3.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW + 5,
+  );
+  check('the real token still gets the winner outcome afterwards',
+    sameAgain.ok && sameAgain.alreadyDone && sameAgain.jobId === (cb as any).jobId, sameAgain);
+  check('the token is stored hashed, not in the clear',
+    handoffBefore.exchange_token_hash === await sha256Hex(new TextEncoder().encode('tok'))
+      && !JSON.stringify(handoffBefore).includes('"tok"'), handoffBefore.exchange_token_hash);
+
+  /*
+    Rows claimed before the hash column existed have nothing to compare a
+    token against. They fail closed: their user signs in again instead.
+  */
+  console.log('\n-- callback: a replay of a row with no stored hash --');
+  await db3.run('UPDATE handoffs SET exchange_token_hash = NULL WHERE id = ?', [p3.handoffId]);
+  const legacy = await handleCallback(
+    db3, lastfm as any, { state: p3.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW + 5,
+  );
+  check('fails closed even with the right token',
+    !legacy.ok && (legacy as any).reason === 'replay', legacy);
+
+  /*
+    The other replay path: a duplicate that read the row while it was still
+    `issued` and lost the claim to the winner.
+  */
+  console.log('\n-- callback: a replay that loses the claim --');
+  for (const [label, token, expectOk] of [
+    ['with the same token', 'tok', true],
+    ['with a different token', 'attacker-junk', false],
+  ] as const) {
+    const raceDb = freshDb();
+    const pc = await preflight(raceDb, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
+    const racingLastFm = new FakeLastFm('alice');
+    const origRun = raceDb.run.bind(raceDb);
+    let winner: any = null;
+    raceDb.run = async (query: string, params: unknown[] = []) => {
+      if (!winner && query.includes('SET state = ?, updated_at = ?') && params[0] === 'exchanging') {
+        raceDb.run = origRun;
+        winner = await handleCallback(
+          raceDb, racingLastFm as any, { state: pc.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+        );
+      }
+      return origRun(query, params);
+    };
+    // eslint-disable-next-line no-await-in-loop
+    const loser = await handleCallback(
+      raceDb, racingLastFm as any, { state: pc.state, token }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check(`the winner exchanged (${label})`, winner?.ok && !winner.alreadyDone, winner);
+    check(`the loser ${label} ${expectOk ? 'gets the winner outcome' : 'is refused as a replay'}`,
+      expectOk
+        ? loser.ok && loser.alreadyDone && loser.jobId === winner.jobId
+        : !loser.ok && (loser as any).reason === 'replay',
+      loser);
+    check(`only the winner exchanged (${label})`, racingLastFm.getSessionCalls === 1);
+  }
+
   console.log('\n-- callback: rejections --');
   const db4 = freshDb();
   const p4 = await preflight(db4, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
@@ -385,6 +461,14 @@ async function main() {
     ) as any;
     check('a replay reports the adopted user',
       replayAnon.ok && replayAnon.alreadyDone && replayAnon.username === 'alice', replayAnon);
+    // One anonymous link works on anyone who clicks it, so this is the case
+    // the token check matters most for.
+    const stolenAnon = await handleCallback(
+      adopt, new FakeLastFm('mallory') as any,
+      { state: p.state, token: 'attacker-junk' }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check('a replay with a different token is refused',
+      !stolenAnon.ok && (stolenAnon as any).reason === 'replay', stolenAnon);
 
     // The per-user check could not run at preflight, so it runs here.
     const busy = freshDb();
