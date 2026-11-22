@@ -47,7 +47,10 @@ const MAX_EXCHANGE_ATTEMPTS = 3;
  */
 export const ALGORITHM_VERSION = 1;
 
-/** 60-day credential TTL; admission control refuses jobs that cannot finish. */
+/**
+ * 60-day credential TTL. A job still running when it passes parks in
+ * `needs_reauth` until the user signs in again.
+ */
 export const CREDENTIAL_TTL_SECONDS = 60 * 86400;
 
 export interface HandoffRow {
@@ -102,12 +105,21 @@ export type PreflightResult =
 export const TRACKS_PER_DAY = importBudget(0);
 
 /**
- * At roughly TRACKS_PER_DAY, a job that cannot finish inside the credential's
- * 60-day life is guaranteed to be abandoned half-done. Refusing it up front is
- * kinder than accepting it — and this assumes no outages, no global pauses and
- * no daily-limit backoff, so it is already optimistic.
+ * The largest import one job accepts: the most plays whose upload fits
+ * `MAX_JOB_COMPRESSED_BYTES` with 10% headroom, worst case.
+ *
+ * Measured 2026-11-21 by test/jobsize.test.ts: 89,000 plays, every one distinct
+ * (seeded random 24/40/40-character artist/track/album, all re-tagged), gzip to
+ * 7,152,650 bytes in the client's chunk format, about 80 KB per 1,000. Real
+ * histories repeat plays and compress far better.
+ *
+ * It used to be `TRACKS_PER_DAY * 60`, refusing anything that could not finish
+ * inside the credential's 60-day life. That turned away imports the storage
+ * could hold; a job that outlives its credential now parks in `needs_reauth`
+ * and the client warns, before the handover, that the user will have to sign
+ * in again.
  */
-export const MAX_TRACKS_PER_JOB = TRACKS_PER_DAY * 60;
+export const MAX_TRACKS_PER_JOB = 89_000;
 
 /**
  * Step 0: commit what we expect *before* redirecting.
