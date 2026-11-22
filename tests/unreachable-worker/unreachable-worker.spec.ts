@@ -1444,6 +1444,120 @@ test.describe('Choosing the server in the confirm dialog', () => {
     });
   }
 
+  /*
+    Leaves for the mock's Last.fm page and stays there: the shim would approve
+    and return at once. Returns the handoff it is waiting on, and a way to
+    approve it after all.
+  */
+  async function waitAtLastFm(page: Page, baseURL: string | undefined, mock: MockWorker) {
+    const { origin } = new URL(baseURL || 'http://localhost:8471');
+    const lastFmPage = (route: Route) => route.fulfill({
+      status: 200,
+      contentType: 'text/html; charset=utf-8',
+      body: '<!doctype html><title>Last.fm</title><h1>Allow access?</h1>',
+    });
+    await page.route(`${origin}/mock-auth*`, lastFmPage);
+    const dialog = await chooseRecentPlays(page, 800);
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+    await expect(page.locator('h1:has-text("Allow access?")')).toBeVisible({ timeout: 15000 });
+    const [handoffId, handoff] = [...mock.world.handoffs.entries()][0];
+    const approve = async () => {
+      await page.unroute(`${origin}/mock-auth*`, lastFmPage);
+      await page.goto(`${origin}/mock-auth?handoff=${handoffId}&session=${handoff.session}&user=testuser`);
+    };
+    return { handoffId, handoff, approve };
+  }
+
+  async function handoffRecords(page: Page) {
+    return page.evaluate(([ownerKey, preflightedKey]) => ({
+      owner: JSON.parse(localStorage.getItem(ownerKey) || 'null'),
+      preflighted: localStorage.getItem(preflightedKey),
+    }), [OWNER_KEY, PREFLIGHTED_KEY]);
+  }
+
+  /*
+    The preflight record is in localStorage, so every tab sees the freeze as
+    this browser's own handoff. Only the tab that left for Last.fm may settle
+    it by its queue; another tab loading meanwhile abandoned the handoff, and
+    the approval then failed.
+  */
+  test('loading the page in another tab leaves a handover waiting at Last.fm alone', async ({ page, baseURL }) => {
+    const { mock, scrobbles } = await openWithWorker(page, baseURL);
+    const { handoffId, handoff, approve } = await waitAtLastFm(page, baseURL, mock);
+
+    const other = await page.context().newPage();
+    await interceptLastFm(other);
+    await other.route('http://background.invalid/**', async (route: Route) => {
+      const url = new URL(route.request().url());
+      await route.fulfill(mock.handle(
+        route.request().method(),
+        url.pathname.replace(/\/+$/, ''),
+        url.searchParams,
+        route.request().postData() || '',
+      ));
+    });
+    await other.goto('/#/scrobble');
+    await expect(other.locator('text=A handover is starting in another tab')).toBeVisible({ timeout: 15000 });
+    await expect(other.locator(RESUME_PROMPT)).toHaveCount(0);
+    expect(handoff.state).toBe('issued');
+    expect(await handoffRecords(other)).toMatchObject({
+      owner: { owner: 'freezing', id: handoffId },
+      preflighted: handoffId,
+    });
+    await other.close();
+
+    await approve();
+    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    expect(mock.world.job).toMatchObject({ importId: handoff.importId });
+    expect(scrobbles).toEqual([]);
+  });
+
+  /*
+    `abandoned: false` means the handoff got past waiting for its approval
+    (approved between the queue check and the withdrawal, say), so the freeze
+    and the preflight stay until it is known what became of it.
+  */
+  test('going back from Last.fm keeps the handover the worker says moved on', async ({ page, baseURL }) => {
+    const { mock, scrobbles } = await openWithWorker(page, baseURL);
+    const { handoffId, handoff, approve } = await waitAtLastFm(page, baseURL, mock);
+    let withdrawals = 0;
+    await page.route('http://background.invalid/scrobblify/handoff/*/abandon', async (route: Route) => {
+      withdrawals += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({ ok: true, abandoned: false }),
+      });
+    });
+
+    await page.goBack();
+    await expect.poll(() => withdrawals, { timeout: 15000 }).toBeGreaterThan(0);
+    await expect(page.getByText(/A handover is starting in another tab|couldn't check whether the background service took over/))
+      .toBeVisible({ timeout: 15000 });
+    await expect(page.locator(RESUME_PROMPT)).toHaveCount(0);
+    expect(await handoffRecords(page)).toMatchObject({
+      owner: { owner: 'freezing', id: handoffId },
+      preflighted: handoffId,
+    });
+
+    await approve();
+    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    expect(scrobbles).toEqual([]);
+  });
+
+  test('going back from Last.fm after the worker dropped the handover still offers the selection', async ({ page, baseURL }) => {
+    const { mock } = await openWithWorker(page, baseURL);
+    const { handoff } = await waitAtLastFm(page, baseURL, mock);
+    // Reaped while the user was away, so there is nothing left to withdraw.
+    handoff.state = 'failed';
+    handoff.failureReason = 'reaped';
+
+    await page.goBack();
+    await expectSelectionOffered(page);
+    expect((await handoffRecords(page)).preflighted).toBeNull();
+  });
+
   test('a page restored from the back-forward cache asks about the queue, not a session', async ({ page, baseURL }) => {
     const importId = 'f1f2f3f4f5f6f7f8f9f0e1e2e3e4e5e6';
     const { mock } = await openWithWorker(page, baseURL, {
@@ -1464,9 +1578,10 @@ test.describe('Choosing the server in the confirm dialog', () => {
     mock.world.handoffs.set('h-mine', handoff);
     await expect(page.locator(RESUME_PROMPT)).toBeVisible({ timeout: 10000 });
     // The page as it was when it left for Last.fm: frozen for the handoff it
-    // preflighted, busy, the selection saved but not on offer.
+    // preflighted (in this tab), busy, the selection saved but not on offer.
     await page.evaluate(async ([ownerKey, preflightedKey]) => {
       localStorage.setItem(preflightedKey, 'h-mine');
+      sessionStorage.setItem(preflightedKey, 'h-mine');
       localStorage.setItem(ownerKey, JSON.stringify({ owner: 'freezing', id: 'h-mine', attempt: `${Date.now()}.t` }));
       let inst = (document.querySelector('.upload-step') as any).__vueParentComponent;
       while (inst && !(inst.proxy && typeof inst.proxy.recoverFromBfcache === 'function')) {

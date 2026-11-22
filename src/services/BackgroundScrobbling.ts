@@ -1533,6 +1533,24 @@ export function isOwnHandoffFreeze(owner: QueueOwner | null): boolean {
 }
 
 /**
+ * `isOwnHandoffFreeze`, and preflighted in this very tab: the one that left
+ * for Last.fm, back without a return. The localStorage record is every tab's,
+ * so a tab loading while another waits at Last.fm would otherwise take the
+ * freeze as its own to settle, and abandon a handoff about to be approved.
+ * The sessionStorage copy survives the same-tab round trip and Back.
+ */
+export function isThisTabsHandoffFreeze(owner: QueueOwner | null): boolean {
+  if (!isOwnHandoffFreeze(owner)) {
+    return false;
+  }
+  try {
+    return window.sessionStorage.getItem(PREFLIGHTED_STORAGE_KEY) === (owner as QueueOwner).id;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Releases ownership once a handoff is known not to be running.
  *
  * Same hazard as `releaseQueueOwner`, from the other side of the redirect: the
@@ -2545,6 +2563,11 @@ export async function preflight(
       trackError('background.recordPreflight', e);
       return null;
     }
+    try {
+      window.sessionStorage.setItem(PREFLIGHTED_STORAGE_KEY, body.handoffId);
+    } catch {
+      // Then no tab settles it by its queue, and the freshness rules apply.
+    }
     // A new attempt is on its way, and its own answers are not to be waived.
     forgetAbandonedImport();
     return { handoffId: body.handoffId, authoriseUrl: body.authoriseUrl };
@@ -2710,11 +2733,23 @@ export async function abandonHandoff(
  * in `/import/:id`, so there is no `pending` answer left to waive. Unanswered
  * (worker unreachable, or a worker too old to have the route) it still does,
  * until reaped.
+ *
+ * Released only when the worker withdrew it or didn't answer. `abandoned:
+ * false` means the handoff is past waiting for its approval: maybe approved
+ * since the queue was checked, its return on the way. Releasing then dropped
+ * the preflight record, so that return was refused. Null then, with both
+ * records left for the caller to find out what became of it; otherwise
+ * whether a freeze was lifted.
  */
-export async function abandonOwnHandoff(expected?: QueueOwner, pendingImportId = ''): Promise<boolean> {
+export async function abandonOwnHandoff(
+  expected: QueueOwner,
+  pendingImportId = '',
+): Promise<boolean | null> {
   const own = preflightedHandoff();
-  const mine = expected ? isOwnHandoffFreeze(expected) : !!own;
-  const abandoned = own && mine ? await abandonHandoff(own) : null;
+  const abandoned = own && isOwnHandoffFreeze(expected) ? await abandonHandoff(own) : null;
+  if (abandoned === false) {
+    return null;
+  }
   return releaseAbandonedHandoff(expected, abandoned === true ? '' : pendingImportId);
 }
 

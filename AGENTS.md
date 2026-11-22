@@ -1225,19 +1225,28 @@ came back any other way could never ask about it and stayed blocked ("A
 handover is starting in another tab…", then "…on hold", for good):
 
 - Any `?handoff=failed` return (denied, `exchange_failed`, `already_live`, …)
-  calls `abandonOwnHandoff()`, which withdraws this browser's preflighted
-  handoff at the worker (below) and then `releaseAbandonedHandoff()`, which
-  lifts only a freeze naming that handoff, and forgets the preflight (#160).
+  withdraws this browser's preflighted handoff at the worker (below, in case
+  the refusal left it waiting) and then calls `releaseAbandonedHandoff()`,
+  which lifts only a freeze naming that handoff, and forgets the preflight
+  (#160), whatever the withdrawal answers.
 - Back from Last.fm without approving (a reload, or a bfcache restore), with no
   worker session: `ownHandoffWasTaken` asks `/scrobblify/import/:id` about the
   saved queue. `known: false`, or `known: true, pending: true` (the worker
-  still holds this very handoff, unapproved), withdraws and releases it the
-  same way and offers the saved selection again (on a reload,
+  still holds this very handoff, unapproved), withdraws and releases it
+  (`abandonOwnHandoff`) and offers the saved selection again (on a reload,
   `background_freeze_released` `reason: handoff_not_taken`); any other `known: true`
   blocks as a handed-over queue, with the worker sign-in; no answer changes
-  nothing. Only for the browser's own preflighted freeze, and before the
-  3-minute freshness rule, since the tab that set it is the one that came
-  back. Forgetting the preflight is what makes this safe even if the
+  nothing. Only in the tab that preflighted it (`isThisTabsHandoffFreeze`:
+  `preflight` keeps a sessionStorage copy of the id, which survives the
+  same-tab round trip and Back), and before the 3-minute freshness rule, since
+  that tab is the one that came back. The localStorage record is every tab's,
+  so without that a tab loading while another waited at Last.fm abandoned its
+  handoff, and the approval then failed; other tabs get the freshness rules.
+  Released only when the withdrawal is confirmed (`abandoned: true`) or
+  unanswered: `abandoned: false` means the handoff got past waiting (approved
+  since the queue was asked, say), so both records stay and the queue is asked
+  again (`releaseOwnHandoff`): a job blocks, nothing on its way (failed or
+  reaped while away) releases, still on its way holds. Forgetting the preflight is what makes this safe even if the
   withdrawal goes unanswered: approving that handoff later gets a return this
   browser refuses, so the queue is never uploaded.
 - A handover from the confirm dialog that fails before leaving (full,

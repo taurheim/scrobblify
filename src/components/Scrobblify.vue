@@ -1714,18 +1714,23 @@ export default defineComponent({
     async reconcileQueueOwner(owner: background.QueueOwner) {
       if (owner.owner === 'freezing') {
         /*
-          This browser's own handoff, asked about by its queue: see
-          `ownHandoffWasTaken`. Before the freshness check, because the tab
-          that set it is this one, back from Last.fm, not a sibling mid-attempt.
+          This tab's own handoff, back from Last.fm without a return, asked
+          about by its queue: see `ownHandoffWasTaken`. Before the freshness
+          check, because the tab that set it is this one, not a sibling
+          mid-attempt. In any other tab it is a sibling's, maybe still at
+          Last.fm, and the rules below apply.
         */
         const own = await this.ownHandoffWasTaken(owner);
-        if (own.taken === false && await background.abandonOwnHandoff(owner, own.pendingImportId)) {
+        const settled = own.taken === false
+          ? await this.releaseOwnHandoff(owner, own.pendingImportId)
+          : null;
+        if (settled === 'released') {
           this.ownershipBlocked = false;
           await this.exposeSavedStateUnlessStale('handoff_not_taken');
           trackEvent('background_freeze_released', { reason: 'handoff_not_taken' });
           return;
         }
-        if (own.taken === true) {
+        if (own.taken === true || settled === 'taken') {
           await this.blockForHandedOverQueue();
           return;
         }
@@ -1805,14 +1810,15 @@ export default defineComponent({
      * `releaseAbandonedHandoff` to record if the withdrawal goes unanswered,
      * so later checks of it don't read the same answer as handed over (#162).
      *
-     * `taken` is null when unanswered, or when the freeze isn't this browser's
-     * own preflighted handoff, which only its tab may settle.
+     * `taken` is null when unanswered, or when the freeze isn't this tab's
+     * own preflighted handoff (`isThisTabsHandoffFreeze`), which only this
+     * tab may settle.
      */
     async ownHandoffWasTaken(
       owner: background.QueueOwner | null,
     ): Promise<{ taken: boolean | null; pendingImportId: string }> {
       const unsettled = { taken: null, pendingImportId: '' };
-      if (!background.isOwnHandoffFreeze(owner) || background.getSession()) {
+      if (!background.isThisTabsHandoffFreeze(owner) || background.getSession()) {
         return unsettled;
       }
       let importId = '';
@@ -1835,6 +1841,35 @@ export default defineComponent({
         return { taken: false, pendingImportId: importId };
       }
       return { taken: this.handedOverByStatus(importId, status), pendingImportId: '' };
+    },
+
+    /**
+     * Withdraws and releases this tab's own handoff that `ownHandoffWasTaken`
+     * found not taken (`abandonOwnHandoff`).
+     *
+     * If the worker says it had already moved on, nothing is released yet and
+     * the queue is asked once more. A job by now means it was taken after
+     * all; nothing on its way means it ended without one (failed, or reaped
+     * while the user was away), and the freeze lifts, or it would never lift;
+     * still on its way (approved, say, its return coming) or unanswered, it
+     * stays (`in_flight`).
+     */
+    async releaseOwnHandoff(
+      owner: background.QueueOwner,
+      pendingImportId: string,
+    ): Promise<'released' | 'not_released' | 'taken' | 'in_flight'> {
+      const released = await background.abandonOwnHandoff(owner, pendingImportId);
+      if (released !== null) {
+        return released ? 'released' : 'not_released';
+      }
+      const again = await this.ownHandoffWasTaken(owner);
+      if (again.taken === true) {
+        return 'taken';
+      }
+      if (again.taken === false && !again.pendingImportId) {
+        return background.releaseAbandonedHandoff(owner) ? 'released' : 'not_released';
+      }
+      return 'in_flight';
     },
 
     /**
@@ -2160,7 +2195,9 @@ export default defineComponent({
       // Captured before the round-trip, like every release below that follows one.
       const observed = background.queueOwner();
       let owned: boolean | null;
-      let pendingImportId = '';
+      // Whether this tab's own freeze was settled by its queue, below.
+      let ownSettled = false;
+      let releasedOwn = false;
       if (marker) {
         owned = await background.resolveOwnershipMarker(marker);
       } else if (pendingId) {
@@ -2169,7 +2206,16 @@ export default defineComponent({
         // Nothing to ask about the job with; the queue can still be asked about.
         const own = await this.ownHandoffWasTaken(observed);
         owned = own.taken;
-        pendingImportId = own.pendingImportId;
+        if (owned === false && observed) {
+          ownSettled = true;
+          const settled = await this.releaseOwnHandoff(observed, own.pendingImportId);
+          releasedOwn = settled === 'released';
+          if (settled === 'taken') {
+            owned = true;
+          } else if (settled === 'in_flight') {
+            owned = null;
+          }
+        }
       } else {
         owned = await background.hasLiveJob();
       }
@@ -2218,9 +2264,10 @@ export default defineComponent({
       // Scoped: this tab's own freeze, or a `server` record we have just
       // disproved. A freeze another tab is actively holding stays. With no
       // pending handoff, this tab's freeze names the one it preflighted, which
-      // the worker is told to withdraw.
-      const releasedOwn = !pendingId && !!observed
-        && await background.abandonOwnHandoff(observed, pendingImportId);
+      // the worker is told to withdraw (above, when settled by the queue).
+      if (!ownSettled && !pendingId && observed) {
+        releasedOwn = (await background.abandonOwnHandoff(observed)) === true;
+      }
       if (!releasedOwn) {
         background.releaseQueueOwnerIfUnclaimed(pendingId || '');
       }
@@ -2295,8 +2342,10 @@ export default defineComponent({
         // The worker refused the handoff, so it can never start, and this
         // browser has no session to ask about it with (#160). Withdrawn as
         // well, in case the refusal left it waiting (a return with no token);
-        // one the callback already failed just answers no.
-        await background.abandonOwnHandoff();
+        // one the callback already failed just answers no, and is released
+        // all the same.
+        await background.abandonHandoff(background.preflightedHandoff() || '');
+        background.releaseAbandonedHandoff();
         if (reason === 'already_live') {
           this.backgroundNotice = ALREADY_LIVE_NOTICE;
           this.showReauth = true;
