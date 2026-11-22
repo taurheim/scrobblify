@@ -72,6 +72,8 @@ export default defineComponent({
   async mounted() {
     this.hadToken = !!this.$route.query.token;
     const { hadToken } = this;
+    // Read now: the parent may stop passing it once it hears `failed`.
+    const quiet = this.quietFailure;
     this.$data.checkingAuth = true;
     const api = this.$store.state.lfmApi as LastFm;
     try {
@@ -86,11 +88,11 @@ export default defineComponent({
       // recovery prompt instead of the generic error dialog.
       if (LastFm.isAuthTokenError(e)) {
         trackEvent('auth_token_invalid');
-        this.tokenExpired = !this.quietFailure;
+        this.tokenExpired = !quiet;
         return;
       }
       trackEvent('auth_failed');
-      if (this.quietFailure) {
+      if (quiet) {
         return;
       }
       this.errorMessage = 'Failed to authenticate with Last.fm. Please try again.';
