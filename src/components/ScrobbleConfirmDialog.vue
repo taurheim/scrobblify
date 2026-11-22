@@ -1,6 +1,16 @@
 <template>
   <v-dialog v-model="visible" max-width="620" scrollable>
-    <v-card class="scrobble-confirm text-left">
+    <v-card v-if="stage === 'choice'" class="scrobble-confirm text-left">
+      <v-card-title>{{ trackCount.toLocaleString() }} plays</v-card-title>
+      <v-card-text class="pt-2">
+        <server-choice :count="trackCount" :show-date-note="hasReTagged" @server="chooseServer" @local="chooseLocal" />
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer></v-spacer>
+        <v-btn variant="text" @click="visible = false">Cancel</v-btn>
+      </v-card-actions>
+    </v-card>
+    <v-card v-else class="scrobble-confirm text-left">
       <v-card-title>Scrobble {{ trackCount.toLocaleString() }} tracks?</v-card-title>
 
       <v-card-text class="pt-2">
@@ -9,7 +19,12 @@
           replaces it. The next resume would then start from this run's count
           and re-send what the saved one already had.
         -->
-        <v-alert v-if="savedProgress" type="warning" variant="tonal" class="saved-progress-warning mb-4">
+        <v-alert
+          v-if="stage === 'saved' && savedProgress"
+          type="warning"
+          variant="tonal"
+          class="saved-progress-warning mb-4"
+        >
           <strong>You have saved progress<template v-if="savedProgress.total > 0">
             ({{ savedProgress.succeeded.toLocaleString() }} of
             {{ savedProgress.total.toLocaleString() }} tracks scrobbled)</template>.</strong>
@@ -50,8 +65,8 @@
       <v-card-actions>
         <v-spacer></v-spacer>
         <v-btn variant="text" @click="visible = false">Cancel</v-btn>
-        <template v-if="savedProgress">
-          <v-btn variant="text" color="error" @click="confirm">Start over</v-btn>
+        <template v-if="stage === 'saved'">
+          <v-btn variant="text" color="error" @click="startOver">Start over</v-btn>
           <v-btn color="primary" variant="flat" @click="resumeSaved">Resume saved progress</v-btn>
         </template>
         <v-btn v-else color="primary" @click="confirm">Start scrobbling</v-btn>
@@ -62,10 +77,13 @@
 
 <script lang="ts">
 import { defineComponent, PropType } from 'vue';
+import ServerChoice from '@/components/ServerChoice.vue';
 import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import {
   IMPORT_DAILY_BUDGET, ScrobbleEstimate, backgroundCanFinish, formatDuration,
 } from '@/services/ScrobbleEstimate';
+import { backgroundOfferSource } from '@/services/BackgroundScrobbling';
+import { trackEvent } from '@/services/Analytics';
 
 export interface SavedProgressSummary {
   succeeded: number;
@@ -74,6 +92,7 @@ export interface SavedProgressSummary {
 
 export default defineComponent({
   name: 'ScrobbleConfirmDialog',
+  components: { ServerChoice },
   props: {
     modelValue: { type: Boolean, default: false },
     trackCount: { type: Number, required: true },
@@ -82,17 +101,36 @@ export default defineComponent({
     backgroundTrackLimit: { type: Number, default: 0 },
     /** Saved progress the new run would replace; `total` is 0 when it couldn't be read. */
     savedProgress: { type: Object as PropType<SavedProgressSummary | null>, default: null },
+    /** Some of the selected plays are moved to today ("Scrobble tracks older than 2 weeks"). */
+    hasReTagged: { type: Boolean, default: false },
   },
-  emits: ['update:modelValue', 'confirm', 'resume-saved'],
+  emits: ['update:modelValue', 'confirm', 'resume-saved', 'server'],
   data() {
-    return { dailyCap: LASTFM_DAILY_CAP, dailyBudget: IMPORT_DAILY_BUDGET };
+    return {
+      dailyCap: LASTFM_DAILY_CAP,
+      dailyBudget: IMPORT_DAILY_BUDGET,
+      /**
+       * What the open dialog asks: about the saved progress first, then
+       * whether the server should send these, else just to confirm. Set on
+       * opening, so a capacity answer arriving meanwhile doesn't swap it.
+       */
+      stage: 'plain' as 'saved' | 'choice' | 'plain',
+    };
   },
   computed: {
     visible: {
       get(): boolean { return this.modelValue; },
       set(val: boolean) { this.$emit('update:modelValue', val); },
     },
-    // The offer appears on the stop screen, for whatever is left after today.
+    /** The whole selection could go to the server now. */
+    showServerChoice(): boolean {
+      return backgroundCanFinish(this.trackCount, this.backgroundTrackLimit);
+    },
+    /*
+      The offer appears on the stop screen, for whatever is left after today.
+      Still reachable in the plain stage: a selection just over the server's
+      limit can leave a remainder under it.
+    */
     canFinishInBackground(): boolean {
       return backgroundCanFinish(this.trackCount - this.estimate.todayCount, this.backgroundTrackLimit);
     },
@@ -107,7 +145,49 @@ export default defineComponent({
         .toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
     },
   },
+  watch: {
+    modelValue: {
+      immediate: true,
+      handler(open: boolean) {
+        if (!open) { return; }
+        if (this.savedProgress) {
+          this.stage = 'saved';
+        } else if (this.showServerChoice) {
+          this.enterChoice();
+        } else {
+          this.stage = 'plain';
+        }
+      },
+    },
+  },
   methods: {
+    enterChoice() {
+      this.stage = 'choice';
+      trackEvent('background_offer_shown', {
+        entry_point: 'confirm',
+        track_count: this.trackCount,
+        offer_source: backgroundOfferSource(),
+      });
+    },
+    startOver() {
+      if (this.showServerChoice) {
+        this.enterChoice();
+      } else {
+        this.confirm();
+      }
+    },
+    chooseServer() {
+      this.visible = false;
+      this.$emit('server');
+    },
+    chooseLocal() {
+      trackEvent('background_offer_declined', {
+        entry_point: 'confirm',
+        track_count: this.trackCount,
+        all_re_tagged: false,
+      });
+      this.confirm();
+    },
     days(n: number): string {
       return n === 1 ? '1 day' : `${n} days`;
     },

@@ -368,7 +368,7 @@ import {
   resolveExportedRepeats,
 } from '@/services/BackgroundHandoff';
 import {
-  trackEvent, trackError, resetUser, onFeatureFlags,
+  trackEvent, trackError, resetUser, onFeatureFlags, identifyUser,
 } from '@/services/Analytics';
 import {
   ConflictReason, ProgressCount, findCompletedImport, isSameImport, progressOf, recordCompletedImport,
@@ -437,6 +437,11 @@ const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sig
  * the worker, so the unreachable banner is the only one worth showing.
  */
 const NEEDS_WORKER_NOTICES = [SESSION_EXPIRED_NOTICE, REAUTH_UNREACHABLE_NOTICE];
+/**
+ * A handoff that named nobody came back refused: the Last.fm account that
+ * authorised it already has a job. Signing in to the worker shows that job.
+ */
+const ALREADY_LIVE_NOTICE = 'You already have an import running on Scrobblify.';
 
 /** The stepper's steps. Signing in isn't one, so they start at 2. */
 const STEPPER_ITEMS = [
@@ -610,6 +615,8 @@ export default defineComponent({
        * replaces the notice and the button must keep its label.
        */
       reauthFixNow: false,
+      /** Replaces the sign-in button's label when set; cleared with `reauthFixNow`. */
+      reauthLabelText: '',
       resumeSignInMessage: '',
       /**
        * What the sign-in banner's button signs in for. Only a refused resume of
@@ -1033,6 +1040,9 @@ export default defineComponent({
         && (this.authorityUnknown || this.authorityPending));
     },
     reauthLabel(): string {
+      if (this.reauthLabelText) {
+        return this.reauthLabelText;
+      }
       return this.reauthFixNow
         ? 'Fix now'
         : 'Sign in to the background service';
@@ -1236,6 +1246,7 @@ export default defineComponent({
         if (!this.backgroundJob) {
           this.showReauth = true;
           this.reauthFixNow = false;
+          this.reauthLabelText = '';
           this.backgroundNotice = 'Your import is still running on the server, so scrobbling from this browser is switched off to stop the same tracks being sent twice. Sign in to check on it or bring it back here.';
         }
         trackEvent('background_authority_check', { result: 'live', signed_in: String(!!this.backgroundJob) });
@@ -1428,6 +1439,7 @@ export default defineComponent({
       if (!this.backgroundJob) {
         this.showReauth = true;
         this.reauthFixNow = false;
+        this.reauthLabelText = '';
         const p = this.handedOverProgress;
         const detail = p ? ` It has scrobbled ${p.scrobbled} of ${p.total} tracks.` : '';
         this.backgroundNotice = `This import was handed over to the background service, so scrobbling it from this browser is switched off — the tracks it already sent would be sent again and silently discarded.${detail} Sign in to check on it or bring it back here.`;
@@ -1698,6 +1710,7 @@ export default defineComponent({
         // an apology.
         this.showReauth = true;
         this.reauthFixNow = true;
+        this.reauthLabelText = '';
         this.backgroundNotice = SESSION_EXPIRED_NOTICE;
       }
     },
@@ -1781,6 +1794,7 @@ export default defineComponent({
       this.ownershipBlocked = true;
       this.showReauth = background.isSessionExpired();
       this.reauthFixNow = this.showReauth;
+      this.reauthLabelText = '';
       this.backgroundNotice = background.isSessionExpired()
         ? SESSION_EXPIRED_NOTICE
         : 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
@@ -1795,11 +1809,8 @@ export default defineComponent({
      * back after the redirect may do that.
      */
     async reauthenticate() {
+      // Empty is fine: the worker then signs in whoever authorises on Last.fm.
       const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
-      if (!username) {
-        this.backgroundNotice = 'Sign in to Last.fm first, then try again.';
-        return;
-      }
       this.reauthBusy = true;
       trackEvent('background_reauth_started');
       const url = await background.startReauth(username);
@@ -2076,6 +2087,20 @@ export default defineComponent({
     },
 
     /**
+     * Remembers the Last.fm account the worker says signed in, for a browser
+     * that didn't know one. Only the name: with no session key the browser is
+     * still signed out of Scrobblify's own Last.fm access.
+     */
+    rememberWorkerUser(user: string) {
+      const api = this.$store.state.lfmApi as LastFm;
+      if (!user || api.getUserName()) {
+        return;
+      }
+      api.setUserName(user);
+      identifyUser(user);
+    },
+
+    /**
      * Finishes a handoff that Last.fm has just redirected back to us.
      *
      * Returns true when this page load belongs to a handoff, in which case the
@@ -2090,8 +2115,19 @@ export default defineComponent({
       }
 
       if (handoffParam === 'failed') {
-        this.backgroundNotice = 'Last.fm didn\'t complete the handoff, so nothing was started. Your progress is still saved here.';
-        trackEvent('background_handoff_failed', { reason: params.get('reason') || 'callback' });
+        const reason = params.get('reason') || 'callback';
+        if (reason === 'already_live') {
+          // The worker refused the handoff, so it can never start, and this
+          // browser has no session to ask about it with.
+          background.releaseRefusedHandoff();
+          this.backgroundNotice = ALREADY_LIVE_NOTICE;
+          this.showReauth = true;
+          this.reauthFixNow = false;
+          this.reauthLabelText = 'Sign in to see it';
+        } else {
+          this.backgroundNotice = 'Last.fm didn\'t complete the handoff, so nothing was started. Your progress is still saved here.';
+        }
+        trackEvent('background_handoff_failed', { reason });
         this.stripQuery();
         return false;
       }
@@ -2099,6 +2135,10 @@ export default defineComponent({
       const fragment = background.consumeRedirectFragment();
       const handoffId = (fragment && fragment.handoffId) || background.getPendingHandoff();
       this.stripQuery();
+      this.rememberWorkerUser((fragment && fragment.user) || '');
+      // A handoff started before signing in learns its user only here (the
+      // mock worker's shim stores it before the page loads instead).
+      const workerUser = (this.$store.state.lfmApi as LastFm).getUserName() || '';
       if (!handoffId) {
         this.backgroundNotice = 'The handoff came back without a session, so nothing was started. Your progress is still saved here.';
         return false;
@@ -2110,7 +2150,7 @@ export default defineComponent({
       try {
         result = await completeHandoff(this.stateManager, handoffId, (done, total) => {
           this.backgroundNotice = `Uploading your remaining tracks… ${done} of ${total}`;
-        });
+        }, workerUser);
       } catch (e) {
         trackError('background.completeHandoff', e);
         // An unexpected throw tells us nothing about whether the job started,
@@ -2889,73 +2929,107 @@ export default defineComponent({
       resetUser();
       trackEvent('user_logged_out');
     },
-    async onSelectionComplete() {
+    /**
+     * Saves the selection as progress with nothing sent, for a trip away from
+     * this page (to Last.fm, or to the worker's sign-in) that nothing in
+     * memory survives. Returns null, having said why, when it refuses or fails.
+     */
+    async saveSelectionBeforeLeaving(): Promise<ScrobbleState | null> {
+      /*
+        This save replaces whatever progress is saved here, and the
+        confirmation only asks about saved progress `savedProgress` knows of.
+        That is null whenever the resume prompt is withheld (an unanswered or
+        blocked authority check, a live job) or out of date (another tab
+        saved since), so the disk is asked too (#102).
+      */
+      if (this.sendingBlocked) {
+        this.backgroundNotice = background.isBetaOptedIn()
+          ? 'Hold on — still checking whether an import is already running on the server for your account.'
+          : 'Hold on, still getting ready. Try again in a moment.';
+        return null;
+      }
+      if (!this.savedProgress) {
+        let saved: ScrobbleState | null = null;
+        try {
+          saved = await this.stateManager.loadState();
+        } catch (e) {
+          // Unreadable, so there is nothing it could be replacing that a
+          // resume could reach either.
+        }
+        const newId = (this.$store.state.importId as string) || '';
+        if (saved && (!newId || (saved.importId || '') !== newId)) {
+          this.errorMessage = 'You have saved progress that would be replaced. '
+            + 'Go back and choose Resume or Start over.';
+          this.errorDetails = '';
+          this.showError = true;
+          // So the next press of Scrobble asks about it.
+          await this.exposeSavedStateUnlessStale(
+            'send_refused',
+            !!background.getOwnershipUnresolved() || !!background.queueOwner(),
+          );
+          return null;
+        }
+      }
+      const snapshot: ProgressSnapshot = {
+        scrobbledTracks: 0,
+        originalTotalTracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
+        originalSucceededCount: 0,
+        pendingVerification: [],
+        sendTimestamps: [],
+        lastReTagTimestampSec: this.$store.state.reTagCursorSec as number,
+        burstCount: 0,
+        dailyCount: 0,
+      };
+      try {
+        const state = this.buildState(snapshot);
+        await this.persist(() => this.stateManager.saveState(state));
+        return state;
+      } catch (e) {
+        trackError('scrobblify.saveBeforeSignIn', e);
+        this.errorMessage = "Couldn't save your selection before signing in.";
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+        return null;
+      }
+    },
+    /**
+     * The confirm dialog's answer. `server`: hand the selection to the
+     * background service, signed in here or not; the worker's own sign-in
+     * names the user when this browser doesn't know them.
+     */
+    async onSelectionComplete(path: 'tab' | 'server' = 'tab') {
+      const api = this.$store.state.lfmApi as LastFm;
+      if (path === 'server') {
+        const state = await this.saveSelectionBeforeLeaving();
+        if (!state) {
+          return;
+        }
+        const list = uploadListFromState(state, Math.floor(Date.now() / 1000));
+        this.pendingState = state;
+        this.pendingSnapshot = null;
+        this.pendingEntryPoint = 'confirm';
+        this.backgroundRemaining = state.tracks.length;
+        this.backgroundAnyReTagged = list.some((t) => t.reTagged);
+        this.backgroundAllReTagged = list.every((t) => t.reTagged);
+        // Saved, not on offer: on failure the resume prompt offers it again.
+        this.hasResumableState = false;
+        await this.startBackgroundHandoff();
+        return;
+      }
       /*
         Nothing to send with yet, so sign in first. The selection is saved as
         ordinary progress (nothing sent) because nothing in memory survives
         the trip to Last.fm; `continueSignInIntent` restores it afterwards. An
         abandoned sign-in leaves it as saved progress for next time.
       */
-      const api = this.$store.state.lfmApi as LastFm;
       if (!api.isAuthenticated()) {
-        /*
-          This save replaces whatever progress is saved here, and the
-          confirmation only asks about saved progress `savedProgress` knows of.
-          That is null whenever the resume prompt is withheld (an unanswered or
-          blocked authority check, a live job) or out of date (another tab
-          saved since), so the disk is asked too (#102).
-        */
-        if (this.sendingBlocked) {
-          this.backgroundNotice = background.isBetaOptedIn()
-            ? 'Hold on — still checking whether an import is already running on the server for your account.'
-            : 'Hold on, still getting ready. Try again in a moment.';
-          return;
-        }
-        if (!this.savedProgress) {
-          let saved: ScrobbleState | null = null;
-          try {
-            saved = await this.stateManager.loadState();
-          } catch (e) {
-            // Unreadable, so there is nothing it could be replacing that a
-            // resume could reach either.
-          }
-          const newId = (this.$store.state.importId as string) || '';
-          if (saved && (!newId || (saved.importId || '') !== newId)) {
-            this.errorMessage = 'You have saved progress that would be replaced. '
-              + 'Go back and choose Resume or Start over.';
-            this.errorDetails = '';
-            this.showError = true;
-            // So the next press of Scrobble asks about it.
-            await this.exposeSavedStateUnlessStale(
-              'send_refused',
-              !!background.getOwnershipUnresolved() || !!background.queueOwner(),
-            );
-            return;
-          }
-        }
-        const snapshot: ProgressSnapshot = {
-          scrobbledTracks: 0,
-          originalTotalTracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
-          originalSucceededCount: 0,
-          pendingVerification: [],
-          sendTimestamps: [],
-          lastReTagTimestampSec: this.$store.state.reTagCursorSec as number,
-          burstCount: 0,
-          dailyCount: 0,
-        };
-        try {
-          const state = this.buildState(snapshot);
-          await this.persist(() => this.stateManager.saveState(state));
+        const state = await this.saveSelectionBeforeLeaving();
+        if (state) {
           startSignIn(api, {
             kind: 'send',
             importId: state.importId || '',
             checkDuplicates: this.$store.state.deferredDuplicateCheck as boolean,
           });
-        } catch (e) {
-          trackError('scrobblify.saveBeforeSignIn', e);
-          this.errorMessage = "Couldn't save your selection before signing in.";
-          this.errorDetails = (e as Error).message || String(e);
-          this.showError = true;
         }
         return;
       }

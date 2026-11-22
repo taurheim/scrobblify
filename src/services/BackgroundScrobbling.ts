@@ -1424,6 +1424,30 @@ export function releaseQueueOwnerIfSame(expected: QueueOwner): boolean {
 }
 
 /**
+ * Lifts the freeze this browser set for the handoff it last preflighted, once
+ * the worker has refused that handoff at its callback. Nothing else may: the
+ * refusal carries no handoff id, so only the freeze naming this browser's own
+ * preflight is known to be about it. Without a worker session the handoff
+ * can't be asked about later, so the freeze would otherwise never lift.
+ *
+ * Returns whether a freeze was lifted.
+ */
+export function releaseRefusedHandoff(): boolean {
+  let preflighted: string | null = null;
+  try {
+    preflighted = window.localStorage.getItem(PREFLIGHTED_STORAGE_KEY);
+    window.localStorage.removeItem(PREFLIGHTED_STORAGE_KEY);
+  } catch {
+    return false;
+  }
+  const owner = queueOwner();
+  if (!preflighted || !owner || owner.owner !== 'freezing' || owner.id !== preflighted) {
+    return false;
+  }
+  return releaseQueueOwnerIfSame(owner);
+}
+
+/**
  * Releases ownership once a handoff is known not to be running.
  *
  * Same hazard as `releaseQueueOwner`, from the other side of the redirect: the

@@ -4,6 +4,7 @@ import {
 import path from 'path';
 import JSZip from 'jszip';
 import { interceptLastFm, mockLastFmAuth, routeLastFmSignIn } from '../lastfmMock';
+import { interceptBackgroundWorker, MockWorker } from '../backgroundMock';
 
 /*
   Runs only under `playwright.unreachable-worker.config.ts`, which compiles in
@@ -910,5 +911,279 @@ test.describe('Home with a job on the server', () => {
     await openHome(page, 'testuser', 'refuse');
     await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
     expect(await page.evaluate((key) => localStorage.getItem(key), RECORD_KEY)).not.toBeNull();
+  });
+});
+
+test.describe('Choosing the server in the confirm dialog', () => {
+  const JOB_BANNER = 'text=Scrobblify is finishing your import in the background.';
+  const HANDED_OVER_KEY = 'scrobblify.background.handedOverImport';
+
+  type Opened = {
+    scrobbles: string[];
+    preflights: Record<string, unknown>[];
+    mock: MockWorker;
+  };
+
+  /*
+    The mock worker end to end: preflight, the Last.fm shim, upload and job
+    status. `beta` opts in with `?beta=1`, `false` opts out with `?beta=0`.
+  */
+  async function openWithWorker(
+    page: Page,
+    baseURL: string | undefined,
+    {
+      beta = true, signedIn = false, worker = {}, saved = null,
+    }: {
+      beta?: boolean;
+      signedIn?: boolean;
+      worker?: Record<string, unknown>;
+      saved?: Record<string, unknown> | null;
+    } = {},
+  ): Promise<Opened> {
+    const scrobbles: string[] = [];
+    const preflights: Record<string, unknown>[] = [];
+    let capacityAnswers = 0;
+    await interceptLastFm(page);
+    await routeLastFmSignIn(page);
+    const mock = await interceptBackgroundWorker(page, {
+      apiOrigin: 'http://background.invalid',
+      appOrigin: new URL(baseURL || 'http://localhost:8471').origin,
+      log: false,
+      ...worker,
+    });
+    page.on('response', (response) => {
+      if (response.url().endsWith('/scrobblify/capacity')) {
+        capacityAnswers += 1;
+      }
+    });
+    page.on('request', (request) => {
+      if (request.url().endsWith('/scrobblify/handoff/preflight')) {
+        preflights.push(JSON.parse(request.postData() || '{}'));
+      }
+      const params = new URLSearchParams(request.postData() || '');
+      if (request.url().startsWith('https://ws.audioscrobbler.com/') && params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+    });
+    await page.goto('/#/scrobble');
+    if (signedIn) {
+      await mockLastFmAuth(page);
+    }
+    if (saved) {
+      await page.evaluate(async (state) => {
+        await new Promise<void>((resolve, reject) => {
+          const request = indexedDB.open('scrobblify', 1);
+          request.onupgradeneeded = () => {
+            if (!request.result.objectStoreNames.contains('scrobbleState')) {
+              request.result.createObjectStore('scrobbleState');
+            }
+          };
+          request.onsuccess = () => {
+            const db = request.result;
+            const tx = db.transaction('scrobbleState', 'readwrite');
+            tx.objectStore('scrobbleState').put(state, 'current');
+            tx.oncomplete = () => { db.close(); resolve(); };
+            tx.onerror = () => { db.close(); reject(tx.error); };
+          };
+          request.onerror = () => reject(request.error);
+        });
+      }, saved);
+    }
+    await page.goto(beta ? '/?beta=1#/scrobble' : '/?beta=0#/scrobble');
+    capacityAnswers = 0;
+    await page.reload();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    if (beta) {
+      // The capacity probe decides whether the choice is offered at all.
+      await expect.poll(() => capacityAnswers, { timeout: 10000 }).toBeGreaterThan(0);
+    }
+    return { scrobbles, preflights, mock };
+  }
+
+  // Recent plays, so none is re-tagged and the large-history gate stays shut.
+  // A few distinct tracks, so validation looks up only those.
+  async function chooseRecentPlays(page: Page, count: number) {
+    const startMs = Date.now() - 3 * 86400 * 1000;
+    const zip = new JSZip();
+    zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024.json', JSON.stringify(
+      Array.from({ length: count }, (_, i) => ({
+        ts: new Date(startMs + i * 60000).toISOString(),
+        master_metadata_track_name: `Track ${i % 20}`,
+        master_metadata_album_artist_name: 'Queen',
+        master_metadata_album_album_name: 'An Album',
+        ms_played: 300000,
+      })),
+    ));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data.zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+    await page.locator('button:has-text("Find tracks")').click();
+    await page.locator('.upload-step button:has-text("Choose which tracks to scrobble")').click({ timeout: 30000 });
+    await page.locator('button:has-text("matching")').click({ timeout: 5000 });
+    await page.locator(`button:has-text("Scrobble ${count} selected tracks")`).click();
+    const dialog = page.locator('.scrobble-confirm');
+    await expect(dialog).toBeVisible({ timeout: 10000 });
+    return dialog;
+  }
+
+  const SAVED = {
+    userName: '',
+    totalTracks: 5,
+    completedIndices: [0, 1, 2],
+    failedIndices: [],
+    tracks: [1, 2, 3, 4, 5].map((n) => ({
+      track: `Old ${n}`, artist: 'Band', album: '', timestamp: Date.UTC(2024, 0, n),
+    })),
+    originalTotalTracks: 5,
+    originalSucceededCount: 3,
+    sendTimestamps: [],
+    burstCount: 0,
+    dailyCount: 0,
+    dailyCountDate: new Date().toISOString().split('T')[0],
+    savedAt: new Date().toISOString(),
+  };
+
+  test('a signed-out beta user hands a large selection to the server without signing in here', async ({ page, baseURL }) => {
+    const events = captureEvents(page);
+    const { scrobbles, preflights } = await openWithWorker(page, baseURL);
+    const dialog = await chooseRecentPlays(page, 800);
+
+    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await expect(dialog.locator('.scrobble-estimate')).toHaveCount(0);
+    await expect(dialog.locator('.choice-dates')).toHaveCount(0);
+    await expect(dialog.locator('button:has-text("Start scrobbling")')).toHaveCount(0);
+    await expect.poll(() => events.filter((e) => e.name === 'background_offer_shown').map((e) => e.props))
+      .toContainEqual(expect.objectContaining({ entry_point: 'confirm', track_count: 800 }));
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+
+    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    expect(preflights).toHaveLength(1);
+    expect(preflights[0]).not.toHaveProperty('username');
+    const stored = await page.evaluate((key) => ({
+      user: localStorage.getItem('scrobblifyLfmUserName'),
+      key: localStorage.getItem('scrobblifyLfmAuthKey'),
+      handedOver: localStorage.getItem(key),
+    }), HANDED_OVER_KEY);
+    expect(stored.user).toBe('testuser');
+    expect(stored.key).toBeNull();
+    expect(JSON.parse(stored.handedOver || '{}')).toMatchObject({ username: 'testuser', originalTotal: 800 });
+    expect(scrobbles).toEqual([]);
+    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
+  });
+
+  test('"scrobble locally" signs in to Last.fm here and lands ready to send', async ({ page, baseURL }) => {
+    const events = captureEvents(page);
+    const { scrobbles, preflights } = await openWithWorker(page, baseURL);
+    const dialog = await chooseRecentPlays(page, 800);
+    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await dialog.locator('a:has-text("scrobble locally")').click();
+
+    await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 15000 });
+    await expect(page.getByRole('button', { name: 'Scrobble', exact: true })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=800 tracks ready to scrobble')).toBeVisible();
+    expect(preflights).toEqual([]);
+    expect(scrobbles).toEqual([]);
+    const declined = events.filter((e) => e.name === 'background_offer_declined');
+    expect(declined.map((e) => e.props)).toEqual([
+      { entry_point: 'confirm', track_count: 800, all_re_tagged: false },
+    ]);
+  });
+
+  test('a selection under a day\'s cap gets the plain dialog', async ({ page, baseURL }) => {
+    await openWithWorker(page, baseURL);
+    const dialog = await chooseRecentPlays(page, 700);
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 700 tracks?');
+    await expect(dialog.locator('button:has-text("Start scrobbling")')).toBeVisible();
+    await expect(dialog.locator('text=Let Scrobblify scrobble for me')).toHaveCount(0);
+  });
+
+  test('outside the beta the dialog is the plain one', async ({ page, baseURL }) => {
+    await openWithWorker(page, baseURL, { beta: false });
+    const dialog = await chooseRecentPlays(page, 800);
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
+    await expect(dialog.locator('button:has-text("Start scrobbling")')).toBeVisible();
+    await expect(dialog.locator('text=Let Scrobblify scrobble for me')).toHaveCount(0);
+  });
+
+  test('a full server gets the plain dialog', async ({ page, baseURL }) => {
+    await openWithWorker(page, baseURL, { worker: { capacityAvailable: false } });
+    const dialog = await chooseRecentPlays(page, 800);
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
+    await expect(dialog.locator('text=Let Scrobblify scrobble for me')).toHaveCount(0);
+  });
+
+  test('saved progress is asked about first, and "Start over" goes on to the choice', async ({ page, baseURL }) => {
+    await openWithWorker(page, baseURL, { saved: SAVED });
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    const dialog = await chooseRecentPlays(page, 800);
+
+    await expect(dialog.locator('.saved-progress-warning')).toContainText('3 of 5 tracks scrobbled');
+    await expect(dialog.locator('text=Let Scrobblify scrobble for me')).toHaveCount(0);
+    await dialog.locator('button:has-text("Start over")').click();
+
+    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await expect(dialog.locator('.saved-progress-warning')).toHaveCount(0);
+    await expect(dialog.locator('button:has-text("Let Scrobblify scrobble for me")')).toBeVisible();
+  });
+
+  test('a signed-in user\'s handoff names them', async ({ page, baseURL }) => {
+    const { scrobbles, preflights } = await openWithWorker(page, baseURL, { signedIn: true });
+    const dialog = await chooseRecentPlays(page, 800);
+    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+
+    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    expect(preflights).toHaveLength(1);
+    expect(preflights[0]).toMatchObject({ username: 'testuser', trackCount: 800 });
+    expect(scrobbles).toEqual([]);
+  });
+
+  test('an anonymous handoff for someone whose job is live comes back to "Sign in to see it"', async ({ page, baseURL }) => {
+    const { mock, scrobbles } = await openWithWorker(page, baseURL);
+    const nowMs = Date.now();
+    mock.world.job = {
+      id: 'j-live',
+      username: 'testuser',
+      importId: 'd1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6',
+      state: 'active',
+      reason: null,
+      totalTracks: 5000,
+      scrobbled: 0,
+      failed: 0,
+      waitingUntil: null,
+      createdAtMs: nowMs,
+      lastTickMs: nowMs,
+      completedAtMs: null,
+      inactivityDeadlineSec: null,
+      exportClaim: '',
+    };
+    // The real worker's capacity counts places, not this user's job.
+    await page.route('http://background.invalid/scrobblify/capacity', (route: Route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: { 'Access-Control-Allow-Origin': '*' },
+      body: JSON.stringify({
+        available: true, used: 1, capacity: 50, minTracks: 750, maxTracks: 200000, chunkTracks: 5000,
+      }),
+    }));
+    await page.reload();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    const dialog = await chooseRecentPlays(page, 800);
+    await expect(dialog.locator('.v-card-title')).toHaveText('800 plays');
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me")').click();
+
+    await expect(page.locator('text=You already have an import running on Scrobblify.')).toBeVisible({ timeout: 20000 });
+    const signIn = page.locator('button:has-text("Sign in to see it")');
+    await expect(signIn).toBeVisible();
+    // The selection is kept for later, and nothing is left frozen.
+    await expect(page.locator('text=Resume previous session?')).toBeVisible();
+    await expect(page.locator('text=A handover')).toHaveCount(0);
+    expect(scrobbles).toEqual([]);
+
+    // With no username anywhere, signing in to the worker finds the job.
+    await signIn.click();
+    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
   });
 });
