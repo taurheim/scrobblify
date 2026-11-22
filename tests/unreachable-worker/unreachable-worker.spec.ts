@@ -3,7 +3,9 @@ import {
 } from '@playwright/test';
 import path from 'path';
 import JSZip from 'jszip';
-import { interceptLastFm, mockLastFmAuth, routeLastFmSignIn } from '../lastfmMock';
+import {
+  interceptLastFm, mockLastFmAuth, routeLastFmSignIn, MOCK_SESSION_KEY,
+} from '../lastfmMock';
 import {
   interceptBackgroundWorker, MockWorker, MAX_TRACKS,
 } from '../backgroundMock';
@@ -813,9 +815,14 @@ test.describe('Offering background scrobbling', () => {
         },
       },
       ...rest,
-    }, { 'scrobblify.background.beta': '1', 'scrobblify.background.session': 's-1' });
+    }, {
+      'scrobblify.background.beta': '1',
+      'scrobblify.background.session': 's-1',
+      // Dismissed, so /scrobble doesn't send it to Home's status page.
+      'scrobblify.background.dismissedJob': 'job-done',
+    });
     await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
-    await expect(page.locator('text=Your background import has finished')).toBeVisible({ timeout: 15000 });
+    await expect.poll(() => workerCalls.includes('/scrobblify/job')).toBe(true);
     await stopForTheDay(page, false);
 
     await expect(page.locator('text=Your progress has been saved automatically >> visible=true')).toBeVisible();
@@ -1341,18 +1348,164 @@ test.describe('Home as the status page', () => {
     await expect(card.locator('.status-action')).toHaveText(['Sign in']);
 
     await card.locator('.status-action:has-text("Sign in")').click();
-    await page.waitForURL(/#\/scrobble/);
+    // The sign-in returns to /scrobble, which sends it back here.
+    await expect(card.locator('.status-sub')).toHaveText(SAFE, { timeout: 15000 });
+    await expect(page).toHaveURL(/\/#\/$/);
     expect(signIns).toEqual([expect.objectContaining({ username: 'testuser' })]);
     expect(await page.evaluate((key) => localStorage.getItem(key), SESSION_KEY)).toBeTruthy();
-    await page.goto('/#/');
-    await expect(card.locator('.status-sub')).toHaveText(SAFE, { timeout: 15000 });
   });
 
   test('"Sign in again" reconnects Last.fm and the job carries on', async ({ page, baseURL }) => {
     const mock = await openStatus(page, baseURL, { job: { state: 'needs_reauth' } });
     await page.locator(`${CARD} .status-action:has-text("Sign in again")`).click();
-    await page.waitForURL(/#\/scrobble/);
+    await expect(page.locator(`${CARD} .status-line`)).toContainText('This will finish around', { timeout: 15000 });
+    await expect(page).toHaveURL(/\/#\/$/);
     expect(mock.world.job!.state).toBe('active');
+  });
+
+  test('/scrobble with a job on the server goes to the status page', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL);
+    await expect(page.locator(CARD)).toBeVisible({ timeout: 15000 });
+    await page.goto('/#/scrobble');
+    await expect(page).toHaveURL(/\/#\/$/, { timeout: 15000 });
+    await expect(page.locator(`${CARD} .status-sub`)).toHaveText(SAFE, { timeout: 15000 });
+    await expect(page.locator('.upload-step')).toHaveCount(0);
+  });
+
+  test('/scrobble with a finished job that was dismissed stays on the upload step', async ({ page, baseURL }) => {
+    const jobChecks: string[] = [];
+    page.on('response', (response) => {
+      if (new URL(response.url()).pathname === '/scrobblify/job') {
+        jobChecks.push(response.url());
+      }
+    });
+    await openStatus(page, baseURL, {
+      job: { state: 'completed', scrobbled: 8000, completedAtMs: Date.now() },
+      seed: { [DISMISSED_KEY]: 'j-status' },
+    });
+    await expect(page.locator('.returning-card')).toBeVisible({ timeout: 15000 });
+    jobChecks.length = 0;
+    await page.goto('/#/scrobble');
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect.poll(() => jobChecks.length).toBeGreaterThan(0);
+    await page.waitForTimeout(500);
+    await expect(page).toHaveURL(/#\/scrobble$/);
+  });
+
+  // Signed in to Last.fm in this browser as the job's user.
+  const SIGNED_IN = { scrobblifyLfmAuthToken: 'fake-token', scrobblifyLfmAuthKey: MOCK_SESSION_KEY };
+  const OUT_OF_DATE = 'text=out-of-date copy of your import';
+
+  /*
+    Where "Scrobble the rest locally" ends up: back on /scrobble with the
+    server's remaining tracks saved here, the job cancelled, and Resume
+    offered. Resume must then actually send (#148 left the tab halted).
+  */
+  async function expectMovedBack(page: Page, mock: MockWorker) {
+    await expect(page.locator('text=Your remaining tracks are back in this browser.')).toBeVisible({ timeout: 20000 });
+    await expect(page).toHaveURL(/#\/scrobble/);
+    const resume = page.locator('.scrobblify > .v-alert button:has-text("Resume")');
+    await expect(resume).toBeVisible();
+    await expect(page.locator(OUT_OF_DATE)).toHaveCount(0);
+    expect(mock.world.job!.state).toBe('cancelled');
+    // Nothing sends it back to Home: the job is gone.
+    await page.waitForTimeout(500);
+    await expect(page).toHaveURL(/#\/scrobble/);
+    await expect(page.locator(OUT_OF_DATE)).toHaveCount(0);
+
+    const scrobbles: string[] = [];
+    page.on('request', (request) => {
+      const params = new URLSearchParams(request.postData() || '');
+      if (request.url().startsWith('https://ws.audioscrobbler.com/') && params.get('method') === 'track.scrobble') {
+        scrobbles.push(params.get('track[0]') || '');
+      }
+    });
+    await resume.click();
+    const scrobble = page.getByRole('button', { name: 'Scrobble', exact: true });
+    await expect(scrobble).toBeEnabled({ timeout: 10000 });
+    await scrobble.click();
+    await expect.poll(() => scrobbles.length, { timeout: 15000 }).toBeGreaterThan(0);
+  }
+
+  test('"Scrobble the rest locally", signed in here, brings the tracks back (#148)', async ({ page, baseURL }) => {
+    const events = captureEvents(page);
+    const mock = await openStatus(page, baseURL, { seed: SIGNED_IN });
+    await page.locator(`${CARD} .status-action:has-text("${MOVE_BACK}")`).click({ timeout: 15000 });
+    await expectMovedBack(page, mock);
+    expect(events.map((e) => e.name)).not.toContain('move_back_explainer_shown');
+    expect(events.map((e) => e.name)).not.toContain('background_stale_tab_blocked');
+    expect(events.map((e) => e.name)).toContain('background_job_reclaimed');
+  });
+
+  test('"Scrobble the rest locally" while signed out explains the second Last.fm approval first', async ({ page, baseURL }) => {
+    const events = captureEvents(page);
+    await routeLastFmSignIn(page);
+    const mock = await openStatus(page, baseURL);
+    await page.locator(`${CARD} .status-action:has-text("${MOVE_BACK}")`).click({ timeout: 15000 });
+
+    const dialog = page.locator('.v-dialog .move-back-explainer');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble the rest locally?');
+    await expect(dialog.locator('.v-card-text')).toHaveText('Scrobblify talks to Last.fm in two ways, one for its server and one for your browser, so Last.fm will ask you to approve Scrobblify again. You won\'t lose your progress.');
+    await expect(dialog.locator('button')).toHaveText(['Cancel', 'Continue to Last.fm']);
+    expect(events.map((e) => e.name)).toContain('move_back_explainer_shown');
+
+    await dialog.locator('button:has-text("Continue to Last.fm")').click();
+    await expectMovedBack(page, mock);
+    expect(events).toContainEqual({ name: 'move_back_explainer_choice', props: { choice: 'continue' } });
+    expect(events).toContainEqual({ name: 'sign_in_started', props: { intent: 'takeBack' } });
+  });
+
+  test('the explainer\'s Cancel changes nothing', async ({ page, baseURL }) => {
+    const events = captureEvents(page);
+    const lastFmSignIns: string[] = [];
+    page.on('request', (request) => {
+      if (request.url().startsWith('https://www.last.fm/api/auth/')) {
+        lastFmSignIns.push(request.url());
+      }
+    });
+    const mock = await openStatus(page, baseURL);
+    await page.locator(`${CARD} .status-action:has-text("${MOVE_BACK}")`).click({ timeout: 15000 });
+    const dialog = page.locator('.v-dialog .move-back-explainer');
+    await dialog.locator('button:has-text("Cancel")').click();
+    await expect(dialog).toBeHidden();
+    await expect(page).toHaveURL(/\/#\/$/);
+    await expect(page.locator(`${CARD} .status-sub`)).toHaveText(SAFE);
+    expect(mock.world.job!.state).toBe('active');
+    expect(lastFmSignIns).toEqual([]);
+    expect(events).toContainEqual({ name: 'move_back_explainer_choice', props: { choice: 'cancel' } });
+    expect(await page.evaluate(() => sessionStorage.getItem('scrobblify.signInIntent'))).toBeNull();
+  });
+
+  // #148: the tab that took the progress back ignores its own release, but a
+  // sibling still holding the pre-handover queue in memory must stay blocked.
+  test('a sibling tab is still told it is out of date after a take-back (#148)', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, { seed: SIGNED_IN, session: false });
+    const sibling = await page.context().newPage();
+    await interceptLastFm(sibling);
+    // The same mock worker, so both tabs see one job.
+    await sibling.route('http://background.invalid/**', async (route: Route) => {
+      const url = new URL(route.request().url());
+      await route.fulfill(mock.handle(
+        route.request().method(),
+        url.pathname.replace(/\/+$/, ''),
+        url.searchParams,
+        route.request().postData() || '',
+      ));
+    });
+    // No worker session yet, so the sibling can't see the job and stays on
+    // /scrobble, blocked by the live answer for its username.
+    await sibling.goto('/#/scrobble');
+    await expect(sibling.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 15000 });
+
+    await page.evaluate((key) => localStorage.setItem(key, 's-status'), SESSION_KEY);
+    await page.reload();
+    await page.locator(`${CARD} .status-action:has-text("${MOVE_BACK}")`).click({ timeout: 15000 });
+    await expect(page.locator('text=Your remaining tracks are back in this browser.')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator(OUT_OF_DATE)).toHaveCount(0);
+
+    await expect(sibling.locator(OUT_OF_DATE)).toBeVisible({ timeout: 10000 });
+    await expect(sibling.locator('.scrobblify > .v-alert button:has-text("Resume")')).toHaveCount(0);
+    expect(mock.world.job!.state).toBe('cancelled');
   });
 
   test('a reconnect that can\'t reach the server says so', async ({ page, baseURL }) => {
@@ -1425,7 +1578,6 @@ test.describe('Home as the status page', () => {
 });
 
 test.describe('"Already scrobbling on scrobblify?" with a worker', () => {
-  const JOB_BANNER = 'text=Scrobblify is finishing your import in the background.';
   const NOTHING = "text=We weren't able to find an active scrobblify session for you.";
 
   /*
@@ -1472,14 +1624,17 @@ test.describe('"Already scrobbling on scrobblify?" with a worker', () => {
     };
     await page.locator('button:has-text("Re-connect to last.fm")').click();
 
-    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
-    await expect(page).toHaveURL(/#\/scrobble/);
+    // Back on /scrobble, which reports the lookup and sends it on to Home.
+    await expect.poll(() => events, { timeout: 20000 })
+      .toContainEqual({ name: 'worker_lookup_result', props: { result: 'job' } });
+    const card = page.locator('.status-card');
+    await expect(card.locator('.status-sub')).toHaveText("Scrobbling remotely, it's safe to close this tab.", { timeout: 20000 });
+    await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to testuser');
+    await expect(page).toHaveURL(/\/#\/$/);
     await expect(page.locator(NOTHING)).toHaveCount(0);
     expect(await page.evaluate(() => localStorage.getItem('scrobblifyLfmUserName'))).toBe('testuser');
     expect(lastFmSignIns).toEqual([]);
     expect(events.map((e) => e.name)).toContain('worker_lookup_started');
-    await expect.poll(() => events).toContainEqual({ name: 'worker_lookup_result', props: { result: 'job' } });
-    // The banner can render before mount takes the flag, so this is only certain once the lookup has reported.
     expect(await page.evaluate(() => sessionStorage.getItem('scrobblify.background.lookup'))).toBeNull();
   });
 
@@ -1516,7 +1671,6 @@ test.describe('"Already scrobbling on scrobblify?" with a worker', () => {
 });
 
 test.describe('Choosing the server in the confirm dialog', () => {
-  const JOB_BANNER = 'text=Scrobblify is finishing your import in the background.';
   const HANDED_OVER_KEY = 'scrobblify.background.handedOverImport';
 
   /*
@@ -1697,14 +1851,9 @@ test.describe('Choosing the server in the confirm dialog', () => {
     expect(JSON.parse(stored.handedOver || '{}')).toMatchObject({ username: 'testuser', originalTotal: 800 });
     expect(scrobbles).toEqual([]);
 
-    // /scrobble still has the job, with its controls.
+    // /scrobble sends it back to Home's status page.
     await page.goto('/#/scrobble');
-    const jobBanner = page.locator('.scrobblify > .v-alert');
-    await expect(jobBanner.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
-    await expect(jobBanner.locator('button:has-text("Pause")')).toBeVisible();
-    await expect(jobBanner.locator('button:has-text("Take my progress back")')).toBeVisible();
-    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0);
-    await expect(page.locator('text=Resume previous session?')).toHaveCount(0);
+    await expectHomeShowsJob(page);
     expect(scrobbles).toEqual([]);
   });
 
@@ -1819,7 +1968,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
 
     // With no username anywhere, signing in to the worker finds the job.
     await signIn.click();
-    await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
+    await expectHomeShowsJob(page);
   });
 
   const OWNER_KEY = 'scrobblify.background.serverOwns';
@@ -2214,11 +2363,13 @@ test.describe('Choosing the server in the confirm dialog', () => {
       expect(stored.handedOver).toMatchObject({ importId: IMPORT_ID, username: 'testuser' });
     });
 
-    // Home would welcome the other user, so the job banner says it here instead.
+    // Home would welcome the other user, so its status page names no one.
     test('does not replace a different user this browser already knows', async ({ page, baseURL }) => {
       const stored = await openReturning(page, baseURL, { scrobblifyLfmUserName: 'someoneelse' });
-      await expect(page.locator(JOB_BANNER)).toBeVisible({ timeout: 20000 });
-      await expect(page.locator('.returning-card')).toHaveCount(0);
+      const card = page.locator('.status-card');
+      await expect(card.locator('.status-sub')).toHaveText("Scrobbling remotely, it's safe to close this tab.", { timeout: 20000 });
+      await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to Last.fm');
+      await expect(page).toHaveURL(/\/#\/$/);
       expect(stored.user).toBe('someoneelse');
       // The job is the account's that authorised it.
       expect(stored.handedOver).toMatchObject({ importId: IMPORT_ID, username: 'testuser' });

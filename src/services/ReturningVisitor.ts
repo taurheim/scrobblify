@@ -102,8 +102,15 @@ export async function detectReturning(
       its whole-import total would be applied to someone else's job.
     */
     const matches = !!record && record.status.totalTracks === job.totalTracks;
+    /*
+      A handover this browser made for another account than the one it
+      remembers (a signed-out handover approved as someone else): the job is
+      most likely theirs, so it is titled with no one rather than the wrong one.
+    */
+    const recordUser = background.handedOverImportUser();
+    const titleUser = recordUser && !sameUser(recordUser, username) ? null : username;
     return {
-      kind: 'job', source: 'job', username, job, originalTotal: record && matches ? record.originalTotal : 0,
+      kind: 'job', source: 'job', username: titleUser, job, originalTotal: record && matches ? record.originalTotal : 0,
     };
   }
   if (record) {

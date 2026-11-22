@@ -47,6 +47,8 @@ const IN_FLIGHT_STORAGE_KEY = 'scrobblify.background.inflightSecond';
 const SERVER_OWNS_STORAGE_KEY = 'scrobblify.background.serverOwns';
 const STALE_SNAPSHOT_STORAGE_KEY = 'scrobblify.background.staleSnapshot';
 const OWNERSHIP_CHANNEL = 'scrobblify.ownership';
+/** Tags this page's ownership broadcasts, which reach its own listener too. */
+const PAGE_ID = `${Date.now()}.${Math.random().toString(36).slice(2)}`;
 
 export interface Capacity {
   available: boolean;
@@ -292,6 +294,19 @@ export function handedOverImport(
     const total = record.originalTotal;
     const originalTotal = typeof total === 'number' && Number.isFinite(total) && total > 0 ? total : 0;
     return { importId: record.importId, originalTotal };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The Last.fm user the handed-over record names, whoever that is; null when
+ * there is none.
+ */
+export function handedOverImportUser(): string | null {
+  try {
+    const record = JSON.parse(window.localStorage.getItem(HANDED_OVER_IMPORT_KEY) || 'null');
+    return record && typeof record.username === 'string' && record.username ? record.username : null;
   } catch {
     return null;
   }
@@ -1347,7 +1362,7 @@ export function setQueueOwner(record: QueueOwner | null): void {
   try {
     if (typeof BroadcastChannel !== 'undefined') {
       const channel = new BroadcastChannel(OWNERSHIP_CHANNEL);
-      channel.postMessage({ queueOwner: record });
+      channel.postMessage({ queueOwner: record, from: PAGE_ID });
       channel.close();
     }
   } catch {
@@ -2188,12 +2203,17 @@ export async function freezeOtherTabs(attempt: string): Promise<boolean> {
  * Calls back when another tab takes or releases the queue, so a loop already
  * running here stops before its next send rather than at its next reload.
  *
+ * A change this page made itself reaches it too, through the channel, with
+ * `fromThisPage` set; `storage` events only ever come from other tabs.
+ *
  * Returns a teardown function.
  */
-export function onServerOwnershipChange(handler: (owner: QueueOwner | null) => void): () => void {
+export function onServerOwnershipChange(
+  handler: (owner: QueueOwner | null, fromThisPage: boolean) => void,
+): () => void {
   const onStorage = (event: StorageEvent) => {
     if (event.key === SERVER_OWNS_STORAGE_KEY) {
-      handler(queueOwner());
+      handler(queueOwner(), false);
     }
   };
   window.addEventListener('storage', onStorage);
@@ -2204,7 +2224,7 @@ export function onServerOwnershipChange(handler: (owner: QueueOwner | null) => v
       channel = new BroadcastChannel(OWNERSHIP_CHANNEL);
       channel.onmessage = (event: MessageEvent) => {
         if (event.data && 'queueOwner' in event.data) {
-          handler(event.data.queueOwner || null);
+          handler(event.data.queueOwner || null, event.data.from === PAGE_ID);
         }
       };
     }

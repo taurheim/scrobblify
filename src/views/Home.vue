@@ -57,6 +57,8 @@
         </button>
       </p>
     </template>
+
+    <move-back-explainer v-model="explainingMoveBack" @continue="continueMoveBack" @cancel="cancelMoveBack" />
   </div>
 </template>
 
@@ -103,6 +105,7 @@
 import { defineComponent, markRaw } from 'vue';
 import LastFm from '@/api/LastFm';
 import BackgroundStatus from '@/components/BackgroundStatus.vue';
+import MoveBackExplainer from '@/components/MoveBackExplainer.vue';
 import HomeGetExport from '@/components/home/HomeGetExport.vue';
 import HomeReturning from '@/components/home/HomeReturning.vue';
 import StateManager from '@/services/StateManager';
@@ -147,6 +150,7 @@ function writeDismissed() {
 export default defineComponent({
   components: {
     'background-status': BackgroundStatus,
+    'move-back-explainer': MoveBackExplainer,
     'home-get-export': HomeGetExport,
     'home-returning': HomeReturning,
   },
@@ -172,6 +176,8 @@ export default defineComponent({
       jobPolling: false,
       jobClockTimer: null as number | null,
       onVisibilityChange: null as (() => void) | null,
+      /** "Scrobble the rest locally" is explaining the second Last.fm approval. */
+      explainingMoveBack: false,
     };
   },
   computed: {
@@ -389,8 +395,31 @@ export default defineComponent({
       this.$router.push('/scrobble');
     },
 
+    /*
+      "Scrobble the rest locally": /scrobble takes the job's progress back
+      (`takeBack` intent) and sends from this browser. That needs this
+      browser's own Last.fm session, so without one Last.fm is asked first,
+      after a word on why it asks again.
+    */
     moveBack() {
-      // Task 3: take the progress back from the server.
+      const r = this.returning;
+      if (r.kind !== 'job' || r.source !== 'job' || this.statusBusy) { return; }
+      if ((this.$store.state.lfmApi as LastFm).isAuthenticated()) {
+        setSignInIntent({ kind: 'takeBack', jobId: r.job.id });
+        this.$router.push('/scrobble');
+        return;
+      }
+      this.explainingMoveBack = true;
+      trackEvent('move_back_explainer_shown');
+    },
+    continueMoveBack() {
+      const r = this.returning;
+      trackEvent('move_back_explainer_choice', { choice: 'continue' });
+      if (r.kind !== 'job' || r.source !== 'job') { return; }
+      startSignIn(this.$store.state.lfmApi as LastFm, { kind: 'takeBack', jobId: r.job.id });
+    },
+    cancelMoveBack() {
+      trackEvent('move_back_explainer_choice', { choice: 'cancel' });
     },
     async go(choice: HomeChoice) {
       if (this.lookingUp) {
