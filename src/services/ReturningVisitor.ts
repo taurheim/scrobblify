@@ -67,6 +67,17 @@ export async function detectReturning(
   const savedLoad = stateManager.loadState().catch(() => null);
 
   const handedOver = background.handedOverImport(username);
+  /*
+    Who else is scrobbling is only asked by a browser with neither a worker
+    session nor a record, and alongside the other lookups, so a stalled worker
+    costs one timeout rather than two. A browser with a session never asks: an
+    unanswered job lookup there must not read as "another device".
+  */
+  const askLive = (): Promise<boolean | null> => (!handedOver && username
+    ? background.liveJobForUsername(username, RETURNING_STATUS_TIMEOUT_MS)
+    : Promise.resolve(null));
+  const hadSession = !!background.getSession();
+  const liveLoad = hadSession ? null : askLive();
   const [job, recordStatus] = await Promise.all([
     background.fetchJob(RETURNING_STATUS_TIMEOUT_MS),
     handedOver
@@ -100,8 +111,10 @@ export async function detectReturning(
       kind: 'job', source: 'import', username, status: record.status, originalTotal: record.originalTotal,
     };
   }
-  if (!handedOver && username
-    && await background.liveJobForUsername(username, RETURNING_STATUS_TIMEOUT_MS) === true) {
+  // A session the worker refused (401) was cleared by the job lookup, which
+  // answers quickly, so the browser is asked about like one that never had it.
+  const live = liveLoad || (hadSession && !background.getSession() ? askLive() : null);
+  if (live && await live === true) {
     return { kind: 'job', source: 'other', username };
   }
 

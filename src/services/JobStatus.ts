@@ -36,12 +36,13 @@ export interface StatusView {
   primaryDisabled: boolean;
   /** Shown as buttons under the bar. */
   secondary: StatusAction[];
-  /** Plays Last.fm rejected, for a completed job; 0 hides the note. */
+  /** Plays Last.fm rejected, for a completed job (already in the line); 0 when none. */
   showRejected: number;
 }
 
 const SAFE_TO_CLOSE = 'Scrobbling remotely, it\'s safe to close this tab.';
 const SIGN_IN_HINT = 'Sign in to manage it';
+const LASTFM_URL = 'https://www.last.fm';
 const MANAGE: StatusAction[] = ['moveBack', 'cancel'];
 const DAY_SEC = 86400;
 
@@ -185,15 +186,19 @@ export function viewFromJob(
   switch (job.state) {
     case 'pending':
     case 'active': {
-      let line = `This will finish around ${longDate(job.estimatedCompletionSec || opts.nowSec)}`;
+      let lineParts: LinePart[] = [{ text: `This will finish around ${longDate(job.estimatedCompletionSec || opts.nowSec)}` }];
       if (reason === DAY_FULL_REASON) {
         const at = job.nextRunAt || job.waitingUntil;
-        line = at
-          ? `Can't upload any more due to last.fm rules. Will continue at ${runTimeLabel(at, opts.nowSec)}`
-          : 'Can\'t upload any more due to last.fm rules. Will continue tomorrow';
+        // "at 4:25 PM", "at 12:20 AM tomorrow" or "at 12:20 AM on Friday":
+        // the day is named whenever the next run is past local midnight.
+        lineParts = [
+          { text: 'Can\'t upload any more due to ' },
+          { text: 'last.fm', href: LASTFM_URL },
+          { text: at ? ` rules. Will continue at ${runTimeLabel(at, opts.nowSec)}` : ' rules. Will continue tomorrow' },
+        ];
       }
       return view({
-        bar: progress, line, sub: SAFE_TO_CLOSE, primary: 'pause', secondary: MANAGE,
+        bar: progress, line: plain(lineParts), lineParts, sub: SAFE_TO_CLOSE, primary: 'pause', secondary: MANAGE,
       });
     }
     case 'paused':
@@ -262,14 +267,24 @@ export function viewFromJob(
     }
     case 'exporting':
       return view({ bar: progress, line: 'Downloading progress from scrobblify servers...' });
-    case 'completed':
+    case 'completed': {
+      const rejected = job.failed > 0 ? job.failed : 0;
+      const lineParts: LinePart[] = rejected > 0
+        ? [
+          { text: `Done · ${rejected.toLocaleString()} rejected by ` },
+          { text: 'Last.fm', href: LASTFM_URL },
+          { text: ' (if this is unexpected please email niko@savas.ca)' },
+        ]
+        : [{ text: 'Done' }];
       return view({
         bar: progress,
-        line: 'Done',
+        line: plain(lineParts),
+        lineParts,
         primary: 'checkItOut',
         secondary: ['newImport'],
-        showRejected: job.failed > 0 ? job.failed : 0,
+        showRejected: rejected,
       });
+    }
     case 'failed':
       return view({
         bar: progress, line: 'Scrobbling stopped.', tooltip: reason, primary: 'newImport',
@@ -284,18 +299,34 @@ export function viewFromJob(
 
 /**
  * No worker session, but this browser handed the import over, so the public
- * lookup has its numbers. The finish date assumes a day's budget a day.
+ * lookup has its numbers, and its state. Only a job that is sending gets the
+ * finish date (a day's budget a day); the lookup can't say why any other job
+ * is stopped, so the line just asks to sign in and see.
  */
 export function viewFromImport(
   status: ImportStatus,
   opts: { nowSec: number; originalTotal?: number },
 ): StatusView {
-  const remaining = Math.max(0, status.totalTracks - status.scrobbledCount);
-  const finishSec = opts.nowSec + Math.ceil(remaining / importBudget(0)) * DAY_SEC;
+  const progress = bar(opts.originalTotal || 0, status.totalTracks, status.scrobbledCount);
+  const sending = status.live && (!status.state || status.state === 'active' || status.state === 'pending');
+  if (sending) {
+    const remaining = Math.max(0, status.totalTracks - status.scrobbledCount);
+    const finishSec = opts.nowSec + Math.ceil(remaining / importBudget(0)) * DAY_SEC;
+    return view({
+      bar: progress,
+      line: `Scrobblify is scrobbling for you, expecting to finish around ${longDate(finishSec)}`,
+      sub: SIGN_IN_HINT,
+      primary: 'signIn',
+    });
+  }
+  if (status.state === 'paused') {
+    return view({
+      bar: progress, line: 'Paused', sub: SIGN_IN_HINT, primary: 'signIn',
+    });
+  }
   return view({
-    bar: bar(opts.originalTotal || 0, status.totalTracks, status.scrobbledCount),
-    line: `Scrobblify is scrobbling for you, expecting to finish around ${longDate(finishSec)}`,
-    sub: SIGN_IN_HINT,
+    bar: progress,
+    line: 'Your import is waiting on Scrobblify. Sign in to see why.',
     primary: 'signIn',
   });
 }

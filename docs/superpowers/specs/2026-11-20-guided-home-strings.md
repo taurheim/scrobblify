@@ -272,3 +272,18 @@ automatically — just come back to this page later and choose "Resume"."
 rather than `scrobble.savedHint`. No longer shown: `notice.reauthNeedsLastfm`
 (the server sign-in works without a Last.fm user now), and the old offer
 dialog's consent copy and "Not now".
+
+## Added in Plan 4 (drafts)
+
+New strings shipped with the status page. Placeholder copy; rewrite in place.
+
+| ID | When | Draft |
+| --- | --- | --- |
+| `status.noSession.stopped` | No server sign-in, this browser handed the import over, and the job isn't sending (needs a sign-in, stopped by errors, on hold, being handed back) | Your import is waiting on Scrobblify. Sign in to see why. |
+
+Reused: `status.noSession` (with `status.noSession.hint` under it) is now
+only shown while the job is sending; a paused job gets `status.paused` with
+the same hint. `status.dayFull`'s `{time}` names the day when the next run
+is past local midnight ("12:20 AM tomorrow", "12:20 AM on Friday"). The
+"last.fm" in `status.dayFull` and the "Last.fm" in `status.rejected` link to
+https://www.last.fm.

@@ -61,7 +61,9 @@ States (copy from the strings file; `{date}` = `toLocaleDateString([], { month: 
 | `completed` | `status.completed` (+ `status.rejected` when failed > 0) | '' | checkItOut | newImport |
 | `failed` | `status.failed` (tooltip = reason) | '' | newImport | none |
 | `cancelled` | never shown | | | |
-| no session, handed over here | `status.noSession` | `status.noSession.hint` | signIn | none |
+| no session, handed over here, sending (`live`, `active`/`pending`) | `status.noSession` | `status.noSession.hint` | signIn | none |
+| no session, handed over here, `paused` | `status.paused` | `status.noSession.hint` | signIn | none |
+| no session, handed over here, any other state | `status.noSession.stopped` | '' | signIn | none |
 | no session, other device | `status.noSession.otherDevice` | `status.noSession.hint` | signIn | none |
 
 `DAY_FULL_REASON`: import it if `src/shared/` can host it, otherwise mirror the worker's string in `JobStatus.ts` with a comment pointing at `worker/src/scheduler.ts` (test that they match in `worker/test`, which can import client files the way `client-*.test.ts` do).
@@ -91,7 +93,7 @@ Dismissed finished jobs: `localStorage['scrobblify.background.dismissedJob']` = 
 Home decides what to show (`detectReturning` grows a `kind: 'job'` result, or Home calls a new `loadJobForHome()` first):
 1. Worker session → `fetchJob()`. A shown job → status page from `viewFromJob`, with the whole-import bar when the handed-over record matches (`importId`/`username`): `overallProgress` already does this math.
 2. No session, handed-over record, public lookup `known` and not ended → `viewFromImport`.
-3. No session, no record, remembered username and `liveJobForUsername` says live → `viewOtherDevice`.
+3. No session, no record, remembered username and `liveJobForUsername` says live → `viewOtherDevice`. Asked only without a worker session (or after the job lookup's 401 cleared it), in parallel with the other lookups.
 4. Otherwise today's cards, unchanged.
 
 `BackgroundStatus.vue` (props: `view: StatusView`, `username`, `busy`; emits one event per action): card titled "Scrobbling to {username}" with a labelled bar (`{done} / {total} · {pct}%`, as Home's card draws it today), Pause/Resume as a small button to the right of the bar when `primary` is pause/resume, otherwise the primary as a block button under the line; the line, the sub-line, a tooltip icon for `tooltip`; secondary actions as text buttons; Cancel opens the confirm dialog (`status.cancel.confirm.*`, body with `{done}`). `checkItOut` links to `https://www.last.fm/user/{username}` (new tab).

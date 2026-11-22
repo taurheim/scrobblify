@@ -36,10 +36,6 @@
             >{{ part.text }}</button>
             <template v-else>{{ part.text }}</template>
           </template>
-          <template v-if="view.showRejected > 0">
-            · {{ view.showRejected.toLocaleString() }} rejected by Last.fm
-            (if this is unexpected please email niko@savas.ca)
-          </template>
           <v-tooltip v-if="view.tooltip" :text="view.tooltip" location="top">
             <template #activator="{ props: tip }">
               <v-icon
