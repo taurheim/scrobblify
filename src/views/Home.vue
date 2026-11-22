@@ -8,6 +8,23 @@
       <v-progress-circular indeterminate color="primary" class="home-loading" aria-label="Loading" />
     </div>
 
+    <background-status
+      v-else-if="statusView"
+      :view="statusView"
+      :username="statusUsername"
+      :busy="statusBusy"
+      :notice="statusNotice"
+      @pause="jobAct('pause')"
+      @resume="jobAct('resume')"
+      @try-again="jobAct('resume')"
+      @reconnect="signInToWorker"
+      @sign-in-again="signInToWorker"
+      @sign-in="signInToWorker"
+      @cancel="cancelJob"
+      @new-import="newImport"
+      @move-back="moveBack"
+    />
+
     <home-returning
       v-else-if="returning.kind !== 'none' && !dismissedReturning"
       :state="returning"
@@ -85,6 +102,7 @@
 <script lang="ts">
 import { defineComponent, markRaw } from 'vue';
 import LastFm from '@/api/LastFm';
+import BackgroundStatus from '@/components/BackgroundStatus.vue';
 import HomeGetExport from '@/components/home/HomeGetExport.vue';
 import HomeReturning from '@/components/home/HomeReturning.vue';
 import StateManager from '@/services/StateManager';
@@ -94,10 +112,21 @@ import {
 import { resetUser, trackEvent } from '@/services/Analytics';
 import { setSignInIntent, startSignIn } from '@/services/SignInIntent';
 import {
-  isBackgroundConfigured, setWorkerLookup, startReauth,
+  clearHandedOverImport, dismissJob, fetchJob, getSession, isBackgroundConfigured, jobAction,
+  setWorkerLookup, startReauth,
 } from '@/services/BackgroundScrobbling';
+import {
+  isJobShown, JOB_CLOCK_TICK_MS, JOB_POLL_FALLBACK_SECONDS, jobPollDueSec, StatusView,
+  viewFromImport, viewFromJob, viewOtherDevice,
+} from '@/services/JobStatus';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
+
+const SERVER_UNREACHABLE = 'Couldn\'t reach our server. Try again in a few minutes.';
+
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
+}
 
 function readDismissed(): boolean {
   try {
@@ -116,7 +145,11 @@ function writeDismissed() {
 }
 
 export default defineComponent({
-  components: { 'home-get-export': HomeGetExport, 'home-returning': HomeReturning },
+  components: {
+    'background-status': BackgroundStatus,
+    'home-get-export': HomeGetExport,
+    'home-returning': HomeReturning,
+  },
   data() {
     return {
       // Nothing renders until the returning check settles, so a returning
@@ -129,7 +162,41 @@ export default defineComponent({
       /** "Re-connect" is asking the worker for its sign-in link. */
       lookingUp: false,
       onPageShow: null as ((event: PageTransitionEvent) => void) | null,
+      /** A status page action is under way. */
+      statusBusy: false,
+      statusNotice: '',
+      /** Bumped by every action, so a poll that lands after one is discarded. */
+      statusSeq: 0,
+      nowSec: nowSec(),
+      jobPollDueSec: 0,
+      jobPolling: false,
+      jobClockTimer: null as number | null,
+      onVisibilityChange: null as (() => void) | null,
     };
+  },
+  computed: {
+    statusView(): StatusView | null {
+      const r = this.returning;
+      if (r.kind !== 'job') {
+        return null;
+      }
+      if (r.source === 'job') {
+        return viewFromJob(r.job, { nowSec: this.nowSec, originalTotal: r.originalTotal });
+      }
+      if (r.source === 'import') {
+        return viewFromImport(r.status, { nowSec: this.nowSec, originalTotal: r.originalTotal });
+      }
+      return viewOtherDevice();
+    },
+    statusUsername(): string | null {
+      return this.returning.kind === 'job' ? this.returning.username : null;
+    },
+  },
+  watch: {
+    // Every new answer about the job decides when to ask again.
+    returning() {
+      this.scheduleJobPoll();
+    },
   },
   async mounted() {
     // A lookup only ever starts here, so one still flagged is from a trip to
@@ -139,6 +206,7 @@ export default defineComponent({
     this.onPageShow = (event: PageTransitionEvent) => {
       if (event.persisted) {
         this.lookingUp = false;
+        this.statusBusy = false;
         setWorkerLookup(false);
       }
     };
@@ -150,6 +218,7 @@ export default defineComponent({
     if (this.onPageShow) {
       window.removeEventListener('pageshow', this.onPageShow);
     }
+    this.stopJobClock();
     this.$store.commit('setShowingServerJob', false);
   },
   methods: {
@@ -161,8 +230,15 @@ export default defineComponent({
         api.loadStoredUser();
         this.returning = await detectReturning(api, this.stateManager);
         const r = this.returning;
-        this.$store.commit('setShowingServerJob', r.kind === 'server_job' && !this.dismissedReturning);
-        if (r.kind !== 'none' && !this.dismissedReturning) {
+        // The status page shows whatever "Not you?" said: it is about a job.
+        this.$store.commit('setShowingServerJob', r.kind === 'job');
+        if (r.kind === 'job') {
+          trackEvent('home_returning_shown', {
+            state: 'server_job',
+            source: r.source,
+            ...(r.source === 'job' ? { job_state: r.job.state } : {}),
+          });
+        } else if (r.kind !== 'none' && !this.dismissedReturning) {
           let state: string = r.kind;
           if (r.kind === 'saved') {
             state = r.signedIn ? 'saved_signed_in' : 'saved_signed_out';
@@ -175,6 +251,146 @@ export default defineComponent({
       } finally {
         this.ready = true;
       }
+    },
+
+    /*
+      The status page refreshes itself (see `jobPollDueSec`): an active job
+      just after each of its batches, and a job on hold for a full server every
+      few minutes, so Reconnect comes back when a place opens up. Only while
+      the tab is visible; a tab shown again asks at once.
+    */
+    scheduleJobPoll() {
+      this.nowSec = nowSec();
+      const r = this.returning;
+      const due = r.kind === 'job' && r.source === 'job' ? jobPollDueSec(r.job, this.nowSec) : null;
+      if (due === null) {
+        this.stopJobClock();
+        return;
+      }
+      this.jobPollDueSec = due;
+      this.startJobClock();
+    },
+
+    startJobClock() {
+      if (this.jobClockTimer !== null) { return; }
+      this.jobClockTimer = window.setInterval(() => this.onJobClockTick(false), JOB_CLOCK_TICK_MS);
+      this.onVisibilityChange = () => {
+        if (document.visibilityState === 'visible') {
+          this.onJobClockTick(true);
+        }
+      };
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
+    },
+
+    stopJobClock() {
+      if (this.jobClockTimer !== null) {
+        window.clearInterval(this.jobClockTimer);
+        this.jobClockTimer = null;
+      }
+      if (this.onVisibilityChange) {
+        document.removeEventListener('visibilitychange', this.onVisibilityChange);
+        this.onVisibilityChange = null;
+      }
+    },
+
+    onJobClockTick(returning: boolean) {
+      this.nowSec = nowSec();
+      if (document.visibilityState !== 'visible') { return; }
+      if (returning || this.nowSec >= this.jobPollDueSec) {
+        this.pollJob();
+      }
+    },
+
+    /**
+     * Refreshes the status page without letting a slow or failed answer undo
+     * anything newer. A failed check keeps the page as it was; a job that is
+     * gone (cancelled elsewhere) or a session the worker refused sends Home
+     * back through the whole decision.
+     */
+    async pollJob() {
+      const r = this.returning;
+      if (r.kind !== 'job' || r.source !== 'job' || this.jobPolling || this.statusBusy) { return; }
+      const seq = this.statusSeq;
+      this.jobPolling = true;
+      const job = await fetchJob();
+      this.jobPolling = false;
+      if (seq !== this.statusSeq || this.statusBusy || this.returning !== r) { return; }
+      if (isJobShown(job)) {
+        this.returning = { ...r, job };
+        return;
+      }
+      if (job || !getSession()) {
+        await this.refreshReturning();
+        return;
+      }
+      this.jobPollDueSec = nowSec() + JOB_POLL_FALLBACK_SECONDS;
+    },
+
+    /** Pause, Resume, and Try again (a resume of a job stopped by errors). */
+    async jobAct(action: 'pause' | 'resume') {
+      const r = this.returning;
+      if (r.kind !== 'job' || r.source !== 'job' || this.statusBusy) { return; }
+      this.statusSeq += 1;
+      this.statusBusy = true;
+      this.statusNotice = '';
+      if (!await jobAction(r.job.id, action)) {
+        this.statusNotice = SERVER_UNREACHABLE;
+      }
+      const job = await fetchJob();
+      this.statusBusy = false;
+      if (isJobShown(job)) {
+        this.returning = { ...r, job };
+      } else if (job || !getSession()) {
+        await this.refreshReturning();
+      }
+    },
+
+    /*
+      Reconnect, Sign in again and Sign in all sign in to the worker: it
+      re-attaches a job's Last.fm access, or just gives this browser a session
+      to manage the job with. The return lands on /scrobble.
+    */
+    async signInToWorker() {
+      if (this.statusBusy) { return; }
+      this.statusBusy = true;
+      this.statusNotice = '';
+      trackEvent('background_reauth_started', { source: 'home' });
+      const url = await startReauth(this.statusUsername || '');
+      if (!url) {
+        this.statusBusy = false;
+        this.statusNotice = SERVER_UNREACHABLE;
+        return;
+      }
+      window.location.href = url;
+    },
+
+    async cancelJob() {
+      const r = this.returning;
+      if (r.kind !== 'job' || r.source !== 'job' || this.statusBusy) { return; }
+      this.statusSeq += 1;
+      this.statusBusy = true;
+      this.statusNotice = '';
+      if (!await jobAction(r.job.id, 'cancel')) {
+        this.statusBusy = false;
+        this.statusNotice = SERVER_UNREACHABLE;
+        return;
+      }
+      clearHandedOverImport();
+      await this.refreshReturning();
+      this.statusBusy = false;
+    },
+
+    // A finished job stays out of the way from now on.
+    newImport() {
+      const r = this.returning;
+      if (r.kind === 'job' && r.source === 'job') {
+        dismissJob(r.job.id);
+      }
+      this.$router.push('/scrobble');
+    },
+
+    moveBack() {
+      // Task 3: take the progress back from the server.
     },
     async go(choice: HomeChoice) {
       if (this.lookingUp) {

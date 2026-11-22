@@ -59,6 +59,7 @@ import {
   type ScrobbleOutcome,
 } from '../../src/shared/lastfm/protocol';
 import {
+  DAY_FULL_REASON,
   LASTFM_DAILY_CAP,
   importBudget,
   nextUtcDayStartSec,
@@ -139,9 +140,8 @@ export function nextRunAt(
  */
 export const DAY_RESUME_OFFSET_SECONDS = 20 * 60;
 
-/** Shown on the job card while a job waits for the next UTC day. */
-export const DAY_FULL_REASON = `Last.fm keeps at most ${LASTFM_DAILY_CAP} scrobbles a day and today's are used up. `
-  + 'Scrobbling continues after midnight UTC.';
+// Lives with the cap because the status page recognises it too.
+export { DAY_FULL_REASON };
 
 /** Shown while a job waits for today's resume point just after midnight UTC. */
 export const DAY_START_REASON = 'Scrobbling resumes a few minutes after midnight UTC.';

@@ -373,6 +373,9 @@ import ErrorDialog from '@/components/ErrorDialog.vue';
 import BackgroundOffer from '@/components/BackgroundOffer.vue';
 import * as background from '@/services/BackgroundScrobbling';
 import {
+  clockTime, JOB_CLOCK_TICK_MS, JOB_POLL_FALLBACK_SECONDS, nextJobPollSec, runTimeLabel,
+} from '@/services/JobStatus';
+import {
   beginHandoff, completeHandoff, uploadListFromState, stateFromExport,
   resolveExportedRepeats,
 } from '@/services/BackgroundHandoff';
@@ -402,42 +405,6 @@ interface FileConflict {
  */
 const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
 
-/*
-  The job card refreshes itself while a background job is active and the tab is
-  visible, so the count moves without a reload. The worker only sends on its
-  five-minute tick, so the card asks once shortly after each tick rather than on
-  a short fixed interval: `JOB_POLL_AFTER_RUN_SECONDS` past `nextRunAt` gives the
-  tick time to reach this job and record its batches.
-*/
-const JOB_POLL_AFTER_RUN_SECONDS = 45;
-// Never sooner, so a tick that runs late is not asked about every few seconds.
-const JOB_POLL_MIN_SECONDS = 15;
-// Never later, so a job waiting until tomorrow still notices a pause or cancel
-// made from another device.
-const JOB_POLL_MAX_SECONDS = 10 * 60;
-// After a failed check, or from a worker that sends no `nextRunAt`.
-const JOB_POLL_FALLBACK_SECONDS = 60;
-// How often the countdown and the poll deadline are re-evaluated.
-const JOB_CLOCK_TICK_MS = 15 * 1000;
-
-function clockTime(sec: number): string {
-  return new Date(sec * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-}
-
-/** "4:25 PM", "12:20 AM tomorrow" or "12:20 AM on Friday", in local time. */
-function runTimeLabel(sec: number, nowSec: number): string {
-  const at = new Date(sec * 1000);
-  const now = new Date(nowSec * 1000);
-  if (at.toDateString() === now.toDateString()) {
-    return clockTime(sec);
-  }
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-  if (at.toDateString() === tomorrow.toDateString()) {
-    return `${clockTime(sec)} tomorrow`;
-  }
-  return `${clockTime(sec)} on ${at.toLocaleDateString([], { weekday: 'long' })}`;
-}
 /** Shown when the bearer token for the worker has expired, wherever that is detected. */
 const SESSION_EXPIRED_NOTICE = 'You need to refresh your connection to the scrobble worker.';
 const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sign in. Please try again in a few minutes.';
@@ -2450,17 +2417,10 @@ export default defineComponent({
 
     /**
      * When the card should next ask: just after the job's next tick, within
-     * the bounds above.
+     * the bounds in `JobStatus.ts`.
      */
     nextJobPollSec(job: background.JobStatus): number {
-      const now = Math.floor(Date.now() / 1000);
-      if (!job.nextRunAt) {
-        return now + JOB_POLL_FALLBACK_SECONDS;
-      }
-      return Math.min(
-        now + JOB_POLL_MAX_SECONDS,
-        Math.max(now + JOB_POLL_MIN_SECONDS, job.nextRunAt + JOB_POLL_AFTER_RUN_SECONDS),
-      );
+      return nextJobPollSec(job, Math.floor(Date.now() / 1000));
     },
 
     startJobClock() {

@@ -7,6 +7,7 @@ import { interceptLastFm, mockLastFmAuth, routeLastFmSignIn } from '../lastfmMoc
 import {
   interceptBackgroundWorker, MockWorker, MAX_TRACKS,
 } from '../backgroundMock';
+import { DAY_FULL_REASON } from '../../src/shared/lastfm/dailyCap';
 
 /*
   Runs only under `playwright.unreachable-worker.config.ts`, which compiles in
@@ -920,30 +921,35 @@ test.describe('Home with a job on the server', () => {
     ok: true, known: true, live: true, state: 'active', cursor: 1200, scrobbledCount: 1200, totalTracks: 4000,
   };
 
-  test('shows the job\'s progress from the handed-over import id', async ({ page }) => {
+  test('shows the job\'s progress from the handed-over import id, with a way to sign in', async ({ page }) => {
     await openHome(page, 'testuser', LIVE);
-    const card = page.locator('.returning-card');
-    await expect(card.locator('.returning-bar')).toContainText('1,200 / 4,000 · 30%');
-    await expect(card).toContainText("Scrobbling remotely, it's safe to close this tab.");
-    await expect(card.locator('button')).toHaveCount(0);
+    const card = page.locator('.status-card');
+    await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to testuser');
+    await expect(card.locator('.status-bar')).toContainText('1,200 / 4,000 · 30%');
+    // 2,800 left at 700 a day: 4 days from now.
+    const date = await page.evaluate(() => new Date(Date.now() + 4 * 86400 * 1000)
+      .toLocaleDateString([], { month: 'long', day: 'numeric' }));
+    await expect(card.locator('.status-line')).toHaveText(`Scrobblify is scrobbling for you, expecting to finish around ${date}`);
+    await expect(card.locator('.status-sub')).toHaveText('Sign in to manage it');
+    await expect(card.locator('button')).toHaveText(['Sign in']);
   });
 
   test('counts the whole import, not just the server\'s share, when its size was recorded', async ({ page }) => {
     // 1,000 were scrobbled in the browser before 4,000 were handed over.
     await openHome(page, 'testuser', LIVE, 5000);
-    await expect(page.locator('.returning-card .returning-bar')).toContainText('2,200 / 5,000 · 44%');
+    await expect(page.locator('.status-card .status-bar')).toContainText('2,200 / 5,000 · 44%');
   });
 
   test('another user\'s handed-over import is not shown', async ({ page }) => {
     const paths = await openHome(page, 'someoneelse', LIVE);
     await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
-    await expect(page.getByText("Scrobbling remotely, it's safe to close this tab.")).toHaveCount(0);
+    await expect(page.locator('.status-card')).toHaveCount(0);
     expect(paths.filter((p) => p.startsWith('/scrobblify/import/'))).toEqual([]);
   });
 
   test('a live job shows the BETA tag to a browser outside the beta', async ({ page }) => {
     await openHome(page, 'testuser', LIVE);
-    await expect(page.locator('.returning-card')).toContainText("Scrobbling remotely, it's safe to close this tab.");
+    await expect(page.locator('.status-card')).toBeVisible();
     expect(await page.evaluate(() => localStorage.getItem('scrobblify.background.beta'))).toBeNull();
     await expect(page.locator('#logo .beta-tag')).toHaveText('BETA');
     await page.locator('#nav a:has-text("About")').click();
@@ -963,6 +969,364 @@ test.describe('Home with a job on the server', () => {
     await openHome(page, 'testuser', 'refuse');
     await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
     expect(await page.evaluate((key) => localStorage.getItem(key), RECORD_KEY)).not.toBeNull();
+  });
+});
+
+test.describe('Home as the status page', () => {
+  const IMPORT_ID = 'f1f2f3f4f5f6f7f8f9f0a1a2a3a4a5a6';
+  const RECORD_KEY = 'scrobblify.background.handedOverImport';
+  const DISMISSED_KEY = 'scrobblify.background.dismissedJob';
+  const SESSION_KEY = 'scrobblify.background.session';
+  const SAFE = "Scrobbling remotely, it's safe to close this tab.";
+  const CARD = '.status-card';
+  const MOVE_BACK = 'Scrobble the rest locally';
+  const DAY_SEC = 86400;
+
+  type StatusOptions = {
+    job?: Record<string, unknown>;
+    /** A worker session in this browser. */
+    session?: boolean;
+    record?: Record<string, unknown> | null;
+    username?: string | null;
+    worker?: Record<string, unknown>;
+    /** Fakes the page's clock, so a test can move time on. */
+    clock?: boolean;
+    seed?: Record<string, string>;
+  };
+
+  /*
+    Home with the mock worker holding one job for testuser (8,000 tracks,
+    2,000 sent). Its ticks are an hour apart, so nothing moves by itself.
+  */
+  async function openStatus(page: Page, baseURL: string | undefined, {
+    job = {}, session = true, record = null, username = 'testuser', worker = {}, clock = false, seed = {},
+  }: StatusOptions = {}): Promise<MockWorker> {
+    if (clock) {
+      await page.clock.install();
+    }
+    await interceptLastFm(page);
+    const mock = await interceptBackgroundWorker(page, {
+      apiOrigin: 'http://background.invalid',
+      appOrigin: new URL(baseURL || 'http://localhost:8471').origin,
+      log: false,
+      tickSeconds: 3600,
+      ...worker,
+    });
+    const nowMs = Date.now();
+    mock.world.job = {
+      id: 'j-status',
+      username: 'testuser',
+      importId: IMPORT_ID,
+      state: 'active',
+      reason: null,
+      totalTracks: 8000,
+      scrobbled: 2000,
+      failed: 0,
+      waitingUntil: null,
+      createdAtMs: nowMs,
+      lastTickMs: nowMs,
+      completedAtMs: null,
+      inactivityDeadlineSec: null,
+      dormantFrom: null,
+      exportClaim: '',
+      ...job,
+    };
+    mock.world.imports.set(IMPORT_ID, { trackCount: mock.world.job.totalTracks, jobId: 'j-status' });
+    const entries: Record<string, string> = { ...seed };
+    if (session) {
+      entries[SESSION_KEY] = 's-status';
+    }
+    if (username) {
+      entries.scrobblifyLfmUserName = username;
+    }
+    if (record) {
+      entries[RECORD_KEY] = JSON.stringify(record);
+    }
+    await page.goto('/#/');
+    await page.evaluate((values) => {
+      Object.entries(values).forEach(([key, value]) => localStorage.setItem(key, value));
+    }, entries);
+    await page.reload();
+    return mock;
+  }
+
+  /** The job as the worker describes it right now. */
+  function jobView(mock: MockWorker): Record<string, number> {
+    return JSON.parse(mock.handle('GET', '/scrobblify/job', new URLSearchParams(), '').body).job;
+  }
+
+  function longDate(page: Page, sec: number): Promise<string> {
+    return page.evaluate((s) => new Date(s * 1000)
+      .toLocaleDateString([], { month: 'long', day: 'numeric' }), sec);
+  }
+
+  type Row = {
+    name: string;
+    job: Record<string, unknown>;
+    /** The status line, given the job the worker describes. */
+    line: (page: Page, job: Record<string, number>) => Promise<string | RegExp>;
+    sub?: string;
+    actions: string[];
+  };
+
+  const deadline = () => Math.floor(Date.now() / 1000) + 30 * DAY_SEC;
+  const dormantLine = async (page: Page, job: Record<string, number>) => `You paused your scrobbling. We'll delete your progress from our servers after ${await longDate(page, job.inactivityDeadline)} (any tracks you've scrobbled will stay on last.fm)`;
+
+  const ROWS: Row[] = [
+    {
+      name: 'active',
+      job: {},
+      line: async (page, job) => `This will finish around ${await longDate(page, job.estimatedCompletionSec)}`,
+      sub: SAFE,
+      actions: ['Pause', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'active with today\'s share sent',
+      job: { reason: DAY_FULL_REASON },
+      line: async () => /^Can't upload any more due to last\.fm rules\. Will continue at \d{1,2}:\d{2}\s[AP]M/,
+      sub: SAFE,
+      actions: ['Pause', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'paused',
+      job: { state: 'paused' },
+      line: async () => 'Paused',
+      actions: ['Resume', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'signed out by Last.fm',
+      job: { state: 'needs_reauth' },
+      line: async () => 'Last.fm signed us out',
+      actions: ['Sign in again', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'stopped by errors',
+      job: { state: 'needs_attention', reason: 'Last.fm failed 10 times in a row.' },
+      line: async () => 'Scrobblify stopped after repeated errors.',
+      actions: ['Try again', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'on hold after a pause',
+      job: { state: 'dormant', dormantFrom: 'paused', inactivityDeadlineSec: deadline() },
+      line: dormantLine,
+      actions: ['Reconnect', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'on hold, reason unknown',
+      job: { state: 'dormant', dormantFrom: null, inactivityDeadlineSec: deadline() },
+      line: dormantLine,
+      actions: ['Reconnect', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'on hold after being signed out',
+      job: { state: 'dormant', dormantFrom: 'needs_reauth', inactivityDeadlineSec: deadline() },
+      line: async (page, job) => `Your sign-in to scrobblify expired. If you don't sign in before ${await longDate(page, job.inactivityDeadline)} we'll delete your progress from our servers (any tracks already scrobbled will stay on last.fm).`,
+      actions: ['Reconnect', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'on hold after errors',
+      job: { state: 'dormant', dormantFrom: 'needs_attention', inactivityDeadlineSec: deadline() },
+      line: async () => 'Scrobblify stopped after repeated errors. Please let me know at niko@savas.ca',
+      actions: ['Reconnect', MOVE_BACK, 'Cancel'],
+    },
+    {
+      name: 'handing progress back',
+      job: { state: 'exporting' },
+      line: async () => 'Downloading progress from scrobblify servers...',
+      actions: [],
+    },
+    {
+      name: 'completed with rejections',
+      job: {
+        state: 'completed', scrobbled: 7997, failed: 3, completedAtMs: Date.now(),
+      },
+      line: async () => 'Done · 3 rejected by Last.fm (if this is unexpected please email niko@savas.ca)',
+      actions: ['Check it out!', 'Start a new import'],
+    },
+    {
+      name: 'failed',
+      job: { state: 'failed', reason: 'The upload was damaged.', completedAtMs: Date.now() },
+      line: async () => 'Scrobbling stopped.',
+      actions: ['Start a new import'],
+    },
+  ];
+
+  for (const row of ROWS) {
+    test(`a job ${row.name} shows its line and buttons`, async ({ page, baseURL }) => {
+      const mock = await openStatus(page, baseURL, { job: row.job });
+      const card = page.locator(CARD);
+      await expect(card.locator('.v-card-title')).toHaveText('Scrobbling to testuser', { timeout: 15000 });
+      await expect(card.locator('.status-line')).toHaveText(await row.line(page, jobView(mock)));
+      if (row.sub) {
+        await expect(card.locator('.status-sub')).toHaveText(row.sub);
+      } else {
+        await expect(card.locator('.status-sub')).toHaveCount(0);
+      }
+      await expect(card.locator('.status-action')).toHaveText(row.actions);
+      for (const action of row.actions) {
+        await expect(card.locator(`.status-action:has-text("${action}")`)).toBeEnabled();
+      }
+    });
+  }
+
+  test('the server\'s reason is in a tooltip', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL, {
+      job: { state: 'needs_attention', reason: 'Last.fm failed 10 times in a row.' },
+    });
+    await page.locator(`${CARD} .status-reason`).hover();
+    await expect(page.locator('.v-tooltip .v-overlay__content'))
+      .toHaveText('Last.fm failed 10 times in a row.');
+  });
+
+  test('a job on hold for a full server can\'t reconnect until a place opens up', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, {
+      job: { state: 'dormant', dormantFrom: 'paused', inactivityDeadlineSec: deadline() },
+      worker: { capacityAvailable: false },
+      clock: true,
+    });
+    const card = page.locator(CARD);
+    await expect(card.locator('.status-line')).toHaveText('Paused by scrobblify. A lot of people are scrobbling! Feel free to buy me a coffee so I can run more servers! You can scrobble locally or try again later.', { timeout: 15000 });
+    await expect(card.locator('.status-line a:has-text("buy me a coffee")')).toHaveAttribute('href', 'https://buymeacoffee.com/nikosavas');
+    await expect(card.locator('.status-line button:has-text("scrobble locally")')).toBeVisible();
+    await expect(card.locator('.status-action')).toHaveText(['Reconnect', MOVE_BACK, 'Cancel']);
+    await expect(card.locator('.status-action:has-text("Reconnect")')).toBeDisabled();
+
+    mock.world.capacityAvailable = true;
+    await page.clock.fastForward('05:30');
+    await expect(card.locator('.status-action:has-text("Reconnect")')).toBeEnabled({ timeout: 10000 });
+    await expect(card.locator('.status-line')).toHaveText(await dormantLine(page, jobView(mock)));
+  });
+
+  test('an active job refreshes itself after its next batch', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, { clock: true });
+    const bar = page.locator(`${CARD} .status-bar`);
+    await expect(bar).toContainText('2,000 / 8,000 · 25%', { timeout: 15000 });
+    mock.world.job!.scrobbled = 4000;
+    await page.clock.fastForward('10:30');
+    await expect(bar).toContainText('4,000 / 8,000 · 50%', { timeout: 10000 });
+  });
+
+  test('a cancelled job is not shown', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL, { job: { state: 'cancelled', completedAtMs: Date.now() } });
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator(CARD)).toHaveCount(0);
+  });
+
+  test('a finished job that was dismissed is not shown', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL, {
+      job: { state: 'completed', scrobbled: 8000, completedAtMs: Date.now() },
+      seed: { [DISMISSED_KEY]: 'j-status' },
+    });
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator(CARD)).toHaveCount(0);
+  });
+
+  test('counts the whole import when this browser handed it over', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL, {
+      job: { totalTracks: 12000, scrobbled: 3710 },
+      record: { importId: IMPORT_ID, username: 'testuser', originalTotal: 18523 },
+    });
+    await expect(page.locator(`${CARD} .status-bar`)).toContainText('10,233 / 18,523 · 55%', { timeout: 15000 });
+  });
+
+  test('shows the BETA tag to a browser outside the beta', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL);
+    await expect(page.locator(CARD)).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('#logo .beta-tag')).toHaveText('BETA');
+  });
+
+  test('a job on another device, with no sign-in here, offers to sign in', async ({ page, baseURL }) => {
+    const signIns: Record<string, unknown>[] = [];
+    page.on('request', (request) => {
+      if (request.url().endsWith('/scrobblify/auth/signin')) {
+        signIns.push(JSON.parse(request.postData() || '{}'));
+      }
+    });
+    await openStatus(page, baseURL, { session: false });
+    const card = page.locator(CARD);
+    await expect(card.locator('.status-line')).toHaveText('Scrobblify is scrobbling for you!', { timeout: 15000 });
+    await expect(card.locator('.status-sub')).toHaveText('Sign in to manage it');
+    await expect(card.locator('.status-bar')).toHaveCount(0);
+    await expect(card.locator('.status-action')).toHaveText(['Sign in']);
+
+    await card.locator('.status-action:has-text("Sign in")').click();
+    await page.waitForURL(/#\/scrobble/);
+    expect(signIns).toEqual([expect.objectContaining({ username: 'testuser' })]);
+    expect(await page.evaluate((key) => localStorage.getItem(key), SESSION_KEY)).toBeTruthy();
+    await page.goto('/#/');
+    await expect(card.locator('.status-sub')).toHaveText(SAFE, { timeout: 15000 });
+  });
+
+  test('"Sign in again" reconnects Last.fm and the job carries on', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, { job: { state: 'needs_reauth' } });
+    await page.locator(`${CARD} .status-action:has-text("Sign in again")`).click();
+    await page.waitForURL(/#\/scrobble/);
+    expect(mock.world.job!.state).toBe('active');
+  });
+
+  test('a reconnect that can\'t reach the server says so', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL, {
+      job: { state: 'dormant', dormantFrom: 'paused', inactivityDeadlineSec: deadline() },
+    });
+    await page.route('http://background.invalid/scrobblify/auth/signin', (route: Route) => route.abort('internetdisconnected'));
+    await page.locator(`${CARD} .status-action:has-text("Reconnect")`).click();
+    await expect(page.locator(`${CARD} .status-notice`)).toHaveText("Couldn't reach our server. Try again in a few minutes.");
+    await expect(page).toHaveURL(/\/#\/$/);
+  });
+
+  test('Pause, then Resume', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL);
+    const card = page.locator(CARD);
+    await card.locator('.status-action:has-text("Pause")').click({ timeout: 15000 });
+    await expect(card.locator('.status-line')).toHaveText('Paused');
+    expect(mock.world.job!.state).toBe('paused');
+    await card.locator('.status-action:has-text("Resume")').click();
+    await expect(card.locator('.status-line')).toContainText('This will finish around');
+    expect(mock.world.job!.state).toBe('active');
+  });
+
+  test('"Try again" restarts a job stopped by errors', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, { job: { state: 'needs_attention', reason: 'Errors.' } });
+    await page.locator(`${CARD} .status-action:has-text("Try again")`).click({ timeout: 15000 });
+    await expect(page.locator(`${CARD} .status-line`)).toContainText('This will finish around');
+    expect(mock.world.job!.state).toBe('active');
+  });
+
+  test('Cancel asks first, then stops the job and goes back to the normal page', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, {
+      record: { importId: IMPORT_ID, username: 'testuser', originalTotal: 8000 },
+    });
+    const card = page.locator(CARD);
+    await card.locator('.status-action:has-text("Cancel")').click({ timeout: 15000 });
+    const dialog = page.locator('.v-dialog .status-cancel');
+    await expect(dialog.locator('.v-card-title')).toHaveText('Stop scrobbling');
+    await expect(dialog.locator('.v-card-text')).toHaveText('Your remaining tracks will be deleted from our servers. The 2,000 already scrobbled to last.fm will stay there.');
+    await dialog.locator('button:has-text("Keep scrobbling")').click();
+    await expect(dialog).toBeHidden();
+    expect(mock.world.job!.state).toBe('active');
+
+    await card.locator('.status-action:has-text("Cancel")').click();
+    await dialog.locator('button:has-text("Cancel")').click();
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible();
+    await expect(page.locator(CARD)).toHaveCount(0);
+    expect(mock.world.job!.state).toBe('cancelled');
+    expect(await page.evaluate((key) => localStorage.getItem(key), RECORD_KEY)).toBeNull();
+  });
+
+  test('a finished job links to Last.fm, and "Start a new import" dismisses it', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL, {
+      job: { state: 'completed', scrobbled: 8000, completedAtMs: Date.now() },
+    });
+    const card = page.locator(CARD);
+    const link = card.locator('a.status-action:has-text("Check it out!")');
+    await expect(link).toHaveAttribute('href', 'https://www.last.fm/user/testuser', { timeout: 15000 });
+    await expect(link).toHaveAttribute('target', '_blank');
+    await card.locator('.status-action:has-text("Start a new import")').click();
+    await page.waitForURL(/#\/scrobble$/);
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    expect(await page.evaluate((key) => localStorage.getItem(key), DISMISSED_KEY)).toBe('j-status');
+    await page.goto('/#/');
+    await expect(page.locator('.returning-card button:has-text("Upload Spotify zip")')).toBeVisible({ timeout: 15000 });
   });
 });
 
@@ -1066,8 +1430,8 @@ test.describe('Choosing the server in the confirm dialog', () => {
     URL, and the welcome-back card showing the job running.
   */
   async function expectHomeShowsJob(page: Page, user = 'testuser') {
-    const card = page.locator('.returning-card');
-    await expect(card).toContainText("Scrobbling remotely, it's safe to close this tab.", { timeout: 20000 });
+    const card = page.locator('.status-card');
+    await expect(card.locator('.status-sub')).toHaveText("Scrobbling remotely, it's safe to close this tab.", { timeout: 20000 });
     await expect(card.locator('.v-card-title')).toHaveText(`Scrobbling to ${user}`);
     await expect(page).toHaveURL(/\/#\/$/);
     await expect(page.locator('.upload-step')).toHaveCount(0);

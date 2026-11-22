@@ -87,6 +87,12 @@ export interface JobStatus {
    * when reconnecting would be refused because the service is full.
    */
   reconnectAvailable?: boolean;
+  /**
+   * For a `dormant` job, the parked state it went on hold from (`paused`,
+   * `needs_reauth`, `needs_attention`). Null otherwise, for jobs that went
+   * dormant before the worker recorded it, and absent from older workers.
+   */
+  dormantFrom?: string | null;
 }
 
 export interface UploadTrack {
@@ -202,6 +208,27 @@ export function setBetaOptIn(on: boolean): void {
 }
 
 const HANDED_OVER_IMPORT_KEY = 'scrobblify.background.handedOverImport';
+const DISMISSED_JOB_KEY = 'scrobblify.background.dismissedJob';
+
+/**
+ * Hides a finished job from the status page for good ("Start a new import").
+ * One id: the worker lists one job per user, and a new one has a new id.
+ */
+export function dismissJob(jobId: string): void {
+  try {
+    window.localStorage.setItem(DISMISSED_JOB_KEY, jobId);
+  } catch {
+    // Private browsing: the job shows again on the next visit to Home.
+  }
+}
+
+export function isJobDismissed(jobId: string): boolean {
+  try {
+    return !!jobId && window.localStorage.getItem(DISMISSED_JOB_KEY) === jobId;
+  } catch {
+    return false;
+  }
+}
 
 export function clearHandedOverImport(): void {
   try {
@@ -2478,12 +2505,12 @@ export async function hasLiveJob(jobId = ''): Promise<boolean | null> {
   }
 }
 
-export async function fetchJob(): Promise<JobStatus | null> {
+export async function fetchJob(timeoutMs = STATUS_TIMEOUT_MS): Promise<JobStatus | null> {
   if (!isBackgroundConfigured() || !getSession()) {
     return null;
   }
   try {
-    const res = await getWithTimeout('/scrobblify/job', true);
+    const res = await getWithTimeout('/scrobblify/job', true, timeoutMs);
     if (!res) {
       return null;
     }

@@ -1,12 +1,25 @@
 import LastFm from '@/api/LastFm';
 import StateManager from '@/services/StateManager';
 import * as background from '@/services/BackgroundScrobbling';
+import { isJobShown } from '@/services/JobStatus';
+
+/**
+ * A background job Home shows as its status page, by where it was learned:
+ * the job itself (worker session), the public import lookup (this browser
+ * handed it over), or only that the user has one running (another device).
+ * `originalTotal` is the whole import's size when this browser handed it over
+ * and the record matches, else 0.
+ */
+export type ServerJobState =
+  | { kind: 'job'; source: 'job'; username: string | null; job: background.JobStatus; originalTotal: number }
+  | { kind: 'job'; source: 'import'; username: string | null; status: background.ImportStatus; originalTotal: number }
+  | { kind: 'job'; source: 'other'; username: string | null };
 
 /** Which Home page a visitor gets. */
 export type ReturningState =
   | { kind: 'none' }
   | { kind: 'saved'; username: string | null; signedIn: boolean; done: number; total: number }
-  | { kind: 'server_job'; username: string | null; done: number; total: number }
+  | ServerJobState
   | { kind: 'username_only'; username: string };
 
 // Per tab, so a dismissed card stays dismissed when the visitor comes back to Home.
@@ -35,27 +48,12 @@ export function progressPct(done: number, total: number): number {
 }
 
 /**
- * Overall progress for an import partly scrobbled in this browser before it
- * was handed over: the worker counts only the tracks it was handed. Plays this
- * browser gave up on before the handover count as done here, unlike
- * `originalSucceededCount`. Other browsers have no `originalTotal` and get the
- * worker's own numbers.
- */
-export function overallProgress(
-  originalTotal: number,
-  status: { totalTracks: number; scrobbledCount: number },
-): { done: number; total: number } {
-  if (originalTotal > 0 && originalTotal >= status.totalTracks) {
-    const remaining = status.totalTracks - status.scrobbledCount;
-    const done = Math.min(originalTotal, Math.max(0, originalTotal - remaining));
-    return { done, total: originalTotal };
-  }
-  return { done: status.scrobbledCount, total: status.totalTracks };
-}
-
-/**
- * Decides the Home state, most specific first: a job this browser handed to
- * the worker, then saved progress, then a remembered username.
+ * Decides the Home state, most specific first: a background job (the status
+ * page), then saved progress, then a remembered username.
+ *
+ * The job comes from the worker session if this browser has one; else from
+ * the public lookup of the import this browser handed over; else, with
+ * neither, from whether the worker says this username has a job running.
  *
  * Never throws: an unreadable IndexedDB or an unreachable worker just means
  * less is known, and the visitor gets a simpler page.
@@ -65,24 +63,46 @@ export async function detectReturning(
   stateManager: StateManager,
 ): Promise<ReturningState> {
   const username = api.getUserName();
-  // Started now so the IndexedDB read overlaps the worker check.
+  // Started now so the IndexedDB read overlaps the worker checks.
   const savedLoad = stateManager.loadState().catch(() => null);
 
-  /*
-    Only a *live* job (sending, paused or stopped by errors, all of which keep
-    their place) is shown as running. One that is signed out or on hold falls
-    through to the plain card; /scrobble's job banner explains it. A
-    record the server doesn't know, or whose job has ended, is dropped.
-  */
   const handedOver = background.handedOverImport(username);
-  if (handedOver) {
-    const status = await background.importStatus(handedOver.importId, RETURNING_STATUS_TIMEOUT_MS);
-    if (status && status.live) {
-      return { kind: 'server_job', username, ...overallProgress(handedOver.originalTotal, status) };
-    }
-    if (status && (!status.known || ENDED_STATES.includes(status.state || ''))) {
-      background.clearHandedOverImport();
-    }
+  const [job, recordStatus] = await Promise.all([
+    background.fetchJob(RETURNING_STATUS_TIMEOUT_MS),
+    handedOver
+      ? background.importStatus(handedOver.importId, RETURNING_STATUS_TIMEOUT_MS)
+      : Promise.resolve(null),
+  ]);
+  // A record the server doesn't know, or whose job has ended, is dropped.
+  const recordEnded = !!recordStatus
+    && (!recordStatus.known || ENDED_STATES.includes(recordStatus.state || ''));
+  if (recordEnded) {
+    background.clearHandedOverImport();
+  }
+  // Not a handoff still on its way: the record is only written once one is live.
+  const record = handedOver && recordStatus && !recordEnded && !recordStatus.pending
+    ? { ...handedOver, status: recordStatus }
+    : null;
+
+  if (isJobShown(job)) {
+    /*
+      The job doesn't name its import, so the record is taken to be this job's
+      when the lookup of its import describes a job the same size. Otherwise
+      its whole-import total would be applied to someone else's job.
+    */
+    const matches = !!record && record.status.totalTracks === job.totalTracks;
+    return {
+      kind: 'job', source: 'job', username, job, originalTotal: record && matches ? record.originalTotal : 0,
+    };
+  }
+  if (record) {
+    return {
+      kind: 'job', source: 'import', username, status: record.status, originalTotal: record.originalTotal,
+    };
+  }
+  if (!handedOver && username
+    && await background.liveJobForUsername(username, RETURNING_STATUS_TIMEOUT_MS) === true) {
+    return { kind: 'job', source: 'other', username };
   }
 
   const saved = await savedLoad;
