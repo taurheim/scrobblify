@@ -156,7 +156,7 @@ test.describe('Home Page', () => {
     await page.locator('button:has-text("Show me how")').click();
 
     await expect(page.locator('h2:has-text("Get your history from Spotify")')).toBeVisible();
-    await expect(page.locator('.get-export li')).toHaveCount(3);
+    await expect(page.locator('.get-export > ol > li')).toHaveCount(3);
     await expect(page.locator('.get-export a[href="https://www.spotify.com/account/privacy/"]')).toBeVisible();
     await expect(page.locator('.home-card')).toHaveCount(0);
     await expect.poll(() => events).toContainEqual({ name: 'home_choice', props: { choice: 'get_export' } });
@@ -191,6 +191,38 @@ test.describe('Home Page', () => {
     await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
     expect(events).toContainEqual({ name: 'home_choice', props: { choice: 'resume' } });
     expect(events.filter((e) => e.name === 'sign_in_started')).toEqual([]);
+  });
+
+  test('the export guide helps set up Last.fm while waiting, with ListenBrainz as an alternative', async ({ page }) => {
+    await page.goto('/#/');
+    await page.getByRole('button', { name: 'Show me how' }).click();
+
+    const guide = page.locator('.get-export');
+    await expect(guide.getByRole('heading', { name: 'While you wait, create your accounts' })).toBeVisible();
+    const setup = guide.locator('.get-export-setup');
+    await expect(setup.locator('ol').first().locator('li')).toHaveCount(2);
+    await expect(setup.locator('ol').last().locator('li')).toHaveCount(3);
+    await expect(setup).toContainText('new Spotify listens get automatically scrobbled');
+    await expect(setup).toContainText('Last.fm has a two week limit on scrobbling old tracks.');
+    await expect(setup.getByRole('link', { name: 'ListenBrainz', exact: true })).toHaveAttribute('href', 'https://listenbrainz.org/');
+    await expect(setup).toContainText('Record Spotify Listening History');
+    await expect(setup.locator('ol').last().locator('li').last()).toContainText('Once you have your ZIP file from Spotify');
+    for (const href of [
+      'https://www.last.fm/join',
+      'https://www.last.fm/settings/applications',
+      'https://listenbrainz.org/',
+      'https://listenbrainz.org/login/',
+      'https://listenbrainz.org/settings/music-services/details/',
+      'https://listenbrainz.org/settings/import/',
+    ]) {
+      const link = guide.locator(`a[href="${href}"]`);
+      await expect(link).toBeVisible();
+      await expect(link).toHaveAttribute('target', '_blank');
+      await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    }
+
+    await guide.getByRole('link', { name: 'scrobble', exact: true }).click();
+    await expect(page).toHaveURL(/#\/scrobble/);
   });
 
   test('has navigation links', async ({ page }) => {
