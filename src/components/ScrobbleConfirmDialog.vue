@@ -22,7 +22,7 @@
           {{ dailyBudget.toLocaleString() }} a day, these will take
           <strong>{{ days(estimate.laterDays) }}</strong>.
           <template v-if="canFinishInBackground">
-            You don't have to wait for it: choose "Finish this in the background" when it stops,
+            You don't have to wait for it: choose "Scrobble the rest for me" when it stops,
             and Scrobblify's server will send them for you, even with this tab closed.
           </template>
         </p>
@@ -33,7 +33,7 @@
           {{ estimate.todayCount.toLocaleString() }} go today, which takes roughly {{ todayDuration }}.
           Scrobblify then saves your progress and stops.
           <template v-if="canFinishInBackground">
-            You can then choose "Finish this in the background" and Scrobblify's server will send
+            You can then choose "Scrobble the rest for me" and Scrobblify's server will send
             the rest for you, even with this tab closed.
           </template>
           <template v-else>

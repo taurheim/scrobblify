@@ -248,7 +248,7 @@
         <v-stepper-window-item :value="4" eager>
           <scrobble-step
             ref="scrobbleStep"
-            :background-available="backgroundAvailable"
+            :background-available="backgroundAvailable && !backgroundJob"
             :sending-blocked="sendingBlocked"
             :worker-unreachable="authorityUnknown"
             :persist-progress="onAutoSave"
@@ -272,7 +272,7 @@
     <background-offer
       v-model="showBackgroundOffer"
       :remaining="backgroundRemaining"
-      :all-re-tagged="backgroundAllReTagged"
+      :any-re-tagged="backgroundAnyReTagged"
       :busy="backgroundBusy"
       v-on:accept="startBackgroundHandoff"
       v-on:decline="onBackgroundDeclined"
@@ -524,6 +524,9 @@ export default defineComponent({
       /** The worker's per-job ceiling, from the same capacity answer. */
       backgroundMaxTracks: 0,
       backgroundRemaining: 0,
+      /** Shown in the offer: some remaining plays will be dated today. */
+      backgroundAnyReTagged: false,
+      /** For `background_offer_declined` only. */
       backgroundAllReTagged: false,
       backgroundBusy: false,
       backgroundJob: null as background.JobStatus | null,
@@ -1861,7 +1864,8 @@ export default defineComponent({
         return;
       }
       const state = this.buildState(info);
-      const remaining = uploadListFromState(state, Math.floor(Date.now() / 1000)).length;
+      const list = uploadListFromState(state, Math.floor(Date.now() / 1000));
+      const remaining = list.length;
       if (!this.canOfferBackground(remaining)) {
         return;
       }
@@ -1869,7 +1873,8 @@ export default defineComponent({
       this.pendingState = null;
       this.pendingEntryPoint = 'scrobble_step';
       this.backgroundRemaining = remaining;
-      this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
+      this.backgroundAnyReTagged = list.some((t) => t.reTagged);
+      this.backgroundAllReTagged = list.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
       trackEvent('background_offer_shown', {
         entry_point: 'scrobble_step',
@@ -1879,8 +1884,8 @@ export default defineComponent({
     },
 
     /**
-     * A deliberate "Not now". Distinct from dismissing the dialog, so the
-     * decline rate measures people who read the consent copy and said no.
+     * A deliberate "scrobble locally". Distinct from dismissing the dialog, so
+     * the decline rate measures people who read the offer and said no.
      */
     onBackgroundDeclined() {
       trackEvent('background_offer_declined', {
@@ -3231,7 +3236,8 @@ export default defineComponent({
       if (!this.backgroundAvailable || this.backgroundJob) {
         return;
       }
-      const remaining = uploadListFromState(state, Math.floor(Date.now() / 1000)).length;
+      const list = uploadListFromState(state, Math.floor(Date.now() / 1000));
+      const remaining = list.length;
       if (!this.canOfferBackground(remaining)) {
         return;
       }
@@ -3243,7 +3249,8 @@ export default defineComponent({
       this.pendingState = state;
       this.pendingEntryPoint = entryPoint;
       this.backgroundRemaining = remaining;
-      this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
+      this.backgroundAnyReTagged = list.some((t) => t.reTagged);
+      this.backgroundAllReTagged = list.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
       trackEvent('background_offer_shown', {
         entry_point: entryPoint,

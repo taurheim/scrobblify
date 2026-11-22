@@ -27,6 +27,23 @@ const FINISHED = 'text=Finished scrobbling >> visible=true';
 // a path prefix to the JSON the worker answers it with.
 type WorkerBehaviour = 'refuse' | 'hang' | Record<string, unknown>;
 
+type Tracked = { name: string; props: Record<string, unknown> };
+
+// What `trackEvent` would have sent, read from its dev-build console echo.
+function captureEvents(page: Page): Tracked[] {
+  const events: Tracked[] = [];
+  page.on('console', (msg) => {
+    const match = msg.text().match(/^\[scrobblify:event\] (\S+) ([\s\S]*)$/);
+    if (!match) return;
+    try {
+      events.push({ name: match[1], props: JSON.parse(match[2]) });
+    } catch {
+      // Not ours.
+    }
+  });
+  return events;
+}
+
 async function openUploadStep(
   page: Page,
   worker: WorkerBehaviour,
@@ -491,10 +508,9 @@ test.describe('Offering background scrobbling', () => {
       available: true, used: 0, capacity: 100, minTracks: 750, maxTracks: 200000, chunkTracks: 5000,
     },
   };
-  const OFFER = 'text=Finish this in the background >> visible=true';
+  const OFFER = 'text=Let Scrobblify scrobble for me >> visible=true';
 
-  function largeProgressFile(reTagged = false) {
-    const count = 3000;
+  function largeProgressFile(reTagged = false, count = 3000) {
     const tracks = Array.from({ length: count }, (_, i) => ({
       track: `Track ${i}`,
       artist: `Artist ${i % 50}`,
@@ -594,7 +610,7 @@ test.describe('Offering background scrobbling', () => {
     await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
     const gate = await openLargeHistoryGate(page);
 
-    await expect(gate).toContainText('Finish this in the background');
+    await expect(gate).toContainText('Scrobble the rest for me');
     await expect(gate).not.toContainText("You'll need to come back each day");
   });
 
@@ -603,13 +619,11 @@ test.describe('Offering background scrobbling', () => {
     const gate = await openLargeHistoryGate(page);
 
     await expect(gate).toContainText("You'll need to come back each day");
-    await expect(gate).not.toContainText('Finish this in the background');
+    await expect(gate).not.toContainText('Scrobble the rest for me');
   });
 
-  test('the daily stop points to the background offer, not only "come back"', async ({ page }) => {
-    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
-    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
-    // Today's UTC day already holds 700 plays, so the first re-tagged send stops for the day.
+  // Today's UTC day already holds 700 plays, so the first re-tagged send stops for the day.
+  async function stopForTheDay(page: Page, declineResumeOffer = true) {
     await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
       const params = new URLSearchParams(new URL(route.request().url()).search);
       if (params.get('method') !== 'user.getrecenttracks') {
@@ -623,11 +637,137 @@ test.describe('Offering background scrobbling', () => {
       });
     });
     await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile(true));
-    await page.locator('button:has-text("Not now") >> visible=true').click({ timeout: 15000 });
-    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+    if (declineResumeOffer) {
+      await page.locator('a:has-text("scrobble locally") >> visible=true').click({ timeout: 15000 });
+    }
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click({ timeout: 15000 });
+    await expect(page.locator('text=Your progress has been saved automatically >> visible=true')
+      .or(page.locator('text=Stopped. You can resume at any time >> visible=true')))
+      .toBeVisible({ timeout: 30000 });
+  }
+
+  test('the daily stop points to the background offer, not only "come back"', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await stopForTheDay(page);
 
     await expect(page.locator("text=hand the rest to Scrobblify's server below >> visible=true"))
-      .toBeVisible({ timeout: 30000 });
+      .toBeVisible();
+  });
+
+  test('the stop screen offers "Scrobble the rest for me", which opens the choice', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await stopForTheDay(page);
+
+    await expect(page.locator('text=Stopped. You can resume at any time, or >> visible=true')).toBeVisible();
+    await expect(page.locator('a:has-text("have scrobblify scrobble the rest for you") >> visible=true'))
+      .toBeVisible();
+    await expect(page.locator("text=Don't want to keep coming back?")).toHaveCount(0);
+    await page.locator('button:has-text("Scrobble the rest for me") >> visible=true').click();
+
+    const dialog = page.locator('.background-offer');
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator('.v-card-title')).toHaveText('3,000 plays');
+    await expect(dialog).toContainText('This will take 5 days to scrobble.');
+    await expect(dialog).toContainText('will not have the correct date');
+    await expect(dialog.locator('button:has-text("Let Scrobblify scrobble for me")')).toBeVisible();
+    await expect(dialog.locator('.choice-over60')).toHaveCount(0);
+  });
+
+  test('"Details" expands what the service keeps and how to stop it', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await stopForTheDay(page);
+    await page.locator('a:has-text("have scrobblify scrobble the rest for you") >> visible=true').click();
+
+    const dialog = page.locator('.background-offer');
+    await expect(dialog.locator('.choice-details')).toHaveCount(0);
+    await dialog.locator('a:has-text("Details")').click();
+    const details = dialog.locator('.choice-details p');
+    await expect(details).toHaveCount(3);
+    await expect(details.nth(0)).toContainText('Only your username and tracks listened to are uploaded');
+    await expect(details.nth(1)).toContainText('revoking access');
+    await expect(details.nth(2)).toContainText('niko@savas.ca');
+  });
+
+  test('"scrobble locally" closes the choice and records the decline', async ({ page }) => {
+    const events = captureEvents(page);
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await stopForTheDay(page);
+    await page.locator('button:has-text("Scrobble the rest for me") >> visible=true').click();
+    const dialog = page.locator('.background-offer');
+    await expect(dialog).toBeVisible();
+
+    await dialog.locator('a:has-text("scrobble locally")').click();
+
+    await expect(dialog).toBeHidden();
+    await expect.poll(() => events.filter((e) => e.name === 'background_offer_declined')
+      .map((e) => e.props.entry_point)).toEqual(['resume', 'scrobble_step']);
+    const declined = events.filter((e) => e.name === 'background_offer_declined')[1];
+    expect(declined.props).toMatchObject({ track_count: 3000, all_re_tagged: true });
+  });
+
+  test('a resume of more than 60 days warns about signing in again', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile(false, 42001));
+
+    const dialog = page.locator('.background-offer');
+    await expect(dialog).toBeVisible({ timeout: 30000 });
+    await expect(dialog.locator('.v-card-title')).toHaveText('42,001 plays');
+    await expect(dialog).toContainText('This will take 61 days to scrobble.');
+    await expect(dialog.locator('.choice-over60')).toContainText('more than 60 days of scrobbling');
+  });
+
+  test('a resume of under 60 days has no such warning', async ({ page }) => {
+    const { workerCalls } = await openUploadStep(page, WILLING_WORKER, { 'scrobblify.background.beta': '1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles(largeProgressFile(false, 41000));
+
+    const dialog = page.locator('.background-offer');
+    await expect(dialog).toBeVisible({ timeout: 30000 });
+    await expect(dialog.locator('.v-card-title')).toHaveText('41,000 plays');
+    await expect(dialog).toContainText('This will take 59 days to scrobble.');
+    await expect(dialog.locator('.choice-over60')).toHaveCount(0);
+  });
+
+  // #149: the server refuses a second handover while a job is listed, even a
+  // finished one, so the stop screen must not offer one.
+  test('the stop screen offers nothing while a job is listed', async ({ page }) => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const { '/scrobblify/job/live': live, ...rest } = WILLING_WORKER;
+    const { workerCalls } = await openUploadStep(page, {
+      // Before '/scrobblify/job', which would otherwise answer it by prefix.
+      '/scrobblify/job/live': live,
+      '/scrobblify/job': {
+        job: {
+          id: 'job-done',
+          state: 'completed',
+          reason: null,
+          totalTracks: 2000,
+          scrobbled: 2000,
+          failed: 0,
+          remaining: 0,
+          waitingUntil: null,
+          nextRunAt: null,
+          estimatedCompletionSec: nowSec - 3600,
+          createdAt: nowSec - 5 * 86400,
+          completedAt: nowSec - 3600,
+          credentialExpiresAt: nowSec + 14 * 86400,
+        },
+      },
+      ...rest,
+    }, { 'scrobblify.background.beta': '1', 'scrobblify.background.session': 's-1' });
+    await expect.poll(() => workerCalls.includes('/scrobblify/capacity')).toBe(true);
+    await expect(page.locator('text=Your background import has finished')).toBeVisible({ timeout: 15000 });
+    await stopForTheDay(page, false);
+
+    await expect(page.locator('text=Your progress has been saved automatically >> visible=true')).toBeVisible();
+    await expect(page.locator('text=Scrobble the rest for me >> visible=true')).toHaveCount(0);
+    await expect(page.locator('text=have scrobblify scrobble the rest for you >> visible=true')).toHaveCount(0);
+    await expect(page.locator("text=hand the rest to Scrobblify's server below >> visible=true")).toHaveCount(0);
   });
 });
 

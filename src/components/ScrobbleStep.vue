@@ -68,20 +68,11 @@
         large imports are abandoned: the user has been told to come back in a
         day, and most never do.
       -->
-      <v-alert v-if="canOfferBackground" type="info" variant="tonal" class="mb-4">
-        <div class="font-weight-medium mb-1">
-          Don't want to keep coming back?
-          <v-chip size="x-small" color="deep-purple" variant="flat" class="ml-1">Beta</v-chip>
-        </div>
-        <div class="mb-3 text-body-medium">
-          Scrobblify's server can finish the remaining
-          {{ tracksRemaining.toLocaleString() }} tracks for you. Close the tab
-          and it keeps going.
-        </div>
-        <v-btn color="primary" :disabled="handoffHalted" @click="requestBackground">
-          Finish this in the background
+      <div v-if="canOfferBackground" class="mb-4 text-center">
+        <v-btn color="primary" variant="text" :disabled="handoffHalted" @click="requestBackground">
+          Scrobble the rest for me →
         </v-btn>
-      </v-alert>
+      </div>
 
       <v-card class="pa-4 mb-4 text-center" variant="outlined">
         <div v-if="countdown > 0" class="text-headline-small mb-2">
@@ -90,10 +81,14 @@
         <div v-if="countdown > 0" class="mb-2 text-body-medium">
           You can save progress and leave now, then resume later at any time.
         </div>
-        <div v-if="canResume && autoSaved" class="mb-2 text-body-medium">
+        <div v-if="canResume && autoSaved && canOfferBackground" class="mb-2 text-body-medium">
+          Stopped. You can resume at any time, or
+          <a role="button" tabindex="0" @click="requestBackground" @keydown.enter="requestBackground">have
+            scrobblify scrobble the rest for you</a>.
+        </div>
+        <div v-else-if="canResume && autoSaved" class="mb-2 text-body-medium">
           Your progress has been saved automatically — just come back to this page later
-          and choose "Resume"<template v-if="canOfferBackground">, or use "Finish this in the
-          background" above and you won't need to</template>.
+          and choose "Resume".
         </div>
         <v-alert
           v-else-if="saveFailed"
