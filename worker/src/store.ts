@@ -147,6 +147,12 @@ export interface JobRow {
   updated_at: number;
   credential_expires_at: number;
   inactivity_deadline: number | null;
+  /**
+   * The parked state a `dormant` job left (`paused`, `needs_reauth`,
+   * `needs_attention`); see `007_dormant_from.sql`. NULL otherwise, and for
+   * jobs that went dormant before that migration.
+   */
+  dormant_from: string | null;
   completed_at: number | null;
   purge_after: number | null;
 }

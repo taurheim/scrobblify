@@ -69,7 +69,8 @@ const EXPIRE_AFTER_SEC = 30 * 86400;
 /**
  * Changes a job's state the way the worker's `jobs_inactivity_deadline`
  * trigger sees it: entering a parked state starts a 14-day clock, entering
- * `dormant` a 30-day one, and anything else clears it.
+ * `dormant` a 30-day one, and anything else clears it. Going dormant from a
+ * parked state remembers it in `dormantFrom`, as `markDormant` does.
  */
 function setState(job, state, nowMs) {
   const nowSec = Math.floor(nowMs / 1000);
@@ -77,6 +78,11 @@ function setState(job, state, nowMs) {
   if (state !== job.state) {
     if (state === 'dormant') {
       job.inactivityDeadlineSec = nowSec + EXPIRE_AFTER_SEC;
+      if (PARKED.includes(job.state)) {
+        job.dormantFrom = job.state;
+      } else if (job.state !== 'exporting') {
+        job.dormantFrom = null;
+      }
     } else if (PARKED.includes(state)) {
       job.inactivityDeadlineSec = nowSec + DORMANT_AFTER_SEC;
     } else {
@@ -317,6 +323,7 @@ function createMockWorker(options = {}) {
       // by accident.
       credentialExpiresAt: nowSec + 14 * 86400,
       inactivityDeadline: PARKED.includes(job.state) ? job.inactivityDeadlineSec : null,
+      dormantFrom: job.state === 'dormant' ? (job.dormantFrom ?? null) : null,
       ...(KEYLESS.includes(job.state) ? { reconnectAvailable: reconnectAvailable() } : {}),
     };
   }
@@ -640,10 +647,12 @@ function createMockWorker(options = {}) {
       // worker names them in the return.
       const adopted = body.username ? '' : `&user=${encodeURIComponent(lastFmUser)}`;
       // The real worker re-attaches in the sign-in *callback*; the shim has no
-      // server side, so it happens here instead. Same outcome either way.
+      // server side, so it happens here instead. Same outcome either way: back
+      // to sending, or to `paused` for a job the user had paused.
       const { job } = world;
       if (job && KEYLESS.includes(job.state) && reconnectAvailable()) {
-        setState(job, 'paused', nowMs);
+        setState(job, job.state === 'dormant' && job.dormantFrom === 'paused' ? 'paused' : 'active', nowMs);
+        job.dormantFrom = null;
       }
       return json({
         ok: true,
@@ -663,6 +672,9 @@ function createMockWorker(options = {}) {
       }
       if (body.state) {
         setState(world.job, String(body.state), nowMs);
+      }
+      if (body.dormantFrom !== undefined) {
+        world.job.dormantFrom = body.dormantFrom === null ? null : String(body.dormantFrom);
       }
       return json({ ok: true, job: jobView() });
     }

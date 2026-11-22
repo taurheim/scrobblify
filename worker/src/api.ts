@@ -194,9 +194,10 @@ function authoriseUrl(env: ApiEnv, state: string): string {
  * cannot: this is a bonus on a flow whose actual job is to prove identity, and
  * failing the sign-in would strand the user worse than the parked job does.
  *
- * Restored to `paused` rather than `active` so continuing stays the user's
- * explicit choice, and because `paused` is what the status card offers a
- * Resume button for.
+ * Restored to `active`: signing in again is the only step the user should
+ * have to take, since they never chose to stop the job. The exception is a
+ * job that went dormant while the user had it paused (`dormant_from =
+ * 'paused'`), which comes back `paused` so carrying on stays their choice.
  */
 async function reattachCredential(
   env: ApiEnv,
@@ -211,6 +212,7 @@ async function reattachCredential(
       [username],
     );
     if (!job) { return; }
+    const to = job.state === 'dormant' && job.dormant_from === 'paused' ? 'paused' : 'active';
     /*
       `live_username` carries a unique index, so a job started since this one
       was parked already owns the slot. Taking it would fail the write; racing
@@ -252,26 +254,32 @@ async function reattachCredential(
     const updated = await env.sql.run(
       `UPDATE jobs
           SET session_key_ct = ?, session_key_iv = ?, live_username = ?,
-              state = 'paused', state_reason = NULL, consecutive_failures = 0,
-              credential_expires_at = ?,
+              state = ?, state_reason = NULL, consecutive_failures = 0,
+              dormant_from = NULL, credential_expires_at = ?,
               next_eligible_at = ?, locked_until = 0, updated_at = ?
-        WHERE id = ? AND locked_until <= ?
+        WHERE id = ? AND locked_until <= ? AND state = ? AND dormant_from IS ?
           AND (state = 'needs_reauth' OR (state = 'dormant' AND ${SLOT_AVAILABLE_SQL}))`,
       [
         credential.ciphertext,
         credential.iv,
         username,
+        to,
         nowSec + CREDENTIAL_TTL_SECONDS,
         nowSec,
         nowSec,
         job.id,
         nowSec,
+        job.state,
+        job.dormant_from ?? null,
       ],
     );
     if (updated.changes > 0) {
       await env.sql.run(
         'INSERT INTO audit (id, job_id, generation, event, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        [randomId(), job.id, job.generation, 'credential_reattached', JSON.stringify({ from: job.state }), nowSec],
+        [
+          randomId(), job.id, job.generation, 'credential_reattached',
+          JSON.stringify({ from: job.state, to }), nowSec,
+        ],
       );
     }
   } catch {
@@ -349,6 +357,11 @@ function describeJob(job: JobRow, nowSec: number) {
       rows parked before migration 005, whose deadline is only a fallback.
     */
     inactivityDeadline: PARKED_STATES.includes(job.state) ? job.inactivity_deadline : null,
+    /*
+      Why a dormant job was on hold, so the status page can say so. Null for
+      jobs that went dormant before migration 007.
+    */
+    dormantFrom: job.state === 'dormant' ? (job.dormant_from ?? null) : null,
   };
 }
 
@@ -679,6 +692,13 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       the same id and better numbers, and counting both would let the older,
       emptier handoff row win the ordering.
 
+      So are jobs cancelled before they were finalised (`manifest_key` is only
+      set by `finalize`, together with `active`): the callback made the job but
+      the upload never finished, and the reaper cancelled it. The scheduler
+      only runs `active` jobs, so it never sent anything, and counting it
+      blocked the browser's queue for good with no job to take back (#167).
+      A job cancelled after it went active is still counted: it may have sent.
+
       So are jobless handoffs that have ended (`failed`, `reaped`): one that
       never got past Last.fm can never become a job, and chunks are only
       accepted once the callback has created one, so the worker never had the
@@ -706,11 +726,15 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
               total_tracks AS total_tracks, created_at AS created_at,
               0 AS pending
          FROM jobs WHERE import_id = ?
+          AND NOT (state = 'cancelled' AND manifest_key IS NULL)
        UNION ALL
        SELECT state,
               CASE WHEN live_username IS NULL THEN 0 ELSE 1 END,
               0, 0, track_count, created_at,
-              CASE WHEN EXISTS (SELECT 1 FROM jobs WHERE import_id = ?) THEN 0 ELSE 1 END
+              CASE WHEN EXISTS (
+                SELECT 1 FROM jobs WHERE import_id = ?
+                   AND NOT (state = 'cancelled' AND manifest_key IS NULL)
+              ) THEN 0 ELSE 1 END
          FROM handoffs
         WHERE import_id = ? AND job_id IS NULL AND state NOT IN (${ended})
        ORDER BY is_live DESC, created_at DESC

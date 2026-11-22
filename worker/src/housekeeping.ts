@@ -74,6 +74,9 @@ async function auditJobs(
 /**
  * Parked jobs past their deadline become `dormant`.
  *
+ * `dormant_from` keeps the state it left, so the status page can say why it
+ * was on hold and a reconnect knows whether the user had paused it.
+ *
  * `locked_until` is respected so a drain or a take-back holding the job is
  * never pulled out from under. The generation is bumped so a superseded tick
  * still holding an old lease cannot write over the new state.
@@ -85,6 +88,7 @@ export async function markDormant(sql: Sql, nowSec: number): Promise<number> {
   const moved = await sql.all<{ id: string; generation: number }>(
     `UPDATE jobs
         SET state = 'dormant',
+            dormant_from = state,
             state_reason = 'Not touched for 14 days, so its Last.fm key was deleted',
             generation = generation + 1,
             session_key_ct = NULL, session_key_iv = NULL, live_username = NULL,

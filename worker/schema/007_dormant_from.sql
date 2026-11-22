@@ -1,0 +1,13 @@
+-- 007: a dormant job remembers why it was on hold.
+--
+-- Housekeeping moves a job parked in `paused`, `needs_reauth` or
+-- `needs_attention` to `dormant` after 14 days, and the state it left was lost.
+-- The status page words a dormant job by it ("you paused it", "Last.fm signed
+-- you out", "it kept failing"), and reconnecting brings a job the user paused
+-- back `paused`, anything else straight back to `active`.
+--
+-- Set by `markDormant` in the same UPDATE that makes the job dormant, cleared
+-- when reconnecting brings it back. Nullable, deliberately: jobs that went
+-- dormant before this migration have no record of it, and are treated as
+-- paused for the wording and as active on reconnect.
+ALTER TABLE jobs ADD COLUMN dormant_from TEXT;
