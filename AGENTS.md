@@ -168,6 +168,18 @@ selection coming back from Last.fm, which is not a resume.
 `upload_parse_completed` carries `duplicates_deferred` (true when "Check for
 duplicates" was ticked while signed out, so the check runs after sign-in).
 
+The server path (see "The server choice" under "Background scrobbling beta
+gate") skips the browser sign-in: `background_offer_shown` (`entry_point:
+confirm`) → `tracks_selected` (`path: server`) → `background_handoff_*`, with
+no `sign_in_started` or `auth_success`. Home's "Re-connect to last.fm" with a worker configured emits
+`worker_lookup_started` and, back on `/scrobble`, `worker_lookup_result`
+(`result`: `job`, `saved`, `nothing` or `failed`; see "Signing in after
+choosing"). Since 2026-11-21 too: `background_handoff_return_rejected` (a
+handoff return for a handoff this browser didn't preflight, #157),
+`background_freeze_released` gains `reason: handoff_not_taken`, and
+`background_handoff_failed` gains the worker's `already_live`, `replay` and
+`abandoned` reasons (see "Handing over without signing in").
+
 Home emits `home_choice` (`choice`: `have_export`, `get_export` or `resume`;
 `resume` is the "Already scrobbling on scrobblify?" link) on first visits
 (`get_export` also from the welcome-back card's "Show me how"), and
@@ -184,9 +196,10 @@ exchanged a token, clears it). Start, Start over and Upload Spotify zip open
 signed in as the progress's owner, it records an in-app `resume` intent
 (`setSignInIntent`) and opens `/scrobble`, which resumes on mount; otherwise
 it starts a `resume` sign-in through Last.fm (`startSignIn`) that resumes on
-the way back. **Re-connect to last.fm** starts a
-`reconnect` sign-in when signed out (landing on `/scrobble`, where the job or
-resume banner takes over) and just opens `/scrobble` when signed in. Home reads
+the way back. **Re-connect to last.fm** when signed out signs in to the
+*worker* if one is configured (see "Signing in after choosing"), else starts a
+`reconnect` sign-in (landing on `/scrobble`, where the job or resume banner
+takes over); signed in, it just opens `/scrobble`. Home reads
 the stored user itself (`LastFm.loadStoredUser()`), since only `/scrobble`'s
 sign-in handler (`AuthenticateStep`) runs `init()`.
 
@@ -194,7 +207,10 @@ Since 2026-11-15 `tracks_selected` fires when the user confirms the "Scrobble N
 tracks?" dialog, not on the select step's button. That dialog estimates the
 run time (`src/services/ScrobbleEstimate.ts`): re-tagged plays get today's
 import budget (read from the library, as the loop does), then 700 per UTC day;
-see "Last.fm's daily cap". Cancelling it emits nothing.
+see "Last.fm's daily cap". Cancelling it emits nothing. Since 2026-11-21 it
+carries `path`: `tab` (sent from this browser: "Start scrobbling", "Start
+over" without the server choice, or "scrobble locally") or `server` ("Let
+Scrobblify scrobble for me"; see "The server choice").
 
 **A fresh run never replaces saved progress unasked** (#102). There is one
 saved-progress slot, and a fresh run's first save (checkpoint or stop)
@@ -251,7 +267,8 @@ Copy that tells users to "come back each day" has a background variant on every
 surface, so beta users aren't told to return when the server could finish for
 them. The gate and the confirmation use `backgroundCanFinish` (fed by
 `backgroundTrackLimit`, the capacity probe's `maxTracks`, 0 when the offer is
-off). The stop reasons and the paused panel use `canOfferBackground`, since the
+off or a server job is listed), and point at the stop screen's "Scrobble the
+rest for me". The stop reasons and the paused panel use `canOfferBackground`, since the
 offer sits right under them. The Complete step uses `backgroundTrackLimit > 0`.
 Home's welcome-back card shows a live server job ("Scrobbling remotely, it's
 safe to close this tab.") to any browser that handed it over, whatever its beta status,
@@ -427,9 +444,31 @@ reached in-app by a user who is already signed in records an intent with
 
 | `intent` | Started by | On the way back |
 | --- | --- | --- |
-| `send` (`importId`, `checkDuplicates`) | Confirming "Scrobble N tracks?" while signed out | The saved selection is restored onto Send |
+| `send` (`importId`, `checkDuplicates`) | Confirming "Scrobble N tracks?" while signed out, on the tab path ("Start scrobbling", "scrobble locally") | The saved selection is restored onto Send |
 | `resume` | Home's Continue: through Last.fm when not signed in as the progress's owner, in-app when signed in; the sign-in banner's button after a refused *saved* resume | `resumeFromSaved`, which refuses by itself while sending is withheld |
-| `reconnect` | Home's "Re-connect to last.fm" while signed out; the sign-in banner's button after a refused progress file (#153) | Nothing; the job or resume banner takes over |
+| `reconnect` | Home's "Re-connect to last.fm" while signed out, only when no worker is configured or its sign-in couldn't start; the sign-in banner's button after a refused progress file (#153) | Nothing; the job or resume banner takes over |
+
+The server path records no intent and never signs in to the browser
+application: it goes to Last.fm through the handoff (the worker's
+application) instead; see "The server choice".
+
+**"Already scrobbling on scrobblify?" signs in to the worker** (since
+2026-11-21) when the build has one (`isBackgroundConfigured()`): Home's
+"Re-connect to last.fm" sets `scrobblify.background.lookup` (sessionStorage),
+calls `startReauth('')` (an anonymous worker sign-in, see "Handing over
+without signing in"), emits `worker_lookup_started` and redirects, disabled
+meanwhile. If no sign-in link comes back (worker unreachable) it clears the
+flag and falls back to the `reconnect` browser sign-in. Home clears a leftover
+flag on mount and on a bfcache restore (Back from Last.fm). On the return,
+`/scrobble` remembers the worker's name for the account (`rememberWorkerUser`)
+before the authority check asks by name, and once the job and saved state
+have settled `reportWorkerLookup` takes the flag and emits
+`worker_lookup_result`: `job` (the job banner shows), `saved` (the resume
+prompt), `nothing`, or `failed` (refused, or no worker session; the "didn't
+work" notice is up). `nothing` shows the `nothing` banner, "Nothing to resume"
+with **Upload Spotify zip** (dismisses it) and "Have a progress file? Upload it
+here." (the hidden file input now sits outside the alert so either banner can
+open it); it clears when the user leaves Upload or imports a file.
 
 **An intent only steers the sign-in it was recorded for.** Each carries
 `inApp` (true from `setSignInIntent`, false from `startSignIn`) and `createdAt`
@@ -485,7 +524,8 @@ replaced. Go back and choose Resume or Start over.", re-exposing it so the next
 Scrobble asks. The saved selection carries no `userName` while signed out
 (`buildState` stamps one only when signed in, or for a queue already on Send),
 so a username `clearSessionKey()` left behind doesn't make a sign-in as someone
-else look like the wrong user. for the username.** With "Check for duplicates"
+else look like the wrong user. The server path saves the selection the same
+way, through the same checks (`saveSelectionBeforeLeaving`).
 
 **The duplicate check waits for the username.** With "Check for duplicates"
 ticked while signed out, the upload step skips it ("Duplicates will be checked
@@ -502,7 +542,12 @@ with `clearStateIfMatching`. It gives up if the user has left Upload. If the
 check fails, the queue is sent unfiltered with the upload step's error dialog;
 if only the write fails, the filtered queue is sent from memory and checkpoints
 save it. Both report `scrobblify.deferredDuplicates`. A signed-in user's check
-still runs during upload, as before.
+still runs during upload, as before. **The server path never runs the deferred
+check**: a signed-out user who chooses "Let Scrobblify scrobble for me" hands
+over the queue unfiltered, because it is committed at preflight (its digest
+and count), before the worker's callback says who the user is. Re-dated plays,
+the bulk of a server-sized import, are exempt from the check anyway (see
+"Scrobble timestamps").
 
 `manualPause()` deliberately does **not** save. It only raises the flags; the
 save and the `scrobble_stopped` event happen in the scrobble loop's pause check,
@@ -750,7 +795,7 @@ allocator marches *down* from the present and never below midnight, so at
 00:01 it would have a minute of seconds to spend. A real-dated play on a full
 day is failed without being sent (`DAY_FULL_FAILURE`); repeats (pinned retries,
 reused seconds) go through unchecked; a count that can't be read sends nothing
-and counts as a failed attempt. Estimates (`describeJob`, `BackgroundOffer`)
+and counts as a failed attempt. Estimates (`describeJob`, `ServerChoice`)
 use `importBudget(0)`, 700 a day. What it still lacks is the read-back:
 `scrobbled_count` counts accepted replies, so the user's own scrobbler landing
 between the count and the send can still tip a day over, and pending browser
@@ -933,9 +978,11 @@ Locally, `localStorage['scrobblify.flags'] = '{"scrobblify-background-scrobbling
 forces it (non-production builds only). `background_offer_shown` carries
 `offer_source` (`opt_in` / `flag` / `flag_anonymous`; `flag_anonymous` is the
 flag answering for a browser PostHog hasn't identified yet, from 2026-11-21)
-and `entry_point` (`scrobble_step`, `resume`, or `sign_in` for a selection
-restored after signing in, from 2026-11-21), which its decline and opt-in
-events repeat.
+and `entry_point` (`scrobble_step`, `resume`, `sign_in` for a selection
+restored after signing in, or `confirm` for the confirm dialog's server
+choice, both from 2026-11-21), which its decline and opt-in events repeat.
+`background_offer_declined` from `confirm` always carries `all_re_tagged:
+false` (#163), so split decline rates by it only for the other entry points.
 
 `App.vue` applies `?beta=` once per page load (`consumeBetaParam`, in
 `created()`), so an invite link works on any page (in dev's hash mode, editing
@@ -955,7 +1002,9 @@ only says whether the build *can* reach a worker.
 `scrobblify.background.handedOverImport` (localStorage) holds JSON
 `{ importId, username, originalTotal? }` for the queue this browser last handed
 over (`originalTotal` is the import's `originalTotalTracks`). It is written in
-`completeHandoff` when a handover goes live, and cleared after a confirmed
+`completeHandoff` when a handover goes live, under the queue's `userName` or,
+for a selection saved signed out, the account the worker named in the return,
+and cleared after a confirmed
 take-back; when a handover has no import id or user (so it never names an
 older one); when `completeHandoff` finds no local state while the handoff is
 active (its import id can't be known); and when Home sees the job ended or
@@ -1017,7 +1066,8 @@ duplicates are actually possible.
 
 **The page shows one banner at a time**, picked by the `banner` computed in
 `Scrobblify.vue`: outage, then a server job, then the Last.fm sign-in prompt,
-then the resume prompt, then a `backgroundNotice` on its own. A
+then the sign-in `retry`, then "Nothing to resume" (`nothing`), then the resume
+prompt, then a `backgroundNotice` on its own. A
 `backgroundNotice` that isn't the banner shows as the winning
 banner's first line. While the worker is unreachable, notices that need the
 worker to act on (`NEEDS_WORKER_NOTICES`, the expired-connection "Fix now")
@@ -1045,6 +1095,112 @@ would switch itself off exactly when a handoff came back. The parameter is
 read from the query string *and* the hash (dev runs the router in hash mode)
 and deliberately not stripped — see `consumeBetaParam`.
 
+**The server choice** (since 2026-11-21). Beta users choose the server in the
+"Scrobble N tracks?" dialog itself, before any sign-in.
+`ScrobbleConfirmDialog` picks a `stage` when it opens, so a capacity answer
+arriving meanwhile doesn't swap it: `saved` when there is saved progress
+(#102's prompt comes first, unchanged), else `choice` when
+`backgroundCanFinish(trackCount, backgroundTrackLimit)` holds (beta, the
+server has room, no job listed, the browser can compress, at least 750 plays
+and no more than the worker's `maxTracks`), else `plain`, the old dialog.
+**Start over** goes on to `choice` when it would show. `choice` is titled "{n}
+plays" and holds `ServerChoice` (`src/components/ServerChoice.vue`): the days
+at 700 a day, the "will not have the correct date" note when some selected
+plays are re-dated, the over-60-days warning, **Let Scrobblify scrobble for
+me**, **Details** and "or scrobble locally". Entering it emits
+`background_offer_shown` (`entry_point: confirm`); "scrobble locally" emits
+`background_offer_declined` and carries on as the `tab` path (a Last.fm
+sign-in first when signed out). The server button emits `tracks_selected`
+`path: server`, and `onSelectionComplete('server')` saves the selection
+(`saveSelectionBeforeLeaving`, nothing sent), sets `pendingEntryPoint`
+`confirm` and runs `startBackgroundHandoff` with whatever username this
+browser knows, possibly none (see "Handing over without signing in"). If the
+handover doesn't happen, the saved selection is offered again (see "A handoff
+that never reaches the worker unfreezes this browser").
+
+`BackgroundOffer` is now a small dialog around the same `ServerChoice`, for
+the mid-run (`scrobble_step`) and `resume` entry points; its consent copy
+("What you're agreeing to", "Not now") is gone, with the data and beta notes
+behind Details. The scrobble step's "Don't want to keep coming back? / Finish
+this in the background" alert is now a text button, **Scrobble the rest for
+me →**, and a stopped, auto-saved panel reads "Stopped. You can resume at any
+time, or have scrobblify scrobble the rest for you." with the offer as a link.
+Both follow `ScrobbleStep.canOfferBackground`, which takes the parent's
+`backgroundTrackLimit` (0 while a server job is listed) and needs the
+remaining plays between 750 and that limit, matching the parent's
+`canOfferBackground` (`remaining <= backgroundMaxTracks`). Before, the button
+showed while a job was listed and did nothing (#149), and a queue over the
+limit got the offer and a trip to Last.fm before the worker refused it as
+`too_large`. Its `role="button"` links answer Enter and Space.
+
+**The job limit stays at 60 days.** `MAX_TRACKS_PER_JOB` is
+`TRACKS_PER_DAY * 60` (42,000), the capacity probe's `maxTracks`.
+`worker/test/jobsize.test.ts` measures the worst-case upload (every play
+distinct, seeded 24/40/40-character names, all re-tagged) at about 80 KB per
+1,000 plays, so 89,000 would fit `MAX_JOB_COMPRESSED_BYTES` (8 MB) with 10%
+headroom, and briefly was the limit. It went back because other costs grow
+with job size and aren't bounded yet: a take-back's export exceeds Workers
+Free's 50 D1 queries past ~21,000 tracks left (#158), and settled batch rows
+can fill the main database (#159). Raise it once both are fixed.
+`ServerChoice` already warns ("That's more than 60 days of scrobbling…") when
+the count needs more than 60 days at 700 a day, which today's limit never
+allows (42,000 is exactly 60 days). The mock worker's `MAX_TRACKS` matches;
+its `maxTracks` option raises it for a test.
+
+**Handing over without signing in** (since 2026-11-21). The worker takes a
+handoff and a sign-in with no username and adopts the Last.fm account that
+authorises, at its callback:
+
+- `POST /scrobblify/handoff/preflight` takes `username` absent or empty (a
+  non-string is still `bad_request`); the client leaves it out when empty.
+  `reserveSlot` reserves a capacity slot as usual but skips the per-user check
+  and stores `username = ''`, `live_username = NULL`, so anonymous preflights
+  don't clash. `handleCallback` runs the per-user check there instead, on
+  `auth.getSession`'s normalised name and before the key is kept: if a job or
+  another handoff holds that `live_username`, the handoff fails as
+  `already_live` and the key is discarded, as on a mismatch. It then adopts
+  the name (`UPDATE … WHERE username = ''`; a unique-index clash is
+  `already_live` too) and checks jobs once more, since a sign-in could have
+  re-attached a parked job in between. A named handoff keeps its
+  `username_mismatch` check.
+- `POST /scrobblify/auth/signin` likewise takes no username (`u: ''` in the
+  signed state). Its callback signs in whoever authorised and
+  `reattachCredential`s only their own job; the nonce still ties the return to
+  the browser that asked. A named sign-in keeps its check.
+- Both success fragments add `user=` (Last.fm's spelling):
+  `#session=…&handoff=…&user=…` and `#session=…&nonce=…&user=…`.
+  `consumeRedirectFragment` returns `{ session, handoffId, user }` and
+  `consumeReauthFragment` `{ user } | null` (it was a boolean); `user` is
+  empty from older workers.
+- The browser remembers that name **without a session key**
+  (`rememberWorkerUser`: `setUserName` and `identifyUser`, only when it knew
+  no one), so Home can welcome them and the authority check can ask by name,
+  while the browser stays signed out of its own Last.fm application, as
+  `clearSessionKey()` leaves it. Always on a handoff return; on a worker
+  sign-in only for Home's lookup ("Signing in after choosing").
+- `?handoff=failed&reason=already_live` shows "You already have an import
+  running on Scrobblify." with the sign-in button relabelled **Sign in to see
+  it** (`reauthLabelText`). `reauthenticate` no longer needs a username (the
+  "Sign in to Last.fm first, then try again." notice is gone): an anonymous
+  worker sign-in shows the job.
+- **A replayed callback gets a session only with the same token** (#157).
+  Duplicate callbacks are routine (scanners, a second tab), so one for an
+  exchanged handoff answers with the winner's outcome, which the API turns
+  into a worker session. But the `state` is in the authorise URL, so whoever
+  preflighted holds it: anyone who got a victim to approve their link could
+  replay the callback with any token and get a session for the victim's
+  account, and an anonymous link works on whoever approves it.
+  `handleCallback` stores the SHA-256 of the token that claimed the exchange
+  (`exchange_token_hash`, migration `006`), and a replay succeeds only with
+  the same token; any other gets `?handoff=failed&reason=replay` and no
+  session. Rows claimed before the migration have no hash and fail closed.
+
+The mock worker adopts `testuser` (`MOCK_USER`, or its `username` option) for
+an anonymous preflight or sign-in and names it in the shim URL (`user=`, which
+the shim writes to `scrobblifyLfmUserName`). An anonymous preflight while a
+job is live gets a shim URL with `fail=already_live`, returning
+`?handoff=failed&reason=already_live` as the real callback would.
+
 **A handoff return is accepted only for a handoff this browser preflighted**
 (#157). `preflight` records the id in localStorage
 (`scrobblify.background.preflighted`) before the redirect, and
@@ -1071,7 +1227,8 @@ handover is starting in another tab…", then "…on hold", for good):
   worker session: `ownHandoffWasTaken` asks `/scrobblify/import/:id` about the
   saved queue. `known: false`, or `known: true, pending: true` (the worker
   still holds this very handoff, unapproved), withdraws and releases it the
-  same way and offers the saved selection again; any other `known: true`
+  same way and offers the saved selection again (on a reload,
+  `background_freeze_released` `reason: handoff_not_taken`); any other `known: true`
   blocks as a handed-over queue, with the worker sign-in; no answer changes
   nothing. Only for the browser's own preflighted freeze, and before the
   3-minute freshness rule, since the tab that set it is the one that came
@@ -1079,7 +1236,8 @@ handover is starting in another tab…", then "…on hold", for good):
   withdrawal goes unanswered: approving that handoff later gets a return this
   browser refuses, so the queue is never uploaded.
 - A handover from the confirm dialog that fails before leaving (full,
-  preflight failed, …) offers the saved selection again, so the next Scrobble
+  preflight failed, a halt or freeze failing: `startBackgroundHandoff`
+  resolves false) offers the saved selection again, so the next Scrobble
   asks Resume / Start over instead of refusing to replace "saved progress"
   that is the same selection with a fresh import id (#102's check).
 

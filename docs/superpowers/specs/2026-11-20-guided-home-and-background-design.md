@@ -129,14 +129,16 @@ for **only the one it needs**.
 | "Already scrobbling on scrobblify?" | Worker first; see 4.4 |
 | Scrobble the rest locally (move back) | Browser application, only if this browser has none; see 6.3 |
 
-**For now (Plan 2), every path signs in to the browser application.** Signing
-in to the worker application alone needs worker changes:
-`/scrobblify/handoff/preflight` and `/scrobblify/auth/signin` both require a
-username today and check Last.fm's answer against it, and before a browser
-sign-in there is no username to send. Worker-only sign-in therefore moves to
-Plan 3 with the server-choice dialog. Until then beta users sign in to the
-browser application and get today's background offer afterwards, and a
-browser that already has a session never sees a sign-in.
+**As built (Plan 3): the server path signs in to the worker application
+only.** `/scrobblify/handoff/preflight` and `/scrobblify/auth/signin` accept
+no username; the worker's callback adopts the account `auth.getSession`
+names, checks there that it has no live job (`already_live`), and names it in
+the return (`user=` in the fragment). The browser remembers that name without
+a session key, so it stays signed out of the browser application. The tab
+path ("scrobble locally", small or non-beta imports) signs in to the browser
+application as in Plan 2. Plan 2's note, kept for the record: every path
+signed in to the browser application, because both worker routes required a
+username and checked Last.fm's answer against it.
 
 ### 4.2 Surviving the redirect
 
@@ -171,6 +173,13 @@ On the server path the browser has no Last.fm key of its own, so the check reads
 duplicate check on that path; the read fails soft, as today, and the import
 proceeds with everything.
 
+**As built (Plan 3): the server path doesn't run the check for a signed-out
+user.** The queue is committed at preflight (its digest and count), before the
+worker's callback says who the user is, so there is no username to check with
+until it is too late to change the queue. Re-dated plays, the bulk of a
+server-sized import, are exempt from the check anyway. A signed-in user's
+queue was already checked during upload.
+
 ### 4.4 "Already scrobbling on scrobblify?"
 
 1. Sign in to the **worker** application.
@@ -185,11 +194,14 @@ A local-progress branch would be unreachable and is deliberately absent.
 All the existing resume guards stay: `restoreFromState` still refuses without a
 browser session key, and `scrobblePlay` still throws `NotAuthenticatedError`.
 
-**For now (Plan 2) this is a browser sign-in**, because a worker-only sign-in
-isn't possible yet (see 4.1): "Re-connect to last.fm" signs in to the browser
-application and lands on `/scrobble`, where the existing job banner (live job)
-or resume banner takes over. Steps 1–3 above, and the "Nothing to resume"
-screen, come with Plan 3.
+**As built (Plan 3): steps 1 and 3 are done; step 2 lands on today's job
+banner.** With a worker configured, "Re-connect to last.fm" signs in to the
+worker application without a username and lands on `/scrobble`: a job shows
+the existing job banner (the status page is Plan 4), saved progress the resume
+prompt, and otherwise the "Nothing to resume" banner. It emits
+`worker_lookup_started` and `worker_lookup_result` (`job`, `saved`, `nothing`
+or `failed`). When the worker's sign-in can't start, or no worker is
+configured, it falls back to Plan 2's browser sign-in (`reconnect`).
 
 ### 4.5 The server-authority check after the new sign-in
 
@@ -267,6 +279,28 @@ limits (section 7.1) decide whether the choice is offered at all.
 
 Existing `background_offer_shown` / `background_offer_declined` /
 `background_handoff_*` events stay. "Scrobble locally" counts as declined.
+
+### As built (Plan 3)
+
+- `ServerChoice.vue` holds the content; `ScrobbleConfirmDialog` shows it as a
+  `choice` stage titled "{n} plays", and `BackgroundOffer` is a small dialog
+  around it for the mid-run and resume entry points. The stage is chosen when
+  the dialog opens: saved progress first, and **Start over** goes on to the
+  choice when it would show.
+- The date note shows when any of the plays will be re-dated (the box ticked
+  and some plays older than 2 weeks), not merely because the box is ticked.
+- `background_offer_shown` / `background_offer_declined` carry `entry_point:
+  confirm` from the dialog, and `tracks_selected` carries `path` (`tab` or
+  `server`). The confirm dialog's decline always reports `all_re_tagged:
+  false` (#163, open).
+- Mid-run, "Scrobble the rest for me →" replaces the old alert, and the
+  stopped panel's saved hint links to the same offer. Every entry point is
+  offered only when the remaining plays are within the worker's limit
+  (`maxTracks`) and no server job is listed, which also fixes the dead button
+  of #149.
+- A handover from the confirm dialog that doesn't happen (server full,
+  preflight refused, Back from Last.fm, a refused callback) offers the saved
+  selection again rather than leaving it blocked (#160, #162, #164, #165).
 
 ## 6. Status page
 
@@ -357,6 +391,16 @@ measurement for 42,000 was about 5 MB, so this should land near 65,000. The
 
 The 60-day credential life is unchanged; jobs past it go to `needs_reauth` as
 today, and the client shows `choice.over60` up front.
+
+**As built (Plan 3): the limit is not raised.** `worker/test/jobsize.test.ts`
+measured the worst case at about 80 KB per 1,000 plays (7.15 MB for 89,000),
+so the blob store would hold 89,000 with 10% headroom. But other costs grow
+with job size and aren't bounded yet: a take-back's export exceeds Workers
+Free's 50 D1 queries past ~21,000 tracks left (#158), and settled batch rows
+can fill the main database (#159). `MAX_TRACKS_PER_JOB` stays
+`TRACKS_PER_DAY * 60` (42,000) until both are fixed; the measurement test
+stays, and `choice.over60` is in place for when it is raised (at 42,000 it
+can't show).
 
 ### 7.2 Reconnect resumes the job
 

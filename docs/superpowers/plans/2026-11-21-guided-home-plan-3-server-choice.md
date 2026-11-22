@@ -341,3 +341,17 @@ Behaviour:
 - [ ] `cd worker; npm test`; `$env:PORT=8644; npx playwright test`; `npx playwright test -c playwright.unreachable-worker.config.ts`; `npm run lint:check`; `npm run build`.
 - [ ] Real browser (Orca) against `$env:PORT=8650; npm run dev:mock:bg`: signed-out beta user, 800-play zip → choice → server → job banner, Home shows "Scrobbling to testuser"; "scrobble locally"; Already-scrobbling with and without a job.
 - [ ] Before/after screenshots of every changed screen (confirm dialog small/beta/over-60/details, mid-run link, offer dialog, nothing-to-resume, already-live notice) for the user.
+
+## As built
+
+Deviations from the tasks above, and what was added on the way:
+
+- **The job limit was not raised** (Task 3). `e02c008` set `MAX_TRACKS_PER_JOB` to the measured 89,000; `6d6237d` put it back to `TRACKS_PER_DAY * 60` (42,000), because a take-back's export (#158) and settled batch rows (#159) grow with job size and aren't bounded yet. `worker/test/jobsize.test.ts` stays, and the over-60-day warning is in `ServerChoice` for when the limit is raised (at 42,000 it can't show). Task 6's over-60 tests answer the capacity probe with a higher `maxTracks`, and a 43,000-play queue against the default limit gets no offer.
+- **Replay and return checks (#157):** `2e68af5` makes a replayed handoff callback get a session only with the token that won the exchange (`exchange_token_hash`, migration 006); `7704592` makes the client accept a handoff return only for the handoff it preflighted (`scrobblify.background.preflighted`, `background_handoff_return_rejected`).
+- **#149:** the mid-run offer is hidden while a server job is listed (`44ffa0b`), and every offer requires the remaining plays to fit the worker's `maxTracks` (`8611937`, which also makes the new `role="button"` links answer Space).
+- **A handover that doesn't happen leaves the selection usable** (`4511775`, #160): any `?handoff=failed` return, or coming back from Last.fm without approving, releases this browser's own freeze and re-offers the saved selection.
+- **`/import/:id` ignores jobless handoffs that ended** and answers `pending: true` for in-flight ones (`3e8fc76`, #162), with the `abandonedImport` record for an unconfirmed withdrawal.
+- **`POST /scrobblify/handoff/:id/abandon`** (`e84da93`, #164, #165): the client withdraws its own unapproved handoff before releasing the freeze and before the page-load authority check.
+- The anonymous handoff's `already_live` refusal shows "You already have an import running on Scrobblify." / "Sign in to see it", and the server sign-in no longer needs a Last.fm user.
+
+Filed and left open: #158, #159 (the job limit), #161 (older links ignore Space), #163 (`all_re_tagged` always false on the confirm dialog's decline), #166 (Back from Last.fm with a leftover worker session blocks for an hour), #167 (a job cancelled before its upload finished marks the queue handed over).

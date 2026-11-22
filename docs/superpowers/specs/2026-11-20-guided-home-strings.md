@@ -249,3 +249,27 @@ show when a signed-out "Start scrobbling" comes before the server check has
 answered. The existing sign-in banner line "Sign in to Last.fm first, then
 choose Resume." is now slightly off: after signing in from that banner the
 saved progress resumes by itself.
+
+## Added in Plan 3 (drafts)
+
+New or changed strings shipped with the server choice (PR 4). Placeholder
+copy; rewrite in place.
+
+| ID | When | Draft |
+| --- | --- | --- |
+| `notice.alreadyLive` | Back from a handover chosen signed out, and the Last.fm account that approved it already has an import on the server | You already have an import running on Scrobblify. |
+| `notice.alreadyLive.button` | Same; signs in to the server to show that import | Sign in to see it |
+| `choice.cancel` | Server choice in the "Scrobble N tracks?" dialog, closes it | Cancel |
+| `confirm.laterBackground` | "Scrobble N tracks?" without the choice, re-dated plays left for later days, and the rest would fit the server | You don't have to wait for it: choose "Scrobble the rest for me" when it stops, and Scrobblify's server will send them for you, even with this tab closed. |
+| `confirm.todayBackground` | Same dialog, more than today's share selected, and the rest would fit the server | You can then choose "Scrobble the rest for me" and Scrobblify's server will send the rest for you, even with this tab closed. |
+| `gate.background` | Large-history gate, the server could finish it | You don't have to come back each day, though: once today's share is sent, choose "Scrobble the rest for me" and Scrobblify's server will scrobble the rest for you, even with this tab closed. |
+
+The last three replace "Finish this in the background" with the new button's
+name; the rest of those sentences is unchanged. Reused: `choice.title` also
+titles the mid-run and resume offer dialog ("{count} plays", the plays left),
+and `signin.nothing.*` is the "Nothing to resume" banner as drafted. The
+stopped panel without the offer keeps today's "Your progress has been saved
+automatically — just come back to this page later and choose "Resume"."
+rather than `scrobble.savedHint`. No longer shown: `notice.reauthNeedsLastfm`
+(the server sign-in works without a Last.fm user now), and the old offer
+dialog's consent copy and "Not now".
