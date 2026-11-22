@@ -23,6 +23,8 @@
 //     is the route. The shim writes the same localStorage keys the fragment
 //     handler would and navigates back.
 
+const { MOCK_USER } = require('./lastfmMock');
+
 const DEFAULT_API_ORIGIN = 'http://localhost:8787';
 const DEFAULT_APP_ORIGIN = 'http://localhost:8080';
 
@@ -40,8 +42,9 @@ const CHUNK_TRACKS = 1000;
 // "Should finish within a day" — the status card would contradict the offer
 // dialog the user had just read.
 const WORKER_TRACKS_PER_DAY = 700;
-// `MAX_TRACKS_PER_JOB` in worker/src/handoff.ts: 60 days at the worker's pace.
-const MAX_TRACKS = WORKER_TRACKS_PER_DAY * 60;
+// `MAX_TRACKS_PER_JOB` in worker/src/handoff.ts (700 a day for 60 days). A test
+// can raise it with the `maxTracks` option.
+const MAX_TRACKS = 42000;
 
 const CORS = {
   // Safe as a wildcard: the session travels in an Authorization header, not a
@@ -54,6 +57,8 @@ const CORS = {
 
 /** States in which the worker has definitively stopped sending. */
 const TERMINAL = ['completed', 'failed', 'cancelled'];
+/** Handoff states that may still produce a job (`HandoffState` in worker/src/store.ts). */
+const IN_FLIGHT_HANDOFF = ['issued', 'exchanging'];
 /** States waiting on the user, which carry an inactivity deadline. */
 const PARKED = ['paused', 'needs_reauth', 'needs_attention', 'dormant'];
 /** States whose Last.fm key is gone, so only a reconnect can revive them. */
@@ -136,10 +141,33 @@ function syntheticTracks(count) {
  *
  * `location.replace` keeps it out of the back stack, so the user cannot reload
  * their way into re-authorising a handoff that is already done.
+ *
+ * `user` is the Last.fm account the real worker names in its fragment when
+ * the handoff or sign-in named none. It is remembered the way the app
+ * remembers a signed-out user (a name with no session key, as
+ * `LastFm.clearSessionKey` leaves it). `fail` stands in for a callback the
+ * real worker refuses: nothing is written and the app gets
+ * `?handoff=failed&reason=<fail>`.
  */
-function shimHtml(session, handoffId) {
+function shimHtml(session, handoffId, user = '', fail = '') {
+  if (fail) {
+    const failed = `/?handoff=failed&reason=${encodeURIComponent(fail)}#/scrobble`;
+    return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Mock Last.fm authorisation</title>
+<style>body{font:16px system-ui;margin:4rem auto;max-width:32rem;color:#222}</style></head>
+<body>
+<h1>Authorising&hellip;</h1>
+<p>Mock Last.fm approval failed. Returning to Scrobblify.</p>
+<script>
+  location.replace(${JSON.stringify(failed)});
+</script>
+</body></html>`;
+  }
   const setHandoff = handoffId
     ? `localStorage.setItem('scrobblify.background.handoff', ${JSON.stringify(handoffId)});`
+    : '';
+  const setUser = user
+    ? `localStorage.setItem('scrobblifyLfmUserName', ${JSON.stringify(user)});`
     : '';
   const back = handoffId
     ? `/?handoff=${encodeURIComponent(handoffId)}#/scrobble`
@@ -154,10 +182,23 @@ function shimHtml(session, handoffId) {
   try {
     localStorage.setItem('scrobblify.background.session', ${JSON.stringify(session)});
     ${setHandoff}
+    ${setUser}
   } catch (e) { /* the app reports the failure for us */ }
   location.replace(${JSON.stringify(back)});
 </script>
 </body></html>`;
+}
+
+/**
+ * Answers a shim URL the way both callers need, from its query.
+ */
+function shimFromQuery(searchParams) {
+  return shimHtml(
+    searchParams.get('session') || '',
+    searchParams.get('handoff') || '',
+    searchParams.get('user') || '',
+    searchParams.get('fail') || '',
+  );
 }
 
 /**
@@ -183,11 +224,17 @@ function createMockWorker(options = {}) {
   // localhost:8080 — the port the Playwright suite runs on.
   const appOrigin = options.appOrigin === undefined ? DEFAULT_APP_ORIGIN : options.appOrigin;
   const verbose = options.log !== false;
+  // The Last.fm account that "authorises" a handoff or sign-in that named
+  // none, as the real worker adopts it at the callback.
+  const lastFmUser = options.username || MOCK_USER;
 
   const world = {
     rate: options.rate || 40,
     tickSeconds: options.tickSeconds || 20,
     capacityAvailable: options.capacityAvailable !== false,
+    // A reason makes every handoff's authorisation fail with it, as a denial
+    // or a refused callback does (`?handoff=failed&reason=…`).
+    authoriseFail: options.authoriseFail || '',
     handoffs: new Map(),
     imports: new Map(),
     job: null,
@@ -287,7 +334,7 @@ function createMockWorker(options = {}) {
       used: isLive() ? 1 : 0,
       capacity: 50,
       minTracks: MIN_TRACKS,
-      maxTracks: MAX_TRACKS,
+      maxTracks: options.maxTracks || MAX_TRACKS,
       chunkTracks: CHUNK_TRACKS,
     });
   }
@@ -295,6 +342,26 @@ function createMockWorker(options = {}) {
   function handleImport(importId) {
     const rec = world.imports.get(importId);
     if (!rec) {
+      /*
+        The real worker also counts a jobless handoff still on its way
+        (preflighted, not yet authorised) and says it is only `pending`; one
+        that has failed never had the queue (#162). A named one holds the
+        user's `live_username`, so it reads as live.
+      */
+      const inFlight = [...world.handoffs.values()].reverse().find((h) => h.importId === importId
+        && !h.jobId && IN_FLIGHT_HANDOFF.includes(h.state || 'issued'));
+      if (inFlight) {
+        return json({
+          ok: true,
+          known: true,
+          live: !!inFlight.named,
+          state: inFlight.state || 'issued',
+          cursor: 0,
+          scrobbledCount: 0,
+          totalTracks: inFlight.trackCount,
+          pending: true,
+        });
+      }
       return json({
         ok: true, known: false, live: false, cursor: 0, scrobbledCount: 0, totalTracks: 0,
       });
@@ -316,13 +383,36 @@ function createMockWorker(options = {}) {
     if (Number(body.trackCount) < MIN_TRACKS) {
       return json({ ok: false, reason: 'too_small' }, 400);
     }
+    const named = String(body.username || '');
+    if (!named && isLive()) {
+      // The real worker only learns who an anonymous handoff belongs to at the
+      // callback, so it accepts the preflight and fails the return.
+      const refusedId = `h-${hex(16)}`;
+      world.handoffs.set(refusedId, {
+        state: 'issued',
+        named: false,
+        username: '',
+        trackCount: Number(body.trackCount) || 0,
+        importId: String(body.importId || ''),
+        chunksSeen: new Set(),
+        session: '',
+        jobId: '',
+      });
+      return json({
+        ok: true,
+        handoffId: refusedId,
+        authoriseUrl: `${appOrigin}/mock-auth?fail=already_live&handoff=${refusedId}`,
+      });
+    }
     if (isLive()) {
       return json({ ok: false, reason: 'already_running' }, 409);
     }
     const handoffId = `h-${hex(16)}`;
     const session = `s-${hex(24)}`;
     world.handoffs.set(handoffId, {
-      username: String(body.username || ''),
+      state: 'issued',
+      named: !!named,
+      username: named || lastFmUser,
       trackCount: Number(body.trackCount) || 0,
       importId: String(body.importId || ''),
       chunksSeen: new Set(),
@@ -332,11 +422,20 @@ function createMockWorker(options = {}) {
     if (verbose) {
       console.log(`[worker-mock] preflight: ${body.trackCount} tracks, handoff ${handoffId}`);
     }
+    if (world.authoriseFail) {
+      // Last.fm (or the callback) refuses this one: see `authorise`.
+      return json({
+        ok: true,
+        handoffId,
+        authoriseUrl: `${appOrigin}/mock-auth?handoff=${handoffId}&fail=${encodeURIComponent(world.authoriseFail)}`,
+      });
+    }
     // Points at the shim rather than Last.fm. See the header.
+    const adopted = named ? '' : `&user=${encodeURIComponent(lastFmUser)}`;
     return json({
       ok: true,
       handoffId,
-      authoriseUrl: `${appOrigin}/mock-auth?handoff=${handoffId}&session=${session}`,
+      authoriseUrl: `${appOrigin}/mock-auth?handoff=${handoffId}&session=${session}${adopted}`,
     });
   }
 
@@ -347,6 +446,7 @@ function createMockWorker(options = {}) {
     }
     if (!rec.jobId) {
       rec.jobId = `j-${hex(16)}`;
+      rec.state = 'active';
       world.job = {
         id: rec.jobId,
         username: rec.username,
@@ -462,10 +562,31 @@ function createMockWorker(options = {}) {
     }
 
     // Public, and deliberately so — this is the one ownership question a
-    // browser that has lost its session can still ask.
+    // browser that has lost its session can still ask. A named handoff on its
+    // way holds its user's `live_username` from preflight, as in the real
+    // worker, so an unapproved one reads as live until withdrawn (#164).
     if (path === '/scrobblify/job/live' && method === 'GET') {
-      const username = query.get('username') || '';
-      return json({ ok: true, live: isSending() && world.job.username === username });
+      const username = (query.get('username') || '').trim().toLowerCase();
+      const handoffLive = [...world.handoffs.values()].some((h) => h.named && !h.jobId
+        && IN_FLIGHT_HANDOFF.includes(h.state || 'issued')
+        && String(h.username).toLowerCase() === username);
+      return json({
+        ok: true,
+        live: (isSending() && String(world.job.username).toLowerCase() === username) || handoffLive,
+      });
+    }
+
+    // Public: the browser coming back without approving has no session. Only
+    // a handoff nobody has approved yet can be withdrawn.
+    const abandonMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/abandon$/);
+    if (abandonMatch && method === 'POST') {
+      const rec = world.handoffs.get(abandonMatch[1]);
+      const abandoned = !!rec && !rec.jobId && !rec.approved && (rec.state || 'issued') === 'issued';
+      if (abandoned) {
+        rec.state = 'failed';
+        rec.failureReason = 'abandoned';
+      }
+      return json({ ok: true, abandoned });
     }
 
     // Public for the same reason, plus the import id *is* the credential.
@@ -515,6 +636,9 @@ function createMockWorker(options = {}) {
     if (path === '/scrobblify/auth/signin' && method === 'POST') {
       const body = JSON.parse(bodyText || '{}');
       const nonce = encodeURIComponent(body.nonce || '');
+      // A sign-in that named nobody adopts whoever authorises, and the real
+      // worker names them in the return.
+      const adopted = body.username ? '' : `&user=${encodeURIComponent(lastFmUser)}`;
       // The real worker re-attaches in the sign-in *callback*; the shim has no
       // server side, so it happens here instead. Same outcome either way.
       const { job } = world;
@@ -523,7 +647,7 @@ function createMockWorker(options = {}) {
       }
       return json({
         ok: true,
-        authoriseUrl: `${appOrigin}/mock-auth?session=s-${hex(24)}&nonce=${nonce}`,
+        authoriseUrl: `${appOrigin}/mock-auth?session=s-${hex(24)}&nonce=${nonce}${adopted}`,
       });
     }
 
@@ -546,8 +670,30 @@ function createMockWorker(options = {}) {
     return json({ ok: false, reason: 'not_found' }, 404);
   }
 
+  /**
+   * The `/mock-auth` shim page for a URL's query, standing in for Last.fm and
+   * the worker's callback. A `fail` return fails the handoff it names, as the
+   * real callback does, so it no longer counts in `/import/:id`. An approval
+   * of a handoff that has already failed (withdrawn, say) is refused the way
+   * the real callback refuses it, and makes no job (#165); any other approval
+   * puts it past withdrawing.
+   */
+  function authorise(searchParams) {
+    const fail = searchParams.get('fail') || '';
+    const rec = world.handoffs.get(searchParams.get('handoff') || '');
+    if (!fail && rec && rec.state === 'failed') {
+      return shimHtml('', '', '', rec.failureReason === 'abandoned' ? 'abandoned' : 'exchange_failed');
+    }
+    if (fail && rec && !rec.jobId) {
+      rec.state = 'failed';
+    } else if (rec) {
+      rec.approved = true;
+    }
+    return shimFromQuery(searchParams);
+  }
+
   return {
-    world, handle, apiOrigin, appOrigin,
+    world, handle, authorise, apiOrigin, appOrigin,
   };
 }
 
@@ -586,7 +732,7 @@ async function interceptBackgroundWorker(page, options = {}) {
     await route.fulfill({
       status: 200,
       contentType: 'text/html; charset=utf-8',
-      body: shimHtml(url.searchParams.get('session') || '', url.searchParams.get('handoff') || ''),
+      body: mock.authorise(url.searchParams),
     });
   });
 
@@ -598,7 +744,9 @@ module.exports = {
   createMockWorker,
   setState,
   shimHtml,
+  shimFromQuery,
   MIN_TRACKS,
+  MAX_TRACKS,
   DEFAULT_API_ORIGIN,
   DEFAULT_APP_ORIGIN,
 };

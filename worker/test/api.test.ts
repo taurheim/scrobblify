@@ -320,9 +320,57 @@ async function main() {
     )).json();
     check('an in-flight handoff with no job yet is known and live',
       pending.known === true && pending.live === true, pending);
+    check('and says it is only on its way', pending.pending === true, pending);
 
     check('the id is the credential, so it says nothing about who owns it',
       pending.username === undefined && pending.jobId === undefined, Object.keys(pending));
+
+    /*
+      A handoff that ended without a job (Back on Last.fm's page, a denial, a
+      failed exchange, the reaper) never had the queue. Counting it blocked
+      the user's saved selection for good (#162).
+    */
+    for (const state of ['failed', 'reaped']) {
+      const id = `ended-${state}-import-0123456789`;
+      // eslint-disable-next-line no-await-in-loop
+      await sql.run(
+        `INSERT INTO handoffs (id, state, username, live_username, payload_digest,
+            track_count, chunk_count, declared_bytes, algorithm_version, import_id,
+            created_at, updated_at, expires_at)
+         VALUES (?, ?, 'other', NULL, 'd', 5000, 1, 10, ?, ?, ?, ?, ?)`,
+        [`h-${state}`, state, ALGORITHM_VERSION, id, NOW, NOW, NOW + 3600],
+      );
+      // eslint-disable-next-line no-await-in-loop
+      const ended: any = await (await handleRequest(env, req(`/scrobblify/import/${id}`))).json();
+      check(`a ${state} handoff that never got a job is not known`,
+        ended.known === false && ended.live === false, ended);
+    }
+
+    // Once a handoff has a job, the job answers: handed over, not pending.
+    const WITH_JOB = 'with-job-import-0123456789';
+    const handedJob = await seedJob(sql, blobs, 'third', { importId: WITH_JOB, total: 900 });
+    await sql.run(
+      `INSERT INTO handoffs (id, state, username, live_username, payload_digest,
+          track_count, chunk_count, declared_bytes, algorithm_version, import_id, job_id,
+          created_at, updated_at, expires_at)
+       VALUES ('h-job', 'active', 'third', NULL, 'd', 900, 1, 10, ?, ?, ?, ?, ?, ?)`,
+      [ALGORITHM_VERSION, WITH_JOB, handedJob, NOW, NOW, NOW + 3600],
+    );
+    const withJob: any = await (await handleRequest(env, req(`/scrobblify/import/${WITH_JOB}`))).json();
+    check('a handoff with a job is known', withJob.known === true, withJob);
+    check('and not pending', withJob.pending === undefined, withJob);
+
+    // A new attempt in flight for a queue a job already had is handed over too.
+    await sql.run(
+      `INSERT INTO handoffs (id, state, username, live_username, payload_digest,
+          track_count, chunk_count, declared_bytes, algorithm_version, import_id,
+          created_at, updated_at, expires_at)
+       VALUES ('h-again', 'issued', 'fourth', 'fourth', 'd', 900, 1, 10, ?, ?, ?, ?, ?)`,
+      [ALGORITHM_VERSION, WITH_JOB, NOW + 1, NOW + 1, NOW + 3600],
+    );
+    const reissued: any = await (await handleRequest(env, req(`/scrobblify/import/${WITH_JOB}`))).json();
+    check('an in-flight attempt for a queue a job had is not pending',
+      reissued.known === true && reissued.pending === undefined, reissued);
   }
 
   console.log('\n-- preflight --');
@@ -369,6 +417,156 @@ async function main() {
       method: 'POST', body: 'not json',
     }));
     check('malformed JSON is a 400, not a 500', badBody.status === 400);
+  }
+
+  console.log('\n-- preflight without a username --');
+  {
+    const sql = freshSql();
+    const env = makeEnv(sql, new MemoryBlobs(), {
+      getSession: async () => ({ sessionKey: 'sk', username: 'Listener Name' }),
+    });
+    const send = (extra: Record<string, unknown>) => handleRequest(env, req('/scrobblify/handoff/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000, ...extra,
+      }),
+    }));
+    const res = await send({});
+    const body: any = await res.json();
+    check('a preflight with no username is accepted', res.status === 200 && body.ok === true, body);
+    check('so is a blank one', (await send({ username: '' })).status === 200);
+    check('a username that is not a string is a 400', (await send({ username: 42 })).status === 400);
+
+    const state = new URL(new URL(body.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+    const cb = await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    );
+    const location = new URL(cb.headers.get('Location')!);
+    check('the callback succeeds', cb.status === 302
+      && location.searchParams.get('handoff') === 'ok', location.toString());
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    check('and tells the browser who signed in',
+      fragment.get('user') === 'Listener Name', location.hash);
+    check('with a session for that user',
+      (await handleRequest(env, req(`/scrobblify/handoff/${body.handoffId}`, {
+        token: fragment.get('session')!,
+      }))).status === 200);
+  }
+
+  console.log('\n-- a replayed callback gets a session only with the same token --');
+  for (const username of ['listener', undefined]) {
+    const label = username ? 'named' : 'anonymous';
+    const sql = freshSql();
+    const env = makeEnv(sql, new MemoryBlobs(), {
+      getSession: async () => ({ sessionKey: 'sk', username: 'Listener' }),
+    });
+    // eslint-disable-next-line no-await-in-loop
+    const pre: any = await (await handleRequest(env, req('/scrobblify/handoff/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        username, payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000,
+      }),
+    }))).json();
+    const state = new URL(new URL(pre.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+    const callback = async (token: string) => new URL((await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=${token}`),
+    )).headers.get('Location')!);
+
+    // eslint-disable-next-line no-await-in-loop
+    const first = await callback('tok');
+    check(`the first callback succeeds (${label})`, first.searchParams.get('handoff') === 'ok', first.toString());
+    // eslint-disable-next-line no-await-in-loop
+    const stolen = await callback('attacker-junk');
+    check(`a replay with another token is refused as a replay (${label})`,
+      stolen.searchParams.get('handoff') === 'failed'
+      && stolen.searchParams.get('reason') === 'replay', stolen.toString());
+    check(`and carries no session (${label})`, stolen.hash === '', stolen.hash);
+    // eslint-disable-next-line no-await-in-loop
+    const again = await callback('tok');
+    const fragment = new URLSearchParams(again.hash.slice(1));
+    check(`a replay with the same token still succeeds (${label})`,
+      again.searchParams.get('handoff') === 'ok'
+      && again.searchParams.get('job') === first.searchParams.get('job'), again.toString());
+    check(`with a working session (${label})`,
+      // eslint-disable-next-line no-await-in-loop
+      (await handleRequest(env, req(`/scrobblify/handoff/${pre.handoffId}`, {
+        token: fragment.get('session')!,
+      }))).status === 200);
+  }
+
+  console.log('\n-- abandoning a handoff nobody approved --');
+  {
+    const sql = freshSql();
+    let exchanges = 0;
+    const env = makeEnv(sql, new MemoryBlobs(), {
+      getSession: async () => {
+        exchanges += 1;
+        return { sessionKey: 'sk', username: 'Listener' };
+      },
+    });
+    const IMPORT = 'abandoned-import-0123456789';
+    const preflightFor = async () => (await handleRequest(env, req('/scrobblify/handoff/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: 'Listener', payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000,
+        importId: IMPORT,
+      }),
+    }))).json() as Promise<any>;
+    const isLive = async () => ((await (await handleRequest(
+      env, req('/scrobblify/job/live?username=listener'),
+    )).json()) as any).live;
+    const used = async () => ((await (await handleRequest(env, req('/scrobblify/capacity'))).json()) as any).used;
+    const abandon = (id: string) => handleRequest(env, req(`/scrobblify/handoff/${id}/abandon`, { method: 'POST' }));
+
+    const pre = await preflightFor();
+    check('before: the user reads as live', await isLive() === true);
+    check('before: the handoff holds a slot', await used() === 1);
+
+    const res = await abandon(pre.handoffId);
+    const body: any = await res.json();
+    check('abandon answers without a session', res.status === 200, res.status);
+    check('and says it was abandoned', body.ok === true && body.abandoned === true, body);
+    const row = await sql.first<any>('SELECT * FROM handoffs WHERE id = ?', [pre.handoffId]);
+    check('the handoff is failed as abandoned',
+      row.state === 'failed' && row.failure_reason === 'abandoned' && row.live_username === null, row);
+    check('the user no longer reads as live (#164)', await isLive() === false);
+    check('the slot is free again', await used() === 0);
+    const lookup: any = await (await handleRequest(env, req(`/scrobblify/import/${IMPORT}`))).json();
+    check('the queue is not known as handed over', lookup.known === false, lookup);
+
+    // Approving the same Last.fm page later (#165).
+    const state = new URL(new URL(pre.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+    const late = new URL((await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    )).headers.get('Location')!);
+    check('a later approval fails', late.searchParams.get('handoff') === 'failed'
+      && late.searchParams.get('reason') === 'abandoned', late.toString());
+    check('with no session', late.hash === '', late.hash);
+    check('without exchanging the token', exchanges === 0, exchanges);
+    check('and creates no job or credential', (await sql.all('SELECT id FROM jobs')).length === 0);
+    check('the queue is still not known', ((await (await handleRequest(
+      env, req(`/scrobblify/import/${IMPORT}`),
+    )).json()) as any).known === false);
+
+    check('abandoning it again says no',
+      ((await (await abandon(pre.handoffId)).json()) as any).abandoned === false);
+    const unknown = await abandon('no-such-handoff-0123456789');
+    check('an unknown id gets the same answer, not a 404',
+      unknown.status === 200 && ((await unknown.json()) as any).abandoned === false);
+
+    // An approved handoff is past withdrawing: it has a job and a credential.
+    const approved = await preflightFor();
+    const approvedState = new URL(new URL(approved.authoriseUrl).searchParams.get('cb')!)
+      .searchParams.get('state')!;
+    await handleRequest(env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(approvedState)}&token=tok`));
+    const refused: any = await (await abandon(approved.handoffId)).json();
+    check('a handoff with a job is not abandoned', refused.ok === true && refused.abandoned === false, refused);
+    const kept = await sql.first<any>('SELECT * FROM handoffs WHERE id = ?', [approved.handoffId]);
+    check('and is left as it was',
+      kept.state === 'pending_upload' && kept.job_id !== null && kept.live_username === 'listener', kept);
+    const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [kept.job_id]);
+    check('so is its job', job.state === 'pending' && job.session_key_ct !== null, job.state);
+    check('which still reads as live', await isLive() === true);
   }
 
   console.log('\n-- the import id survives preflight --');
@@ -1097,6 +1295,55 @@ async function main() {
       }))).status === 404);
     const preflightCors = await handleRequest(env, req('/scrobblify/job', { method: 'OPTIONS' }));
     check('preflight OPTIONS is answered without a token', preflightCors.status === 204);
+  }
+
+  console.log('\n-- a sign-in without a username --');
+  {
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs, {
+      getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'Listener' }),
+    });
+    await seedJob(sql, blobs, 'listener');
+    const nonce = 'nonce-that-is-long-enough';
+    const signin = (body: Record<string, unknown>) => handleRequest(env, req('/scrobblify/auth/signin', {
+      method: 'POST', body: JSON.stringify({ nonce, ...body }),
+    }));
+
+    const res = await signin({});
+    const body: any = await res.json();
+    check('a sign-in with no username is accepted',
+      res.status === 200 && typeof body.authoriseUrl === 'string', body);
+    check('so is a blank one', (await signin({ username: '  ' })).status === 200);
+    check('a username that is not a string is a 400', (await signin({ username: 7 })).status === 400);
+
+    const state = new URL(new URL(body.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+    const cb = await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
+    );
+    const location = new URL(cb.headers.get('Location')!);
+    check('the callback signs in whoever authorised', cb.status === 302
+      && location.searchParams.get('signin') === 'ok', location.toString());
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    check('the nonce comes back', fragment.get('nonce') === nonce, location.hash);
+    check('and so does the user, as Last.fm spells it', fragment.get('user') === 'Listener', location.hash);
+    const job = await handleRequest(env, req('/scrobblify/job', { token: fragment.get('session')! }));
+    const jobBody: any = await job.json();
+    check('the session reaches that user\'s job', job.status === 200 && !!jobBody.job, jobBody);
+
+    // A named sign-in keeps its check.
+    const named = await signHandoffState(
+      {
+        h: '', exp: NOW + 600, k: 'signin', u: 'someone-else', n: nonce,
+      },
+      SIGNING,
+    );
+    const refused = await handleRequest(
+      env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(named)}&token=tok`),
+    );
+    check('a named sign-in by another account still fails',
+      new URL(refused.headers.get('Location')!).searchParams.get('signin') === 'failed',
+      refused.headers.get('Location'));
   }
 
   console.log('\n-- signing in gives a re-auth job its credential back --');

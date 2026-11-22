@@ -373,6 +373,8 @@ export async function completeHandoff(
   stateManager: StateManager,
   handoffId: string,
   onProgress?: (uploaded: number, total: number) => void,
+  /** Who the queue went to when it names nobody: a handoff started signed out. */
+  fallbackUser = '',
 ): Promise<CompleteResult> {
   const state = await stateManager.loadState();
   if (!state) {
@@ -409,7 +411,7 @@ export async function completeHandoff(
     // can reconcile it against terminal job status rather than being blocked
     // by a flag nothing ever clears.
     api.setQueueOwner({ owner: 'server', id: outcome.jobId });
-    api.recordHandedOverImport(state.importId || '', state.userName || '', state.originalTotalTracks || 0);
+    api.recordHandedOverImport(state.importId || '', state.userName || fallbackUser, state.originalTotalTracks || 0);
     try {
       await stateManager.clearState();
     } catch (e) {
@@ -452,7 +454,7 @@ export async function completeHandoff(
     */
     const jobId = await api.jobIdForHandoff(handoffId);
     api.setQueueOwner({ owner: 'server', id: jobId });
-    api.recordHandedOverImport(state.importId || '', state.userName || '', state.originalTotalTracks || 0);
+    api.recordHandedOverImport(state.importId || '', state.userName || fallbackUser, state.originalTotalTracks || 0);
     try {
       await stateManager.clearState();
     } catch (e) {

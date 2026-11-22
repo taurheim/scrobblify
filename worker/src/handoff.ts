@@ -28,6 +28,7 @@ import {
   encryptCredential,
   normalizeUsername,
   randomId,
+  sha256Hex,
   signHandoffState,
   verifyHandoffState,
 } from './crypto';
@@ -61,6 +62,8 @@ export interface HandoffRow {
   algorithm_version: number;
   job_id: string | null;
   exchange_attempts: number;
+  /** SHA-256 of the Last.fm token that claimed the exchange; NULL before 006. */
+  exchange_token_hash: string | null;
   failure_reason: string | null;
   import_id: string | null;
   created_at: number;
@@ -69,6 +72,10 @@ export interface HandoffRow {
 }
 
 export interface PreflightRequest {
+  /**
+   * Empty when the browser chose the handover before signing in to Last.fm.
+   * The handoff then adopts whichever account authorises it at the callback.
+   */
   username: string;
   payloadDigest: string;
   trackCount: number;
@@ -95,10 +102,16 @@ export type PreflightResult =
 export const TRACKS_PER_DAY = importBudget(0);
 
 /**
- * At roughly TRACKS_PER_DAY, a job that cannot finish inside the credential's
- * 60-day life is guaranteed to be abandoned half-done. Refusing it up front is
- * kinder than accepting it — and this assumes no outages, no global pauses and
- * no daily-limit backoff, so it is already optimistic.
+ * The largest import one job accepts: what finishes inside the credential's
+ * 60-day life.
+ *
+ * The blob store would hold more. test/jobsize.test.ts measures the worst-case
+ * upload (every play distinct) at about 80 KB per 1,000 plays, so 89,000 fit
+ * `MAX_JOB_COMPRESSED_BYTES` with 10% headroom. The limit stays here because
+ * other costs grow with job size and are not bounded yet: a take-back's export
+ * exceeds Workers Free's 50 D1 queries past ~21,000 tracks left (#158), and
+ * settled batch rows fill the main database (#159). Raise it once both are
+ * fixed; the client already warns about imports longer than 60 days.
  */
 export const MAX_TRACKS_PER_JOB = TRACKS_PER_DAY * 60;
 
@@ -164,10 +177,27 @@ export async function preflight(
 }
 
 export type CallbackResult =
-  | { ok: true; handoffId: string; jobId: string; alreadyDone: boolean }
+  | {
+    ok: true;
+    handoffId: string;
+    jobId: string;
+    alreadyDone: boolean;
+    /** The account the job writes to: Last.fm's spelling when just exchanged. */
+    username: string;
+  }
   | {
     ok: false;
-    reason: 'bad_state' | 'unknown' | 'expired' | 'username_mismatch' | 'exchange_failed';
+    reason:
+      | 'bad_state'
+      | 'unknown'
+      | 'expired'
+      | 'username_mismatch'
+      | 'already_live'
+      | 'exchange_failed'
+      /** The browser that preflighted it withdrew it (`abandonHandoff`). */
+      | 'abandoned'
+      /** A replay of an exchanged handoff with a token other than the winner's. */
+      | 'replay';
   };
 
 /**
@@ -179,7 +209,9 @@ export type CallbackResult =
  * credential controls. If it disagrees with the username recorded at preflight
  * — a user logged into a second account in another tab, or an attacker landing
  * their own callback — we would write one person's listening history into
- * someone else's account. The key is discarded and the handoff failed.
+ * someone else's account. The key is discarded and the handoff failed. A
+ * handoff preflighted without a username has nothing to disagree with; it
+ * adopts the account Last.fm names, unless that account already has a job.
  *
  * **Credential and owner are written together.** The encrypted session key is
  * inserted in the same batch as the job row that owns it. Writing the
@@ -209,32 +241,45 @@ export async function handleCallback(
   // A replayed callback must return the winner's outcome rather than calling
   // auth.getSession a second time: the token is single-use and the second call
   // would fail, turning a successful handoff into a reported error.
+  //
+  // But only to the same return. The state is in the authorise URL, so whoever
+  // preflighted holds it, and the API answers this outcome with a session for
+  // the handoff's account. A link the victim approved would otherwise give its
+  // author that session for the price of any token (#157). Genuine duplicates
+  // carry the token Last.fm sent, so they still get through.
+  const tokenHash = await sha256Hex(new TextEncoder().encode(params.token));
   if (handoff.state !== 'issued') {
     if (handoff.job_id) {
-      return { ok: true, handoffId: handoff.id, jobId: handoff.job_id, alreadyDone: true };
+      return replayOutcome(handoff, tokenHash);
     }
-    return { ok: false, reason: handoff.state === 'failed' ? 'exchange_failed' : 'bad_state' };
+    // A failed handoff never becomes a job, whoever approves it later (#165).
+    if (handoff.state === 'failed') {
+      return { ok: false, reason: handoff.failure_reason === 'abandoned' ? 'abandoned' : 'exchange_failed' };
+    }
+    return { ok: false, reason: 'bad_state' };
   }
   if (handoff.expires_at <= nowSec) {
     await failHandoff(sql, handoff.id, 'expired', nowSec);
     return { ok: false, reason: 'expired' };
   }
 
-  // Claim the exchange. The loser of this CAS must not proceed.
+  // Claim the exchange, recording which token claimed it. The loser of this
+  // CAS must not proceed.
   const claimed = await transitionHandoff(
     sql,
     handoff.id,
     'issued',
     'exchanging',
     nowSec,
-    'exchange_attempts = exchange_attempts + 1',
+    'exchange_attempts = exchange_attempts + 1, exchange_token_hash = ?',
+    [tokenHash],
   );
   if (!claimed) {
     const current = await sql.first<HandoffRow>('SELECT * FROM handoffs WHERE id = ?', [
       handoff.id,
     ]);
     if (current && current.job_id) {
-      return { ok: true, handoffId: current.id, jobId: current.job_id, alreadyDone: true };
+      return replayOutcome(current, tokenHash);
     }
     return { ok: false, reason: 'bad_state' };
   }
@@ -251,7 +296,67 @@ export async function handleCallback(
     return { ok: false, reason: 'exchange_failed' };
   }
 
-  if (normalizeUsername(session.username) !== normalizeUsername(handoff.username)) {
+  let username = handoff.username;
+  if (handoff.username === '') {
+    /*
+      An anonymous handoff: the browser chose the handover before signing in,
+      so it had no username to commit to and preflight could not refuse a user
+      who already has a job running. Last.fm's answer is the only identity
+      there is, so the per-user check happens here instead — before the key is
+      kept — and a user who already holds the account slot is refused exactly
+      as a second tab would have been at preflight. The key is discarded, as
+      on a mismatch.
+
+      The unique index on `live_username` is still the real arbiter: two
+      anonymous handoffs exchanging for the same account at once both pass
+      the read, and the loser's UPDATE throws.
+    */
+    username = normalizeUsername(session.username);
+    if (!username) {
+      // Nothing to adopt; never store a key against no account.
+      await failHandoff(sql, handoff.id, 'exchange_failed', nowSec);
+      return { ok: false, reason: 'exchange_failed' };
+    }
+    const held = await sql.first<{ n: number }>(
+      `SELECT 1 AS n FROM jobs WHERE live_username = ?
+        UNION ALL
+       SELECT 1 AS n FROM handoffs WHERE live_username = ?
+        LIMIT 1`,
+      [username, username],
+    );
+    if (held) {
+      await failHandoff(sql, handoff.id, 'already_live', nowSec);
+      return { ok: false, reason: 'already_live' };
+    }
+    let adopted: { changes: number };
+    try {
+      adopted = await sql.run(
+        `UPDATE handoffs SET username = ?, live_username = ?
+          WHERE id = ? AND state = 'exchanging' AND username = ''`,
+        [username, username, handoff.id],
+      );
+    } catch {
+      await failHandoff(sql, handoff.id, 'already_live', nowSec);
+      return { ok: false, reason: 'already_live' };
+    }
+    if (adopted.changes === 0) {
+      return { ok: false, reason: 'bad_state' };
+    }
+    /*
+      Checked again now the handoff holds the name. Between the read above and
+      the UPDATE, a sign-in could have re-attached a parked job to this
+      account; it defers to a handoff holding the name, so from here on
+      nothing else can take it.
+    */
+    const jobHeld = await sql.first<{ n: number }>(
+      'SELECT 1 AS n FROM jobs WHERE live_username = ? LIMIT 1',
+      [username],
+    );
+    if (jobHeld) {
+      await failHandoff(sql, handoff.id, 'already_live', nowSec);
+      return { ok: false, reason: 'already_live' };
+    }
+  } else if (normalizeUsername(session.username) !== normalizeUsername(handoff.username)) {
     // Discard the key. It is a working credential for an account that did not
     // ask for this, and it must not be persisted even momentarily.
     await failHandoff(sql, handoff.id, 'username_mismatch', nowSec);
@@ -273,8 +378,8 @@ export async function handleCallback(
               ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?, 1, ?, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
       params: [
         jobId,
-        handoff.username,
-        handoff.username,
+        username,
+        username,
         encrypted.ciphertext,
         encrypted.iv,
         handoff.algorithm_version,
@@ -296,7 +401,28 @@ export async function handleCallback(
     },
   ]);
 
-  return { ok: true, handoffId: handoff.id, jobId, alreadyDone: false };
+  return {
+    ok: true, handoffId: handoff.id, jobId, alreadyDone: false, username: session.username,
+  };
+}
+
+/**
+ * The winner's outcome for a replayed callback, if it presented the winner's
+ * token.
+ *
+ * A row claimed before `exchange_token_hash` existed has no hash to compare
+ * against, so it fails closed: its user signs in again rather than anyone
+ * being handed a session on the strength of the state alone. Each callback
+ * hashes a single-use token once, so comparing digests leaks nothing a timing
+ * attack could use.
+ */
+function replayOutcome(handoff: HandoffRow, tokenHash: string): CallbackResult {
+  if (!handoff.job_id || !handoff.exchange_token_hash || handoff.exchange_token_hash !== tokenHash) {
+    return { ok: false, reason: 'replay' };
+  }
+  return {
+    ok: true, handoffId: handoff.id, jobId: handoff.job_id, alreadyDone: true, username: handoff.username,
+  };
 }
 
 /**
@@ -335,6 +461,29 @@ export async function failHandoff(
     });
   }
   await sql.batch(statements);
+}
+
+/**
+ * Withdraws a handoff nobody approved: the browser that preflighted it came
+ * back from Last.fm without authorising (Back, a closed tab, a denial).
+ *
+ * Until then it sat in `issued` for `HANDOFF_TTL_SECONDS`, holding the user's
+ * `live_username` (so `/job/live` said they had something running, #164) and a
+ * capacity slot, and approving that Last.fm page later still made a job for a
+ * queue the browser had taken back (#165).
+ *
+ * A compare-and-set from `issued` only. Anything later has been approved and
+ * may hold a credential or a job, which is `failHandoff`'s and the reaper's to
+ * end. An `issued` row never has a job: the job is created in the same batch
+ * that moves `exchanging` to `pending_upload`. Moving to `failed` clears
+ * `live_username`, which frees the slot and the per-user lock, and
+ * `handleCallback` refuses a failed handoff.
+ *
+ * Returns whether it was withdrawn; false for an unknown id or any state but
+ * `issued`.
+ */
+export async function abandonHandoff(sql: Sql, handoffId: string, nowSec: number): Promise<boolean> {
+  return transitionHandoff(sql, handoffId, 'issued', 'failed', nowSec, 'failure_reason = ?', ['abandoned']);
 }
 
 export type FinalizeResult =

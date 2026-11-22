@@ -124,7 +124,11 @@ export interface HandoffState {
    * existed still verify and still mean "handoff".
    */
   k?: 'signin';
-  /** Username the signin state was requested for. Only set when `k` is set. */
+  /**
+   * Username the signin state was requested for. Only set when `k` is set;
+   * empty when the browser had none to name, and the callback then adopts
+   * whichever account authorised.
+   */
   u?: string;
   /**
    * Nonce echoed back to the initiating browser, which compares it against the

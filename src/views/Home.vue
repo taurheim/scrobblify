@@ -35,7 +35,9 @@
       </div>
       <p class="home-already">
         Already scrobbling on scrobblify?
-        <button type="button" class="link-button" @click="go('resume')">Re-connect to last.fm</button>
+        <button type="button" class="link-button" :disabled="lookingUp" @click="go('resume')">
+          Re-connect to last.fm
+        </button>
       </p>
     </template>
   </div>
@@ -91,6 +93,9 @@ import {
 } from '@/services/ReturningVisitor';
 import { resetUser, trackEvent } from '@/services/Analytics';
 import { setSignInIntent, startSignIn } from '@/services/SignInIntent';
+import {
+  isBackgroundConfigured, setWorkerLookup, startReauth,
+} from '@/services/BackgroundScrobbling';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
 
@@ -121,13 +126,30 @@ export default defineComponent({
       dismissedReturning: false,
       returning: { kind: 'none' } as ReturningState,
       stateManager: markRaw(new StateManager()),
+      /** "Re-connect" is asking the worker for its sign-in link. */
+      lookingUp: false,
+      onPageShow: null as ((event: PageTransitionEvent) => void) | null,
     };
   },
   async mounted() {
+    // A lookup only ever starts here, so one still flagged is from a trip to
+    // Last.fm the user came back from without finishing.
+    setWorkerLookup(false);
+    // Pressing Back on Last.fm can restore this page as it was left.
+    this.onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        this.lookingUp = false;
+        setWorkerLookup(false);
+      }
+    };
+    window.addEventListener('pageshow', this.onPageShow);
     this.dismissedReturning = readDismissed();
     await this.refreshReturning();
   },
   beforeUnmount() {
+    if (this.onPageShow) {
+      window.removeEventListener('pageshow', this.onPageShow);
+    }
     this.$store.commit('setShowingServerJob', false);
   },
   methods: {
@@ -154,12 +176,29 @@ export default defineComponent({
         this.ready = true;
       }
     },
-    go(choice: HomeChoice) {
+    async go(choice: HomeChoice) {
+      if (this.lookingUp) {
+        return;
+      }
       trackEvent('home_choice', { choice });
       const api = this.$store.state.lfmApi as LastFm;
       // "Re-connect to last.fm" signs in first; /scrobble's job or resume
       // banner takes it from there.
       if (choice === 'resume' && !api.isAuthenticated()) {
+        // With a worker, signing in to it says whether it holds an import for
+        // this account, without the browser's own Last.fm sign-in.
+        if (isBackgroundConfigured()) {
+          this.lookingUp = true;
+          setWorkerLookup(true);
+          const url = await startReauth('');
+          if (url) {
+            trackEvent('worker_lookup_started');
+            window.location.href = url;
+            return;
+          }
+          setWorkerLookup(false);
+          this.lookingUp = false;
+        }
         startSignIn(api, { kind: 'reconnect' });
         return;
       }

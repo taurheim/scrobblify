@@ -42,8 +42,9 @@ export const MAX_COMPRESSED_BYTES = 1_000_000;
  * This is what bounds the blob database. Every non-terminal job holds a
  * capacity slot (`SLOT_CONSUMING_STATES`) and terminal ones are swept, so
  * storage never exceeds `max_concurrent_jobs` (50) times this: 400 MB against
- * D1's 500 MB. The largest accepted job, `MAX_TRACKS_PER_JOB` with every play
- * distinct, measured at about 5 MB.
+ * D1's 500 MB. The largest accepted job, `MAX_TRACKS_PER_JOB` (42,000) with
+ * every play distinct, measures about 3.4 MB (test/jobsize.test.ts); 89,000
+ * would fit with 10% headroom, but see `MAX_TRACKS_PER_JOB` for why it stays.
  */
 export const MAX_JOB_COMPRESSED_BYTES = 8_000_000;
 

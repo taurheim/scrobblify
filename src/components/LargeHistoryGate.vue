@@ -20,7 +20,7 @@
             Scrobblify sends up to {{ dailyBudget.toLocaleString() }} a day.
             <template v-if="canFinishInBackground">
               You don't have to come back each day, though: once today's share is sent, choose
-              "Finish this in the background" and Scrobblify's server will scrobble the rest for
+              "Scrobble the rest for me" and Scrobblify's server will scrobble the rest for
               you, even with this tab closed.
             </template>
             <template v-else>

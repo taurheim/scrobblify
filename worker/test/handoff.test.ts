@@ -11,6 +11,7 @@ import {
   handleCallback,
   finalize,
   failHandoff,
+  abandonHandoff,
   reapExpiredHandoffs,
   MAX_TRACKS_PER_JOB,
 } from '../src/handoff';
@@ -202,6 +203,7 @@ async function main() {
     db3, lastfm as any, { state: p3.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
   );
   check('exchange succeeds', cb.ok);
+  check('the result names the Last.fm user', (cb as any).username === 'Alice', cb);
   check('case difference in username is tolerated', cb.ok);
   const job = await db3.first<any>('SELECT * FROM jobs WHERE id = ?', [(cb as any).jobId]);
   check('job created in pending, not active', job.state === 'pending');
@@ -230,6 +232,82 @@ async function main() {
   check('replay returns the same job', (replay as any).jobId === (cb as any).jobId);
   const jobCount = await db3.all('SELECT id FROM jobs');
   check('replay did not create a second job', jobCount.length === 1, jobCount.length);
+
+  /*
+    The state is in the authorise URL, so whoever preflighted holds it. Once
+    the victim has approved, a replay with any token used to be answered with
+    the victim's job, and the API turned that into a session for their account.
+  */
+  console.log('\n-- callback: a replay with a different token --');
+  const handoffBefore = await db3.first<any>('SELECT * FROM handoffs WHERE id = ?', [p3.handoffId]);
+  const jobBefore = await db3.first<any>('SELECT * FROM jobs WHERE id = ?', [(cb as any).jobId]);
+  const stolen = await handleCallback(
+    db3, lastfm as any, { state: p3.state, token: 'attacker-junk' }, SIGNING_KEY, CRED_KEY, NOW + 5,
+  );
+  check('is refused as a replay', !stolen.ok && (stolen as any).reason === 'replay', stolen);
+  check('and does not call auth.getSession', lastfm.getSessionCalls === 1, lastfm.getSessionCalls);
+  check('and changes nothing on the handoff',
+    JSON.stringify(await db3.first<any>('SELECT * FROM handoffs WHERE id = ?', [p3.handoffId]))
+      === JSON.stringify(handoffBefore));
+  check('or on the job',
+    JSON.stringify(await db3.first<any>('SELECT * FROM jobs WHERE id = ?', [(cb as any).jobId]))
+      === JSON.stringify(jobBefore));
+  const sameAgain = await handleCallback(
+    db3, lastfm as any, { state: p3.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW + 5,
+  );
+  check('the real token still gets the winner outcome afterwards',
+    sameAgain.ok && sameAgain.alreadyDone && sameAgain.jobId === (cb as any).jobId, sameAgain);
+  check('the token is stored hashed, not in the clear',
+    handoffBefore.exchange_token_hash === await sha256Hex(new TextEncoder().encode('tok'))
+      && !JSON.stringify(handoffBefore).includes('"tok"'), handoffBefore.exchange_token_hash);
+
+  /*
+    Rows claimed before the hash column existed have nothing to compare a
+    token against. They fail closed: their user signs in again instead.
+  */
+  console.log('\n-- callback: a replay of a row with no stored hash --');
+  await db3.run('UPDATE handoffs SET exchange_token_hash = NULL WHERE id = ?', [p3.handoffId]);
+  const legacy = await handleCallback(
+    db3, lastfm as any, { state: p3.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW + 5,
+  );
+  check('fails closed even with the right token',
+    !legacy.ok && (legacy as any).reason === 'replay', legacy);
+
+  /*
+    The other replay path: a duplicate that read the row while it was still
+    `issued` and lost the claim to the winner.
+  */
+  console.log('\n-- callback: a replay that loses the claim --');
+  for (const [label, token, expectOk] of [
+    ['with the same token', 'tok', true],
+    ['with a different token', 'attacker-junk', false],
+  ] as const) {
+    const raceDb = freshDb();
+    const pc = await preflight(raceDb, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
+    const racingLastFm = new FakeLastFm('alice');
+    const origRun = raceDb.run.bind(raceDb);
+    let winner: any = null;
+    raceDb.run = async (query: string, params: unknown[] = []) => {
+      if (!winner && query.includes('SET state = ?, updated_at = ?') && params[0] === 'exchanging') {
+        raceDb.run = origRun;
+        winner = await handleCallback(
+          raceDb, racingLastFm as any, { state: pc.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+        );
+      }
+      return origRun(query, params);
+    };
+    // eslint-disable-next-line no-await-in-loop
+    const loser = await handleCallback(
+      raceDb, racingLastFm as any, { state: pc.state, token }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check(`the winner exchanged (${label})`, winner?.ok && !winner.alreadyDone, winner);
+    check(`the loser ${label} ${expectOk ? 'gets the winner outcome' : 'is refused as a replay'}`,
+      expectOk
+        ? loser.ok && loser.alreadyDone && loser.jobId === winner.jobId
+        : !loser.ok && (loser as any).reason === 'replay',
+      loser);
+    check(`only the winner exchanged (${label})`, racingLastFm.getSessionCalls === 1);
+  }
 
   console.log('\n-- callback: rejections --');
   const db4 = freshDb();
@@ -261,6 +339,46 @@ async function main() {
   hrow = await db5.first<any>('SELECT * FROM handoffs WHERE id = ?', [p5.handoffId]);
   check('failed exchange releases the slot', hrow.live_username === null);
   check('failed exchange is not left mid-flight', hrow.state === 'failed');
+
+  console.log('\n-- abandon: a handoff nobody approved --');
+  {
+    const db = freshDb();
+    const p = await preflight(db, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
+    check('an issued handoff is abandoned', await abandonHandoff(db, p.handoffId, NOW + 5) === true);
+    const row = await db.first<any>('SELECT * FROM handoffs WHERE id = ?', [p.handoffId]);
+    check('it is failed as abandoned',
+      row.state === 'failed' && row.failure_reason === 'abandoned', row);
+    check('and holds no account lock', row.live_username === null, row.live_username);
+    check('a second abandon changes nothing', await abandonHandoff(db, p.handoffId, NOW + 6) === false);
+
+    // Approving the same Last.fm page afterwards (#165).
+    const lastfm = new FakeLastFm('alice');
+    const late = await handleCallback(
+      db, lastfm as any, { state: p.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW + 10,
+    );
+    check('a later approval is refused', !late.ok && (late as any).reason === 'abandoned', late);
+    check('without exchanging the token', lastfm.getSessionCalls === 0, lastfm.getSessionCalls);
+    check('and creates no job, so no credential', (await db.all('SELECT id FROM jobs')).length === 0);
+
+    const again = await preflight(db, req('alice'), SIGNING_KEY, CALLBACK, NOW + 20);
+    check('the user can hand over again at once', again.ok, again);
+
+    // Once approved, only the reaper or a failure may end it.
+    const db2 = freshDb();
+    const p2 = await preflight(db2, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
+    const cb2 = await handleCallback(
+      db2, new FakeLastFm('alice') as any, { state: p2.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    ) as any;
+    check('a handoff with a job is not abandoned', await abandonHandoff(db2, p2.handoffId, NOW) === false);
+    const kept = await db2.first<any>('SELECT * FROM handoffs WHERE id = ?', [p2.handoffId]);
+    const keptJob = await db2.first<any>('SELECT * FROM jobs WHERE id = ?', [cb2.jobId]);
+    check('it is left as it was',
+      kept.state === 'pending_upload' && kept.live_username === 'alice' && kept.failure_reason === null, kept);
+    check('and so is its job',
+      keptJob.state === 'pending' && keptJob.session_key_ct !== null, keptJob.state);
+
+    check('an unknown id is not abandoned', await abandonHandoff(db2, 'no-such-handoff', NOW) === false);
+  }
 
   console.log('\n-- finalize --');
   const db6 = freshDb();
@@ -340,6 +458,118 @@ async function main() {
   const survivor = await db8.first<any>('SELECT * FROM jobs WHERE id = ?', [cb8.jobId]);
   check('a late reaper cannot kill an active job', survivor.state === 'active', survivor.state);
   check('a late reaper cannot destroy a live credential', survivor.session_key_ct !== null);
+
+  console.log('\n-- a handoff without a username --');
+  {
+    /*
+      The handover is chosen before the browser has signed in to Last.fm, so
+      it may have no username to commit to. The slot is reserved all the same,
+      and the account is whichever one Last.fm says authorised.
+    */
+    const anon = freshDb();
+    const a1 = await preflight(anon, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    check('an anonymous preflight succeeds', a1.ok, a1);
+    const row = await anon.first<any>('SELECT * FROM handoffs WHERE id = ?', [a1.handoffId]);
+    check('its row has no username yet', row.username === '', row.username);
+    check('and holds no account lock', row.live_username === null, row.live_username);
+    const a2 = await preflight(anon, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    check('a second anonymous preflight is not refused as already live', a2.ok, a2);
+
+    const full = freshDb();
+    await full.run('UPDATE control SET max_concurrent_jobs = 1 WHERE id = 1');
+    await preflight(full, req('alice'), SIGNING_KEY, CALLBACK, NOW);
+    const refused = await preflight(full, req(''), SIGNING_KEY, CALLBACK, NOW);
+    check('an anonymous preflight still respects capacity',
+      !refused.ok && (refused as any).reason === 'at_capacity', refused);
+
+    const adopt = freshDb();
+    const p = await preflight(adopt, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    const cbAnon = await handleCallback(
+      adopt, new FakeLastFm('Alice') as any,
+      { state: p.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    ) as any;
+    check('the callback succeeds', cbAnon.ok, cbAnon);
+    check('and reports Last.fm\'s spelling of the user', cbAnon.username === 'Alice', cbAnon);
+    const adopted = await adopt.first<any>('SELECT * FROM handoffs WHERE id = ?', [p.handoffId]);
+    check('the handoff adopts the Last.fm user',
+      adopted.username === 'alice' && adopted.live_username === 'alice', adopted);
+    const adoptedJob = await adopt.first<any>('SELECT * FROM jobs WHERE id = ?', [cbAnon.jobId]);
+    check('and so does its job',
+      adoptedJob.username === 'alice' && adoptedJob.live_username === 'alice', adoptedJob);
+    const replayAnon = await handleCallback(
+      adopt, new FakeLastFm('Alice') as any,
+      { state: p.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    ) as any;
+    check('a replay reports the adopted user',
+      replayAnon.ok && replayAnon.alreadyDone && replayAnon.username === 'alice', replayAnon);
+    // One anonymous link works on anyone who clicks it, so this is the case
+    // the token check matters most for.
+    const stolenAnon = await handleCallback(
+      adopt, new FakeLastFm('mallory') as any,
+      { state: p.state, token: 'attacker-junk' }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check('a replay with a different token is refused',
+      !stolenAnon.ok && (stolenAnon as any).reason === 'replay', stolenAnon);
+
+    // The per-user check could not run at preflight, so it runs here.
+    const busy = freshDb();
+    const live = await preflight(busy, req('alice', 10), SIGNING_KEY, CALLBACK, NOW) as any;
+    const liveCb = await handleCallback(
+      busy, new FakeLastFm('alice') as any,
+      { state: live.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    ) as any;
+    const pb = await preflight(busy, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    const second = await handleCallback(
+      busy, new FakeLastFm('ALICE') as any,
+      { state: pb.state, token: 'tok2' }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check('a user who already has a job is refused',
+      !second.ok && (second as any).reason === 'already_live', second);
+    const failedRow = await busy.first<any>('SELECT * FROM handoffs WHERE id = ?', [pb.handoffId]);
+    check('that handoff is failed',
+      failedRow.state === 'failed' && failedRow.failure_reason === 'already_live', failedRow);
+    check('and holds no lock', failedRow.live_username === null && failedRow.job_id === null, failedRow);
+    const jobs = await busy.all<any>('SELECT id FROM jobs');
+    check('no second job is created', jobs.length === 1 && jobs[0].id === liveCb.jobId, jobs);
+    const keys = await busy.all<any>('SELECT id FROM jobs WHERE session_key_ct IS NOT NULL');
+    check('and no second credential is stored', keys.length === 1, keys);
+
+    // A sign-in re-attaching a parked job between the check and the adoption.
+    const raceDb = new DatabaseSync(':memory:');
+    raceDb.exec(schemaSql());
+    const racing = new NodeSql(raceDb);
+    const pr = await preflight(racing, req(''), SIGNING_KEY, CALLBACK, NOW) as any;
+    const origRun = racing.run.bind(racing);
+    racing.run = async (query: string, params: unknown[] = []) => {
+      if (query.includes('SET username = ?, live_username = ?')) {
+        raceDb.prepare(
+          `INSERT INTO jobs (id, username, live_username, state, algorithm_version, total_tracks,
+              created_at, updated_at, credential_expires_at)
+           VALUES ('reattached', 'alice', 'alice', 'paused', 1, 10, ?, ?, ?)`,
+        ).run(NOW, NOW, NOW + 86400);
+      }
+      return origRun(query, params);
+    };
+    const raced = await handleCallback(
+      racing, new FakeLastFm('alice') as any,
+      { state: pr.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check('a job that takes the account mid-adoption still refuses the handoff',
+      !raced.ok && (raced as any).reason === 'already_live', raced);
+    const racedRow = await racing.first<any>('SELECT * FROM handoffs WHERE id = ?', [pr.handoffId]);
+    check('and the handoff is not left mid-flight',
+      racedRow.state === 'failed' && racedRow.live_username === null, racedRow);
+
+    // A named handoff keeps its own check.
+    const named = freshDb();
+    const pn = await preflight(named, req('alice'), SIGNING_KEY, CALLBACK, NOW) as any;
+    const wrong = await handleCallback(
+      named, new FakeLastFm('mallory') as any,
+      { state: pn.state, token: 'tok' }, SIGNING_KEY, CRED_KEY, NOW,
+    );
+    check('a named handoff still refuses another account',
+      !wrong.ok && (wrong as any).reason === 'username_mismatch', wrong);
+  }
 
   console.log('\n-- misc --');
   check('sha256 is stable', (await sha256Hex(new TextEncoder().encode('abc')))

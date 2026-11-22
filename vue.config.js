@@ -146,7 +146,7 @@ function mockMiddlewares() {
   ];
 
   if (MOCK_BACKGROUND) {
-    const { createMockWorker, shimHtml } = require('./tests/backgroundMock');
+    const { createMockWorker } = require('./tests/backgroundMock');
     // A relative appOrigin, for the same reason the paths are relative: the
     // authorise URL has to work from whatever host the browser actually used.
     const mock = createMockWorker({ appOrigin: '' });
@@ -178,10 +178,7 @@ function mockMiddlewares() {
         send(res, {
           status: 200,
           contentType: 'text/html; charset=utf-8',
-          body: shimHtml(
-            url.searchParams.get('session') || '',
-            url.searchParams.get('handoff') || '',
-          ),
+          body: mock.authorise(url.searchParams),
         });
       }),
     });

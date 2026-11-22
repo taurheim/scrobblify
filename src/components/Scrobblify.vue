@@ -13,7 +13,7 @@
     <v-alert
       v-if="banner"
       :type="bannerType"
-      :prominent="banner === 'job' || banner === 'signIn' || banner === 'retry' || banner === 'resume'"
+      :prominent="!!banner && banner !== 'outage' && banner !== 'notice'"
       class="mb-4"
     >
       <div v-if="showBackgroundNotice" :class="{ 'mb-3': banner !== 'notice' }">
@@ -248,7 +248,7 @@
         <v-stepper-window-item :value="4" eager>
           <scrobble-step
             ref="scrobbleStep"
-            :background-available="backgroundAvailable"
+            :background-track-limit="backgroundTrackLimit"
             :sending-blocked="sendingBlocked"
             :worker-unreachable="authorityUnknown"
             :persist-progress="onAutoSave"
@@ -272,7 +272,7 @@
     <background-offer
       v-model="showBackgroundOffer"
       :remaining="backgroundRemaining"
-      :all-re-tagged="backgroundAllReTagged"
+      :any-re-tagged="backgroundAnyReTagged"
       :busy="backgroundBusy"
       v-on:accept="startBackgroundHandoff"
       v-on:decline="onBackgroundDeclined"
@@ -331,6 +331,15 @@
       </v-card>
     </v-dialog>
     <error-dialog v-model="showError" :message="errorMessage" :details="errorDetails"></error-dialog>
+    <v-dialog v-model="nothingToResume" max-width="420">
+      <v-card class="nothing-to-resume">
+        <v-card-text>We weren't able to find an active scrobblify session for you.</v-card-text>
+        <v-card-actions>
+          <v-spacer></v-spacer>
+          <v-btn color="primary" variant="flat" @click="nothingToResume = false">OK</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 <style>
@@ -368,7 +377,7 @@ import {
   resolveExportedRepeats,
 } from '@/services/BackgroundHandoff';
 import {
-  trackEvent, trackError, resetUser, onFeatureFlags,
+  trackEvent, trackError, resetUser, onFeatureFlags, identifyUser,
 } from '@/services/Analytics';
 import {
   ConflictReason, ProgressCount, findCompletedImport, isSameImport, progressOf, recordCompletedImport,
@@ -437,6 +446,11 @@ const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sig
  * the worker, so the unreachable banner is the only one worth showing.
  */
 const NEEDS_WORKER_NOTICES = [SESSION_EXPIRED_NOTICE, REAUTH_UNREACHABLE_NOTICE];
+/**
+ * A handoff that named nobody came back refused: the Last.fm account that
+ * authorised it already has a job. Signing in to the worker shows that job.
+ */
+const ALREADY_LIVE_NOTICE = 'You already have an import running on Scrobblify.';
 
 /** The stepper's steps. Signing in isn't one, so they start at 2. */
 const STEPPER_ITEMS = [
@@ -524,6 +538,9 @@ export default defineComponent({
       /** The worker's per-job ceiling, from the same capacity answer. */
       backgroundMaxTracks: 0,
       backgroundRemaining: 0,
+      /** Shown in the offer: some remaining plays will be dated today. */
+      backgroundAnyReTagged: false,
+      /** For `background_offer_declined` only. */
       backgroundAllReTagged: false,
       backgroundBusy: false,
       backgroundJob: null as background.JobStatus | null,
@@ -607,6 +624,8 @@ export default defineComponent({
        * replaces the notice and the button must keep its label.
        */
       reauthFixNow: false,
+      /** Replaces the sign-in button's label when set; cleared with `reauthFixNow`. */
+      reauthLabelText: '',
       resumeSignInMessage: '',
       /**
        * What the sign-in banner's button signs in for. Only a refused resume of
@@ -636,6 +655,12 @@ export default defineComponent({
       signInRetryNote: '' as '' | 'selection' | 'progress',
       /** This load's token exchange failed (AuthenticateStep's `failed`). */
       signInFailed: false,
+      /**
+       * Home's "Re-connect" signed in to the worker, which holds nothing for
+       * this account, and this browser has nothing saved either: the dialog
+       * that says so is open.
+       */
+      nothingToResume: false,
       /** The deferred duplicate check is running. */
       checkingDuplicates: false,
       /** Plays it dropped; shown until the user starts sending. */
@@ -674,6 +699,11 @@ export default defineComponent({
       // A re-authentication return is consumed first, and only for its token: it
       // owns no handoff and must not be mistaken for one.
       const reauthed = background.consumeReauthFragment();
+      // Before anything asks about this account: the authority check below
+      // asks by name.
+      if (reauthed && background.isWorkerLookup()) {
+        this.rememberWorkerUser(reauthed.user);
+      }
 
       const resumed = await this.resumeHandoffIfReturning();
       if (resumed) {
@@ -830,13 +860,17 @@ export default defineComponent({
       if (unresolved) {
         await this.resolveOwnership(unresolved);
       }
+      const signInRefused = new URLSearchParams(window.location.search).get('signin') === 'failed';
       if (reauthed) {
         trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
-      } else if (new URLSearchParams(window.location.search).get('signin') === 'failed') {
+      } else if (signInRefused) {
         this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
         this.showReauth = true;
         this.stripQuery();
         trackEvent('background_reauth_failed');
+      }
+      if (background.takeWorkerLookup()) {
+        this.reportWorkerLookup(signInRefused);
       }
       this.probeBackgroundAvailability();
       // The rollout flag can change after mount: flags load asynchronously,
@@ -1030,6 +1064,9 @@ export default defineComponent({
         && (this.authorityUnknown || this.authorityPending));
     },
     reauthLabel(): string {
+      if (this.reauthLabelText) {
+        return this.reauthLabelText;
+      }
       return this.reauthFixNow
         ? 'Fix now'
         : 'Sign in to the background service';
@@ -1124,7 +1161,9 @@ export default defineComponent({
     canOfferBackground(remaining: number): boolean {
       return this.backgroundAvailable
         && !this.backgroundJob
-        && remaining >= LASTFM_DAILY_CAP;
+        && remaining >= LASTFM_DAILY_CAP
+        // The worker refuses a bigger queue as `too_large`, after the sign-in.
+        && remaining <= this.backgroundMaxTracks;
     },
 
     /**
@@ -1233,6 +1272,7 @@ export default defineComponent({
         if (!this.backgroundJob) {
           this.showReauth = true;
           this.reauthFixNow = false;
+          this.reauthLabelText = '';
           this.backgroundNotice = 'Your import is still running on the server, so scrobbling from this browser is switched off to stop the same tracks being sent twice. Sign in to check on it or bring it back here.';
         }
         trackEvent('background_authority_check', { result: 'live', signed_in: String(!!this.backgroundJob) });
@@ -1393,13 +1433,25 @@ export default defineComponent({
       if (!status) {
         return null;
       }
+      return this.handedOverByStatus(importId, status);
+    },
+
+    /**
+     * `queueWasHandedOver`'s decision on an answer.
+     *
+     * A `pending` answer (a handoff on its way, no job yet) blocks like any
+     * other `known`: another tab or device may be about to hand this queue
+     * over. Except for the queue whose own pending handoff this browser
+     * abandoned (`recordAbandonedImport`), which can never upload.
+     */
+    handedOverByStatus(importId: string, status: background.ImportStatus): boolean {
       /*
         `known` is the whole answer, and `live` is deliberately ignored here.
         The dangerous case is precisely a handover that is *no longer* live:
         the tracks were sent, the marker is gone, and only this record
         remembers it happened.
       */
-      if (!status.known) {
+      if (!status.known || (status.pending && background.isAbandonedImport(importId))) {
         return false;
       }
       this.handedOverProgress = status.totalTracks
@@ -1425,6 +1477,7 @@ export default defineComponent({
       if (!this.backgroundJob) {
         this.showReauth = true;
         this.reauthFixNow = false;
+        this.reauthLabelText = '';
         const p = this.handedOverProgress;
         const detail = p ? ` It has scrobbled ${p.scrobbled} of ${p.total} tracks.` : '';
         this.backgroundNotice = `This import was handed over to the background service, so scrobbling it from this browser is switched off — the tracks it already sent would be sent again and silently discarded.${detail} Sign in to check on it or bring it back here.`;
@@ -1647,6 +1700,28 @@ export default defineComponent({
     async reconcileQueueOwner(owner: background.QueueOwner) {
       if (owner.owner === 'freezing') {
         /*
+          This tab's own handoff, back from Last.fm without a return, asked
+          about by its queue: see `ownHandoffWasTaken`. Before the freshness
+          check, because the tab that set it is this one, not a sibling
+          mid-attempt. In any other tab it is a sibling's, maybe still at
+          Last.fm, and the rules below apply, until it is too old to be
+          approved and is asked about by its queue as well (#168).
+        */
+        const own = await this.ownHandoffWasTaken(owner);
+        const settled = own.taken === false
+          ? await this.releaseOwnHandoff(owner, own.pendingImportId)
+          : null;
+        if (settled === 'released') {
+          this.ownershipBlocked = false;
+          await this.exposeSavedStateUnlessStale('handoff_not_taken');
+          trackEvent('background_freeze_released', { reason: 'handoff_not_taken' });
+          return;
+        }
+        if (own.taken === true || settled === 'taken') {
+          await this.blockForHandedOverQueue();
+          return;
+        }
+        /*
           A freeze that was written moments ago belongs to a tab that is still
           working through its handover. This runs on every load, including in a
           tab the user opened *during* that handover, and clearing the record
@@ -1676,7 +1751,17 @@ export default defineComponent({
         if (active === true) {
           background.setQueueOwner({ owner: 'server', id: owner.id });
         }
-        this.backgroundNotice = 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until we can tell whether it took effect. Please refresh in a few minutes.';
+        /*
+          A sibling's handoff this browser has no session to ask about is only
+          settled once it expires (`ownHandoffWasTaken`), so refreshing sooner
+          changes nothing unless that tab finishes.
+        */
+        const waitsForExpiry = active === null && !background.getSession()
+          && background.isOwnHandoffFreeze(owner) && !background.isThisTabsHandoffFreeze(owner)
+          && !background.freezeHandoffHasExpired(owner);
+        this.backgroundNotice = waitsForExpiry
+          ? 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until it does. If that tab was closed, the handover expires within the hour: refresh then.'
+          : 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until we can tell whether it took effect. Please refresh in a few minutes.';
         return;
       }
 
@@ -1695,8 +1780,110 @@ export default defineComponent({
         // an apology.
         this.showReauth = true;
         this.reauthFixNow = true;
+        this.reauthLabelText = '';
         this.backgroundNotice = SESSION_EXPIRED_NOTICE;
       }
+    },
+
+    /**
+     * Whether the worker took the queue this browser froze for its own
+     * handoff, asked with the public import check, for a browser with no
+     * worker session to ask about the handoff itself.
+     *
+     * That is every browser that left for Last.fm and came back without
+     * approving (Back, a refresh after it): a session is only issued by a
+     * successful callback, so `isHandoffActive` and `hasLiveJob` can only say
+     * "unknown", and without a username nothing else is asked either. The
+     * import id was minted before the preflight and only reaches a job at the
+     * callback, so "not known" means it never did. A late approval can't
+     * change that once the freeze is released: the caller withdraws the
+     * handoff at the worker (`abandonOwnHandoff`), so its callback is refused
+     * and makes no job (#165), and the preflight record goes with the freeze,
+     * so a return is refused too.
+     *
+     * Known only as `pending` (a handoff on its way, no job) is this handoff,
+     * still waiting at the worker for an approval that will now be refused,
+     * so it is not taken either. `pendingImportId` then names the queue, for
+     * `releaseAbandonedHandoff` to record if the withdrawal goes unanswered,
+     * so later checks of it don't read the same answer as handed over (#162).
+     *
+     * `taken` is null when unanswered, or when the freeze isn't this tab's
+     * own preflighted handoff (`isThisTabsHandoffFreeze`), which only this
+     * tab may settle while it can still be approved.
+     *
+     * Another tab's (closed at Last.fm, say) is settled too once it can't be
+     * approved any more (`freezeHandoffHasExpired`), or its freeze would hold
+     * every later tab for good (#168). Only a queue the worker doesn't know
+     * releases it then: a jobless `pending` this late is a handoff not yet
+     * reaped, so it is still waited on, and `releaseOwnHandoff` withdraws
+     * nothing for it.
+     */
+    async ownHandoffWasTaken(
+      owner: background.QueueOwner | null,
+    ): Promise<{ taken: boolean | null; pendingImportId: string }> {
+      const unsettled = { taken: null, pendingImportId: '' };
+      const thisTabs = background.isThisTabsHandoffFreeze(owner);
+      const expired = !thisTabs && background.isOwnHandoffFreeze(owner)
+        && background.freezeHandoffHasExpired(owner as background.QueueOwner);
+      if ((!thisTabs && !expired) || background.getSession()) {
+        return unsettled;
+      }
+      let importId = '';
+      try {
+        const saved = await this.stateManager.loadState();
+        importId = (saved && saved.importId) || '';
+      } catch (e) {
+        // Unreadable: nothing to ask about.
+      }
+      if (!importId) {
+        // The handoff saved an identified queue before preflighting, so
+        // without one this isn't the queue the freeze is about.
+        return unsettled;
+      }
+      const status = await background.importStatus(importId);
+      if (!status) {
+        return unsettled;
+      }
+      if (status.pending) {
+        return thisTabs ? { taken: false, pendingImportId: importId } : unsettled;
+      }
+      return { taken: this.handedOverByStatus(importId, status), pendingImportId: '' };
+    },
+
+    /**
+     * Withdraws and releases this tab's own handoff that `ownHandoffWasTaken`
+     * found not taken (`abandonOwnHandoff`).
+     *
+     * If the worker says it had already moved on, nothing is released yet and
+     * the queue is asked once more. A job by now means it was taken after
+     * all; nothing on its way means it ended without one (failed, or reaped
+     * while the user was away), and the freeze lifts, or it would never lift;
+     * still on its way (approved, say, its return coming) or unanswered, it
+     * stays (`in_flight`).
+     *
+     * Another tab's expired handoff is only released: it can't be approved
+     * any more, so there is nothing to withdraw, and the queue check has just
+     * said it never got a job.
+     */
+    async releaseOwnHandoff(
+      owner: background.QueueOwner,
+      pendingImportId: string,
+    ): Promise<'released' | 'not_released' | 'taken' | 'in_flight'> {
+      if (!background.isThisTabsHandoffFreeze(owner)) {
+        return background.releaseAbandonedHandoff(owner) ? 'released' : 'not_released';
+      }
+      const released = await background.abandonOwnHandoff(owner, pendingImportId);
+      if (released !== null) {
+        return released ? 'released' : 'not_released';
+      }
+      const again = await this.ownHandoffWasTaken(owner);
+      if (again.taken === true) {
+        return 'taken';
+      }
+      if (again.taken === false && !again.pendingImportId) {
+        return background.releaseAbandonedHandoff(owner) ? 'released' : 'not_released';
+      }
+      return 'in_flight';
     },
 
     /**
@@ -1778,6 +1965,7 @@ export default defineComponent({
       this.ownershipBlocked = true;
       this.showReauth = background.isSessionExpired();
       this.reauthFixNow = this.showReauth;
+      this.reauthLabelText = '';
       this.backgroundNotice = background.isSessionExpired()
         ? SESSION_EXPIRED_NOTICE
         : 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
@@ -1792,11 +1980,8 @@ export default defineComponent({
      * back after the redirect may do that.
      */
     async reauthenticate() {
+      // Empty is fine: the worker then signs in whoever authorises on Last.fm.
       const username = (this.$store.state.lfmApi as LastFm).getUserName() || '';
-      if (!username) {
-        this.backgroundNotice = 'Sign in to Last.fm first, then try again.';
-        return;
-      }
       this.reauthBusy = true;
       trackEvent('background_reauth_started');
       const url = await background.startReauth(username);
@@ -1861,7 +2046,8 @@ export default defineComponent({
         return;
       }
       const state = this.buildState(info);
-      const remaining = uploadListFromState(state, Math.floor(Date.now() / 1000)).length;
+      const list = uploadListFromState(state, Math.floor(Date.now() / 1000));
+      const remaining = list.length;
       if (!this.canOfferBackground(remaining)) {
         return;
       }
@@ -1869,7 +2055,8 @@ export default defineComponent({
       this.pendingState = null;
       this.pendingEntryPoint = 'scrobble_step';
       this.backgroundRemaining = remaining;
-      this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
+      this.backgroundAnyReTagged = list.some((t) => t.reTagged);
+      this.backgroundAllReTagged = list.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
       trackEvent('background_offer_shown', {
         entry_point: 'scrobble_step',
@@ -1879,8 +2066,8 @@ export default defineComponent({
     },
 
     /**
-     * A deliberate "Not now". Distinct from dismissing the dialog, so the
-     * decline rate measures people who read the consent copy and said no.
+     * A deliberate "scrobble locally". Distinct from dismissing the dialog, so
+     * the decline rate measures people who read the offer and said no.
      */
     onBackgroundDeclined() {
       trackEvent('background_offer_declined', {
@@ -1890,7 +2077,8 @@ export default defineComponent({
       });
     },
 
-    async startBackgroundHandoff() {
+    /** Resolves true when the tab is navigating to Last.fm, false when the handover didn't start. */
+    async startBackgroundHandoff(): Promise<boolean> {
       const step = this.$refs.scrobbleStep as any;
 
       // Halt the loop *before* anything else. The handoff uploads whatever is
@@ -1909,7 +2097,7 @@ export default defineComponent({
           step.releaseHandoffHalt();
           this.backgroundNotice = 'Couldn\'t pause this tab\'s scrobbling in time, so the handover was cancelled to avoid sending anything twice. Nothing has changed — try again in a moment.';
           trackEvent('background_handoff_failed', { reason: 'halt_timeout' });
-          return;
+          return false;
         }
       }
 
@@ -1922,7 +2110,7 @@ export default defineComponent({
         : this.pendingState;
       if (!state) {
         this.backgroundBusy = false;
-        return;
+        return false;
       }
 
       const username = (this.$store.state.lfmApi as LastFm).getUserName() || state.userName || '';
@@ -1983,9 +2171,11 @@ export default defineComponent({
         this.backgroundNotice = result.reason === 'at_capacity'
           ? 'The background service is full right now — it is limited during the beta. Your progress is saved; try again later or keep scrobbling in this tab.'
           : 'Couldn\'t hand this over to the background service. Your progress is saved and nothing has changed — keep scrobbling in this tab.';
+        return false;
       }
       // On success the tab is navigating to Last.fm; leave `busy` set so the
       // dialog cannot be double-submitted during the redirect.
+      return true;
     },
 
     /**
@@ -2016,11 +2206,30 @@ export default defineComponent({
       */
       const marker = background.getOwnershipUnresolved();
       const pendingId = background.getPendingHandoff();
+      // Captured before the round-trip, like every release below that follows one.
+      const observed = background.queueOwner();
       let owned: boolean | null;
+      // Whether this tab's own freeze was settled by its queue, below.
+      let ownSettled = false;
+      let releasedOwn = false;
       if (marker) {
         owned = await background.resolveOwnershipMarker(marker);
       } else if (pendingId) {
         owned = await background.isHandoffActive(pendingId);
+      } else if (!background.getSession()) {
+        // Nothing to ask about the job with; the queue can still be asked about.
+        const own = await this.ownHandoffWasTaken(observed);
+        owned = own.taken;
+        if (owned === false && observed) {
+          ownSettled = true;
+          const settled = await this.releaseOwnHandoff(observed, own.pendingImportId);
+          releasedOwn = settled === 'released';
+          if (settled === 'taken') {
+            owned = true;
+          } else if (settled === 'in_flight') {
+            owned = null;
+          }
+        }
       } else {
         owned = await background.hasLiveJob();
       }
@@ -2035,8 +2244,12 @@ export default defineComponent({
         }
         // Other tabs are told too. This path is reached from the bfcache, so
         // the freeze this tab set before redirecting may be all that is
-        // standing between a sibling and a live job.
-        background.setQueueOwner({ owner: 'server', id: fallbackId || '' });
+        // standing between a sibling and a live job. Unless it is still that
+        // freeze with nothing more known: it blocks just the same, and it
+        // names the handoff, so the next load can settle it by the queue.
+        if (owned === true || fallbackId || !background.isOwnHandoffFreeze(observed)) {
+          background.setQueueOwner({ owner: 'server', id: fallbackId || '' });
+        }
         this.backgroundBusy = false;
         this.showBackgroundOffer = false;
         this.hasResumableState = false;
@@ -2045,6 +2258,12 @@ export default defineComponent({
         this.backgroundNotice = owned === true
           ? 'Your import was handed over and is running on the server, so scrobbling in this tab is switched off.'
           : 'We couldn\'t check whether the background service took over your import, so scrobbling in this tab is on hold. Please refresh in a few minutes.';
+        if (owned === true && !this.backgroundJob) {
+          // Known only by its queue: signing in to the worker shows the job.
+          this.showReauth = true;
+          this.reauthFixNow = false;
+          this.reauthLabelText = '';
+        }
         trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore', resolved: String(owned) });
         return;
       }
@@ -2057,8 +2276,15 @@ export default defineComponent({
       background.clearPendingHandoff();
       background.clearOwnershipUnresolved();
       // Scoped: this tab's own freeze, or a `server` record we have just
-      // disproved. A freeze another tab is actively holding stays.
-      background.releaseQueueOwnerIfUnclaimed(pendingId || '');
+      // disproved. A freeze another tab is actively holding stays. With no
+      // pending handoff, this tab's freeze names the one it preflighted, which
+      // the worker is told to withdraw (above, when settled by the queue).
+      if (!ownSettled && !pendingId && observed) {
+        releasedOwn = (await background.abandonOwnHandoff(observed)) === true;
+      }
+      if (!releasedOwn) {
+        background.releaseQueueOwnerIfUnclaimed(pendingId || '');
+      }
       background.clearHandoffLineage();
 
       const step = this.$refs.scrobbleStep as any;
@@ -2067,7 +2293,48 @@ export default defineComponent({
       }
 
       this.backgroundNotice = 'The handover wasn\'t completed, so nothing was started. Your progress is still here — carry on in this tab, or try handing it over again.';
+      if (this.pendingEntryPoint === 'confirm') {
+        // The selection was saved for the trip, so it is what there is to carry on with.
+        await this.exposeSavedStateUnlessStale('bfcache_restore');
+      }
       trackEvent('background_handoff_abandoned', { reason: 'bfcache_restore', resolved: 'false' });
+    },
+
+    /**
+     * Remembers the Last.fm account the worker says signed in, for a browser
+     * that didn't know one. Only the name: with no session key the browser is
+     * still signed out of Scrobblify's own Last.fm access.
+     */
+    rememberWorkerUser(user: string) {
+      const api = this.$store.state.lfmApi as LastFm;
+      if (!user || api.getUserName()) {
+        return;
+      }
+      api.setUserName(user);
+      identifyUser(user);
+    },
+
+    /**
+     * The return from Home's "Re-connect" sign-in to the worker: says what it
+     * found. A job shows its own banner and saved progress the resume prompt;
+     * with neither, a dialog says so rather than leaving a bare upload step.
+     * On the mock worker's shim the name arrives in localStorage
+     * instead of the fragment, so it is already remembered.
+     */
+    reportWorkerLookup(signInRefused: boolean) {
+      let result: 'job' | 'saved' | 'nothing' | 'failed';
+      if (signInRefused || !background.getSession()) {
+        // The "didn't work" notice, if any, is already up.
+        result = 'failed';
+      } else if (this.backgroundJob) {
+        result = 'job';
+      } else if (this.hasResumableState) {
+        result = 'saved';
+      } else {
+        this.nothingToResume = true;
+        result = 'nothing';
+      }
+      trackEvent('worker_lookup_result', { result });
     },
 
     /**
@@ -2085,8 +2352,23 @@ export default defineComponent({
       }
 
       if (handoffParam === 'failed') {
-        this.backgroundNotice = 'Last.fm didn\'t complete the handoff, so nothing was started. Your progress is still saved here.';
-        trackEvent('background_handoff_failed', { reason: params.get('reason') || 'callback' });
+        const reason = params.get('reason') || 'callback';
+        // The worker refused the handoff, so it can never start, and this
+        // browser has no session to ask about it with (#160). Withdrawn as
+        // well, in case the refusal left it waiting (a return with no token);
+        // one the callback already failed just answers no, and is released
+        // all the same.
+        await background.abandonHandoff(background.preflightedHandoff() || '');
+        background.releaseAbandonedHandoff();
+        if (reason === 'already_live') {
+          this.backgroundNotice = ALREADY_LIVE_NOTICE;
+          this.showReauth = true;
+          this.reauthFixNow = false;
+          this.reauthLabelText = 'Sign in to see it';
+        } else {
+          this.backgroundNotice = 'Last.fm didn\'t complete the handoff, so nothing was started. Your progress is still saved here.';
+        }
+        trackEvent('background_handoff_failed', { reason });
         this.stripQuery();
         return false;
       }
@@ -2094,6 +2376,13 @@ export default defineComponent({
       const fragment = background.consumeRedirectFragment();
       const handoffId = (fragment && fragment.handoffId) || background.getPendingHandoff();
       this.stripQuery();
+      this.rememberWorkerUser((fragment && fragment.user) || '');
+      // A handoff started before signing in learns its user only here (the
+      // mock worker's shim stores it before the page loads instead). The
+      // worker's name wins over a different one this browser knew: the job is
+      // the account's that authorised it.
+      const workerUser = (fragment && fragment.user)
+        || (this.$store.state.lfmApi as LastFm).getUserName() || '';
       if (!handoffId) {
         this.backgroundNotice = 'The handoff came back without a session, so nothing was started. Your progress is still saved here.';
         return false;
@@ -2105,7 +2394,7 @@ export default defineComponent({
       try {
         result = await completeHandoff(this.stateManager, handoffId, (done, total) => {
           this.backgroundNotice = `Uploading your remaining tracks… ${done} of ${total}`;
-        });
+        }, workerUser);
       } catch (e) {
         trackError('background.completeHandoff', e);
         // An unexpected throw tells us nothing about whether the job started,
@@ -2119,6 +2408,18 @@ export default defineComponent({
       if (result.outcome.status === 'active') {
         this.backgroundNotice = '';
         this.hasResumableState = false;
+        /*
+          Home's welcome-back card says the job is running and that the tab can
+          be closed, which is all there is to do now. Only when it can show
+          this job: a handover recorded for someone other than the user this
+          browser knows (or not recorded at all) would get a card about the
+          wrong thing, so it stays here with the job banner.
+        */
+        const api = this.$store.state.lfmApi as LastFm;
+        if (background.handedOverImport(api.getUserName())) {
+          await this.$router.replace({ name: 'home' }).catch(() => undefined);
+          return true;
+        }
         await this.refreshBackgroundJob();
         return true;
       }
@@ -2884,73 +3185,118 @@ export default defineComponent({
       resetUser();
       trackEvent('user_logged_out');
     },
-    async onSelectionComplete() {
+    /**
+     * Saves the selection as progress with nothing sent, for a trip away from
+     * this page (to Last.fm, or to the worker's sign-in) that nothing in
+     * memory survives. Returns null, having said why, when it refuses or fails.
+     */
+    async saveSelectionBeforeLeaving(): Promise<ScrobbleState | null> {
+      /*
+        This save replaces whatever progress is saved here, and the
+        confirmation only asks about saved progress `savedProgress` knows of.
+        That is null whenever the resume prompt is withheld (an unanswered or
+        blocked authority check, a live job) or out of date (another tab
+        saved since), so the disk is asked too (#102).
+      */
+      if (this.sendingBlocked) {
+        this.backgroundNotice = background.isBetaOptedIn()
+          ? 'Hold on — still checking whether an import is already running on the server for your account.'
+          : 'Hold on, still getting ready. Try again in a moment.';
+        return null;
+      }
+      if (!this.savedProgress) {
+        let saved: ScrobbleState | null = null;
+        try {
+          saved = await this.stateManager.loadState();
+        } catch (e) {
+          // Unreadable, so there is nothing it could be replacing that a
+          // resume could reach either.
+        }
+        const newId = (this.$store.state.importId as string) || '';
+        if (saved && (!newId || (saved.importId || '') !== newId)) {
+          this.errorMessage = 'You have saved progress that would be replaced. '
+            + 'Go back and choose Resume or Start over.';
+          this.errorDetails = '';
+          this.showError = true;
+          // So the next press of Scrobble asks about it.
+          await this.exposeSavedStateUnlessStale(
+            'send_refused',
+            !!background.getOwnershipUnresolved() || !!background.queueOwner(),
+          );
+          return null;
+        }
+      }
+      const snapshot: ProgressSnapshot = {
+        scrobbledTracks: 0,
+        originalTotalTracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
+        originalSucceededCount: 0,
+        pendingVerification: [],
+        sendTimestamps: [],
+        lastReTagTimestampSec: this.$store.state.reTagCursorSec as number,
+        burstCount: 0,
+        dailyCount: 0,
+      };
+      try {
+        const state = this.buildState(snapshot);
+        await this.persist(() => this.stateManager.saveState(state));
+        return state;
+      } catch (e) {
+        trackError('scrobblify.saveBeforeSignIn', e);
+        this.errorMessage = "Couldn't save your selection before signing in.";
+        this.errorDetails = (e as Error).message || String(e);
+        this.showError = true;
+        return null;
+      }
+    },
+    /**
+     * The confirm dialog's answer. `server`: hand the selection to the
+     * background service, signed in here or not; the worker's own sign-in
+     * names the user when this browser doesn't know them.
+     */
+    async onSelectionComplete(path: 'tab' | 'server' = 'tab') {
+      const api = this.$store.state.lfmApi as LastFm;
+      if (path === 'server') {
+        const state = await this.saveSelectionBeforeLeaving();
+        if (!state) {
+          return;
+        }
+        const list = uploadListFromState(state, Math.floor(Date.now() / 1000));
+        this.pendingState = state;
+        this.pendingSnapshot = null;
+        this.pendingEntryPoint = 'confirm';
+        this.backgroundRemaining = state.tracks.length;
+        this.backgroundAnyReTagged = list.some((t) => t.reTagged);
+        this.backgroundAllReTagged = list.every((t) => t.reTagged);
+        // Saved, not on offer: on failure the resume prompt offers it again.
+        this.hasResumableState = false;
+        if (!await this.startBackgroundHandoff()) {
+          /*
+            Still here, so the saved selection is the user's to carry on with.
+            Offered again, so the next press of Scrobble asks about it (resume,
+            or start over and choose again) instead of refusing to replace what
+            it takes for someone else's saved progress (#102).
+          */
+          await this.exposeSavedStateUnlessStale(
+            'handoff_not_started',
+            !!background.getOwnershipUnresolved() || !!background.queueOwner(),
+          );
+        }
+        return;
+      }
       /*
         Nothing to send with yet, so sign in first. The selection is saved as
         ordinary progress (nothing sent) because nothing in memory survives
         the trip to Last.fm; `continueSignInIntent` restores it afterwards. An
         abandoned sign-in leaves it as saved progress for next time.
       */
-      const api = this.$store.state.lfmApi as LastFm;
       if (!api.isAuthenticated()) {
-        /*
-          This save replaces whatever progress is saved here, and the
-          confirmation only asks about saved progress `savedProgress` knows of.
-          That is null whenever the resume prompt is withheld (an unanswered or
-          blocked authority check, a live job) or out of date (another tab
-          saved since), so the disk is asked too (#102).
-        */
-        if (this.sendingBlocked) {
-          this.backgroundNotice = background.isBetaOptedIn()
-            ? 'Hold on — still checking whether an import is already running on the server for your account.'
-            : 'Hold on, still getting ready. Try again in a moment.';
-          return;
-        }
-        if (!this.savedProgress) {
-          let saved: ScrobbleState | null = null;
-          try {
-            saved = await this.stateManager.loadState();
-          } catch (e) {
-            // Unreadable, so there is nothing it could be replacing that a
-            // resume could reach either.
-          }
-          const newId = (this.$store.state.importId as string) || '';
-          if (saved && (!newId || (saved.importId || '') !== newId)) {
-            this.errorMessage = 'You have saved progress that would be replaced. '
-              + 'Go back and choose Resume or Start over.';
-            this.errorDetails = '';
-            this.showError = true;
-            // So the next press of Scrobble asks about it.
-            await this.exposeSavedStateUnlessStale(
-              'send_refused',
-              !!background.getOwnershipUnresolved() || !!background.queueOwner(),
-            );
-            return;
-          }
-        }
-        const snapshot: ProgressSnapshot = {
-          scrobbledTracks: 0,
-          originalTotalTracks: (this.$store.state.selectedScrobbles as Scrobble[]).length,
-          originalSucceededCount: 0,
-          pendingVerification: [],
-          sendTimestamps: [],
-          lastReTagTimestampSec: this.$store.state.reTagCursorSec as number,
-          burstCount: 0,
-          dailyCount: 0,
-        };
-        try {
-          const state = this.buildState(snapshot);
-          await this.persist(() => this.stateManager.saveState(state));
+        const state = await this.saveSelectionBeforeLeaving();
+        if (state) {
           startSignIn(api, {
             kind: 'send',
             importId: state.importId || '',
             checkDuplicates: this.$store.state.deferredDuplicateCheck as boolean,
           });
-        } catch (e) {
-          trackError('scrobblify.saveBeforeSignIn', e);
-          this.errorMessage = "Couldn't save your selection before signing in.";
-          this.errorDetails = (e as Error).message || String(e);
-          this.showError = true;
         }
         return;
       }
@@ -3231,7 +3577,8 @@ export default defineComponent({
       if (!this.backgroundAvailable || this.backgroundJob) {
         return;
       }
-      const remaining = uploadListFromState(state, Math.floor(Date.now() / 1000)).length;
+      const list = uploadListFromState(state, Math.floor(Date.now() / 1000));
+      const remaining = list.length;
       if (!this.canOfferBackground(remaining)) {
         return;
       }
@@ -3243,7 +3590,8 @@ export default defineComponent({
       this.pendingState = state;
       this.pendingEntryPoint = entryPoint;
       this.backgroundRemaining = remaining;
-      this.backgroundAllReTagged = state.tracks.every((t) => t.reTagged);
+      this.backgroundAnyReTagged = list.some((t) => t.reTagged);
+      this.backgroundAllReTagged = list.every((t) => t.reTagged);
       this.showBackgroundOffer = true;
       trackEvent('background_offer_shown', {
         entry_point: entryPoint,

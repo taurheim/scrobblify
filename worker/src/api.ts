@@ -9,7 +9,7 @@
  */
 import {
   Sql, JobRow, readControl, countCommittedSlots, unresolvedSeconds,
-  REPEATABLE_HANDOFF_WINDOW_SECONDS, SLOT_AVAILABLE_SQL,
+  REPEATABLE_HANDOFF_WINDOW_SECONDS, SLOT_AVAILABLE_SQL, TERMINAL_HANDOFF_STATES,
 } from './store';
 import {
   BlobStore, uploadChunk, deleteJobBlobs, readChunkFor, CHUNK_TRACKS,
@@ -19,6 +19,7 @@ import {
   preflight,
   handleCallback,
   finalize,
+  abandonHandoff,
   reapExpiredHandoffs,
   HandoffRow,
   MAX_TRACKS_PER_JOB,
@@ -385,7 +386,8 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
   // ---- step 0: preflight, before the redirect ----
   if (path === '/scrobblify/handoff/preflight' && request.method === 'POST') {
     const body = await readJson(request);
-    if (!body || typeof body.username !== 'string' || typeof body.payloadDigest !== 'string') {
+    if (!body || (body.username !== undefined && typeof body.username !== 'string')
+      || typeof body.payloadDigest !== 'string') {
       return json(env, { ok: false, reason: 'bad_request' }, 400);
     }
     if (Number(body.trackCount) < MIN_TRACKS_FOR_BACKGROUND) {
@@ -394,7 +396,9 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     const result = await preflight(
       env.sql,
       {
-        username: body.username,
+        // Absent when the handover was chosen before signing in to Last.fm;
+        // the callback then adopts the account that authorised.
+        username: typeof body.username === 'string' ? body.username : '',
         payloadDigest: body.payloadDigest,
         trackCount: Number(body.trackCount),
         chunkCount: Number(body.chunkCount),
@@ -430,9 +434,15 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
   // It reserves no slot and creates no job. The Last.fm session key its
   // callback receives is discarded, not stored: proving who you are is all
   // this flow needs.
+  //
+  // The username is optional. A browser that has not signed in to Last.fm yet
+  // has none to name, and its sign-in adopts whoever authorises. That is safe
+  // because the nonce binds the return to the browser that started it: the
+  // session goes to the person who authorised, and it reaches only their own
+  // job.
   if (path === '/scrobblify/auth/signin' && request.method === 'POST') {
     const body = await readJson(request);
-    if (!body || typeof body.username !== 'string' || !body.username.trim()) {
+    if (!body || (body.username !== undefined && typeof body.username !== 'string')) {
       return json(env, { ok: false, reason: 'bad_request' }, 400);
     }
     // The nonce binds the return to the browser that started it. Without it
@@ -446,7 +456,7 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         h: '',
         exp: nowSec + SIGNIN_TTL_SECONDS,
         k: 'signin',
-        u: normalizeUsername(body.username),
+        u: typeof body.username === 'string' ? normalizeUsername(body.username) : '',
         n: body.nonce,
       },
       env.signingKey,
@@ -475,14 +485,17 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         target.searchParams.set('signin', 'failed');
         return Response.redirect(target.toString(), 302);
       }
-      // The username is checked even though nothing is written: issuing a
+      // A named sign-in is checked even though nothing is written: issuing a
       // session for whoever happened to authorise would hand one account
-      // read access to another's job status.
-      if (!signinState.u || normalizeUsername(identity.username) !== signinState.u) {
+      // read access to another's job status. An anonymous one (no `u`) has
+      // nothing to check against and adopts the account that authorised; its
+      // nonce already ties the return to the browser that asked.
+      const signedIn = normalizeUsername(identity.username);
+      if (!signedIn || (signinState.u && signedIn !== signinState.u)) {
         target.searchParams.set('signin', 'failed');
         return Response.redirect(target.toString(), 302);
       }
-      const session = await issueSession(normalizeUsername(identity.username), env.signingKey, nowSec);
+      const session = await issueSession(signedIn, env.signingKey, nowSec);
       /*
         A job parked for re-authentication gets its write credential back here.
 
@@ -495,16 +508,19 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
         taken back, which abandons any batch still in flight and risks
         duplicating it, or cancelled, which discards the queue.
 
-        Narrow by construction: the username on the state has already been
-        checked against what `auth.getSession` returned, so the key can only
-        ever be attached to its own owner's job.
+        Narrow by construction: the key is attached only to a job owned by
+        the account `auth.getSession` says it belongs to — the one checked
+        against the state's username, or adopted when it named none — so it
+        can only ever reach its own owner's job.
       */
-      await reattachCredential(env, normalizeUsername(identity.username), identity.sessionKey, nowSec);
+      await reattachCredential(env, signedIn, identity.sessionKey, nowSec);
       target.searchParams.set('signin', 'ok');
       // The nonce is echoed back so the initiating browser can prove this
       // return is its own. It travels in the fragment with the token, so it
-      // never reaches a server log.
-      target.hash = `session=${encodeURIComponent(session)}&nonce=${encodeURIComponent(signinState.n ?? '')}`;
+      // never reaches a server log. The user is Last.fm's spelling, for a
+      // browser that signed in without naming one.
+      target.hash = `session=${encodeURIComponent(session)}&nonce=${encodeURIComponent(signinState.n ?? '')}`
+        + `&user=${encodeURIComponent(identity.username)}`;
       return Response.redirect(target.toString(), 302);
     }
 
@@ -526,8 +542,10 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
 
     // The session is issued for the username on the handoff row, which
     // `handleCallback` has already checked against what `auth.getSession`
-    // returned. Trusting anything else here would hand one account a session
-    // for another's job.
+    // returned (or, for a handoff preflighted without one, adopted from it).
+    // Trusting anything else here would hand one account a session for
+    // another's job. A replay only gets this far with the token that won the
+    // exchange; any other is a `replay` failure above, with no session (#157).
     const row = await env.sql.first<HandoffRow>(
       'SELECT * FROM handoffs WHERE id = ?', [result.handoffId],
     );
@@ -544,7 +562,8 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     const session = await issueSession(row.username, env.signingKey, nowSec);
     target.searchParams.set('handoff', 'ok');
     target.searchParams.set('job', result.jobId);
-    target.hash = `session=${encodeURIComponent(session)}&handoff=${encodeURIComponent(result.handoffId)}`;
+    target.hash = `session=${encodeURIComponent(session)}&handoff=${encodeURIComponent(result.handoffId)}`
+      + `&user=${encodeURIComponent(result.username)}`;
     return Response.redirect(target.toString(), 302);
   }
 
@@ -660,27 +679,43 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       the same id and better numbers, and counting both would let the older,
       emptier handoff row win the ordering.
 
+      So are jobless handoffs that have ended (`failed`, `reaped`): one that
+      never got past Last.fm can never become a job, and chunks are only
+      accepted once the callback has created one, so the worker never had the
+      queue. Counting them blocked a user's saved selection for good after
+      pressing Back on the authorise page (#162).
+
+      A jobless handoff still in flight (`issued`, `exchanging`) does count: it
+      may yet produce a job, which then sends. It answers `pending: true`, so
+      the browser that preflighted it, and only knows it abandoned it, can
+      tell "on its way" from "handed over". Not when a job row carries the id
+      as well: that queue was handed over at some point either way.
+
       Ordering prefers a live row, then the most recent. Re-handing a queue
       back and forth creates one row per attempt, and it is the current one
       that decides whether the browser may send.
     */
+    const ended = TERMINAL_HANDOFF_STATES.map(() => '?').join(', ');
     const row = await env.sql.first<{
       state: string; is_live: number; cursor: number;
-      scrobbled_count: number; total_tracks: number; created_at: number;
+      scrobbled_count: number; total_tracks: number; created_at: number; pending: number;
     }>(
       `SELECT state AS state,
               CASE WHEN live_username IS NULL THEN 0 ELSE 1 END AS is_live,
               cursor AS cursor, scrobbled_count AS scrobbled_count,
-              total_tracks AS total_tracks, created_at AS created_at
+              total_tracks AS total_tracks, created_at AS created_at,
+              0 AS pending
          FROM jobs WHERE import_id = ?
        UNION ALL
        SELECT state,
               CASE WHEN live_username IS NULL THEN 0 ELSE 1 END,
-              0, 0, track_count, created_at
-         FROM handoffs WHERE import_id = ? AND job_id IS NULL
+              0, 0, track_count, created_at,
+              CASE WHEN EXISTS (SELECT 1 FROM jobs WHERE import_id = ?) THEN 0 ELSE 1 END
+         FROM handoffs
+        WHERE import_id = ? AND job_id IS NULL AND state NOT IN (${ended})
        ORDER BY is_live DESC, created_at DESC
        LIMIT 1`,
-      [importId, importId],
+      [importId, importId, importId, ...TERMINAL_HANDOFF_STATES],
     );
     if (!row) {
       return json(env, { ok: true, known: false, live: false });
@@ -693,7 +728,36 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       cursor: Number(row.cursor),
       scrobbledCount: Number(row.scrobbled_count),
       totalTracks: Number(row.total_tracks),
+      ...(Number(row.pending) === 1 ? { pending: true } : {}),
     });
+  }
+
+  /*
+    ---- withdrawing a handoff nobody approved, without a session ----
+
+    The browser that preflighted a handoff calls this when it comes back from
+    Last.fm without approving it (Back, a refused callback). Otherwise the
+    handoff stays `issued` until reaped an hour later, telling `/job/live` the
+    user has something running (#164), and an approval of the same Last.fm
+    page later still makes a job (#165).
+
+    Public because that browser has no session: one is only issued by a
+    successful callback, which is exactly what didn't happen. That is safe
+    because only an `issued` handoff can be withdrawn (`abandonHandoff`), and
+    an `issued` handoff has no job, no credential and no uploaded data, so the
+    most anyone holding its id can do is cancel an approval still pending. The
+    id is 128 random bits (`randomId`) and reaches only the browser that
+    preflighted it (and the authorise URL it was sent to), so it isn't
+    guessable.
+
+    Answers the same for an unknown id as for one past `issued`
+    (`abandoned: false`, 200), so it says nothing about which ids exist. A
+    guess costs one indexed read and writes no row.
+  */
+  const abandonMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/abandon$/);
+  if (abandonMatch && request.method === 'POST') {
+    const abandoned = await abandonHandoff(env.sql, abandonMatch[1], nowSec);
+    return json(env, { ok: true, abandoned });
   }
 
   // Everything below needs a session.

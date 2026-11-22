@@ -146,7 +146,9 @@
       :estimate="confirmEstimate"
       :background-track-limit="backgroundTrackLimit"
       :saved-progress="savedProgress"
-      @confirm="scrobbleSelectedTracks"
+      :has-re-tagged="confirmHasReTagged"
+      @confirm="scrobbleSelectedTracks('tab')"
+      @server="scrobbleSelectedTracks('server')"
       @resume-saved="resumeSavedProgress"
     ></scrobble-confirm-dialog>
   </div>
@@ -264,6 +266,7 @@ export default defineComponent({
       confirmOpen: false,
       confirmLoading: false,
       confirmEstimate: null as ScrobbleEstimate | null,
+      confirmHasReTagged: false,
       // Version counter to trigger computed re-evaluation
       trackVersion: 0,
       filterVersion: 0,
@@ -547,6 +550,7 @@ export default defineComponent({
           this.confirmLoading = false;
         }
       }
+      this.confirmHasReTagged = reTagged > 0;
       this.confirmEstimate = estimateScrobbleTime({
         trackCount: selIds.size,
         reTaggedCount: reTagged,
@@ -570,7 +574,8 @@ export default defineComponent({
       trackEvent('saved_progress_choice', { ...this.savedProgressProps(), choice: 'resume' });
       this.$emit('resume-saved');
     },
-    scrobbleSelectedTracks() {
+    /** `server`: the user chose to have the background service send these. */
+    scrobbleSelectedTracks(path: 'tab' | 'server' = 'tab') {
       if (this.savedProgress) {
         trackEvent('saved_progress_choice', { ...this.savedProgressProps(), choice: 'start_over' });
       }
@@ -645,8 +650,9 @@ export default defineComponent({
       trackEvent('tracks_selected', {
         selected_count: selected.length,
         total_count: this.totalTrackCount,
+        path,
       });
-      this.$emit('complete');
+      this.$emit('complete', path);
     },
   },
 });

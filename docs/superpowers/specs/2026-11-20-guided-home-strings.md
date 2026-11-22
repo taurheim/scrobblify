@@ -97,9 +97,9 @@ The small-import dialog and the saved-progress prompt are unchanged.
 
 | ID                              | When                                      | Draft                                                                                                                                                                                                                                                                                                                                 |
 | ------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `choice.title`                  | Beta, ≥ 750 left, server has room         | {count} plays                                                                                                                                                                                                                                                                                                                         |
+| `choice.title`                  | Beta, ≥ 750 left, server has room         | Scrobble {count} tracks?                                                                                                                                                                                                                                                                                                              |
 | `choice.lede`                   | Same                                      | This will take {days} days to scrobble. Scrobblify can now do it for you, or you can do it yourself by returning each day to scrobble.<br><br>(only if the user selected the checkbox to scrobble older tracks) Plays older than 2 weeks **will not have the correct date** and instead show the date of whenever they got scrobbled. |
-| `choice.server`                 | Same                                      | Let Scrobblify scrobble for me                                                                                                                                                                                                                                                                                                        |
+| `choice.server`                 | Same                                      | Let Scrobblify scrobble for me (beta)                                                                                                                                                                                                                                                                                                 |
 | `choice.fine`                   | Same                                      | You'll need to sign in {Details}                                                                                                                                                                                                                                                                                                      |
 | `choice.details.dates`          | Details open                              | Only your username and tracks listened to are uploaded, nothing else. Once the scrobbling is done, your tracks are removed from the service.                                                                                                                                                                                         |
 | `choice.details.dates.already`  | Details open, every play already re-dated |                                                                                                                                                                                                                                                                                                                                       |
@@ -207,10 +207,8 @@ status page or the steps.
 | `signin.dupes.title` | Some plays were skipped as duplicates | {count} plays to scrobble |
 | `signin.dupes.body` | Same | Skipped {skipped} that are already on Last.fm. |
 | `signin.dupes.button` | Same | Start |
-| `signin.nothing.title` | "Already scrobbling on scrobblify?", nothing anywhere | Nothing to resume |
-| `signin.nothing.body` | Same | Scrobblify isn't scrobbling anything for you, and this browser has no saved progress. |
-| `signin.nothing.button` | Same | Upload Spotify zip |
-| `signin.nothing.file` | Same | Have a progress file? {Upload it here}. |
+| `signin.nothing.dialog` | "Already scrobbling on scrobblify?", nothing anywhere (a dialog over the upload step) | We weren't able to find an active scrobblify session for you. |
+| `signin.nothing.ok` | Same; closes the dialog, leaving the upload step | OK |
 | `moveBack.explain.title` | "Scrobble the rest locally", this browser has no Last.fm sign-in | Scrobble the rest locally? |
 | `moveBack.explain.body` | Same | Scrobblify talks to Last.fm in two ways, one for its server and one for your browser, so Last.fm will ask you to approve Scrobblify again. You won't lose your progress. |
 | `moveBack.explain.yes` | Same | Continue to Last.fm |
@@ -249,3 +247,28 @@ show when a signed-out "Start scrobbling" comes before the server check has
 answered. The existing sign-in banner line "Sign in to Last.fm first, then
 choose Resume." is now slightly off: after signing in from that banner the
 saved progress resumes by itself.
+
+## Added in Plan 3 (drafts)
+
+New or changed strings shipped with the server choice (PR 4). Placeholder
+copy; rewrite in place.
+
+| ID | When | Draft |
+| --- | --- | --- |
+| `notice.alreadyLive` | Back from a handover chosen signed out, and the Last.fm account that approved it already has an import on the server | You already have an import running on Scrobblify. |
+| `notice.alreadyLive.button` | Same; signs in to the server to show that import | Sign in to see it |
+| `notice.otherTabHandover.expiring` | `/scrobble`, another tab of this browser left for Last.fm to hand over more than 3 minutes ago and hasn't come back (no server sign-in to ask with); replaces "…Please refresh in a few minutes." until the handover is an hour old | A handover started in another tab and didn't finish, so scrobbling here is on hold until it does. If that tab was closed, the handover expires within the hour: refresh then. |
+| `choice.cancel` | Server choice in the "Scrobble N tracks?" dialog, closes it | Cancel |
+| `confirm.laterBackground` | "Scrobble N tracks?" without the choice, re-dated plays left for later days, and the rest would fit the server | You don't have to wait for it: choose "Scrobble the rest for me" when it stops, and Scrobblify's server will send them for you, even with this tab closed. |
+| `confirm.todayBackground` | Same dialog, more than today's share selected, and the rest would fit the server | You can then choose "Scrobble the rest for me" and Scrobblify's server will send the rest for you, even with this tab closed. |
+| `gate.background` | Large-history gate, the server could finish it | You don't have to come back each day, though: once today's share is sent, choose "Scrobble the rest for me" and Scrobblify's server will scrobble the rest for you, even with this tab closed. |
+
+The last three replace "Finish this in the background" with the new button's
+name; the rest of those sentences is unchanged. Reused: `choice.title` also
+titles the mid-run and resume offer dialog ("Scrobble {count} tracks?", the
+plays left), and `signin.nothing.*` is the "nothing to resume" dialog. The
+stopped panel without the offer keeps today's "Your progress has been saved
+automatically — just come back to this page later and choose "Resume"."
+rather than `scrobble.savedHint`. No longer shown: `notice.reauthNeedsLastfm`
+(the server sign-in works without a Last.fm user now), and the old offer
+dialog's consent copy and "Not now".

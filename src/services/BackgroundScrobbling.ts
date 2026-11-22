@@ -27,6 +27,16 @@ const BETA_STORAGE_KEY = 'scrobblify.background.beta';
 const SESSION_STORAGE_KEY = 'scrobblify.background.session';
 const HANDOFF_STORAGE_KEY = 'scrobblify.background.handoff';
 /**
+ * The handoff this browser last preflighted, so a return from Last.fm can be
+ * told apart from one for a handoff someone else started (#157).
+ */
+const PREFLIGHTED_STORAGE_KEY = 'scrobblify.background.preflighted';
+/**
+ * The import whose handoff this browser abandoned (Back from Last.fm) while the
+ * worker still counted that handoff as on its way: see `recordAbandonedImport`.
+ */
+const ABANDONED_IMPORT_STORAGE_KEY = 'scrobblify.background.abandonedImport';
+/**
  * Set when we know a handoff happened but not whether the server took
  * ownership. Kept out of `clearSession` on purpose: losing the session token
  * makes the uncertainty worse, not better.
@@ -1390,6 +1400,38 @@ export function freezeAttemptIsFresh(record: QueueOwner, nowMs = Date.now()): bo
 }
 
 /**
+ * How long the worker waits for a handoff to be approved: its state token
+ * expires and the reaper fails it after this. Mirrors `HANDOFF_TTL_SECONDS` in
+ * `worker/src/handoff.ts`; keep the two equal.
+ */
+export const HANDOFF_TTL_SECONDS = 60 * 60;
+
+/**
+ * Added to the TTL: clock skew between browser and worker, and the reaper's
+ * five-minute tick. The attempt is minted before the preflight, so it is
+ * never younger than the handoff it names.
+ */
+const HANDOFF_EXPIRY_MARGIN_MS = 5 * 60 * 1000;
+
+/**
+ * Whether a `freezing` record's handoff can no longer be approved: its attempt
+ * is older than the worker's handoff TTL, plus a margin. Any tab may then
+ * settle it by its queue, since a sibling still at Last.fm can't approve it
+ * any more (#168). No usable timestamp, or one from the future, reads as not
+ * expired.
+ */
+export function freezeHandoffHasExpired(record: QueueOwner, nowMs = Date.now()): boolean {
+  if (!record.attempt) {
+    return false;
+  }
+  const mintedAt = Number(record.attempt.split('.')[0]);
+  if (!Number.isFinite(mintedAt)) {
+    return false;
+  }
+  return nowMs - mintedAt >= HANDOFF_TTL_SECONDS * 1000 + HANDOFF_EXPIRY_MARGIN_MS;
+}
+
+/**
  * Clears ownership only if it is still exactly the record the caller examined.
  *
  * Every release here follows an `await` on a network round-trip, and the
@@ -1416,6 +1458,128 @@ export function releaseQueueOwnerIfSame(expected: QueueOwner): boolean {
   }
   setQueueOwner(null);
   return true;
+}
+
+/**
+ * The handoff this browser last preflighted and has not yet had back, if any.
+ * A return is accepted only for it (#157).
+ */
+export function preflightedHandoff(): string | null {
+  try {
+    return window.localStorage.getItem(PREFLIGHTED_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Records that the handoff this browser abandoned for `importId` was, when
+ * last asked, still on its way at the worker (`pending`: preflighted, never
+ * authorised), so later `pending` answers about that queue are about it.
+ *
+ * Its preflight is forgotten with its freeze, so this browser refuses its
+ * return and it can never upload. Normally the worker is told
+ * (`abandonOwnHandoff`) and stops counting it; when that goes unanswered it
+ * still answers `known: true, pending: true` until reaped (an hour), which
+ * every other check reads as handed over: without this, signing in to Last.fm
+ * after coming back blocked the saved selection anyway (#162). A new
+ * preflight forgets it.
+ */
+export function recordAbandonedImport(importId: string): void {
+  if (!importId) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(ABANDONED_IMPORT_STORAGE_KEY, importId);
+  } catch {
+    // Unrecorded: the next check blocks until the worker reaps the handoff.
+  }
+}
+
+/** Whether `importId` is the queue whose own pending handoff this browser abandoned. */
+export function isAbandonedImport(importId: string): boolean {
+  if (!importId) {
+    return false;
+  }
+  try {
+    return window.localStorage.getItem(ABANDONED_IMPORT_STORAGE_KEY) === importId;
+  } catch {
+    return false;
+  }
+}
+
+function forgetAbandonedImport(): void {
+  try {
+    window.localStorage.removeItem(ABANDONED_IMPORT_STORAGE_KEY);
+  } catch {
+    // A leftover record only ever waives `pending` answers about that queue.
+  }
+}
+
+/**
+ * Lifts the freeze this browser set for the handoff it last preflighted, once
+ * that handoff is known never to start: the worker refused it at its callback
+ * (any `?handoff=failed`), or the user came back without approving it and the
+ * worker has never taken the queue. Nothing else may: a refusal carries no
+ * handoff id, so only the freeze naming this browser's own preflight is known
+ * to be about it. Without a worker session the handoff can't be asked about
+ * later, so the freeze would otherwise never lift.
+ *
+ * The preflight record is forgotten too, so a late return for that handoff
+ * (approving it after all) is refused rather than uploading a queue this
+ * browser may by then be sending itself.
+ *
+ * `expected`: only if the freeze is still exactly this one, and still names
+ * the preflight on record; a newer attempt's freeze and preflight are left be.
+ *
+ * `pendingImportId`: the queue the worker still answered `pending` about for
+ * this handoff, recorded once it is released (`recordAbandonedImport`).
+ *
+ * Returns whether a freeze was lifted.
+ */
+export function releaseAbandonedHandoff(expected?: QueueOwner, pendingImportId = ''): boolean {
+  let preflighted: string | null = null;
+  try {
+    preflighted = window.localStorage.getItem(PREFLIGHTED_STORAGE_KEY);
+    if (expected && preflighted !== expected.id) {
+      return false;
+    }
+    window.localStorage.removeItem(PREFLIGHTED_STORAGE_KEY);
+  } catch {
+    return false;
+  }
+  const owner = expected || queueOwner();
+  if (!preflighted || !owner || owner.owner !== 'freezing' || owner.id !== preflighted) {
+    return false;
+  }
+  if (!releaseQueueOwnerIfSame(owner)) {
+    return false;
+  }
+  recordAbandonedImport(pendingImportId);
+  return true;
+}
+
+/** Whether `owner` is the freeze for the handoff this browser preflighted. */
+export function isOwnHandoffFreeze(owner: QueueOwner | null): boolean {
+  return !!owner && owner.owner === 'freezing' && !!owner.id && owner.id === preflightedHandoff();
+}
+
+/**
+ * `isOwnHandoffFreeze`, and preflighted in this very tab: the one that left
+ * for Last.fm, back without a return. The localStorage record is every tab's,
+ * so a tab loading while another waits at Last.fm would otherwise take the
+ * freeze as its own to settle, and abandon a handoff about to be approved.
+ * The sessionStorage copy survives the same-tab round trip and Back.
+ */
+export function isThisTabsHandoffFreeze(owner: QueueOwner | null): boolean {
+  if (!isOwnHandoffFreeze(owner)) {
+    return false;
+  }
+  try {
+    return window.sessionStorage.getItem(PREFLIGHTED_STORAGE_KEY) === (owner as QueueOwner).id;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -2063,6 +2227,13 @@ export const FALLTHROUGH_TIMEOUT_MS = 3000;
 /** Wider than a status check: an export carries the whole remaining queue. */
 const EXPORT_TIMEOUT_MS = 30000;
 
+/**
+ * Withdrawing an unapproved handoff is awaited on page load before the
+ * authority check, so it gets no longer than a browser outside the beta waits
+ * for that check.
+ */
+const ABANDON_TIMEOUT_MS = 3000;
+
 async function getWithTimeout(
   path: string,
   authorised: boolean,
@@ -2139,6 +2310,12 @@ export async function liveJobForUsername(
 export interface ImportStatus {
   known: boolean;
   live: boolean;
+  /**
+   * Known only through a handoff still on its way (preflighted, not yet
+   * authorised): no job has had the queue. Everyone but the browser that
+   * abandoned that handoff treats it as handed over.
+   */
+  pending: boolean;
   state?: string;
   /** Contiguous terminal prefix the worker reached. Safe to skip; nothing else is. */
   cursor: number;
@@ -2188,6 +2365,7 @@ export async function importStatus(
     return {
       known: body.known,
       live: body.live === true,
+      pending: body.known === true && body.pending === true,
       state: typeof body.state === 'string' ? body.state : undefined,
       cursor: Number(body.cursor) || 0,
       scrobbledCount: Number(body.scrobbledCount) || 0,
@@ -2367,6 +2545,14 @@ export function canCompress(): boolean {
  * Returns the URL to send the user to, or null if the worker declined. The
  * digest binds the payload we are about to upload; the worker records it and
  * can verify what arrives.
+ *
+ * An empty `username` is left out of the request: the worker then adopts
+ * whichever Last.fm account authorises, and names it in the return.
+ *
+ * The handoff id is recorded before returning, because the return is only
+ * accepted for a handoff this browser started. A browser that cannot record
+ * it gets null: its return would be refused anyway, after the user had
+ * already been through Last.fm.
  */
 export async function preflight(
   username: string,
@@ -2387,7 +2573,7 @@ export async function preflight(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        username,
+        ...(username ? { username } : {}),
         payloadDigest: digest,
         trackCount: tracks.length,
         chunkCount: Math.ceil(tracks.length / chunkTracks),
@@ -2403,6 +2589,19 @@ export async function preflight(
     if (!res.ok || !body.ok) {
       return null;
     }
+    try {
+      window.localStorage.setItem(PREFLIGHTED_STORAGE_KEY, body.handoffId);
+    } catch (e) {
+      trackError('background.recordPreflight', e);
+      return null;
+    }
+    try {
+      window.sessionStorage.setItem(PREFLIGHTED_STORAGE_KEY, body.handoffId);
+    } catch {
+      // Then no tab settles it by its queue, and the freshness rules apply.
+    }
+    // A new attempt is on its way, and its own answers are not to be waived.
+    forgetAbandonedImport();
     return { handoffId: body.handoffId, authoriseUrl: body.authoriseUrl };
   } catch (e) {
     trackError('background.preflight', e);
@@ -2513,6 +2712,77 @@ export async function isHandoffActive(
   } catch {
     return null;
   }
+}
+
+/**
+ * Withdraws a handoff nobody approved (`POST /scrobblify/handoff/:id/abandon`),
+ * so the worker stops counting it as on its way: no `/job/live` for its user,
+ * no `pending` import, a free slot, and a refused callback if its Last.fm page
+ * is approved later. Only for this browser's own preflight (see
+ * `abandonOwnHandoff`).
+ *
+ * Unauthenticated, because a browser coming back without approving has no
+ * session. True when withdrawn; false when the worker had nothing to withdraw
+ * (unknown, already failed, or approved after all); null when unanswered.
+ * Best effort with a short timeout: an unanswered one leaves the handoff to
+ * the reaper, as before.
+ */
+export async function abandonHandoff(
+  handoffId: string,
+  timeoutMs = ABANDON_TIMEOUT_MS,
+): Promise<boolean | null> {
+  if (!handoffId || !isBackgroundConfigured()) {
+    return null;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${API_BASE}/scrobblify/handoff/${encodeURIComponent(handoffId)}/abandon`, {
+      method: 'POST',
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const body = await res.json();
+    return body && body.ok === true ? body.abandoned === true : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * `releaseAbandonedHandoff`, after first withdrawing the handoff at the worker
+ * (`abandonHandoff`), when it is this browser's own preflight. Unwithdrawn,
+ * an unapproved handoff kept the user live in `/job/live` for an hour, which
+ * blocked a signed-in browser (#164), and approving its Last.fm page later
+ * still made a job that marked the queue handed over for good (#165).
+ *
+ * `pendingImportId` is recorded (`recordAbandonedImport`) only when the
+ * worker didn't confirm the withdrawal: a withdrawn handoff no longer counts
+ * in `/import/:id`, so there is no `pending` answer left to waive. Unanswered
+ * (worker unreachable, or a worker too old to have the route) it still does,
+ * until reaped.
+ *
+ * Released only when the worker withdrew it or didn't answer. `abandoned:
+ * false` means the handoff is past waiting for its approval: maybe approved
+ * since the queue was checked, its return on the way. Releasing then dropped
+ * the preflight record, so that return was refused. Null then, with both
+ * records left for the caller to find out what became of it; otherwise
+ * whether a freeze was lifted.
+ */
+export async function abandonOwnHandoff(
+  expected: QueueOwner,
+  pendingImportId = '',
+): Promise<boolean | null> {
+  const own = preflightedHandoff();
+  const abandoned = own && isOwnHandoffFreeze(expected) ? await abandonHandoff(own) : null;
+  if (abandoned === false) {
+    return null;
+  }
+  return releaseAbandonedHandoff(expected, abandoned === true ? '' : pendingImportId);
 }
 
 /**
@@ -2632,8 +2902,19 @@ export function newExportClaim(): string {
  * to a server or written to an access log — and this token authorises reading
  * a complete listening history. Stripping it stops the token surviving in
  * browser history or being copied out of the address bar.
+ *
+ * Only a return for the handoff this browser preflighted (or, from an older
+ * build, froze its queue for) is accepted (#157).
+ * Anyone can preflight a handoff and send its Last.fm link to someone else;
+ * without this, the victim's browser would store a session from that return
+ * and upload its own queue into the stranger's handoff. A foreign return is
+ * stripped and nothing is stored. The record is consumed on a match, so the
+ * same fragment cannot be replayed into this browser later.
+ *
+ * `user` is the Last.fm account that authorised, which a handoff started
+ * before signing in learns only here. Empty from workers that predate it.
  */
-export function consumeRedirectFragment(): { session: string; handoffId: string } | null {
+export function consumeRedirectFragment(): { session: string; handoffId: string; user: string } | null {
   try {
     const hash = window.location.hash.replace(/^#/, '');
     if (!hash) {
@@ -2645,10 +2926,38 @@ export function consumeRedirectFragment(): { session: string; handoffId: string 
     if (!session || !handoffId) {
       return null;
     }
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    let preflighted: string | null = null;
+    try {
+      preflighted = window.localStorage.getItem(PREFLIGHTED_STORAGE_KEY);
+    } catch {
+      preflighted = null;
+    }
+    /*
+      Builds before the server choice recorded only the freeze naming the
+      handoff, and the return is a fresh page load, so a handoff started in a
+      tab on such a build comes back to this one. The freeze is as much this
+      browser's own as `preflighted` (nobody else can write its localStorage).
+      Only needed for those handoffs: they expire within an hour, but old
+      builds keep running for days (see AGENTS.md), so this can go once no
+      events come from builds without `preflight()`'s record, roughly 2027-01.
+    */
+    const owner = queueOwner();
+    const frozenForIt = !!owner && owner.owner === 'freezing' && owner.id === handoffId;
+    if (preflighted !== handoffId && !frozenForIt) {
+      trackEvent('background_handoff_return_rejected');
+      return null;
+    }
+    try {
+      if (preflighted === handoffId) {
+        window.localStorage.removeItem(PREFLIGHTED_STORAGE_KEY);
+      }
+    } catch {
+      // Nothing to do; the next preflight overwrites it.
+    }
     setSession(session);
     setPendingHandoff(handoffId);
-    window.history.replaceState(null, '', window.location.pathname + window.location.search);
-    return { session, handoffId };
+    return { session, handoffId, user: params.get('user') || '' };
   } catch (e) {
     trackError('background.consumeRedirectFragment', e);
     return null;
@@ -2693,7 +3002,7 @@ export async function startReauth(username: string): Promise<string | null> {
     const res = await fetch(`${API_BASE}/scrobblify/auth/signin`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, nonce }),
+      body: JSON.stringify({ ...(username ? { username } : {}), nonce }),
     });
     const body = await res.json();
     if (!res.ok || !body.ok) {
@@ -2716,12 +3025,15 @@ export async function startReauth(username: string): Promise<string | null> {
  * The nonce is compared before the session is stored, and cleared either way:
  * a return this browser did not initiate is discarded, and a replayed one
  * cannot be used twice.
+ *
+ * Returns the Last.fm account that signed in (empty from workers that predate
+ * naming it), or null when there was no accepted return.
  */
-export function consumeReauthFragment(): boolean {
+export function consumeReauthFragment(): { user: string } | null {
   try {
     const params = new URLSearchParams(window.location.search);
     if (params.get('signin') !== 'ok') {
-      return false;
+      return null;
     }
     const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
     const session = hash.get('session');
@@ -2736,13 +3048,47 @@ export function consumeReauthFragment(): boolean {
     window.history.replaceState(null, '', window.location.pathname);
     if (!session || !returned || !expected || returned !== expected) {
       trackEvent('background_reauth_rejected');
-      return false;
+      return null;
     }
     setSession(session);
     sessionExpired = false;
-    return true;
+    return { user: hash.get('user') || '' };
   } catch (e) {
     trackError('background.consumeReauthFragment', e);
+    return null;
+  }
+}
+
+/**
+ * Marks a sign-in to the worker that Home's "Re-connect to last.fm" started
+ * to find out what the worker holds for this account. Per tab: `/scrobble`
+ * reads it once on return to say what it found.
+ */
+const WORKER_LOOKUP_KEY = 'scrobblify.background.lookup';
+
+export function setWorkerLookup(on: boolean): void {
+  try {
+    if (on) {
+      window.sessionStorage.setItem(WORKER_LOOKUP_KEY, '1');
+    } else {
+      window.sessionStorage.removeItem(WORKER_LOOKUP_KEY);
+    }
+  } catch {
+    // Storage refused: the return just shows /scrobble as it would anyway.
+  }
+}
+
+export function isWorkerLookup(): boolean {
+  try {
+    return window.sessionStorage.getItem(WORKER_LOOKUP_KEY) === '1';
+  } catch {
     return false;
   }
+}
+
+/** Whether this page load is the return from such a sign-in. Clears it. */
+export function takeWorkerLookup(): boolean {
+  const on = isWorkerLookup();
+  setWorkerLookup(false);
+  return on;
 }
