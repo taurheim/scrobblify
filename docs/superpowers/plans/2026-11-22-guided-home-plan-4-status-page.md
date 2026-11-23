@@ -138,3 +138,26 @@ Commit `Home is the status page for a server job`.
 - `cd worker; npm test`; both Playwright suites; `npm run lint:check`; `npm run build`.
 - Real browser on `$env:PORT=8662; npm run dev:mock:bg`: every status row (drive states with `POST /mock/worker/scrobblify/__mock/job`), the header "Scrobble" link landing on Home, move back signed in and signed out, cancel, finished job → new import.
 - Before/after screenshots (master vs branch) of every changed screen.
+
+---
+
+## As built
+
+Commits: `492047e` (Task 1), `bb13b0d` and `102e806` (Task 2), `7abc90b` and `5f67128` (Task 3 and #173), `de16440` (#166), `9fa9ab0` (#163), then this document's `Docs: the status page`. Task 6's verification is separate.
+
+### Deviations from the plan
+
+- **Task 1.** The worker's resume route already accepted `needs_attention` (clearing the failure count and reason), so only a test was added. `reattachCredential`'s update is a compare-and-set on the `state` and `dormant_from` it read, so a job that changed in between isn't restored from a stale reading. A job with no `dormant_from` (dormant before migration 007) reconnects to `active`.
+- **Task 2, sources.** `detectReturning` returns `kind: 'job'` with `source` `job`, `import` or `other` (no separate `loadJobForHome`). The record applies to a session's job when the import lookup's `totalTracks` equals the job's, since the job doesn't name its import (not by `importId`/`username` as planned). `/job/live` is asked only without a worker session (or once the job lookup's 401 cleared it), alongside the other lookups (`102e806`), so a stalled worker costs one timeout and an unanswered job lookup never reads as "other device". `fetchJobAnswer` tells "no job" from "no answer": a worker session with no answer gets `status.checking` with Try again (asked once more by itself on `/scrobble`'s 8 s budget) instead of the start page (`5f67128`, #173's review), emitted as `home_returning_shown` `state: checking`.
+- **Task 2, the view.** `StatusView` grew `lineParts` (links: last.fm, Last.fm, buy me a coffee, the support email, and "scrobble locally" as an action), and the rejected count moved into the completed line. Without a session, only a sending job gets the finish date; paused gets "Paused", anything else the new `status.noSession.stopped` (`102e806`). The title falls back to "Scrobbling to Last.fm" when no one is known or the handover record names another account (`7abc90b`). `DAY_FULL_REASON` moved to `src/shared/lastfm/dailyCap.ts` (the worker's scheduler re-exports it), so there is no mirrored string to test. A job state the client doesn't know gets "Scrobblify is scrobbling for you!" with the manage buttons. `home_returning_shown` `server_job` carries `source` and `job_state`; Reconnect / Sign in again / Sign in emit `background_reauth_started` `source: home`. Polling and `overallProgress` moved to `JobStatus.ts`.
+- **Task 2, polling.** As planned, plus an `exporting` job every 30 s (`5f67128`, #173). The old card's "Next batch around…" and "Last checked" lines were not carried over.
+- **Task 3, the redirect.** `leaveForStatusPage` also waits for the mount to settle (`statusPageArmed`, after the worker lookup's report and a reconnect) and holds off over an open error dialog; the stepper and resume prompt hide while a shown job is listed (`jobShown`). The redirect hands Home the job it found and a refused worker sign-in's notice (`statusHandover` in the store; Home uses the job if under 30 s old), because a worker answering in 3–8 s made Home show the start page while `/scrobble` found the job and sent the user back (`5f67128`).
+- **Task 3, take-back.** `/scrobble` sets `takingBack` before the first render, which also quiets `AuthenticateStep` and shows "Downloading progress from scrobblify servers...". `takeBackFromIntent` accepts the states the export can start from, and `exporting` only with this tab's failed claim. A refused cancel and a failed sign-in show an error dialog (not a notice) whose closing goes back to Home. A failed take-back records its export claim (sessionStorage `scrobblify.background.failedTakeBack`, 15 min) so the status page offers "Scrobble the rest locally" again on the `exporting` job (`notice.moveBackFailed`) and the retry presents the claim the worker still holds; the mock worker now refuses an export under another claim (`5f67128`).
+- **#148** is fixed by tagging ownership broadcasts with the sending page (`fromThisPage` in `onServerOwnershipChange`) and a `_takeBackRelease` flag, rather than a flag naming the job. The take-back's tab only lifts the scrobble step's halt; a sibling-tab test checks the others still revalidate.
+- **#166** also covers `recoverFromBfcache`, which asks `hasLiveJob` with a session when the queue lookup goes unanswered.
+
+### Issues
+
+- Fixed: #148 (`7abc90b`), #163 (`9fa9ab0`), #166 (`de16440`), #167 (`492047e`), #173 (`5f67128`).
+- Filed during the work: #173 (status page never refreshed a job stuck in `exporting`), fixed on this branch.
+- Left as they were: code comments in `worker/src/api.ts`, `worker/src/scheduler.ts` and `worker/src/store.ts` still mention the removed job card and its "Resume on the server" / "take my progress back" buttons; documentation only, no behaviour.
