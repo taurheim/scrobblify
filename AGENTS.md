@@ -530,7 +530,7 @@ Last.fm, a closed tab) leaves the selection as ordinary saved progress**, and
 the next visit offers it through the resume prompt and Home's card; a
 `session_resumed` (`source: saved`) at 0 progress can be this. Because that
 save replaces whatever is saved, it applies #102 itself: it refuses while
-`sendingBlocked` (the "Hold on…" notice), and when the confirmation didn't know
+`sendingBlocked` (the "One moment, still…" notice), and when the confirmation didn't know
 of saved progress (`savedProgress` null: the resume prompt was withheld, or
 another tab saved since) it reads the disk and refuses any saved state for a
 different import (or with no id) with "You have saved progress that would be
@@ -1072,11 +1072,10 @@ The accepted gap: a browser that lost its localStorage but kept a leftover
 handed-over queue in IndexedDB, while the worker is unreachable. A successful
 handover clears the saved queue, so this needs a stale copy as well.
 
-**A blocked browser can choose to carry on.** The "We can't reach the
-background scrobble worker" banner offers "Continue in this browser anyway"
-next to "Try again", warning of double scrobbles if the worker is also
-scrobbling
-(`continueWithoutAuthority`). Without it, an opted-in browser, or one with a
+**A blocked browser can choose to carry on.** The "Can't reach scrobblify
+servers right now." banner offers "Continue locally anyway" next to "Try
+again", with the warning "If scrobblify server is also sending, you may get
+duplicates on last.fm." (`continueWithoutAuthority`). Without it, an opted-in browser, or one with a
 trace of a handover, was blocked for as long as the worker was unreachable.
 The choice lasts for the page load only. It lifts only the no-answer gate: a
 later `live: true` answer still blocks, and it is **never offered over a
@@ -1269,8 +1268,8 @@ URL and calling `resumeHandoffIfReturning`.
 **A handoff that never reaches the worker unfreezes this browser.** Handing
 over writes a `freezing` queue-owner record naming the preflighted handoff, and
 a worker session only comes with a *successful* callback, so a browser that
-came back any other way could never ask about it and stayed blocked ("A
-handover is starting in another tab…", then "…on hold", for good):
+came back any other way could never ask about it and stayed blocked ("Another
+tab is moving this import…", then "…didn't finish", for good):
 
 - Any `?handoff=failed` return (denied, `exchange_failed`, `already_live`, …)
   withdraws this browser's preflighted handoff at the worker (below, in case
@@ -1280,7 +1279,7 @@ handover is starting in another tab…", then "…on hold", for good):
 - Back from Last.fm without approving (a reload, or a bfcache restore), with or
   without a worker session left over from an earlier handoff or sign-in
   (#166; neither `isHandoffActive` nor `/job` sees a handoff nobody approved,
-  so a browser with one stayed blocked, "still running on the server", until
+  so a browser with one stayed blocked, "running on our server", until
   the reaper failed the handoff an hour later): `ownHandoffWasTaken` asks `/scrobblify/import/:id` about the
   saved queue. `known: false`, or `known: true, pending: true` (the worker
   still holds this very handoff, unapproved), withdraws and releases it
@@ -1307,8 +1306,8 @@ handover is starting in another tab…", then "…on hold", for good):
   older than the worker's handoff TTL plus 5 minutes (`freezeHandoffHasExpired`;
   the client's `HANDOFF_TTL_SECONDS` mirrors the worker's). Then `known: false`
   releases (`background_freeze_released` `reason: handoff_not_taken`), a job
-  blocks, and `pending` (not yet reaped) or no answer keeps "…on hold… Please
-  refresh in a few minutes." A browser with a worker session asks about
+  blocks, and `pending` (not yet reaped) or no answer keeps "A handover in
+  another tab didn't finish. Refresh in a few minutes." A browser with a worker session asks about
   another tab's handoff with `isHandoffActive` instead, which sees it once
   reaped. Nothing is withdrawn from such a tab. Before the
   hour is up, a tab that can't ask (no worker session) says the handover
@@ -1591,7 +1590,8 @@ they are out of date.
 Either failure, a refused cancel (`background_takeback_cancel_refused`: "Your
 tracks were copied back, but the background import could not be stopped…
 Use "Scrobble the rest locally" again in a moment.") or anything else
-(`background.takeBackProgress`: "Couldn't bring your progress back…"), shows
+(`background.takeBackProgress`: "Couldn't move your progress back. It's safe
+on our server."), shows
 an error dialog, and closing it goes back to Home. The export may have
 claimed the job, which the worker then holds `exporting` for its claim's 10
 minutes (`EXPORT_CLAIM_SECONDS`), letting only that claim back in. So the

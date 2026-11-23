@@ -31,24 +31,17 @@
           handed its queue over, so the worker is known to have it, not merely
           possibly.
         -->
-        <div v-if="!ownershipBlocked">
-          We can't reach the background scrobble worker. You can continue in
-          browser but you might get double scrobbles if the worker is also
-          scrobbling. Please check in again in a couple hours. If you keep seeing
-          this message, email me at <a href="mailto:niko@savas.ca">niko@savas.ca</a>
-        </div>
-        <div v-else>
-          We can't reach the background scrobble worker. Please check in again in
-          a couple hours. If you keep seeing this message, email me at
-          <a href="mailto:niko@savas.ca">niko@savas.ca</a>
-        </div>
+        <div>Can't reach scrobblify servers right now.</div>
         <div class="mt-3">
           <v-btn color="primary" :loading="authorityPending" @click="retryAuthority">
             Try again
           </v-btn>
           <v-btn v-if="!ownershipBlocked" variant="text" class="ml-2" @click="continueWithoutAuthority">
-            Continue in this browser anyway
+            Continue locally anyway
           </v-btn>
+        </div>
+        <div v-if="!ownershipBlocked" class="mt-2 text-caption outage-warning">
+          If scrobblify server is also sending, you may get duplicates on last.fm.
         </div>
       </template>
 
@@ -338,18 +331,20 @@ interface FileConflict {
 const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
 
 /** Shown when the bearer token for the worker has expired, wherever that is detected. */
-const SESSION_EXPIRED_NOTICE = 'You need to refresh your connection to the scrobble worker.';
-const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sign in. Please try again in a few minutes.';
+const SESSION_EXPIRED_NOTICE = 'Sign in again so we can check your scrobbling progress.';
+const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach our server. Try again in a few minutes.';
 /**
  * Hidden while the worker can't be reached: refreshing the connection needs
  * the worker, so the unreachable banner is the only one worth showing.
  */
 const NEEDS_WORKER_NOTICES = [SESSION_EXPIRED_NOTICE, REAUTH_UNREACHABLE_NOTICE];
 /**
- * The worker's sign-in came back refused (`?signin=failed`). Carried to Home
- * when a job the old session can still see sends the page there.
+ * The worker's sign-in came back refused (`?signin=failed`). Carried to Home,
+ * as Home's own wording, when a job the old session can still see sends the
+ * page there.
  */
-const WORKER_SIGNIN_FAILED_NOTICE = 'Signing in to the background service didn\'t work. Please try again.';
+const WORKER_SIGNIN_FAILED_NOTICE = 'Signing in to our server didn\'t work. Try again.';
+const WORKER_SIGNIN_FAILED_STATUS = 'Signing in to the background service didn\'t work. Please try again.';
 /**
  * A handoff that named nobody came back refused: the Last.fm account that
  * authorised it already has a job. Signing in to the worker shows that job.
@@ -924,7 +919,7 @@ export default defineComponent({
         this.$store.commit('setStatusHandover', {
           job: this.backgroundJob,
           atMs: (this as any)._backgroundJobAtMs || 0,
-          notice: this.backgroundNotice === WORKER_SIGNIN_FAILED_NOTICE ? this.backgroundNotice : '',
+          notice: this.backgroundNotice === WORKER_SIGNIN_FAILED_NOTICE ? WORKER_SIGNIN_FAILED_STATUS : '',
         });
         this.$router.replace({ name: 'home' }).catch(() => undefined);
       }
@@ -1028,7 +1023,7 @@ export default defineComponent({
       }
       return this.reauthFixNow
         ? 'Fix now'
-        : 'Sign in to the background service';
+        : 'Sign in to our server';
     },
   },
   methods: {
@@ -1161,7 +1156,7 @@ export default defineComponent({
           this.showReauth = true;
           this.reauthFixNow = false;
           this.reauthLabelText = '';
-          this.backgroundNotice = 'Your import is still running on the server, so scrobbling from this browser is switched off to stop the same tracks being sent twice. Sign in to check on it or bring it back here.';
+          this.backgroundNotice = 'Your import is running on our server, so this tab won\'t send anything.';
         }
         trackEvent('background_authority_check', { result: 'live', signed_in: String(!!this.backgroundJob) });
         return;
@@ -1367,8 +1362,8 @@ export default defineComponent({
         this.reauthFixNow = false;
         this.reauthLabelText = '';
         const p = this.handedOverProgress;
-        const detail = p ? ` It has scrobbled ${p.scrobbled} of ${p.total} tracks.` : '';
-        this.backgroundNotice = `This import was handed over to the background service, so scrobbling it from this browser is switched off — the tracks it already sent would be sent again and silently discarded.${detail} Sign in to check on it or bring it back here.`;
+        const detail = p ? ` It has sent ${p.scrobbled} of ${p.total}.` : '';
+        this.backgroundNotice = `These tracks are now being scrobbled by scrobblify's servers.${detail} Sign in to check on it.`;
       }
       trackEvent('background_authority_check', { result: 'handed_over', signed_in: String(!!this.backgroundJob) });
     },
@@ -1476,7 +1471,7 @@ export default defineComponent({
       */
       this.hasResumableState = false;
       this.ownershipBlocked = true;
-      this.backgroundNotice = 'This tab is holding an out-of-date copy of your import — the queue on disk has moved on. Reload this page to pick up where it actually got to; resuming here would send tracks that have already been scrobbled.';
+      this.backgroundNotice = 'This tab is out of date. Reload to continue.';
       trackEvent('background_stale_tab_blocked', {
         had_disk_id: String(!!diskId),
         disk_readable: String(diskReadable),
@@ -1617,7 +1612,7 @@ export default defineComponent({
           Left alone and reconciled on a later load instead.
         */
         if (background.freezeAttemptIsFresh(owner)) {
-          this.backgroundNotice = 'A handover is starting in another tab, so scrobbling here is paused for a moment.';
+          this.backgroundNotice = 'Another tab is moving this import to our server. One moment.';
           return;
         }
         // No handoff id means it never got as far as preflight, so nothing was
@@ -1649,7 +1644,7 @@ export default defineComponent({
           && !background.freezeHandoffHasExpired(owner);
         this.backgroundNotice = waitsForExpiry
           ? 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until it does. If that tab was closed, the handover expires within the hour: refresh then.'
-          : 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until we can tell whether it took effect. Please refresh in a few minutes.';
+          : 'A handover in another tab didn\'t finish. Refresh in a few minutes.';
         return;
       }
 
@@ -1820,14 +1815,14 @@ export default defineComponent({
           trackError('background.resolveOwnershipClear', e);
           this.hasResumableState = false;
           await this.refreshBackgroundJob();
-          this.backgroundNotice = 'Your import is running on the server. This browser could not clear its old copy, so scrobbling here stays off to avoid sending anything twice.';
+          this.backgroundNotice = 'Your import is running on our server. This tab won\'t send anything.';
           trackEvent('background_ownership_resolved', { outcome: 'server_owns_clear_failed' });
           return;
         }
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         await this.refreshBackgroundJob();
-        this.backgroundNotice = 'Your import was handed over successfully and is running on the server.';
+        this.backgroundNotice = 'Your import is now running on our server.';
         trackEvent('background_ownership_resolved', { outcome: 'server_owns' });
         return;
       }
@@ -1859,7 +1854,7 @@ export default defineComponent({
       this.reauthLabelText = '';
       this.backgroundNotice = background.isSessionExpired()
         ? SESSION_EXPIRED_NOTICE
-        : 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
+        : 'We couldn\'t check with our server, so this tab is on hold. Refresh in a few minutes.';
       trackEvent('background_ownership_unresolved', { session_expired: background.isSessionExpired() });
     },
 
@@ -1986,7 +1981,7 @@ export default defineComponent({
           this.backgroundBusy = false;
           this.showBackgroundOffer = false;
           step.releaseHandoffHalt();
-          this.backgroundNotice = 'Couldn\'t pause this tab\'s scrobbling in time, so the handover was cancelled to avoid sending anything twice. Nothing has changed — try again in a moment.';
+          this.backgroundNotice = 'Couldn\'t pause this tab in time, so nothing was moved. Try again in a moment.';
           trackEvent('background_handoff_failed', { reason: 'halt_timeout' });
           return false;
         }
@@ -2060,8 +2055,8 @@ export default defineComponent({
           step.releaseHandoffHalt();
         }
         this.backgroundNotice = result.reason === 'at_capacity'
-          ? 'The background service is full right now — it is limited during the beta. Your progress is saved; try again later or keep scrobbling in this tab.'
-          : 'Couldn\'t hand this over to the background service. Your progress is saved and nothing has changed — keep scrobbling in this tab.';
+          ? 'Our server is full right now. Keep going in this tab, or try later.'
+          : 'Couldn\'t move this to our server. Nothing changed.';
         return false;
       }
       // On success the tab is navigating to Last.fm; leave `busy` set so the
@@ -2154,8 +2149,8 @@ export default defineComponent({
         this.ownershipBlocked = true;
         await this.refreshBackgroundJob();
         this.backgroundNotice = owned === true
-          ? 'Your import was handed over and is running on the server, so scrobbling in this tab is switched off.'
-          : 'We couldn\'t check whether the background service took over your import, so scrobbling in this tab is on hold. Please refresh in a few minutes.';
+          ? 'Your import is running on our server, so this tab won\'t send anything.'
+          : 'We couldn\'t check with our server, so this tab is on hold. Refresh in a few minutes.';
         if (owned === true && !this.backgroundJob) {
           // Known only by its queue: signing in to the worker shows the job.
           this.showReauth = true;
@@ -2190,7 +2185,7 @@ export default defineComponent({
         step.releaseHandoffHalt();
       }
 
-      this.backgroundNotice = 'The handover wasn\'t completed, so nothing was started. Your progress is still here — carry on in this tab, or try handing it over again.';
+      this.backgroundNotice = 'The move wasn\'t finished, so nothing changed.';
       if (this.pendingEntryPoint === 'confirm') {
         // The selection was saved for the trip, so it is what there is to carry on with.
         await this.exposeSavedStateUnlessStale('bfcache_restore');
@@ -2265,7 +2260,7 @@ export default defineComponent({
           this.reauthFixNow = false;
           this.reauthLabelText = 'Sign in to see it';
         } else {
-          this.backgroundNotice = 'Last.fm didn\'t complete the handoff, so nothing was started. Your progress is still saved here.';
+          this.backgroundNotice = 'Last.fm didn\'t finish the approval, so nothing changed.';
         }
         trackEvent('background_handoff_failed', { reason });
         this.stripQuery();
@@ -2283,23 +2278,23 @@ export default defineComponent({
       const workerUser = (fragment && fragment.user)
         || (this.$store.state.lfmApi as LastFm).getUserName() || '';
       if (!handoffId) {
-        this.backgroundNotice = 'The handoff came back without a session, so nothing was started. Your progress is still saved here.';
+        this.backgroundNotice = 'Last.fm didn\'t finish the approval, so nothing changed.';
         return false;
       }
 
       this.backgroundBusy = true;
-      this.backgroundNotice = 'Uploading your remaining tracks…';
+      this.backgroundNotice = 'Uploading your tracks…';
       let result;
       try {
         result = await completeHandoff(this.stateManager, handoffId, (done, total) => {
-          this.backgroundNotice = `Uploading your remaining tracks… ${done} of ${total}`;
+          this.backgroundNotice = `Uploading your tracks… ${done} of ${total}`;
         }, workerUser);
       } catch (e) {
         trackError('background.completeHandoff', e);
         // An unexpected throw tells us nothing about whether the job started,
         // so this must not fall through to "resume locally".
         this.backgroundBusy = false;
-        this.backgroundNotice = 'Something went wrong finishing the handoff, and we can\'t tell whether the background import started. Reload this page in a minute — don\'t resume here in the meantime, or your tracks could be scrobbled twice.';
+        this.backgroundNotice = 'We can\'t tell if the move worked. Reload in a minute, and don\'t resume here until then.';
         return true;
       }
       this.backgroundBusy = false;
@@ -2326,11 +2321,11 @@ export default defineComponent({
       if (result.safeToResumeLocally) {
         // `completeHandoff` has withdrawn the job Last.fm's approval made.
         this.uploadFailed = true;
-        this.backgroundNotice = 'The upload didn\'t finish, so nothing is running on the server. Your progress is exactly where you left it.';
+        this.backgroundNotice = 'The upload didn\'t finish. Nothing changed.';
         return false;
       }
 
-      this.backgroundNotice = 'We can\'t tell whether the background import started. Reload this page in a minute — don\'t resume here in the meantime, or your tracks could be scrobbled twice.';
+      this.backgroundNotice = 'We can\'t tell if the move worked. Reload in a minute, and don\'t resume here until then.';
       return true;
     },
 
@@ -2584,8 +2579,8 @@ export default defineComponent({
         */
         const uncertain = Number(exported.uncertainCount) || 0;
         this.backgroundNotice = uncertain > 0
-          ? `Your remaining tracks are back in this browser. Choose "Resume" to carry on here. Note that ${uncertain.toLocaleString()} track(s) were sent without a confirmed reply too long ago to repeat exactly, so they go out again under a new time — if they did arrive, Last.fm may end up with a second copy of them.`
-          : 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
+          ? `Your tracks are back in this tab. ${uncertain.toLocaleString()} may show up twice on Last.fm because we couldn't confirm them.`
+          : 'Your tracks are back in this tab. Press Resume to carry on.';
         trackEvent('background_job_reclaimed', { job_id: jobId, uncertain });
       } catch (e) {
         trackError('background.takeBackProgress', e);
@@ -2598,7 +2593,7 @@ export default defineComponent({
         // The job may have been left paused. Say so, and re-read its real
         // state rather than leaving a stale banner on screen.
         await this.refreshBackgroundJob();
-        this.errorMessage = 'Couldn\'t bring your progress back. Your tracks are still safe on the server — nothing has been lost or scrobbled twice.';
+        this.errorMessage = 'Couldn\'t move your progress back. It\'s safe on our server.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
       }
@@ -3074,8 +3069,8 @@ export default defineComponent({
       */
       if (this.sendingBlocked) {
         this.backgroundNotice = background.isBetaOptedIn()
-          ? 'Hold on — still checking whether an import is already running on the server for your account.'
-          : 'Hold on, still getting ready. Try again in a moment.';
+          ? 'One moment, still checking our server.'
+          : 'One moment, still getting ready.';
         return null;
       }
       if (!this.savedProgress) {
@@ -3189,8 +3184,8 @@ export default defineComponent({
       */
       if (this.authorityPending || this.authorityUnknown || this.ownershipBlocked) {
         this.backgroundNotice = background.isBetaOptedIn()
-          ? 'Hold on — still checking whether an import is already running on the server for your account.'
-          : 'Hold on, still getting ready. Try again in a moment.';
+          ? 'One moment, still checking our server.'
+          : 'One moment, still getting ready.';
         return;
       }
       try {

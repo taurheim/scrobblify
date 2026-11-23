@@ -23,8 +23,8 @@ import { DAY_FULL_REASON } from '../../src/shared/lastfm/dailyCap';
 
 const FIXTURE_ZIP = path.resolve(__dirname, '..', 'fixtures', 'test-spotify-data.zip');
 const WORKER = 'http://background.invalid/**';
-const UNREACHABLE = "text=We can't reach the background scrobble worker";
-const CONTINUE_ANYWAY = 'button:has-text("Continue in this browser anyway")';
+const UNREACHABLE = "text=Can't reach scrobblify servers right now.";
+const CONTINUE_ANYWAY = 'button:has-text("Continue locally anyway")';
 // Vuetify renders every stepper pane up front, so an unfiltered text match
 // finds the hidden copy of this heading before anything has been sent.
 const FINISHED = 'text=Finished scrobbling >> visible=true';
@@ -177,7 +177,7 @@ test.describe('Background worker unreachable', () => {
     await expect(page.locator(CONTINUE_ANYWAY)).toHaveCount(0);
     // Refreshing the worker connection needs the worker, so the unreachable
     // banner is the only one shown.
-    await expect(page.locator('text=You need to refresh your connection')).toHaveCount(0);
+    await expect(page.locator('text=Sign in again so we can check your scrobbling progress.')).toHaveCount(0);
     await expect(page.locator('button:has-text("Fix now")')).toHaveCount(0);
   });
 });
@@ -412,7 +412,7 @@ test.describe('Signing in while the page mounts', () => {
     expect(await page.locator('text=Resume previous session?').count()).toBe(0);
     releaseSecondCall();
 
-    await expect(page.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Your import is running on our server, so this tab won\'t send anything.')).toBeVisible({ timeout: 10000 });
     await expect(page.locator('text=Resume previous session?')).toHaveCount(0);
     expect(scrobbles).toEqual([]);
   });
@@ -489,7 +489,7 @@ test.describe('Signing in after choosing', () => {
     await page.locator('.scrobble-confirm button:has-text("Start scrobbling")').click();
 
     await expect(page.locator('text=Currently authenticated as: testuser')).toBeVisible({ timeout: 10000 });
-    await expect(page.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Your import is running on our server, so this tab won\'t send anything.')).toBeVisible({ timeout: 10000 });
     // Long enough for a send that was going to happen to have happened.
     await page.waitForTimeout(3000);
     expect(scrobbles).toEqual([]);
@@ -1526,7 +1526,7 @@ test.describe('Home as the status page', () => {
 
   // Signed in to Last.fm in this browser as the job's user.
   const SIGNED_IN = { scrobblifyLfmAuthToken: 'fake-token', scrobblifyLfmAuthKey: MOCK_SESSION_KEY };
-  const OUT_OF_DATE = 'text=out-of-date copy of your import';
+  const OUT_OF_DATE = 'text=This tab is out of date. Reload to continue.';
 
   /*
     Where "Scrobble the rest locally" ends up: back on /scrobble with the
@@ -1534,7 +1534,7 @@ test.describe('Home as the status page', () => {
     offered. Resume must then actually send (#148 left the tab halted).
   */
   async function expectMovedBack(page: Page, mock: MockWorker) {
-    await expect(page.locator('text=Your remaining tracks are back in this browser.')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('text=Your tracks are back in this tab. Press Resume to carry on.')).toBeVisible({ timeout: 20000 });
     await expect(page).toHaveURL(/#\/scrobble/);
     const resume = page.locator('.scrobblify > .v-alert button:has-text("Resume")');
     await expect(resume).toBeVisible();
@@ -1596,7 +1596,7 @@ test.describe('Home as the status page', () => {
     const card = page.locator(CARD);
     await card.locator(`.status-action:has-text("${MOVE_BACK}")`).click({ timeout: 15000 });
     const dialog = page.locator('.v-dialog:has-text("Something went wrong")');
-    await expect(dialog).toContainText('Couldn\'t bring your progress back.', { timeout: 20000 });
+    await expect(dialog).toContainText('Couldn\'t move your progress back. It\'s safe on our server.', { timeout: 20000 });
     expect(mock.world.job!.state).toBe('exporting');
     await dialog.locator('button:has-text("OK")').click();
 
@@ -1666,12 +1666,12 @@ test.describe('Home as the status page', () => {
     // No worker session yet, so the sibling can't see the job and stays on
     // /scrobble, blocked by the live answer for its username.
     await sibling.goto('/#/scrobble');
-    await expect(sibling.locator('text=Your import is still running on the server')).toBeVisible({ timeout: 15000 });
+    await expect(sibling.locator('text=Your import is running on our server, so this tab won\'t send anything.')).toBeVisible({ timeout: 15000 });
 
     await page.evaluate((key) => localStorage.setItem(key, 's-status'), SESSION_KEY);
     await page.reload();
     await page.locator(`${CARD} .status-action:has-text("${MOVE_BACK}")`).click({ timeout: 15000 });
-    await expect(page.locator('text=Your remaining tracks are back in this browser.')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('text=Your tracks are back in this tab. Press Resume to carry on.')).toBeVisible({ timeout: 20000 });
     await expect(page.locator(OUT_OF_DATE)).toHaveCount(0);
 
     await expect(sibling.locator(OUT_OF_DATE)).toBeVisible({ timeout: 10000 });
@@ -2161,7 +2161,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     await expect(page.locator(RESUME_PROMPT)).toBeVisible({ timeout: 15000 });
     await expect(page.locator('text=A handover')).toHaveCount(0);
     await expect(page.locator('text=on hold')).toHaveCount(0);
-    await expect(page.locator('text=refresh your connection')).toHaveCount(0);
+    await expect(page.locator('text=Sign in again so we can check')).toHaveCount(0);
     await expect(page.getByText(/handed over/)).toHaveCount(0);
     expect(await page.evaluate((key) => localStorage.getItem(key), OWNER_KEY)).toBeNull();
   }
@@ -2180,7 +2180,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     // Full between the probe and the click.
     mock.world.capacityAvailable = false;
     await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
-    await expect(page.locator('text=The background service is full right now')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Our server is full right now. Keep going in this tab, or try later.')).toBeVisible({ timeout: 10000 });
     expect(preflights).toEqual([]);
 
     mock.world.capacityAvailable = true;
@@ -2209,7 +2209,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     const dialog = await chooseRecentPlays(page, 800);
     await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
 
-    await expect(page.locator('text=The upload didn\'t finish, so nothing is running on the server.')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('text=The upload didn\'t finish. Nothing changed.')).toBeVisible({ timeout: 20000 });
     await expectSelectionOffered(page);
     await expect(page.locator('.upload-step')).toBeVisible();
     await expect(page.locator('.status-card')).toHaveCount(0);
@@ -2233,7 +2233,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
     const dialog = await chooseRecentPlays(page, 800);
     await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
 
-    await expect(page.locator('text=The upload didn\'t finish, so nothing is running on the server.')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('text=The upload didn\'t finish. Nothing changed.')).toBeVisible({ timeout: 20000 });
     expect(mock.world.job).toMatchObject({ state: 'pending' });
     // Still here once the page has settled, not on Home's status page.
     await page.waitForTimeout(2000);
@@ -2293,7 +2293,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
       await page.unroute(`${origin}/mock-auth*`, lastFmPage);
       const adopted = signedIn ? '' : '&user=testuser';
       await page.goto(`${origin}/mock-auth?handoff=${handoffId}&session=${handoff.session}${adopted}`);
-      await expect(page.locator('text=Last.fm didn\'t complete the handoff')).toBeVisible({ timeout: 15000 });
+      await expect(page.locator('text=Last.fm didn\'t finish the approval, so nothing changed.')).toBeVisible({ timeout: 15000 });
       await expectSelectionOffered(page);
       expect(mock.world.job).toBeNull();
       expect(await page.evaluate(() => localStorage.getItem('scrobblify.background.session'))).toBeNull();
@@ -2376,7 +2376,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
 
     const { other } = await openOtherTab(page, mock);
     await other.goto('/#/scrobble');
-    await expect(other.locator('text=A handover is starting in another tab')).toBeVisible({ timeout: 15000 });
+    await expect(other.locator('text=Another tab is moving this import to our server. One moment.')).toBeVisible({ timeout: 15000 });
     await expect(other.locator(RESUME_PROMPT)).toHaveCount(0);
     expect(handoff.state).toBe('issued');
     expect(await handoffRecords(other)).toMatchObject({
@@ -2457,7 +2457,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
 
     await page.goBack();
     await expect.poll(() => withdrawals, { timeout: 15000 }).toBeGreaterThan(0);
-    await expect(page.getByText(/A handover is starting in another tab|couldn't check whether the background service took over/))
+    await expect(page.getByText(/Another tab is moving this import to our server|We couldn't check with our server/))
       .toBeVisible({ timeout: 15000 });
     await expect(page.locator(RESUME_PROMPT)).toHaveCount(0);
     expect(await handoffRecords(page)).toMatchObject({
@@ -2562,7 +2562,7 @@ test.describe('Choosing the server in the confirm dialog', () => {
       const dialog = await chooseRecentPlays(page, 800);
       await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
 
-      await expect(page.locator('text=Last.fm didn\'t complete the handoff')).toBeVisible({ timeout: 15000 });
+      await expect(page.locator('text=Last.fm didn\'t finish the approval, so nothing changed.')).toBeVisible({ timeout: 15000 });
       await expectSelectionOffered(page);
       // The failed handoff never had the queue.
       const importId = String(preflights[0].importId || '');
