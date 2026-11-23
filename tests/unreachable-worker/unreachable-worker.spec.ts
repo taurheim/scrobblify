@@ -2010,6 +2010,17 @@ test.describe('Choosing the server in the confirm dialog', () => {
     ]);
   });
 
+  test('"scrobble locally" reports a selection whose plays are all moved to today (#163)', async ({ page, baseURL }) => {
+    const events = captureEvents(page);
+    await openWithWorker(page, baseURL);
+    const dialog = await chooseRecentPlays(page, 800, { old: true });
+    await expect(dialog.locator('.v-card-title')).toHaveText('Scrobble 800 tracks?');
+    await dialog.locator('a:has-text("scrobble locally")').click();
+
+    await expect.poll(() => events.filter((e) => e.name === 'background_offer_declined').map((e) => e.props))
+      .toEqual([{ entry_point: 'confirm', track_count: 800, all_re_tagged: true }]);
+  });
+
   test('a selection under a day\'s cap gets the plain dialog', async ({ page, baseURL }) => {
     await openWithWorker(page, baseURL);
     const dialog = await chooseRecentPlays(page, 700);

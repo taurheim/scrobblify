@@ -982,8 +982,9 @@ flag answering for a browser PostHog hasn't identified yet, from 2026-11-21)
 and `entry_point` (`scrobble_step`, `resume`, `sign_in` for a selection
 restored after signing in, or `confirm` for the confirm dialog's server
 choice, both from 2026-11-21), which its decline and opt-in events repeat.
-`background_offer_declined` from `confirm` always carries `all_re_tagged:
-false` (#163), so split decline rates by it only for the other entry points.
+`background_offer_declined` from `confirm` carried `all_re_tagged: false`
+whatever was selected until #163 was fixed (2026-11-22), so split decline
+rates by it only for later events or the other entry points.
 
 `App.vue` applies `?beta=` once per page load (`consumeBetaParam`, in
 `created()`), so an invite link works on any page (in dev's hash mode, editing

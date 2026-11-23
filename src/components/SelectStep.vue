@@ -147,6 +147,7 @@
       :background-track-limit="backgroundTrackLimit"
       :saved-progress="savedProgress"
       :has-re-tagged="confirmHasReTagged"
+      :all-re-tagged="confirmAllReTagged"
       @confirm="scrobbleSelectedTracks('tab')"
       @server="scrobbleSelectedTracks('server')"
       @resume-saved="resumeSavedProgress"
@@ -267,6 +268,7 @@ export default defineComponent({
       confirmLoading: false,
       confirmEstimate: null as ScrobbleEstimate | null,
       confirmHasReTagged: false,
+      confirmAllReTagged: false,
       // Version counter to trigger computed re-evaluation
       trackVersion: 0,
       filterVersion: 0,
@@ -551,6 +553,7 @@ export default defineComponent({
         }
       }
       this.confirmHasReTagged = reTagged > 0;
+      this.confirmAllReTagged = reTagged > 0 && reTagged === selIds.size;
       this.confirmEstimate = estimateScrobbleTime({
         trackCount: selIds.size,
         reTaggedCount: reTagged,

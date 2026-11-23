@@ -291,8 +291,8 @@ Existing `background_offer_shown` / `background_offer_declined` /
   and some plays older than 2 weeks), not merely because the box is ticked.
 - `background_offer_shown` / `background_offer_declined` carry `entry_point:
   confirm` from the dialog, and `tracks_selected` carries `path` (`tab` or
-  `server`). The confirm dialog's decline always reports `all_re_tagged:
-  false` (#163, open).
+  `server`). The confirm dialog's decline reported `all_re_tagged: false`
+  for every selection until #163 was fixed (2026-11-22).
 - Mid-run, "Scrobble the rest for me →" replaces the old alert, and the
   stopped panel's saved hint links to the same offer. Every entry point is
   offered only when the remaining plays are within the worker's limit

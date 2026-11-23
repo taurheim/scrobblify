@@ -103,6 +103,8 @@ export default defineComponent({
     savedProgress: { type: Object as PropType<SavedProgressSummary | null>, default: null },
     /** Some of the selected plays are moved to today ("Scrobble tracks older than 2 weeks"). */
     hasReTagged: { type: Boolean, default: false },
+    /** Every selected play is moved to today. */
+    allReTagged: { type: Boolean, default: false },
   },
   emits: ['update:modelValue', 'confirm', 'resume-saved', 'server'],
   data() {
@@ -184,7 +186,7 @@ export default defineComponent({
       trackEvent('background_offer_declined', {
         entry_point: 'confirm',
         track_count: this.trackCount,
-        all_re_tagged: false,
+        all_re_tagged: this.allReTagged,
       });
       this.confirm();
     },
