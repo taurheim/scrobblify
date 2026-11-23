@@ -593,6 +593,12 @@ export default defineComponent({
        * still reports what it found (the worker lookup, a reconnect).
        */
       statusPageArmed: false,
+      /**
+       * This load's handover upload failed and was withdrawn at the worker:
+       * the page stays here with its notice and the selection, even if the
+       * worker (not told in time) still lists the `pending` job it made.
+       */
+      uploadFailed: false,
     };
   },
   created() {
@@ -986,8 +992,15 @@ export default defineComponent({
     bannerType(): string {
       return this.banner === 'resume' ? 'info' : 'warning';
     },
-    /** A server job Home would show as its status page (not cancelled, not dismissed). */
+    /**
+     * A server job Home would show as its status page (not cancelled, not
+     * dismissed). Not the `pending` job of this load's failed upload, which
+     * the worker wasn't told about in time: nothing will send it.
+     */
     jobShown(): boolean {
+      if (this.uploadFailed && this.backgroundJob && this.backgroundJob.state === 'pending') {
+        return false;
+      }
       return isJobShown(this.backgroundJob);
     },
     /**
@@ -997,7 +1010,7 @@ export default defineComponent({
      */
     leaveForStatusPage(): boolean {
       return this.statusPageArmed && this.jobShown && !this.takingBack && !this.backgroundBusy
-        && !this.showError;
+        && !this.showError && !this.uploadFailed;
     },
     /**
      * Whether `backgroundNotice` is shown at all, as the banner or inside it.
@@ -2311,6 +2324,8 @@ export default defineComponent({
       }
 
       if (result.safeToResumeLocally) {
+        // `completeHandoff` has withdrawn the job Last.fm's approval made.
+        this.uploadFailed = true;
         this.backgroundNotice = 'The upload didn\'t finish, so nothing is running on the server. Your progress is exactly where you left it.';
         return false;
       }

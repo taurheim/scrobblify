@@ -2885,6 +2885,43 @@ export async function abandonOwnHandoff(
 }
 
 /**
+ * Withdraws this browser's approved handoff after its upload failed for good
+ * (`POST /scrobblify/handoff/:id/fail`, with the worker session the return
+ * brought). Last.fm's approval already made a `pending` job holding the
+ * user's key; nothing sends from it, but until withdrawn it read as running
+ * (`/job/live`, the status page) until reaped, up to an hour later.
+ *
+ * True when withdrawn; false when the worker had nothing to withdraw (already
+ * ended, or past the upload); null when unanswered. Best effort with a short
+ * timeout: an unanswered one leaves the job to the reaper.
+ */
+export async function withdrawUpload(
+  handoffId: string,
+  timeoutMs = ABANDON_TIMEOUT_MS,
+): Promise<boolean | null> {
+  if (!handoffId || !isBackgroundConfigured() || !getSession()) {
+    return null;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await request(`/scrobblify/handoff/${encodeURIComponent(handoffId)}/fail`, {
+      method: 'POST',
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const body = await res.json();
+    return body && body.ok === true ? body.withdrawn === true : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * The job id a handoff produced, or an empty string if it has none yet.
  *
  * Kept separate from `isHandoffActive` so its two-valued answer stays simple.

@@ -41,6 +41,7 @@ export interface StatusView {
 }
 
 const SAFE_TO_CLOSE = 'Scrobbling remotely, it\'s safe to close this tab.';
+const UPLOADING = 'Uploading your tracks…';
 const SIGN_IN_HINT = 'Sign in to manage it';
 const LASTFM_URL = 'https://www.last.fm';
 const MANAGE: StatusAction[] = ['moveBack', 'cancel'];
@@ -70,7 +71,8 @@ export const DORMANT_FULL_RECHECK_SECONDS = 5 * 60;
 /*
   A job being handed back (`exporting`) asks this often whether it has moved
   on: cancelled by a take-back that worked, or back where it was once a failed
-  one's claim lapses (#173).
+  one's claim lapses (#173). So does one still being uploaded (`pending`): it
+  goes active at finalize, or is withdrawn or reaped, with no tick to wait for.
 */
 export const EXPORTING_RECHECK_SECONDS = 30;
 
@@ -87,13 +89,13 @@ export function nextJobPollSec(job: JobStatus, nowSec: number): number {
 
 /** Whether the page should keep asking about this job, and when next. Null: don't. */
 export function jobPollDueSec(job: JobStatus, nowSec: number): number | null {
-  if (job.state === 'active' || job.state === 'pending') {
+  if (job.state === 'active') {
     return nextJobPollSec(job, nowSec);
   }
   if (job.state === 'dormant' && job.reconnectAvailable === false) {
     return nowSec + DORMANT_FULL_RECHECK_SECONDS;
   }
-  if (job.state === 'exporting') {
+  if (job.state === 'exporting' || job.state === 'pending') {
     return nowSec + EXPORTING_RECHECK_SECONDS;
   }
   return null;
@@ -197,6 +199,13 @@ export function viewFromJob(
 
   switch (job.state) {
     case 'pending':
+      /*
+        Approved on Last.fm, its tracks not all uploaded yet: nothing sends
+        until they are, so no finish date, no "safe to close" and nothing to
+        pause or take back. A browser whose upload failed withdraws it; one
+        that couldn't leaves it to the worker's reaper, or Cancel.
+      */
+      return view({ bar: progress, line: UPLOADING, secondary: ['cancel'] });
     case 'active': {
       let lineParts: LinePart[] = [{ text: `This will finish around ${longDate(job.estimatedCompletionSec || opts.nowSec)}` }];
       if (reason === DAY_FULL_REASON) {
@@ -330,7 +339,8 @@ export function viewFromImport(
   opts: { nowSec: number; originalTotal?: number },
 ): StatusView {
   const progress = bar(opts.originalTotal || 0, status.totalTracks, status.scrobbledCount);
-  const sending = status.live && (!status.state || status.state === 'active' || status.state === 'pending');
+  // `pending` isn't sending yet: its upload hasn't finished.
+  const sending = status.live && (!status.state || status.state === 'active');
   if (sending) {
     const remaining = Math.max(0, status.totalTracks - status.scrobbledCount);
     const finishSec = opts.nowSec + Math.ceil(remaining / importBudget(0)) * DAY_SEC;

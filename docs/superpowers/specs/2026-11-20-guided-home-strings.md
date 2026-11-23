@@ -294,6 +294,7 @@ New strings shipped with the status page. Placeholder copy; rewrite in place.
 | `takeBack.downloading.label` | Same, screen-reader label of the spinner | Downloading progress |
 | `takeBack.stuck` | Take-back copied the tracks back but the server job couldn't be stopped (error dialog, then back to the status page) | Your tracks were copied back, but the background import could not be stopped, so this browser will not resume them yet. Use "Scrobble the rest locally" again in a moment. |
 | `takeBack.signInFailed` | "Scrobble the rest locally" through Last.fm, and the sign-in failed (error dialog, then back to the status page) | Couldn't move your progress back. It's safe on our server. |
+| `status.pending` | `pending`: approved on Last.fm, the browser's upload not finished (nothing sends yet; Cancel is the only button, and it rechecks every 30 seconds) | Uploading your tracks… |
 
 Reused: `status.checking` is now shown (with `status.checking.retry`) when
 Home can't get an answer about the job, rather than the start page.
@@ -308,9 +309,10 @@ is past local midnight ("12:20 AM tomorrow", "12:20 AM on Friday"). The
 https://www.last.fm.
 
 Changed from the tables above: the title is `returning.title` ("Scrobbling
-to {username}"), and `pending`, `active` and day-full jobs show
+to {username}"), and `active` and day-full jobs show
 `returning.server` ("Scrobbling remotely, it's safe to close this tab.")
-under the line instead of `status.safeToClose`. `status.rejected` is part of
+under the line instead of `status.safeToClose`; a `pending` job shows
+`status.pending` with nothing under it. `status.rejected` is part of
 the completed line ("Done · {n} rejected by Last.fm…"). `status.noSession.otherDevice`
 gets `status.noSession.hint` under it. `takeBack.stuck` replaces
 `notice.movedBackStuck` (today's wording, with the new button name), and

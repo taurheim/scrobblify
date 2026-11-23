@@ -1344,6 +1344,35 @@ handed over for good (#165). The client (`abandonOwnHandoff` →
 `abandonHandoff`, 3s timeout, best effort) only ever sends this browser's own
 preflighted id, and is awaited before the page-load authority check.
 
+**A browser whose upload failed withdraws the job its approval made**
+(since 2026-11-22). The callback creates the job `pending`, holding the
+user's key and `live_username`, before the browser uploads. When the upload
+then fails for good (a chunk refused or unreachable, a finalize refused, or a
+lost finalize the worker says is inactive: `completeHandoff`'s
+`safeToResumeLocally`), the browser first calls `POST
+/scrobblify/handoff/:id/fail` (`withdrawUpload`, 3s timeout, best effort).
+The worker (`withdrawUpload` in `worker/src/handoff.ts`, through
+`failHandoff`'s new `onlyFrom` compare-and-set) fails a `pending_upload`
+handoff as `upload_failed` and cancels its `pending` job in the same batch:
+key nulled, `live_username` cleared on both, slot freed, and with no
+`manifest_key` `/import/:id` leaves it out (#167). It answers `{ ok: true,
+withdrawn }`; `finalizing` and later answer `false`, since they may be
+activating. Unlike `/abandon` it needs the handoff user's worker session
+(someone else's handoff is a 404): past `issued` there is a job to lose, and
+the handoff id is readable from the signed state in the Last.fm authorise URL,
+while the session only reaches the browser the callback returned to.
+`/abandon` stays public and `issued`-only. The status page's **Cancel** of a
+`pending` job likewise fails its `pending_upload` handoff (`cancelled`), so
+the user stops reading as live at once and a finalize still on its way is
+refused rather than "activating" a cancelled job. Before this, the job sat
+`pending` until reaped (up to an hour): `/scrobble` found it, sent the page
+to Home (dropping "The upload didn't finish…") and Home called it running
+("This will finish around…", "safe to close"), with Pause and "Scrobble the
+rest locally" doing nothing. `/scrobble` now stays put on that path
+(`uploadFailed`), even if the withdrawal went unanswered: its own failed
+upload's `pending` job doesn't count as shown there, though `/job/live` still
+holds sending back until the reaper ends it.
+
 **`/import/:id` counts a handoff only while it can still become a job**
 (#162). Jobless handoffs that ended (`failed`, `reaped`: Back or a denial on
 Last.fm, a failed exchange, the reaper) are left out, since chunks are only
@@ -1365,7 +1394,10 @@ The mock worker records handoffs at preflight (`pending`), fails them on a
 shim `fail` return (`authoriseFail` option, and the anonymous `already_live`
 refusal) or a withdrawal, refuses a shim approval of a failed one, counts a
 named in-flight handoff as live in `/job/live` as the real worker does, and
-gives them a job at finalize. An unanswered withdrawal still leaves the old
+makes the job at the shim's approval (`pending`, like the callback) and turns
+it `active` at finalize. It implements `/fail` (without checking sessions,
+which it doesn't model), refuses chunks and finalize for a failed handoff,
+and leaves a job cancelled before finalize out of `/import/:id`. An unanswered withdrawal still leaves the old
 behaviour: the user live in `/job/live` until reaped, and a late approval's
 job marking the queue `known` for good, unless that job is never finalised
 (next paragraph).
@@ -1373,7 +1405,8 @@ job marking the queue `known` for good, unless that job is never finalised
 **Nor does it count a job cancelled before it was finalised** (#167). The
 callback makes the job (`pending`), and `finalize` sets `manifest_key` as it
 goes `active`. A handoff reaped in between (an approval after the withdrawal
-went unanswered, a tab closed mid-upload, an upload that failed for good) has
+went unanswered, a tab closed mid-upload, an upload that failed for good and
+whose `/fail` went unanswered) has
 its job cancelled by `failHandoff`, with the import id kept. The scheduler
 only runs `active` jobs, so it never sent anything, but the lookup answered
 `known: true, state: 'cancelled'` for good and the browser holding the queue
@@ -1427,7 +1460,8 @@ every state that has them (marked "+ manage"):
 
 | Job | Line | Main action |
 | --- | --- | --- |
-| `pending`, `active` | "This will finish around {date}" (`estimatedCompletionSec`), then "Scrobbling remotely, it's safe to close this tab." | Pause, + manage |
+| `pending` | "Uploading your tracks…" (approved, the browser's upload not finished; nothing sends yet) | Cancel only |
+| `active` | "This will finish around {date}" (`estimatedCompletionSec`), then "Scrobbling remotely, it's safe to close this tab." | Pause, + manage |
 | `active`, reason `DAY_FULL_REASON` | "Can't upload any more due to last.fm rules. Will continue at {time}" (`nextRunAt`, else `waitingUntil`; the day is named past local midnight), same second line | Pause, + manage |
 | `paused` | "Paused" | Resume, + manage |
 | `needs_reauth` | "Last.fm signed us out" | Sign in again (disabled when `reconnectAvailable === false`), + manage |
@@ -1475,7 +1509,7 @@ The actions:
 while the tab is visible, and at once when the tab is shown again. A clock
 re-evaluates every 15s (`JOB_CLOCK_TICK_MS`):
 
-- An `active` or `pending` job is re-fetched `JOB_POLL_AFTER_RUN_SECONDS`
+- An `active` job is re-fetched `JOB_POLL_AFTER_RUN_SECONDS`
   (45s) after each `nextRunAt`, clamped to 15s–10min, or every 60s from a
   worker that sends none. The scheduler only runs every five minutes
   (`TICK_INTERVAL_SECONDS`, which must match the cron in
@@ -1489,7 +1523,9 @@ re-evaluates every 15s (`JOB_CLOCK_TICK_MS`):
 - An `exporting` job every 30s (`EXPORTING_RECHECK_SECONDS`, #173), so the
   page moves on when a take-back finishes, or when a failed one's claim lapses
   and the job goes back where it was. It used to say "Downloading progress"
-  with no actions until reloaded.
+  with no actions until reloaded. So is a `pending` one (since 2026-11-22),
+  which goes `active` at finalize or is withdrawn, cancelled or reaped, with
+  no tick to wait for.
 
 A failed check keeps the page as it was and asks again in 60s. A job that is
 gone or no longer shown (cancelled elsewhere), or a session the worker
@@ -1503,7 +1539,9 @@ return, the job lookup, the worker lookup's report, a reconnect;
 (`leaveForStatusPage`, a `$router.replace`, so Back doesn't bounce), and so
 does a later check that first finds one. Not while a take-back is starting or
 running (`takingBack`, `backgroundBusy`), nor over an open error dialog:
-closing it goes. Meanwhile the stepper is hidden and the resume prompt is off
+closing it goes, nor after this load's own handover upload failed
+(`uploadFailed`, see "A browser whose upload failed withdraws the job its
+approval made"). Meanwhile the stepper is hidden and the resume prompt is off
 (`jobShown`). `backgroundJob` stays, since the authority and offer logic read
 it. The page leaves Home the job it found (`statusHandover` in the store:
 the job, when it was fetched, and the refused worker sign-in's notice), and

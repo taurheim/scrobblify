@@ -347,7 +347,12 @@ function createMockWorker(options = {}) {
   }
 
   function handleImport(importId) {
-    const rec = world.imports.get(importId);
+    let rec = world.imports.get(importId);
+    const { job } = world;
+    if (rec && job && job.importId === importId && job.state === 'cancelled' && job.finalized === false) {
+      // Cancelled before its upload finished, so it never had the queue (#167).
+      rec = undefined;
+    }
     if (!rec) {
       /*
         The real worker also counts a jobless handoff still on its way
@@ -446,37 +451,65 @@ function createMockWorker(options = {}) {
     });
   }
 
+  /**
+   * What the worker's callback does on approval: a `pending` job holding the
+   * user's key, which only starts sending at finalize (`handleFinalize`).
+   */
+  function createPendingJob(rec, nowMs) {
+    /* eslint-disable no-param-reassign */
+    rec.jobId = `j-${hex(16)}`;
+    rec.state = 'pending_upload';
+    /* eslint-enable no-param-reassign */
+    world.job = {
+      id: rec.jobId,
+      username: rec.username,
+      importId: rec.importId,
+      state: 'pending',
+      reason: null,
+      totalTracks: rec.trackCount,
+      scrobbled: 0,
+      failed: 0,
+      waitingUntil: null,
+      createdAtMs: nowMs,
+      lastTickMs: nowMs,
+      completedAtMs: null,
+      inactivityDeadlineSec: null,
+      exportClaim: '',
+      // No manifest yet: cancelled now, it never had the queue (#167).
+      finalized: false,
+    };
+    if (rec.importId) {
+      world.imports.set(rec.importId, { trackCount: rec.trackCount, jobId: rec.jobId });
+    }
+  }
+
   function handleFinalize(handoffId, nowMs) {
     const rec = world.handoffs.get(handoffId);
     if (!rec) {
       return json({ ok: false, reason: 'unknown_handoff' }, 404);
     }
+    if (rec.state === 'failed') {
+      // Withdrawn (`/fail`) or refused: never becomes a job, as in the worker.
+      return json({ ok: false, reason: 'bad_state' }, 409);
+    }
     if (!rec.jobId) {
-      rec.jobId = `j-${hex(16)}`;
-      rec.state = 'active';
-      world.job = {
-        id: rec.jobId,
-        username: rec.username,
-        importId: rec.importId,
-        state: 'active',
-        reason: null,
-        totalTracks: rec.trackCount,
-        scrobbled: 0,
-        failed: 0,
-        waitingUntil: null,
-        createdAtMs: nowMs,
-        lastTickMs: nowMs,
-        completedAtMs: null,
-        inactivityDeadlineSec: null,
-        exportClaim: '',
-      };
-      if (rec.importId) {
-        world.imports.set(rec.importId, { trackCount: rec.trackCount, jobId: rec.jobId });
-      }
+      // Approved without the shim (a test writing the session itself).
+      createPendingJob(rec, nowMs);
+    }
+    const { job } = world;
+    if (job && job.id === rec.jobId && job.state === 'cancelled' && job.finalized === false) {
+      // Cancelled from the status page mid-upload: the worker fails its handoff.
+      return json({ ok: false, reason: 'bad_state' }, 409);
+    }
+    if (job && job.id === rec.jobId && job.state === 'pending') {
+      // The job only starts sending once its upload is complete.
+      setState(job, 'active', nowMs);
+      job.finalized = true;
       if (verbose) {
         console.log(`[worker-mock] job ${rec.jobId} is live with ${rec.trackCount} tracks`);
       }
     }
+    rec.state = 'active';
     return json({ ok: true, jobId: rec.jobId });
   }
 
@@ -487,6 +520,17 @@ function createMockWorker(options = {}) {
       // nothing was ever taken on, so the browser may resume.
       return json({
         ok: true, active: false, resolved: true, jobId: '',
+      });
+    }
+    if (rec.state === 'failed') {
+      return json({
+        ok: true, active: false, resolved: true, jobId: rec.jobId || '',
+      });
+    }
+    if (rec.state === 'pending_upload') {
+      // Approved, upload unfinished: not active, and not over either.
+      return json({
+        ok: true, active: false, resolved: false, jobId: rec.jobId,
       });
     }
     return json({
@@ -617,8 +661,31 @@ function createMockWorker(options = {}) {
       if (!rec) {
         return json({ ok: false, reason: 'unknown_handoff' }, 404);
       }
+      if (rec.state === 'failed') {
+        return json({ ok: false, reason: 'bad_state', state: rec.state }, 409);
+      }
       rec.chunksSeen.add(Number(chunkMatch[2]));
       return json({ ok: true });
+    }
+
+    // The browser gave up on its upload: an approved handoff and its pending
+    // job end here, as `withdrawUpload` does. The worker also requires the
+    // handoff user's session; the mock doesn't model sessions.
+    const withdrawMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/fail$/);
+    if (withdrawMatch && method === 'POST') {
+      const rec = world.handoffs.get(withdrawMatch[1]);
+      if (!rec) {
+        return json({ ok: false, reason: 'unknown' }, 404);
+      }
+      const withdrawn = rec.state === 'pending_upload';
+      if (withdrawn) {
+        rec.state = 'failed';
+        rec.failureReason = 'upload_failed';
+        if (world.job && world.job.id === rec.jobId && world.job.state === 'pending') {
+          setState(world.job, 'cancelled', nowMs);
+        }
+      }
+      return json({ ok: true, withdrawn });
     }
 
     const finalizeMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/finalize$/);
@@ -693,7 +760,8 @@ function createMockWorker(options = {}) {
    * real callback does, so it no longer counts in `/import/:id`. An approval
    * of a handoff that has already failed (withdrawn, say) is refused the way
    * the real callback refuses it, and makes no job (#165); any other approval
-   * puts it past withdrawing.
+   * puts it past withdrawing, and makes the `pending` job the real callback
+   * makes (it starts sending at finalize).
    */
   function authorise(searchParams) {
     const fail = searchParams.get('fail') || '';
@@ -705,6 +773,9 @@ function createMockWorker(options = {}) {
       rec.state = 'failed';
     } else if (rec) {
       rec.approved = true;
+      if (!rec.jobId) {
+        createPendingJob(rec, Date.now());
+      }
     }
     return shimFromQuery(searchParams);
   }

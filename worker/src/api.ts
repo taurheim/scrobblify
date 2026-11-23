@@ -20,6 +20,7 @@ import {
   handleCallback,
   finalize,
   abandonHandoff,
+  withdrawUpload,
   reapExpiredHandoffs,
   HandoffRow,
   MAX_TRACKS_PER_JOB,
@@ -772,7 +773,8 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     most anyone holding its id can do is cancel an approval still pending. The
     id is 128 random bits (`randomId`) and reaches only the browser that
     preflighted it (and the authorise URL it was sent to), so it isn't
-    guessable.
+    guessable. An approved handoff whose upload failed is withdrawn through
+    `/fail` below instead, which needs the session.
 
     Answers the same for an unknown id as for one past `issued`
     (`abandoned: false`, 200), so it says nothing about which ids exist. A
@@ -788,6 +790,37 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
   const username = await authenticate(request, env.signingKey, nowSec);
   if (!username) {
     return json(env, { ok: false, reason: 'unauthenticated' }, 401);
+  }
+
+  /*
+    ---- withdrawing an approved handoff whose upload failed ----
+
+    The callback made a `pending` job holding the user's key; the browser then
+    couldn't upload or finalize, and resumes locally. Without this the job sat
+    `pending` until reaped, an hour, telling `/job/live` and the status page
+    the user's import was running when nothing ever would send it.
+
+    A separate route from `/abandon` rather than widening it, and behind the
+    handoff user's session, because past `issued` there is something to lose:
+    the handoff id is readable from the signed state in the Last.fm authorise
+    URL (so Last.fm, browser history and anyone the link was sent to hold it),
+    and cancelling a pending job breaks an upload still in progress. The
+    session only reaches the browser the callback returned to, which is the
+    one uploading. `/abandon` stays public and `issued`-only.
+
+    Only from `pending_upload` (`withdrawUpload`); later states answer
+    `withdrawn: false`. Someone else's handoff is a 404, as for the chunks.
+  */
+  const withdrawMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/fail$/);
+  if (withdrawMatch && request.method === 'POST') {
+    const handoff = await env.sql.first<HandoffRow>(
+      'SELECT * FROM handoffs WHERE id = ?', [withdrawMatch[1]],
+    );
+    if (!handoff || handoff.username !== username) {
+      return json(env, { ok: false, reason: 'unknown' }, 404);
+    }
+    const withdrawn = await withdrawUpload(env.sql, handoff.id, nowSec);
+    return json(env, { ok: true, withdrawn });
   }
 
   // ---- step 4: upload chunks ----
@@ -1035,6 +1068,20 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       }
 
       await deleteJobBlobs(env.sql, env.blobs, job.id);
+      /*
+        A job cancelled before its upload finished (`pending`, from the status
+        page) ends its handoff too. Otherwise the handoff kept the user's name
+        live and a slot until reaped, and a finalize still under way would
+        report success for a job that never sends.
+      */
+      if (job.state === 'pending') {
+        await env.sql.run(
+          `UPDATE handoffs
+              SET state = 'failed', live_username = NULL, failure_reason = 'cancelled', updated_at = ?
+            WHERE job_id = ? AND state = 'pending_upload'`,
+          [nowSec, job.id],
+        );
+      }
       return json(env, { ok: true });
     }
 

@@ -640,6 +640,125 @@ async function main() {
       sent.known === true && sent.state === 'cancelled' && sent.cursor === 300, sent);
   }
 
+  console.log('\n-- a browser whose upload failed withdraws its pending job --');
+  {
+    const sql = freshSql();
+    const env = makeEnv(sql, new MemoryBlobs(), {
+      getSession: async () => ({ sessionKey: 'sk', username: 'Listener' }),
+    });
+    let n = 0;
+    // Preflights and approves a handoff, returning its id, job and session.
+    const approve = async () => {
+      n += 1;
+      const importId = `upload-failed-${n}-0123456789`;
+      const pre: any = await (await handleRequest(env, req('/scrobblify/handoff/preflight', {
+        method: 'POST',
+        body: JSON.stringify({
+          username: 'Listener', payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000,
+          importId,
+        }),
+      }))).json();
+      const state = new URL(new URL(pre.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+      const back = new URL((await handleRequest(
+        env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok-${n}`),
+      )).headers.get('Location')!);
+      return {
+        handoffId: pre.handoffId as string,
+        jobId: back.searchParams.get('job')!,
+        session: new URLSearchParams(back.hash.slice(1)).get('session')!,
+        importId,
+      };
+    };
+    const withdraw = (id: string, token?: string) => handleRequest(env, req(
+      `/scrobblify/handoff/${id}/fail`, { method: 'POST', token },
+    ));
+    const isLive = async () => ((await (await handleRequest(
+      env, req('/scrobblify/job/live?username=listener'),
+    )).json()) as any).live;
+    const job = (id: string) => sql.first<any>('SELECT * FROM jobs WHERE id = ?', [id]);
+    const handoff = (id: string) => sql.first<any>('SELECT * FROM handoffs WHERE id = ?', [id]);
+
+    const a = await approve();
+    check('before: the callback made a pending job', (await job(a.jobId)).state === 'pending');
+    check('before: the user reads as live', await isLive() === true);
+
+    check('withdrawing needs a session', (await withdraw(a.handoffId)).status === 401);
+    const stranger = await withdraw(a.handoffId, await issueSession('attacker', SIGNING, NOW));
+    check('and is a 404 for someone else\'s handoff', stranger.status === 404, stranger.status);
+    check('which leaves the job pending', (await job(a.jobId)).state === 'pending');
+
+    const res = await withdraw(a.handoffId, a.session);
+    const body: any = await res.json();
+    check('the owner withdraws it', res.status === 200 && body.ok === true && body.withdrawn === true, body);
+    const failed = await handoff(a.handoffId);
+    check('the handoff is failed as upload_failed',
+      failed.state === 'failed' && failed.failure_reason === 'upload_failed' && failed.live_username === null,
+      failed);
+    const cancelled = await job(a.jobId);
+    check('its job is cancelled', cancelled.state === 'cancelled' && cancelled.live_username === null,
+      cancelled.state);
+    check('with no credential left', cancelled.session_key_ct === null && cancelled.session_key_iv === null);
+    check('the user no longer reads as live', await isLive() === false);
+    const lookup: any = await (await handleRequest(env, req(`/scrobblify/import/${a.importId}`))).json();
+    check('the queue is not known as handed over (#167)', lookup.known === false, lookup);
+    check('the slot is free again',
+      ((await (await handleRequest(env, req('/scrobblify/capacity'))).json()) as any).used === 0);
+
+    const again: any = await (await withdraw(a.handoffId, a.session)).json();
+    check('withdrawing it again says no', again.ok === true && again.withdrawn === false, again);
+    const late = await handleRequest(env, req(`/scrobblify/handoff/${a.handoffId}/finalize`, {
+      method: 'POST', token: a.session,
+    }));
+    check('a late finalize is refused', late.status === 409, late.status);
+    check('and the job stays cancelled', (await job(a.jobId)).state === 'cancelled');
+
+    // Past the upload, the job is (about to be) sending: not the browser's to withdraw.
+    for (const state of ['finalizing', 'active'] as const) {
+      // eslint-disable-next-line no-await-in-loop
+      const b = await approve();
+      // eslint-disable-next-line no-await-in-loop
+      await sql.run('UPDATE handoffs SET state = ? WHERE id = ?', [state, b.handoffId]);
+      if (state === 'active') {
+        // eslint-disable-next-line no-await-in-loop
+        await sql.run("UPDATE jobs SET state = 'active', manifest_key = 'm' WHERE id = ?", [b.jobId]);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const refused: any = await (await withdraw(b.handoffId, b.session)).json();
+      check(`a ${state} handoff is not withdrawn`, refused.ok === true && refused.withdrawn === false, refused);
+      // eslint-disable-next-line no-await-in-loop
+      const kept = await job(b.jobId);
+      check(`and its job keeps its state and credential (${state})`,
+        kept.state === (state === 'active' ? 'active' : 'pending') && kept.session_key_ct !== null, kept.state);
+      // eslint-disable-next-line no-await-in-loop
+      check(`and the handoff is left ${state}`, (await handoff(b.handoffId)).state === state);
+      // eslint-disable-next-line no-await-in-loop
+      await sql.run("UPDATE jobs SET state = 'cancelled', live_username = NULL WHERE id = ?", [b.jobId]);
+      // eslint-disable-next-line no-await-in-loop
+      await sql.run("UPDATE handoffs SET state = 'failed', live_username = NULL WHERE id = ?", [b.handoffId]);
+    }
+
+    // The no-session withdrawal still stops at `issued`.
+    const c = await approve();
+    const publicTry: any = await (await handleRequest(env, req(
+      `/scrobblify/handoff/${c.handoffId}/abandon`, { method: 'POST' },
+    ))).json();
+    check('abandon (no session) still refuses a pending upload', publicTry.abandoned === false, publicTry);
+    check('which keeps its job', (await job(c.jobId)).state === 'pending');
+
+    // Cancel, the status page's one button for a pending job, ends the handoff too.
+    const cancel = await handleRequest(env, req(`/scrobblify/job/${c.jobId}/cancel`, {
+      method: 'POST', token: c.session,
+    }));
+    check('a pending job can be cancelled', cancel.status === 200, cancel.status);
+    const ended = await handoff(c.handoffId);
+    check('which fails its handoff', ended.state === 'failed' && ended.live_username === null, ended);
+    check('so the user no longer reads as live', await isLive() === false);
+    const finalizeLate = await handleRequest(env, req(`/scrobblify/handoff/${c.handoffId}/finalize`, {
+      method: 'POST', token: c.session,
+    }));
+    check('and a finalize still on its way is refused', finalizeLate.status === 409, finalizeLate.status);
+  }
+
   console.log('\n-- the import id survives preflight --');
   {
     const sql = freshSql();

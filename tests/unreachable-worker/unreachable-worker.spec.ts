@@ -7,7 +7,7 @@ import {
   interceptLastFm, mockLastFmAuth, routeLastFmSignIn, MOCK_SESSION_KEY,
 } from '../lastfmMock';
 import {
-  interceptBackgroundWorker, MockWorker, MAX_TRACKS,
+  interceptBackgroundWorker, MockWorker, MAX_TRACKS, setState,
 } from '../backgroundMock';
 import { DAY_FULL_REASON } from '../../src/shared/lastfm/dailyCap';
 
@@ -1152,6 +1152,13 @@ test.describe('Home as the status page', () => {
       actions: [],
     },
     {
+      // Approved, its upload not finished: nothing sends yet, and only Cancel helps.
+      name: 'still uploading',
+      job: { state: 'pending' },
+      line: async () => 'Uploading your tracks…',
+      actions: ['Cancel'],
+    },
+    {
       name: 'completed with rejections',
       job: {
         state: 'completed', scrobbled: 7997, failed: 3, completedAtMs: Date.now(),
@@ -1398,6 +1405,17 @@ test.describe('Home as the status page', () => {
     await page.clock.fastForward('00:45');
     await expect(card.locator('.status-line')).toHaveText('Paused', { timeout: 10000 });
     await expect(card.locator('.status-action')).toHaveText(['Resume', MOVE_BACK, 'Cancel']);
+  });
+
+  test('a job still uploading refreshes itself, and moves on when it starts sending', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, { job: { state: 'pending' }, clock: true });
+    const card = page.locator(CARD);
+    await expect(card.locator('.status-line')).toHaveText('Uploading your tracks…', { timeout: 15000 });
+    await expect(card.locator('.status-sub')).toHaveCount(0);
+    setState(mock.world.job!, 'active', Date.now());
+    await page.clock.fastForward('00:45');
+    await expect(card.locator('.status-sub')).toHaveText(SAFE, { timeout: 10000 });
+    await expect(card.locator('.status-action')).toHaveText(['Pause', MOVE_BACK, 'Cancel']);
   });
 
   test('a cancelled job is not shown', async ({ page, baseURL }) => {
@@ -2157,6 +2175,52 @@ test.describe('Choosing the server in the confirm dialog', () => {
     await expectHomeShowsJob(page);
     await expect(page.locator('text=would be replaced')).toHaveCount(0);
     expect(preflights).toHaveLength(1);
+    expect(scrobbles).toEqual([]);
+  });
+
+  /*
+    The worker makes the job (`pending`, with the user's key) when Last.fm
+    approves, before the browser uploads. An upload that then fails withdraws
+    it, so the page doesn't go to Home's status page for a job nothing will
+    ever send, and the selection is offered again here.
+  */
+  test('an upload that fails withdraws its pending job and offers the selection again', async ({ page, baseURL }) => {
+    const { mock, scrobbles } = await openWithWorker(page, baseURL);
+    // Registered after the mock: later routes win.
+    await page.route('http://background.invalid/scrobblify/handoff/*/chunk/*', (route) => route.abort('failed'));
+    const dialog = await chooseRecentPlays(page, 800);
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
+
+    await expect(page.locator('text=The upload didn\'t finish, so nothing is running on the server.')).toBeVisible({ timeout: 20000 });
+    await expectSelectionOffered(page);
+    await expect(page.locator('.upload-step')).toBeVisible();
+    await expect(page.locator('.status-card')).toHaveCount(0);
+    const [, handoff] = [...mock.world.handoffs.entries()][0];
+    expect(handoff).toMatchObject({ state: 'failed', failureReason: 'upload_failed' });
+    expect(mock.world.job).toMatchObject({ state: 'cancelled' });
+    const live = JSON.parse(mock.handle('GET', '/scrobblify/job/live', new URLSearchParams({ username: 'testuser' }), '').body);
+    expect(live.live).toBe(false);
+
+    // Nor does Home show it.
+    await page.goto('/#/');
+    await expect(page.locator('.returning-card')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('.status-card')).toHaveCount(0);
+    expect(scrobbles).toEqual([]);
+  });
+
+  test('an upload that fails stays here even if the worker isn\'t told', async ({ page, baseURL }) => {
+    const { mock, scrobbles } = await openWithWorker(page, baseURL);
+    await page.route('http://background.invalid/scrobblify/handoff/*/chunk/*', (route) => route.abort('failed'));
+    await page.route('http://background.invalid/scrobblify/handoff/*/fail', (route) => route.abort('failed'));
+    const dialog = await chooseRecentPlays(page, 800);
+    await dialog.locator('button:has-text("Let Scrobblify scrobble for me (beta)")').click();
+
+    await expect(page.locator('text=The upload didn\'t finish, so nothing is running on the server.')).toBeVisible({ timeout: 20000 });
+    expect(mock.world.job).toMatchObject({ state: 'pending' });
+    // Still here once the page has settled, not on Home's status page.
+    await page.waitForTimeout(2000);
+    await expect(page.locator('.upload-step')).toBeVisible();
+    await expect(page.locator('.status-card')).toHaveCount(0);
     expect(scrobbles).toEqual([]);
   });
 

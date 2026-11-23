@@ -427,6 +427,10 @@ export async function completeHandoff(
   }
 
   if (outcome.status === 'failed') {
+    // First, before anything else: Last.fm's approval already made a
+    // `pending` job holding the user's key, which reads as running until the
+    // worker is told. Best effort; the reaper ends it otherwise.
+    await api.withdrawUpload(handoffId);
     // Nothing is running anywhere, so the freeze must lift or every tab is
     // left unable to scrobble a queue that is entirely theirs.
     api.releaseQueueOwnerIfUnclaimed(handoffId);
