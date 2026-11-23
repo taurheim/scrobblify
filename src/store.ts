@@ -2,12 +2,24 @@ import { createStore } from 'vuex';
 import LastFm from '@/api/LastFm';
 import SpotifyListen from '@/models/SpotifyListen';
 import Scrobble, { PendingScrobble } from '@/models/Scrobble';
+import type { JobStatus } from '@/services/BackgroundScrobbling';
 
 export interface CarriedFailure {
   artist: string;
   track: string;
   album?: string;
   reason: string;
+}
+
+/**
+ * What /scrobble hands Home as a shown server job sends it there: the job as
+ * fetched at `atMs`, so Home needn't ask again with a shorter budget and
+ * disagree, and a notice to show beside the status card.
+ */
+export interface StatusHandover {
+  job: JobStatus;
+  atMs: number;
+  notice: string;
 }
 
 export interface RootState {
@@ -29,6 +41,7 @@ export interface RootState {
   importId: string;
   scrobbleRunActive: boolean;
   showingServerJob: boolean;
+  statusHandover: StatusHandover | null;
   deferredDuplicateCheck: boolean;
 }
 
@@ -134,6 +147,8 @@ export default createStore<RootState>({
     // True while a page is showing this user's background job, so the header
     // shows the BETA tag even without the opt-in or flag.
     showingServerJob: false,
+    // Left by /scrobble as it sends the user to Home's status page; Home takes it.
+    statusHandover: null,
     // True when "Check for duplicates" was ticked while signed out, so the
     // check runs on the chosen queue after sign-in instead.
     deferredDuplicateCheck: false,
@@ -189,6 +204,9 @@ export default createStore<RootState>({
     },
     setShowingServerJob(state, on: boolean) {
       state.showingServerJob = on;
+    },
+    setStatusHandover(state, handover: StatusHandover | null) {
+      state.statusHandover = handover;
     },
     setDeferredDuplicateCheck(state, on: boolean) {
       state.deferredDuplicateCheck = on;

@@ -58,6 +58,7 @@ States (copy from the strings file; `{date}` = `toLocaleDateString([], { month: 
 | `dormant`, `dormantFrom` `needs_attention` | `status.dormant.errors` | '' | reconnect | moveBack, cancel |
 | `dormant`, `reconnectAvailable === false` | `status.dormant.full` (links: buy me a coffee; "scrobble locally" = moveBack) | '' | reconnect, disabled | moveBack, cancel |
 | `exporting` | `status.exporting` | '' | none | none |
+| `exporting`, this tab's take-back of it failed | `notice.moveBackFailed` | '' | none | moveBack |
 | `completed` | `status.completed` (+ `status.rejected` when failed > 0) | '' | checkItOut | newImport |
 | `failed` | `status.failed` (tooltip = reason) | '' | newImport | none |
 | `cancelled` | never shown | | | |
@@ -130,7 +131,7 @@ Commit `Home is the status page for a server job`.
 
 ### Task 5: Docs
 
-`AGENTS.md`: the status page on Home (states, sources, polling incl. the dormant re-check, dismissed jobs, the `/scrobble` redirect, take-back intent and explainer events), `dormant_from`/`dormantFrom` and reconnect-resumes, the #167 lookup rule, removal of the `/scrobble` job banner (and any text describing it, e.g. "The job card refreshes itself"). Spec section 6: an "As built (Plan 4)" note for the move to Home. Strings file: any new or changed strings in an "Added in Plan 4 (drafts)" section. This plan: an "As built" section. Commit `Docs: the status page`.
+`AGENTS.md`: the status page on Home (states, sources, polling incl. the dormant re-check, dismissed jobs, the `/scrobble` redirect, take-back intent and explainer events), `dormant_from`/`dormantFrom` and reconnect-resumes, the #167 lookup rule, removal of the `/scrobble` job banner (and any text describing it, e.g. "The job card refreshes itself"). Also (#173 and its review): the redirect hands Home the job it found (`statusHandover` in the store, used if under 30 s old) and a refused worker sign-in's notice; Home's unanswered job lookup with a worker session shows `status.checking` and asks again with /scrobble's 8 s budget; an `exporting` job is re-checked every 30 s, and a take-back that failed in this tab records its claim (sessionStorage `scrobblify.background.failedTakeBack`, 15 min) so the status page can offer "Scrobble the rest locally" again and the retry presents the claim the worker still holds. Spec section 6: an "As built (Plan 4)" note for the move to Home. Strings file: any new or changed strings in an "Added in Plan 4 (drafts)" section. This plan: an "As built" section. Commit `Docs: the status page`.
 
 ### Task 6: Verify
 

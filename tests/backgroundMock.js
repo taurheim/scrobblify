@@ -499,6 +499,11 @@ function createMockWorker(options = {}) {
 
   function handleExport(body, nowMs) {
     const { job } = world;
+    // As in the worker, an export under way can only be re-entered with its
+    // own claim until that claim lapses.
+    if (job.state === 'exporting' && job.exportClaim && body.claim !== job.exportClaim) {
+      return json({ ok: false, reason: 'not_quiescent', detail: 'not_claimable' }, 409);
+    }
     const scrobbled = Math.floor(job.scrobbled);
     const remaining = Math.max(0, job.totalTracks - scrobbled - job.failed);
     setState(job, 'exporting', nowMs);

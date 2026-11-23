@@ -280,8 +280,13 @@ New strings shipped with the status page. Placeholder copy; rewrite in place.
 | ID | When | Draft |
 | --- | --- | --- |
 | `status.noSession.stopped` | No server sign-in, this browser handed the import over, and the job isn't sending (needs a sign-in, stopped by errors, on hold, being handed back) | Your import is waiting on Scrobblify. Sign in to see why. |
+| `status.checking.retry` | Under `status.checking`, once Home's job lookup went unanswered with a worker session (it asks again by itself first) | Try again |
 
-Reused: `status.noSession` (with `status.noSession.hint` under it) is now
+Reused: `status.checking` is now shown (with `status.checking.retry`) when
+Home can't get an answer about the job, rather than the start page.
+`notice.moveBackFailed` is the line of an `exporting` job whose take-back
+failed in this tab, with "Scrobble the rest locally" to try again.
+`status.noSession` (with `status.noSession.hint` under it) is now
 only shown while the job is sending; a paused job gets `status.paused` with
 the same hint. `status.dayFull`'s `{time}` names the day when the next run
 is past local midnight ("12:20 AM tomorrow", "12:20 AM on Friday"). The

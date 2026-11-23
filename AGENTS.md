@@ -184,7 +184,9 @@ Home emits `home_choice` (`choice`: `have_export`, `get_export` or `resume`;
 `resume` is the "Already scrobbling on scrobblify?" link) on first visits
 (`get_export` also from the welcome-back card's "Show me how"), and
 `home_returning_shown` (`state`: `saved_signed_in`, `saved_signed_out`,
-`server_job` or `username_only`) when it shows the welcome-back card instead
+`server_job`, `username_only`, or `checking`: a worker session whose job
+lookup went unanswered, shown "Checking for active scrobbling..." with Try
+again instead of the start page) when it shows the welcome-back card instead
 (`src/services/ReturningVisitor.ts`). The card appears when this browser has a
 remembered username, saved progress (welcomed under the progress's own
 `userName`), or a live job it handed over. "Not you?" on the card signs out

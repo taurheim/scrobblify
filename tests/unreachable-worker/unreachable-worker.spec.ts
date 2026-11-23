@@ -1233,12 +1233,96 @@ test.describe('Home as the status page', () => {
         await p.route('http://background.invalid/scrobblify/job', () => undefined);
       },
     });
-    // The page's own 3-second timeout, plus a little.
-    await expect(page.locator('.returning-card')).toBeVisible({ timeout: 4500 });
-    await expect(page.locator(CARD)).toHaveCount(0);
-    await page.waitForTimeout(500);
+    // The page's own 3-second timeout, plus a little. Not the welcome-back
+    // card: its buttons open /scrobble, which may find the job and come back.
+    const checking = page.locator('.status-checking');
+    await expect(checking).toContainText('Checking for active scrobbling...', { timeout: 4500 });
+    await expect(page.locator('.returning-card')).toHaveCount(0);
     await expect(page.locator(CARD)).toHaveCount(0);
     expect(livePaths).toEqual([]);
+
+    // It asks again by itself, for longer; once the worker answers, a retry finds the job.
+    const retry = checking.locator('button:has-text("Try again")');
+    await expect(retry).toBeEnabled({ timeout: 12000 });
+    await page.unroute('http://background.invalid/scrobblify/job');
+    await retry.click();
+    await expect(page.locator(`${CARD} .status-sub`)).toHaveText(SAFE, { timeout: 10000 });
+    expect(livePaths).toEqual([]);
+  });
+
+  test('a job lookup slower than Home\'s own budget doesn\'t bounce Start back and forth', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, {
+      username: null,
+      job: { state: 'cancelled', completedAtMs: Date.now() },
+    });
+    const start = page.locator('.home-card button:has-text("Start")');
+    await expect(start).toBeVisible({ timeout: 15000 });
+
+    // A job appears, and the worker now takes 5 s to describe it: more than
+    // Home's 3 s, less than /scrobble's 8 s.
+    Object.assign(mock.world.job!, { state: 'active', completedAtMs: null });
+    await page.route('http://background.invalid/scrobblify/job', async (route: Route) => {
+      if (route.request().method() === 'GET') {
+        await new Promise((resolve) => { setTimeout(resolve, 5000); });
+      }
+      await route.fallback();
+    });
+    const visited: string[] = [];
+    let arrivedAtMs = 0;
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame()) {
+        const { hash } = new URL(frame.url());
+        visited.push(hash);
+        // The router rewrites the current entry before it pushes, so Home's
+        // own hash shows up once before /scrobble's.
+        if (hash === '#/' && !arrivedAtMs && visited.includes('#/scrobble')) {
+          arrivedAtMs = Date.now();
+        }
+      }
+    });
+    // Home shows the job /scrobble found rather than asking again.
+    const asksAfterArriving: string[] = [];
+    page.on('request', (request) => {
+      if (arrivedAtMs && request.method() === 'GET' && new URL(request.url()).pathname === '/scrobblify/job') {
+        asksAfterArriving.push(request.url());
+      }
+    });
+
+    await start.click();
+    await expect(page.locator(`${CARD} .status-sub`)).toHaveText(SAFE, { timeout: 40000 });
+    await expect(page).toHaveURL(/\/#\/$/);
+    // Long enough for Home to have asked again and given up, had it done so.
+    await page.waitForTimeout(6000);
+    await expect(page.locator(`${CARD} .status-sub`)).toHaveText(SAFE);
+    await expect(start).toHaveCount(0);
+    expect(visited.filter((hash) => hash.startsWith('#/scrobble')).length).toBe(1);
+    expect(asksAfterArriving).toEqual([]);
+  });
+
+  test('a worker sign-in that fails comes back to the status page and says so', async ({ page, baseURL }) => {
+    const { origin } = new URL(baseURL || 'http://localhost:8471');
+    await openStatus(page, baseURL, {
+      job: { state: 'needs_reauth' },
+      routes: async (p) => {
+        // The worker's callback sends a refused sign-in to /scrobble?signin=failed.
+        await p.route('http://background.invalid/scrobblify/auth/signin', (route: Route) => route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({ ok: true, authoriseUrl: `${origin}/?signin=failed#/scrobble` }),
+        }));
+      },
+    });
+    const card = page.locator(CARD);
+    await card.locator('.status-action:has-text("Sign in again")').click({ timeout: 15000 });
+    await expect(card.locator('.status-notice')).toHaveText('Signing in to the background service didn\'t work. Please try again.', { timeout: 20000 });
+    await expect(card.locator('.status-line')).toHaveText('Last.fm signed us out');
+    await expect(page).toHaveURL(/\/#\/$/);
+    expect(page.url()).not.toContain('signin=failed');
+
+    await page.reload();
+    await expect(card.locator('.status-line')).toHaveText('Last.fm signed us out', { timeout: 15000 });
+    await expect(card.locator('.status-notice')).toHaveCount(0);
   });
 
   test('a stopped job handed over here, with no sign-in, doesn\'t claim to be finishing', async ({ page, baseURL }) => {
@@ -1302,6 +1386,18 @@ test.describe('Home as the status page', () => {
     mock.world.job!.scrobbled = 4000;
     await page.clock.fastForward('10:30');
     await expect(bar).toContainText('4,000 / 8,000 · 50%', { timeout: 10000 });
+  });
+
+  // #173: a take-back's claim lapses and the job goes back to where it was.
+  test('a job being handed back refreshes itself, and moves on when it goes back to paused', async ({ page, baseURL }) => {
+    const mock = await openStatus(page, baseURL, { job: { state: 'exporting' }, clock: true });
+    const card = page.locator(CARD);
+    await expect(card.locator('.status-line')).toHaveText('Downloading progress from scrobblify servers...', { timeout: 15000 });
+    await expect(card.locator('.status-action')).toHaveCount(0);
+    mock.world.job!.state = 'paused';
+    await page.clock.fastForward('00:45');
+    await expect(card.locator('.status-line')).toHaveText('Paused', { timeout: 10000 });
+    await expect(card.locator('.status-action')).toHaveText(['Resume', MOVE_BACK, 'Cancel']);
   });
 
   test('a cancelled job is not shown', async ({ page, baseURL }) => {
@@ -1435,6 +1531,45 @@ test.describe('Home as the status page', () => {
     expect(events.map((e) => e.name)).not.toContain('move_back_explainer_shown');
     expect(events.map((e) => e.name)).not.toContain('background_stale_tab_blocked');
     expect(events.map((e) => e.name)).toContain('background_job_reclaimed');
+  });
+
+  // #173: the job is left `exporting` under this tab's claim, so only this tab can retry before it lapses.
+  test('a take-back that fails goes back to the status page, which can try it again', async ({ page, baseURL }) => {
+    let exports = 0;
+    const mock = await openStatus(page, baseURL, {
+      seed: SIGNED_IN,
+      routes: async (p, m) => {
+        await p.route('http://background.invalid/scrobblify/job/*/export', async (route: Route) => {
+          exports += 1;
+          if (exports > 1) {
+            await route.fallback();
+            return;
+          }
+          // The worker claims the export, then the answer comes back unusable.
+          const url = new URL(route.request().url());
+          m.handle('POST', url.pathname, url.searchParams, route.request().postData() || '');
+          await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            headers: { 'Access-Control-Allow-Origin': '*' },
+            body: JSON.stringify({ ok: true, state: null }),
+          });
+        });
+      },
+    });
+    const card = page.locator(CARD);
+    await card.locator(`.status-action:has-text("${MOVE_BACK}")`).click({ timeout: 15000 });
+    const dialog = page.locator('.v-dialog:has-text("Something went wrong")');
+    await expect(dialog).toContainText('Couldn\'t bring your progress back.', { timeout: 20000 });
+    expect(mock.world.job!.state).toBe('exporting');
+    await dialog.locator('button:has-text("OK")').click();
+
+    await expect(page).toHaveURL(/\/#\/$/, { timeout: 15000 });
+    await expect(card.locator('.status-line')).toHaveText('Couldn\'t move your progress back. It\'s safe on our server.', { timeout: 15000 });
+    await expect(card.locator('.status-action')).toHaveText([MOVE_BACK]);
+    await card.locator(`.status-action:has-text("${MOVE_BACK}")`).click();
+    await expectMovedBack(page, mock);
+    expect(exports).toBe(2);
   });
 
   test('"Scrobble the rest locally" while signed out explains the second Last.fm approval first', async ({ page, baseURL }) => {

@@ -67,6 +67,12 @@ export const JOB_POLL_FALLBACK_SECONDS = 60;
 export const JOB_CLOCK_TICK_MS = 15 * 1000;
 // A job on hold for a full server asks this often whether a place opened up.
 export const DORMANT_FULL_RECHECK_SECONDS = 5 * 60;
+/*
+  A job being handed back (`exporting`) asks this often whether it has moved
+  on: cancelled by a take-back that worked, or back where it was once a failed
+  one's claim lapses (#173).
+*/
+export const EXPORTING_RECHECK_SECONDS = 30;
 
 /** When to ask about an active job next: just after its next tick, within bounds. */
 export function nextJobPollSec(job: JobStatus, nowSec: number): number {
@@ -86,6 +92,9 @@ export function jobPollDueSec(job: JobStatus, nowSec: number): number | null {
   }
   if (job.state === 'dormant' && job.reconnectAvailable === false) {
     return nowSec + DORMANT_FULL_RECHECK_SECONDS;
+  }
+  if (job.state === 'exporting') {
+    return nowSec + EXPORTING_RECHECK_SECONDS;
   }
   return null;
 }
@@ -174,10 +183,13 @@ function plain(parts: LinePart[]): string {
 
 // ---- the views -----------------------------------------------------------
 
-/** For a job read with this browser's worker session. */
+/**
+ * For a job read with this browser's worker session. `takeBackFailed`: this
+ * tab's own take-back of the job failed, and can be tried again.
+ */
 export function viewFromJob(
   job: JobStatus,
-  opts: { nowSec: number; originalTotal?: number },
+  opts: { nowSec: number; originalTotal?: number; takeBackFailed?: boolean },
 ): StatusView {
   const progress = bar(opts.originalTotal || 0, job.totalTracks, job.scrobbled);
   const reason = job.reason || '';
@@ -266,6 +278,16 @@ export function viewFromJob(
       });
     }
     case 'exporting':
+      /*
+        Left `exporting` by this tab's failed take-back, the job only lets a
+        retry from here back in (it presents the same claim) until the claim
+        lapses. Anyone else's take-back is just under way.
+      */
+      if (opts.takeBackFailed) {
+        return view({
+          bar: progress, line: 'Couldn\'t move your progress back. It\'s safe on our server.', secondary: ['moveBack'],
+        });
+      }
       return view({ bar: progress, line: 'Downloading progress from scrobblify servers...' });
     case 'completed': {
       const rejected = job.failed > 0 ? job.failed : 0;

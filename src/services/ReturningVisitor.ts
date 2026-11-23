@@ -15,9 +15,10 @@ export type ServerJobState =
   | { kind: 'job'; source: 'import'; username: string | null; status: background.ImportStatus; originalTotal: number }
   | { kind: 'job'; source: 'other'; username: string | null };
 
-/** Which Home page a visitor gets. */
+/** Which Home page a visitor gets. `checking`: a worker session, but the job lookup went unanswered. */
 export type ReturningState =
   | { kind: 'none' }
+  | { kind: 'checking' }
   | { kind: 'saved'; username: string | null; signedIn: boolean; done: number; total: number }
   | ServerJobState
   | { kind: 'username_only'; username: string };
@@ -56,13 +57,21 @@ export function progressPct(done: number, total: number): number {
  * neither, from whether the worker says this username has a job running.
  *
  * Never throws: an unreadable IndexedDB or an unreachable worker just means
- * less is known, and the visitor gets a simpler page.
+ * less is known, and the visitor gets a simpler page. Except with a worker
+ * session whose job lookup went unanswered: that browser most likely has a
+ * job, and the start page would send it to /scrobble, which may find the job
+ * with its longer budget and send it straight back. It gets `checking`.
+ *
+ * `knownJob` is a job just fetched elsewhere (/scrobble, as it sent the user
+ * here), used instead of asking again. `timeoutMs` is the lookups' budget.
  */
 export async function detectReturning(
   api: LastFm,
   stateManager: StateManager,
+  opts: { knownJob?: background.JobStatus | null; timeoutMs?: number } = {},
 ): Promise<ReturningState> {
   const username = api.getUserName();
+  const timeoutMs = opts.timeoutMs || RETURNING_STATUS_TIMEOUT_MS;
   // Started now so the IndexedDB read overlaps the worker checks.
   const savedLoad = stateManager.loadState().catch(() => null);
 
@@ -74,16 +83,19 @@ export async function detectReturning(
     unanswered job lookup there must not read as "another device".
   */
   const askLive = (): Promise<boolean | null> => (!handedOver && username
-    ? background.liveJobForUsername(username, RETURNING_STATUS_TIMEOUT_MS)
+    ? background.liveJobForUsername(username, timeoutMs)
     : Promise.resolve(null));
   const hadSession = !!background.getSession();
   const liveLoad = hadSession ? null : askLive();
-  const [job, recordStatus] = await Promise.all([
-    background.fetchJob(RETURNING_STATUS_TIMEOUT_MS),
+  const [jobAnswer, recordStatus] = await Promise.all([
+    opts.knownJob
+      ? Promise.resolve({ answered: true, job: opts.knownJob })
+      : background.fetchJobAnswer(timeoutMs),
     handedOver
-      ? background.importStatus(handedOver.importId, RETURNING_STATUS_TIMEOUT_MS)
+      ? background.importStatus(handedOver.importId, timeoutMs)
       : Promise.resolve(null),
   ]);
+  const { job } = jobAnswer;
   // A record the server doesn't know, or whose job has ended, is dropped.
   const recordEnded = !!recordStatus
     && (!recordStatus.known || ENDED_STATES.includes(recordStatus.state || ''));
@@ -112,6 +124,9 @@ export async function detectReturning(
     return {
       kind: 'job', source: 'job', username: titleUser, job, originalTotal: record && matches ? record.originalTotal : 0,
     };
+  }
+  if (!jobAnswer.answered && background.getSession()) {
+    return { kind: 'checking' };
   }
   if (record) {
     return {

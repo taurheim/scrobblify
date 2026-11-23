@@ -2525,14 +2525,16 @@ export async function hasLiveJob(jobId = ''): Promise<boolean | null> {
   }
 }
 
-export async function fetchJob(timeoutMs = STATUS_TIMEOUT_MS): Promise<JobStatus | null> {
+export async function fetchJobAnswer(
+  timeoutMs = STATUS_TIMEOUT_MS,
+): Promise<{ answered: boolean; job: JobStatus | null }> {
   if (!isBackgroundConfigured() || !getSession()) {
-    return null;
+    return { answered: true, job: null };
   }
   try {
     const res = await getWithTimeout('/scrobblify/job', true, timeoutMs);
     if (!res) {
-      return null;
+      return { answered: false, job: null };
     }
     if (res.status === 401) {
       // Recorded before the token is dropped. Without this the ownership
@@ -2540,15 +2542,65 @@ export async function fetchJob(timeoutMs = STATUS_TIMEOUT_MS): Promise<JobStatus
       // has no re-authentication button to offer.
       sessionExpired = true;
       clearSession();
-      return null;
+      return { answered: true, job: null };
     }
     if (!res.ok) {
-      return null;
+      return { answered: false, job: null };
     }
     const body = await res.json();
-    return body.job ?? null;
+    return { answered: true, job: body.job ?? null };
   } catch {
-    return null;
+    return { answered: false, job: null };
+  }
+}
+
+export async function fetchJob(timeoutMs = STATUS_TIMEOUT_MS): Promise<JobStatus | null> {
+  return (await fetchJobAnswer(timeoutMs)).job;
+}
+
+const FAILED_TAKE_BACK_KEY = 'scrobblify.background.failedTakeBack';
+/*
+  How long a failed take-back's record is kept: the worker's export claim
+  (`EXPORT_CLAIM_SECONDS` in worker/src/api.ts, 600 s) plus a sweep (5 min).
+  After that the job has gone back to where it was, so an `exporting` job is
+  someone else's take-back.
+*/
+const FAILED_TAKE_BACK_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Records a take-back from this tab that failed with job `jobId`, possibly
+ * left `exporting` under `claim`. The worker lets only that claim back in
+ * until it lapses, so a retry presents it (`failedTakeBackClaim`). Per tab
+ * (sessionStorage): two tabs retrying with one claim could both read the
+ * export, which is what the claim exists to prevent.
+ */
+export function recordFailedTakeBack(jobId: string, claim: string): void {
+  try {
+    window.sessionStorage.setItem(FAILED_TAKE_BACK_KEY, JSON.stringify({ jobId, claim, atMs: Date.now() }));
+  } catch {
+    // Storage refused: a retry waits for the claim to lapse instead.
+  }
+}
+
+/** The claim of this tab's failed take-back of job `jobId`, while it may still hold; else null. */
+export function failedTakeBackClaim(jobId: string): string | null {
+  try {
+    const record = JSON.parse(window.sessionStorage.getItem(FAILED_TAKE_BACK_KEY) || 'null');
+    if (record && record.jobId === jobId && typeof record.claim === 'string' && record.claim
+      && Date.now() - Number(record.atMs) < FAILED_TAKE_BACK_TTL_MS) {
+      return record.claim;
+    }
+  } catch {
+    // Unreadable: no record.
+  }
+  return null;
+}
+
+export function clearFailedTakeBack(): void {
+  try {
+    window.sessionStorage.removeItem(FAILED_TAKE_BACK_KEY);
+  } catch {
+    // Nothing to clear.
   }
 }
 

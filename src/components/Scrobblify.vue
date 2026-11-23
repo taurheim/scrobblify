@@ -346,6 +346,11 @@ const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sig
  */
 const NEEDS_WORKER_NOTICES = [SESSION_EXPIRED_NOTICE, REAUTH_UNREACHABLE_NOTICE];
 /**
+ * The worker's sign-in came back refused (`?signin=failed`). Carried to Home
+ * when a job the old session can still see sends the page there.
+ */
+const WORKER_SIGNIN_FAILED_NOTICE = 'Signing in to the background service didn\'t work. Please try again.';
+/**
  * A handoff that named nobody came back refused: the Last.fm account that
  * authorised it already has a job. Signing in to the worker shows that job.
  */
@@ -789,7 +794,7 @@ export default defineComponent({
       if (reauthed) {
         trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
       } else if (signInRefused) {
-        this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
+        this.backgroundNotice = WORKER_SIGNIN_FAILED_NOTICE;
         this.showReauth = true;
         this.stripQuery();
         trackEvent('background_reauth_failed');
@@ -902,9 +907,19 @@ export default defineComponent({
       While a server job is shown, Home is its status page, so the page goes
       there: once the mount has settled, and whenever a later check first finds
       one. A `replace`, so Back doesn't return here only to be sent on again.
+
+      The job goes along, so Home shows it rather than asking again with its
+      shorter budget, which a slow worker can miss: Home would then show the
+      start page, whose Start comes straight back here. So does a refused
+      worker sign-in's notice, which this page won't be showing.
     */
     leaveForStatusPage(go: boolean) {
       if (go && !(this as any)._unmounted) {
+        this.$store.commit('setStatusHandover', {
+          job: this.backgroundJob,
+          atMs: (this as any)._backgroundJobAtMs || 0,
+          notice: this.backgroundNotice === WORKER_SIGNIN_FAILED_NOTICE ? this.backgroundNotice : '',
+        });
         this.$router.replace({ name: 'home' }).catch(() => undefined);
       }
     },
@@ -2306,7 +2321,10 @@ export default defineComponent({
     },
 
     async refreshBackgroundJob() {
-      this.backgroundJob = await background.fetchJob();
+      const job = await background.fetchJob();
+      // When it was fetched, for Home (`leaveForStatusPage`). Not reactive.
+      (this as any)._backgroundJobAtMs = Date.now();
+      this.backgroundJob = job;
     },
 
     /**
@@ -2340,7 +2358,9 @@ export default defineComponent({
         the server refuses a cancel during an active export unless the caller
         can prove it owns that export.
       */
-      const exportClaim = background.newExportClaim();
+      // A retry of this tab's own failed take-back presents its claim, which
+      // the worker may still be holding the job `exporting` under (#173).
+      const exportClaim = background.failedTakeBackClaim(jobId) || background.newExportClaim();
       try {
         if (!await background.jobAction(jobId, 'pause')) {
           throw new Error('The background import could not be paused.');
@@ -2489,6 +2509,7 @@ export default defineComponent({
           }
           this.hasResumableState = false;
           trackEvent('background_takeback_cancel_refused', { job_id: jobId });
+          background.recordFailedTakeBack(jobId, exportClaim);
           await this.refreshBackgroundJob();
           // Home's status page is where to try again, once this is read.
           this.errorMessage = 'Your tracks were copied back, but the background import could not be stopped, so this browser will not resume them yet. Use "Scrobble the rest locally" again in a moment.';
@@ -2499,6 +2520,7 @@ export default defineComponent({
         }
 
         this.backgroundJob = null;
+        background.clearFailedTakeBack();
         this.hasResumableState = true;
         this.ownershipBlocked = false;
         /*
@@ -2542,6 +2564,12 @@ export default defineComponent({
         trackEvent('background_job_reclaimed', { job_id: jobId, uncertain });
       } catch (e) {
         trackError('background.takeBackProgress', e);
+        /*
+          The export may have claimed the job, which then stays `exporting`
+          for the claim's ten minutes. Home's status page offers to try again
+          from this tab, which can present that claim.
+        */
+        background.recordFailedTakeBack(jobId, exportClaim);
         // The job may have been left paused. Say so, and re-read its real
         // state rather than leaving a stale banner on screen.
         await this.refreshBackgroundJob();
@@ -2808,7 +2836,11 @@ export default defineComponent({
           await this.refreshBackgroundJob();
         }
         const job = this.backgroundJob;
-        if ((this as any)._unmounted || !job || job.id !== jobId || !TAKE_BACK_STATES.includes(job.state)) {
+        // `exporting` only after this tab's own take-back failed: a retry
+        // presents its claim. Anyone else's would be refused until it lapses.
+        const exportable = !!job && (TAKE_BACK_STATES.includes(job.state)
+          || (job.state === 'exporting' && !!background.failedTakeBackClaim(job.id)));
+        if ((this as any)._unmounted || !job || job.id !== jobId || !exportable) {
           return;
         }
         await this.takeBackProgress();

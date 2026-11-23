@@ -58,7 +58,7 @@ export default defineComponent({
   computed: {
     title(): string {
       const s = this.state;
-      const name = s.kind === 'none' ? null : s.username;
+      const name = s.kind === 'none' || s.kind === 'checking' ? null : s.username;
       return name ? `Scrobbling to ${name}` : 'Welcome back';
     },
     hasProgress(): boolean {

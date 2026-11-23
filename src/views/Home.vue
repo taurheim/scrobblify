@@ -25,6 +25,25 @@
       @move-back="moveBack"
     />
 
+    <!-- A worker session, but the job lookup went unanswered: not the start page, whose Start may find the job. -->
+    <v-card v-else-if="returning.kind === 'checking'" class="status-checking mx-auto" max-width="440">
+      <v-card-text class="d-flex align-center">
+        <v-progress-circular
+          v-if="rechecking"
+          indeterminate
+          color="primary"
+          size="20"
+          width="2"
+          class="mr-3"
+          aria-label="Checking"
+        />
+        Checking for active scrobbling...
+      </v-card-text>
+      <v-card-actions>
+        <v-btn variant="text" :disabled="rechecking" @click="recheck">Try again</v-btn>
+      </v-card-actions>
+    </v-card>
+
     <home-returning
       v-else-if="returning.kind !== 'none' && !dismissedReturning"
       :state="returning"
@@ -115,17 +134,22 @@ import {
 import { resetUser, trackEvent } from '@/services/Analytics';
 import { setSignInIntent, startSignIn } from '@/services/SignInIntent';
 import {
-  clearHandedOverImport, dismissJob, fetchJob, getSession, isBackgroundConfigured, jobAction,
-  setWorkerLookup, startReauth,
+  clearHandedOverImport, dismissJob, failedTakeBackClaim, fetchJob, getSession, isBackgroundConfigured,
+  JobStatus, jobAction, setWorkerLookup, startReauth,
 } from '@/services/BackgroundScrobbling';
 import {
   isJobShown, JOB_CLOCK_TICK_MS, JOB_POLL_FALLBACK_SECONDS, jobPollDueSec, StatusView,
   viewFromImport, viewFromJob, viewOtherDevice,
 } from '@/services/JobStatus';
+import type { StatusHandover } from '@/store';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
 
 const SERVER_UNREACHABLE = 'Couldn\'t reach our server. Try again in a few minutes.';
+// A job /scrobble hands over is shown instead of asking again while younger than this.
+const HANDOVER_FRESH_MS = 30 * 1000;
+// "Checking for active scrobbling..." asks again with /scrobble's budget (`fetchJob`'s default).
+const RECHECK_TIMEOUT_MS = 8000;
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
@@ -178,6 +202,8 @@ export default defineComponent({
       onVisibilityChange: null as (() => void) | null,
       /** "Scrobble the rest locally" is explaining the second Last.fm approval. */
       explainingMoveBack: false,
+      /** "Checking for active scrobbling..." is asking again. */
+      rechecking: false,
     };
   },
   computed: {
@@ -187,7 +213,11 @@ export default defineComponent({
         return null;
       }
       if (r.source === 'job') {
-        return viewFromJob(r.job, { nowSec: this.nowSec, originalTotal: r.originalTotal });
+        return viewFromJob(r.job, {
+          nowSec: this.nowSec,
+          originalTotal: r.originalTotal,
+          takeBackFailed: !!failedTakeBackClaim(r.job.id),
+        });
       }
       if (r.source === 'import') {
         return viewFromImport(r.status, { nowSec: this.nowSec, originalTotal: r.originalTotal });
@@ -218,7 +248,21 @@ export default defineComponent({
     };
     window.addEventListener('pageshow', this.onPageShow);
     this.dismissedReturning = readDismissed();
-    await this.refreshReturning();
+    /*
+      Sent here by /scrobble, which found a job to show: that job, if recent,
+      rather than asking again on a shorter budget that a slow worker can
+      miss, and whatever it had to say (a refused worker sign-in).
+    */
+    const handover = this.$store.state.statusHandover as StatusHandover | null;
+    this.$store.commit('setStatusHandover', null);
+    if (handover && handover.notice) {
+      this.statusNotice = handover.notice;
+    }
+    const knownJob = handover && Date.now() - handover.atMs < HANDOVER_FRESH_MS ? handover.job : null;
+    await this.refreshReturning({ knownJob });
+    if (this.returning.kind === 'checking') {
+      await this.recheck();
+    }
   },
   beforeUnmount() {
     if (this.onPageShow) {
@@ -228,13 +272,13 @@ export default defineComponent({
     this.$store.commit('setShowingServerJob', false);
   },
   methods: {
-    async refreshReturning() {
+    async refreshReturning(opts: { knownJob?: JobStatus | null; timeoutMs?: number } = {}) {
       const api = this.$store.state.lfmApi as LastFm;
       try {
         // Only /scrobble's sign-in handler runs init(), so a visit that starts
         // here has to read the stored user itself.
         api.loadStoredUser();
-        this.returning = await detectReturning(api, this.stateManager);
+        this.returning = await detectReturning(api, this.stateManager, opts);
         const r = this.returning;
         // The status page shows whatever "Not you?" said: it is about a job.
         this.$store.commit('setShowingServerJob', r.kind === 'job');
@@ -244,7 +288,7 @@ export default defineComponent({
             source: r.source,
             ...(r.source === 'job' ? { job_state: r.job.state } : {}),
           });
-        } else if (r.kind !== 'none' && !this.dismissedReturning) {
+        } else if (r.kind === 'checking' || (r.kind !== 'none' && !this.dismissedReturning)) {
           let state: string = r.kind;
           if (r.kind === 'saved') {
             state = r.signedIn ? 'saved_signed_in' : 'saved_signed_out';
@@ -260,9 +304,25 @@ export default defineComponent({
     },
 
     /*
+      "Checking for active scrobbling...": asks again, with /scrobble's
+      budget rather than Home's, so the two agree on a slow worker.
+    */
+    async recheck() {
+      if (this.rechecking) { return; }
+      this.rechecking = true;
+      try {
+        await this.refreshReturning({ timeoutMs: RECHECK_TIMEOUT_MS });
+      } finally {
+        this.rechecking = false;
+      }
+    },
+
+    /*
       The status page refreshes itself (see `jobPollDueSec`): an active job
       just after each of its batches, and a job on hold for a full server every
-      few minutes, so Reconnect comes back when a place opens up. Only while
+      few minutes, so Reconnect comes back when a place opens up, and a job
+      being handed back every 30 seconds, so a take-back that failed elsewhere
+      doesn't leave it "Downloading progress" for good (#173). Only while
       the tab is visible; a tab shown again asks at once.
     */
     scheduleJobPoll() {
@@ -354,7 +414,8 @@ export default defineComponent({
     /*
       Reconnect, Sign in again and Sign in all sign in to the worker: it
       re-attaches a job's Last.fm access, or just gives this browser a session
-      to manage the job with. The return lands on /scrobble.
+      to manage the job with. The return lands on /scrobble, which sends a
+      shown job back here, with the notice if the sign-in was refused.
     */
     async signInToWorker() {
       if (this.statusBusy) { return; }
