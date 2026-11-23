@@ -96,14 +96,16 @@ export async function detectReturning(
       : Promise.resolve(null),
   ]);
   const { job } = jobAnswer;
-  // A record the server doesn't know, or whose job has ended, is dropped.
+  // A record the server doesn't know, or whose job has ended, is dropped,
+  // except while that finished job is still shown: its whole-import bar
+  // comes from the record, until the user dismisses it.
   const recordEnded = !!recordStatus
     && (!recordStatus.known || ENDED_STATES.includes(recordStatus.state || ''));
-  if (recordEnded) {
-    background.clearHandedOverImport();
-  }
   // Not a handoff still on its way: the record is only written once one is live.
   const record = handedOver && recordStatus && !recordEnded && !recordStatus.pending
+    ? { ...handedOver, status: recordStatus }
+    : null;
+  const recordForJob = handedOver && recordStatus && recordStatus.known && !recordStatus.pending
     ? { ...handedOver, status: recordStatus }
     : null;
 
@@ -113,7 +115,10 @@ export async function detectReturning(
       when the lookup of its import describes a job the same size. Otherwise
       its whole-import total would be applied to someone else's job.
     */
-    const matches = !!record && record.status.totalTracks === job.totalTracks;
+    const matches = !!recordForJob && recordForJob.status.totalTracks === job.totalTracks;
+    if (recordEnded && !matches) {
+      background.clearHandedOverImport();
+    }
     /*
       A handover this browser made for another account than the one it
       remembers (a signed-out handover approved as someone else): the job is
@@ -122,8 +127,11 @@ export async function detectReturning(
     const recordUser = background.handedOverImportUser();
     const titleUser = recordUser && !sameUser(recordUser, username) ? null : username;
     return {
-      kind: 'job', source: 'job', username: titleUser, job, originalTotal: record && matches ? record.originalTotal : 0,
+      kind: 'job', source: 'job', username: titleUser, job, originalTotal: recordForJob && matches ? recordForJob.originalTotal : 0,
     };
+  }
+  if (recordEnded) {
+    background.clearHandedOverImport();
   }
   if (!jobAnswer.answered && background.getSession()) {
     return { kind: 'checking' };

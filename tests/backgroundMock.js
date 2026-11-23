@@ -95,6 +95,10 @@ function setState(job, state, nowMs) {
   if (TERMINAL.includes(state) && !job.completedAtMs) {
     job.completedAtMs = nowMs;
   }
+  // A forced finish looks like a real one: everything not rejected was sent.
+  if (state === 'completed') {
+    job.scrobbled = Math.max(0, job.totalTracks - job.failed);
+  }
   job.state = state;
   /* eslint-enable no-param-reassign */
 }

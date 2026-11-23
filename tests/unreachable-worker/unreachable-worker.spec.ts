@@ -1441,6 +1441,24 @@ test.describe('Home as the status page', () => {
     await expect(page.locator(`${CARD} .status-bar`)).toContainText('10,233 / 18,523 · 55%', { timeout: 15000 });
   });
 
+  test('a finished job still counts the whole import, until it is dismissed', async ({ page, baseURL }) => {
+    await openStatus(page, baseURL, {
+      job: {
+        state: 'completed', totalTracks: 12000, scrobbled: 12000, completedAtMs: Date.now(),
+      },
+      record: { importId: IMPORT_ID, username: 'testuser', originalTotal: 18523 },
+    });
+    await expect(page.locator(`${CARD} .status-bar`)).toContainText('18,523 / 18,523 · 100%', { timeout: 15000 });
+    expect(await page.evaluate((k) => localStorage.getItem(k), RECORD_KEY)).not.toBeNull();
+    await page.locator(`${CARD} .status-action:has-text("Start a new import")`).click();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 15000 });
+    await page.goto('/#/');
+    await page.reload();
+    await expect(page.locator('.returning-card')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator(CARD)).toHaveCount(0);
+    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), RECORD_KEY)).toBeNull();
+  });
+
   test('shows the BETA tag to a browser outside the beta', async ({ page, baseURL }) => {
     await openStatus(page, baseURL);
     await expect(page.locator(CARD)).toBeVisible({ timeout: 15000 });
