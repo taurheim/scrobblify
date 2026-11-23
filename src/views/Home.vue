@@ -8,6 +8,42 @@
       <v-progress-circular indeterminate color="primary" class="home-loading" aria-label="Loading" />
     </div>
 
+    <background-status
+      v-else-if="statusView"
+      :view="statusView"
+      :username="statusUsername"
+      :busy="statusBusy"
+      :notice="statusNotice"
+      @pause="jobAct('pause')"
+      @resume="jobAct('resume')"
+      @try-again="jobAct('resume')"
+      @reconnect="signInToWorker"
+      @sign-in-again="signInToWorker"
+      @sign-in="signInToWorker"
+      @cancel="cancelJob"
+      @new-import="newImport"
+      @move-back="moveBack"
+    />
+
+    <!-- A worker session, but the job lookup went unanswered: not the start page, whose Start may find the job. -->
+    <v-card v-else-if="returning.kind === 'checking'" class="status-checking mx-auto" max-width="440">
+      <v-card-text class="d-flex align-center">
+        <v-progress-circular
+          v-if="rechecking"
+          indeterminate
+          color="primary"
+          size="20"
+          width="2"
+          class="mr-3"
+          aria-label="Checking"
+        />
+        Checking for active scrobbling...
+      </v-card-text>
+      <v-card-actions>
+        <v-btn variant="text" :disabled="rechecking" @click="recheck">Try again</v-btn>
+      </v-card-actions>
+    </v-card>
+
     <home-returning
       v-else-if="returning.kind !== 'none' && !dismissedReturning"
       :state="returning"
@@ -40,6 +76,8 @@
         </button>
       </p>
     </template>
+
+    <move-back-explainer v-model="explainingMoveBack" @continue="continueMoveBack" @cancel="cancelMoveBack" />
   </div>
 </template>
 
@@ -85,6 +123,8 @@
 <script lang="ts">
 import { defineComponent, markRaw } from 'vue';
 import LastFm from '@/api/LastFm';
+import BackgroundStatus from '@/components/BackgroundStatus.vue';
+import MoveBackExplainer from '@/components/MoveBackExplainer.vue';
 import HomeGetExport from '@/components/home/HomeGetExport.vue';
 import HomeReturning from '@/components/home/HomeReturning.vue';
 import StateManager from '@/services/StateManager';
@@ -94,10 +134,26 @@ import {
 import { resetUser, trackEvent } from '@/services/Analytics';
 import { setSignInIntent, startSignIn } from '@/services/SignInIntent';
 import {
-  isBackgroundConfigured, setWorkerLookup, startReauth,
+  clearHandedOverImport, dismissJob, failedTakeBackClaim, fetchJob, getSession, isBackgroundConfigured,
+  JobStatus, jobAction, setWorkerLookup, startReauth,
 } from '@/services/BackgroundScrobbling';
+import {
+  isJobShown, JOB_CLOCK_TICK_MS, JOB_POLL_FALLBACK_SECONDS, jobPollDueSec, StatusView,
+  viewFromImport, viewFromJob, viewOtherDevice,
+} from '@/services/JobStatus';
+import type { StatusHandover } from '@/store';
 
 type HomeChoice = 'have_export' | 'get_export' | 'resume';
+
+const SERVER_UNREACHABLE = 'Couldn\'t reach our server. Try again in a few minutes.';
+// A job /scrobble hands over is shown instead of asking again while younger than this.
+const HANDOVER_FRESH_MS = 30 * 1000;
+// "Checking for active scrobbling..." asks again with /scrobble's budget (`fetchJob`'s default).
+const RECHECK_TIMEOUT_MS = 8000;
+
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
+}
 
 function readDismissed(): boolean {
   try {
@@ -116,7 +172,12 @@ function writeDismissed() {
 }
 
 export default defineComponent({
-  components: { 'home-get-export': HomeGetExport, 'home-returning': HomeReturning },
+  components: {
+    'background-status': BackgroundStatus,
+    'move-back-explainer': MoveBackExplainer,
+    'home-get-export': HomeGetExport,
+    'home-returning': HomeReturning,
+  },
   data() {
     return {
       // Nothing renders until the returning check settles, so a returning
@@ -129,7 +190,49 @@ export default defineComponent({
       /** "Re-connect" is asking the worker for its sign-in link. */
       lookingUp: false,
       onPageShow: null as ((event: PageTransitionEvent) => void) | null,
+      /** A status page action is under way. */
+      statusBusy: false,
+      statusNotice: '',
+      /** Bumped by every action, so a poll that lands after one is discarded. */
+      statusSeq: 0,
+      nowSec: nowSec(),
+      jobPollDueSec: 0,
+      jobPolling: false,
+      jobClockTimer: null as number | null,
+      onVisibilityChange: null as (() => void) | null,
+      /** "Scrobble the rest locally" is explaining the second Last.fm approval. */
+      explainingMoveBack: false,
+      /** "Checking for active scrobbling..." is asking again. */
+      rechecking: false,
     };
+  },
+  computed: {
+    statusView(): StatusView | null {
+      const r = this.returning;
+      if (r.kind !== 'job') {
+        return null;
+      }
+      if (r.source === 'job') {
+        return viewFromJob(r.job, {
+          nowSec: this.nowSec,
+          originalTotal: r.originalTotal,
+          takeBackFailed: !!failedTakeBackClaim(r.job.id),
+        });
+      }
+      if (r.source === 'import') {
+        return viewFromImport(r.status, { nowSec: this.nowSec, originalTotal: r.originalTotal });
+      }
+      return viewOtherDevice();
+    },
+    statusUsername(): string | null {
+      return this.returning.kind === 'job' ? this.returning.username : null;
+    },
+  },
+  watch: {
+    // Every new answer about the job decides when to ask again.
+    returning() {
+      this.scheduleJobPoll();
+    },
   },
   async mounted() {
     // A lookup only ever starts here, so one still flagged is from a trip to
@@ -139,30 +242,53 @@ export default defineComponent({
     this.onPageShow = (event: PageTransitionEvent) => {
       if (event.persisted) {
         this.lookingUp = false;
+        this.statusBusy = false;
         setWorkerLookup(false);
       }
     };
     window.addEventListener('pageshow', this.onPageShow);
     this.dismissedReturning = readDismissed();
-    await this.refreshReturning();
+    /*
+      Sent here by /scrobble, which found a job to show: that job, if recent,
+      rather than asking again on a shorter budget that a slow worker can
+      miss, and whatever it had to say (a refused worker sign-in).
+    */
+    const handover = this.$store.state.statusHandover as StatusHandover | null;
+    this.$store.commit('setStatusHandover', null);
+    if (handover && handover.notice) {
+      this.statusNotice = handover.notice;
+    }
+    const knownJob = handover && Date.now() - handover.atMs < HANDOVER_FRESH_MS ? handover.job : null;
+    await this.refreshReturning({ knownJob });
+    if (this.returning.kind === 'checking') {
+      await this.recheck();
+    }
   },
   beforeUnmount() {
     if (this.onPageShow) {
       window.removeEventListener('pageshow', this.onPageShow);
     }
+    this.stopJobClock();
     this.$store.commit('setShowingServerJob', false);
   },
   methods: {
-    async refreshReturning() {
+    async refreshReturning(opts: { knownJob?: JobStatus | null; timeoutMs?: number } = {}) {
       const api = this.$store.state.lfmApi as LastFm;
       try {
         // Only /scrobble's sign-in handler runs init(), so a visit that starts
         // here has to read the stored user itself.
         api.loadStoredUser();
-        this.returning = await detectReturning(api, this.stateManager);
+        this.returning = await detectReturning(api, this.stateManager, opts);
         const r = this.returning;
-        this.$store.commit('setShowingServerJob', r.kind === 'server_job' && !this.dismissedReturning);
-        if (r.kind !== 'none' && !this.dismissedReturning) {
+        // The status page shows whatever "Not you?" said: it is about a job.
+        this.$store.commit('setShowingServerJob', r.kind === 'job');
+        if (r.kind === 'job') {
+          trackEvent('home_returning_shown', {
+            state: 'server_job',
+            source: r.source,
+            ...(r.source === 'job' ? { job_state: r.job.state } : {}),
+          });
+        } else if (r.kind === 'checking' || (r.kind !== 'none' && !this.dismissedReturning)) {
           let state: string = r.kind;
           if (r.kind === 'saved') {
             state = r.signedIn ? 'saved_signed_in' : 'saved_signed_out';
@@ -175,6 +301,186 @@ export default defineComponent({
       } finally {
         this.ready = true;
       }
+    },
+
+    /*
+      "Checking for active scrobbling...": asks again, with /scrobble's
+      budget rather than Home's, so the two agree on a slow worker.
+    */
+    async recheck() {
+      if (this.rechecking) { return; }
+      this.rechecking = true;
+      try {
+        await this.refreshReturning({ timeoutMs: RECHECK_TIMEOUT_MS });
+      } finally {
+        this.rechecking = false;
+      }
+    },
+
+    /*
+      The status page refreshes itself (see `jobPollDueSec`): an active job
+      just after each of its batches, and a job on hold for a full server every
+      few minutes, so Reconnect comes back when a place opens up, and a job
+      being handed back every 30 seconds, so a take-back that failed elsewhere
+      doesn't leave it "Downloading progress" for good (#173). Only while
+      the tab is visible; a tab shown again asks at once.
+    */
+    scheduleJobPoll() {
+      this.nowSec = nowSec();
+      const r = this.returning;
+      const due = r.kind === 'job' && r.source === 'job' ? jobPollDueSec(r.job, this.nowSec) : null;
+      if (due === null) {
+        this.stopJobClock();
+        return;
+      }
+      this.jobPollDueSec = due;
+      this.startJobClock();
+    },
+
+    startJobClock() {
+      if (this.jobClockTimer !== null) { return; }
+      this.jobClockTimer = window.setInterval(() => this.onJobClockTick(false), JOB_CLOCK_TICK_MS);
+      this.onVisibilityChange = () => {
+        if (document.visibilityState === 'visible') {
+          this.onJobClockTick(true);
+        }
+      };
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
+    },
+
+    stopJobClock() {
+      if (this.jobClockTimer !== null) {
+        window.clearInterval(this.jobClockTimer);
+        this.jobClockTimer = null;
+      }
+      if (this.onVisibilityChange) {
+        document.removeEventListener('visibilitychange', this.onVisibilityChange);
+        this.onVisibilityChange = null;
+      }
+    },
+
+    onJobClockTick(returning: boolean) {
+      this.nowSec = nowSec();
+      if (document.visibilityState !== 'visible') { return; }
+      if (returning || this.nowSec >= this.jobPollDueSec) {
+        this.pollJob();
+      }
+    },
+
+    /**
+     * Refreshes the status page without letting a slow or failed answer undo
+     * anything newer. A failed check keeps the page as it was; a job that is
+     * gone (cancelled elsewhere) or a session the worker refused sends Home
+     * back through the whole decision.
+     */
+    async pollJob() {
+      const r = this.returning;
+      if (r.kind !== 'job' || r.source !== 'job' || this.jobPolling || this.statusBusy) { return; }
+      const seq = this.statusSeq;
+      this.jobPolling = true;
+      const job = await fetchJob();
+      this.jobPolling = false;
+      if (seq !== this.statusSeq || this.statusBusy || this.returning !== r) { return; }
+      if (isJobShown(job)) {
+        this.returning = { ...r, job };
+        return;
+      }
+      if (job || !getSession()) {
+        await this.refreshReturning();
+        return;
+      }
+      this.jobPollDueSec = nowSec() + JOB_POLL_FALLBACK_SECONDS;
+    },
+
+    /** Pause, Resume, and Try again (a resume of a job stopped by errors). */
+    async jobAct(action: 'pause' | 'resume') {
+      const r = this.returning;
+      if (r.kind !== 'job' || r.source !== 'job' || this.statusBusy) { return; }
+      this.statusSeq += 1;
+      this.statusBusy = true;
+      this.statusNotice = '';
+      if (!await jobAction(r.job.id, action)) {
+        this.statusNotice = SERVER_UNREACHABLE;
+      }
+      const job = await fetchJob();
+      this.statusBusy = false;
+      if (isJobShown(job)) {
+        this.returning = { ...r, job };
+      } else if (job || !getSession()) {
+        await this.refreshReturning();
+      }
+    },
+
+    /*
+      Reconnect, Sign in again and Sign in all sign in to the worker: it
+      re-attaches a job's Last.fm access, or just gives this browser a session
+      to manage the job with. The return lands on /scrobble, which sends a
+      shown job back here, with the notice if the sign-in was refused.
+    */
+    async signInToWorker() {
+      if (this.statusBusy) { return; }
+      this.statusBusy = true;
+      this.statusNotice = '';
+      trackEvent('background_reauth_started', { source: 'home' });
+      const url = await startReauth(this.statusUsername || '');
+      if (!url) {
+        this.statusBusy = false;
+        this.statusNotice = SERVER_UNREACHABLE;
+        return;
+      }
+      window.location.href = url;
+    },
+
+    async cancelJob() {
+      const r = this.returning;
+      if (r.kind !== 'job' || r.source !== 'job' || this.statusBusy) { return; }
+      this.statusSeq += 1;
+      this.statusBusy = true;
+      this.statusNotice = '';
+      if (!await jobAction(r.job.id, 'cancel')) {
+        this.statusBusy = false;
+        this.statusNotice = SERVER_UNREACHABLE;
+        return;
+      }
+      clearHandedOverImport();
+      await this.refreshReturning();
+      this.statusBusy = false;
+    },
+
+    // A finished job stays out of the way from now on.
+    newImport() {
+      const r = this.returning;
+      if (r.kind === 'job' && r.source === 'job') {
+        dismissJob(r.job.id);
+      }
+      this.$router.push('/scrobble');
+    },
+
+    /*
+      "Scrobble the rest locally": /scrobble takes the job's progress back
+      (`takeBack` intent) and sends from this browser. That needs this
+      browser's own Last.fm session, so without one Last.fm is asked first,
+      after a word on why it asks again.
+    */
+    moveBack() {
+      const r = this.returning;
+      if (r.kind !== 'job' || r.source !== 'job' || this.statusBusy) { return; }
+      if ((this.$store.state.lfmApi as LastFm).isAuthenticated()) {
+        setSignInIntent({ kind: 'takeBack', jobId: r.job.id });
+        this.$router.push('/scrobble');
+        return;
+      }
+      this.explainingMoveBack = true;
+      trackEvent('move_back_explainer_shown');
+    },
+    continueMoveBack() {
+      const r = this.returning;
+      trackEvent('move_back_explainer_choice', { choice: 'continue' });
+      if (r.kind !== 'job' || r.source !== 'job') { return; }
+      startSignIn(this.$store.state.lfmApi as LastFm, { kind: 'takeBack', jobId: r.job.id });
+    },
+    cancelMoveBack() {
+      trackEvent('move_back_explainer_choice', { choice: 'cancel' });
     },
     async go(choice: HomeChoice) {
       if (this.lookingUp) {

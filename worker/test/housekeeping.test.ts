@@ -232,6 +232,16 @@ async function main() {
     check('one second early is left alone', (await job(sql, early)).state === 'paused');
     check('needs_reauth goes dormant too', (await job(sql, reauth)).state === 'dormant');
     check('needs_attention goes dormant too', (await job(sql, attention)).state === 'dormant');
+
+    // The status page words a dormant job by why it was on hold.
+    check('it remembers it was paused', d.dormant_from === 'paused', d.dormant_from);
+    check('or waiting for a sign-in',
+      (await job(sql, reauth)).dormant_from === 'needs_reauth', (await job(sql, reauth)).dormant_from);
+    check('or stopped on errors',
+      (await job(sql, attention)).dormant_from === 'needs_attention',
+      (await job(sql, attention)).dormant_from);
+    check('a job that stayed parked has none', (await job(sql, early)).dormant_from === null,
+      (await job(sql, early)).dormant_from);
     check('a running job is never touched, however old', (await job(sql, running)).state === 'active');
     check('a job under a lease is skipped', (await job(sql, leased)).state === 'paused');
   }

@@ -11,6 +11,11 @@
  *   callback  -> exchanging -> pending_upload   (job row + credential created)
  *   finalize  -> finalizing -> active
  *
+ * and the two ways a browser withdraws one: `abandonHandoff` (issued -> failed,
+ * no session, nobody approved it) and `withdrawUpload` (pending_upload ->
+ * failed with its job cancelled, the handoff user's session, the upload
+ * failed).
+ *
  * Every transition is a compare-and-set from the expected prior state, because
  * duplicate callbacks are routine: link scanners, prefetchers and a user's
  * second tab all replay the URL.
@@ -431,24 +436,30 @@ function replayOutcome(handoff: HandoffRow, tokenHash: string): CallbackResult {
  * Guarded against clobbering a terminal row: a reaper firing while a finalize
  * is committing must not turn a live job's handoff back into a failure. Any job
  * row already created is cancelled and its credential nulled in the same batch,
- * because a failed handoff must never leave a usable key behind.
+ * because a failed handoff must never leave a usable key behind; only if the
+ * handoff did fail, so a finalize that won the race keeps its job.
+ *
+ * `onlyFrom` restricts it to a handoff in that state (a compare-and-set), for
+ * callers acting on a state they read earlier. Returns whether it failed it.
  */
 export async function failHandoff(
   sql: Sql,
   handoffId: string,
   reason: string,
   nowSec: number,
-): Promise<void> {
+  onlyFrom?: HandoffState,
+): Promise<boolean> {
   const handoff = await sql.first<HandoffRow>('SELECT * FROM handoffs WHERE id = ?', [handoffId]);
-  if (!handoff || isTerminalHandoffState(handoff.state)) {
-    return;
+  if (!handoff || isTerminalHandoffState(handoff.state) || (onlyFrom && handoff.state !== onlyFrom)) {
+    return false;
   }
   const statements: { query: string; params: unknown[] }[] = [
     {
       query: `UPDATE handoffs
                  SET state = 'failed', live_username = NULL, failure_reason = ?, updated_at = ?
-               WHERE id = ? AND state NOT IN ('active', 'failed', 'reaped')`,
-      params: [reason, nowSec, handoffId],
+               WHERE id = ? AND state NOT IN ('active', 'failed', 'reaped')
+                 ${onlyFrom ? 'AND state = ?' : ''}`,
+      params: [reason, nowSec, handoffId, ...(onlyFrom ? [onlyFrom] : [])],
     },
   ];
   if (handoff.job_id) {
@@ -456,11 +467,31 @@ export async function failHandoff(
       query: `UPDATE jobs
                  SET state = 'cancelled', live_username = NULL, state_reason = ?,
                      session_key_ct = NULL, session_key_iv = NULL, updated_at = ?
-               WHERE id = ? AND state = 'pending'`,
-      params: [reason, nowSec, handoff.job_id],
+               WHERE id = ? AND state = 'pending'
+                 AND EXISTS (SELECT 1 FROM handoffs WHERE id = ? AND state = 'failed')`,
+      params: [reason, nowSec, handoff.job_id, handoffId],
     });
   }
-  await sql.batch(statements);
+  const results = await sql.batch(statements);
+  return results[0].changes > 0;
+}
+
+/**
+ * Withdraws a handoff whose upload the browser gave up on: approved, so it has
+ * a `pending` job holding the user's Last.fm key, but the chunks or the
+ * finalize failed for good. Nothing ever sends from a `pending` job, yet it
+ * holds the user's `live_username` (so `/job/live` and the status page call it
+ * running) and a capacity slot until the reaper ends it, up to
+ * `HANDOFF_TTL_SECONDS` later.
+ *
+ * Only from `pending_upload`. `finalizing` and later may be activating or
+ * sending, and the browser that failed to finalize might just have lost the
+ * response; those stay the reaper's and the job actions' to end. The job is
+ * cancelled and its key nulled with the handoff (`failHandoff`), and with no
+ * manifest `/import/:id` no longer counts it (#167).
+ */
+export async function withdrawUpload(sql: Sql, handoffId: string, nowSec: number): Promise<boolean> {
+  return failHandoff(sql, handoffId, 'upload_failed', nowSec, 'pending_upload');
 }
 
 /**

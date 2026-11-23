@@ -31,100 +31,17 @@
           handed its queue over, so the worker is known to have it, not merely
           possibly.
         -->
-        <div v-if="!ownershipBlocked">
-          We can't reach the background scrobble worker. You can continue in
-          browser but you might get double scrobbles if the worker is also
-          scrobbling. Please check in again in a couple hours. If you keep seeing
-          this message, email me at <a href="mailto:niko@savas.ca">niko@savas.ca</a>
-        </div>
-        <div v-else>
-          We can't reach the background scrobble worker. Please check in again in
-          a couple hours. If you keep seeing this message, email me at
-          <a href="mailto:niko@savas.ca">niko@savas.ca</a>
-        </div>
+        <div>Can't reach scrobblify servers right now.</div>
         <div class="mt-3">
           <v-btn color="primary" :loading="authorityPending" @click="retryAuthority">
             Try again
           </v-btn>
           <v-btn v-if="!ownershipBlocked" variant="text" class="ml-2" @click="continueWithoutAuthority">
-            Continue in this browser anyway
+            Continue locally anyway
           </v-btn>
         </div>
-      </template>
-
-      <template v-else-if="banner === 'job'">
-        <div>
-          <strong>{{ jobHeadline }}</strong>
-          <v-chip size="x-small" color="deep-purple" variant="flat" class="ml-2">Beta</v-chip>
-        </div>
-        <div class="mt-1">
-          {{ backgroundJob.scrobbled.toLocaleString() }} of
-          {{ backgroundJob.totalTracks.toLocaleString() }} scrobbled<span
-            v-if="backgroundJob.failed > 0"
-          >, {{ backgroundJob.failed.toLocaleString() }} rejected by Last.fm</span>.
-          <span v-if="jobEta">{{ jobEta }}</span>
-        </div>
-        <div v-if="jobNextRun" class="mt-1 text-body-medium">
-          {{ jobNextRun }}<span v-if="jobCheckedAt"> Last checked {{ jobCheckedAt }}.</span>
-        </div>
-        <div
-          v-if="backgroundJob.reason && backgroundJob.state !== 'dormant'"
-          class="mt-1 text-body-medium"
-        >{{ backgroundJob.reason }}</div>
-        <!--
-          A parked job that nobody touches goes dormant after 14 days: its
-          Last.fm key is deleted and its place freed. It is cancelled if it is
-          still dormant 30 days after that. Both dates come from the server.
-        -->
-        <div v-if="backgroundJob.state === 'dormant'" class="mt-1 text-body-medium">
-          Nothing happened with this import for 14 days, so Scrobblify deleted
-          its Last.fm access and gave its place to someone else. Your remaining
-          tracks are kept<span v-if="inactivityDate"> until {{ inactivityDate }}</span>.
-          Reconnect Last.fm to carry on, or take your progress back and finish in
-          this browser.
-          <span v-if="backgroundJob.reconnectAvailable === false">
-            The background service is full right now, so reconnecting won't work
-            until a place opens up.
-          </span>
-        </div>
-        <div v-else-if="inactivityDate" class="mt-1 text-body-medium">
-          If it's still waiting on {{ inactivityDate }}, Scrobblify will delete
-          its Last.fm access and put it on hold.
-        </div>
-        <div class="mt-2">
-          <v-btn
-            v-if="backgroundJob.state === 'active'"
-            variant="outlined"
-            class="mr-2"
-            :loading="backgroundBusy"
-            @click="pauseBackgroundJob"
-          >Pause</v-btn>
-          <v-btn
-            v-else-if="backgroundJob.state === 'paused'"
-            color="primary"
-            class="mr-2"
-            :loading="backgroundBusy"
-            @click="resumeBackgroundJob"
-          >Resume on the server</v-btn>
-          <!--
-            The only way a job parked for re-auth can ever send again: the
-            sign-in callback re-attaches the credential it proves. Without the
-            button the headline told the user to reconnect and gave them nothing
-            to reconnect with, leaving take-back (which abandons any batch still
-            in flight) as their only exit.
-          -->
-          <v-btn
-            v-else-if="backgroundJob.state === 'needs_reauth' || backgroundJob.state === 'dormant'"
-            color="primary"
-            class="mr-2"
-            :loading="reauthBusy"
-            :disabled="backgroundJob.reconnectAvailable === false"
-            @click="reauthenticate"
-          >Reconnect Last.fm</v-btn>
-          <v-btn variant="outlined" class="mr-2" :loading="backgroundBusy" @click="takeBackProgress">
-            Take my progress back
-          </v-btn>
-          <v-btn variant="text" @click="refreshBackgroundJob">Refresh</v-btn>
+        <div v-if="!ownershipBlocked" class="mt-2 text-caption outage-warning">
+          If scrobblify server is also sending, you may get duplicates on last.fm.
         </div>
       </template>
 
@@ -180,10 +97,16 @@
       wherever it is needed, through `startSignIn`.
     -->
     <authenticate-step
-      :quiet-failure="settlingSignIn"
+      :quiet-failure="settlingSignIn || takingBack"
       v-on:complete="onAuthenticated"
       v-on:failed="onAuthFailed"
     ></authenticate-step>
+
+    <!-- Home's "Scrobble the rest locally": the server's remaining tracks are on their way here. -->
+    <div v-if="takingBack && signedIn" class="d-flex justify-center align-center mb-4 taking-back">
+      <v-progress-circular indeterminate color="primary" size="24" class="mr-2" aria-label="Downloading progress" />
+      Downloading progress from scrobblify servers...
+    </div>
 
     <!-- Signed in, and still on the way to wherever the trip to Last.fm was for. -->
     <div
@@ -203,7 +126,11 @@
       Skipped {{ skippedDuplicates }} that are already on Last.fm.
     </v-alert>
 
-    <v-stepper v-show="!settlingSignIn" v-model="currentStep">
+    <!--
+      Hidden while a server job is shown: the page is on its way to Home's
+      status page, or taking the job's progress back.
+    -->
+    <v-stepper v-show="!settlingSignIn && !jobShown" v-model="currentStep">
       <v-stepper-header>
         <!--
           `value` keeps the old step numbers (2 upload … 5 complete) so
@@ -372,6 +299,7 @@ import { LASTFM_DAILY_CAP } from '@/shared/lastfm/dailyCap';
 import ErrorDialog from '@/components/ErrorDialog.vue';
 import BackgroundOffer from '@/components/BackgroundOffer.vue';
 import * as background from '@/services/BackgroundScrobbling';
+import { isJobShown } from '@/services/JobStatus';
 import {
   beginHandoff, completeHandoff, uploadListFromState, stateFromExport,
   resolveExportedRepeats,
@@ -402,50 +330,21 @@ interface FileConflict {
  */
 const RETAG_BACKFILL_SECONDS = 6 * 60 * 60;
 
-/*
-  The job card refreshes itself while a background job is active and the tab is
-  visible, so the count moves without a reload. The worker only sends on its
-  five-minute tick, so the card asks once shortly after each tick rather than on
-  a short fixed interval: `JOB_POLL_AFTER_RUN_SECONDS` past `nextRunAt` gives the
-  tick time to reach this job and record its batches.
-*/
-const JOB_POLL_AFTER_RUN_SECONDS = 45;
-// Never sooner, so a tick that runs late is not asked about every few seconds.
-const JOB_POLL_MIN_SECONDS = 15;
-// Never later, so a job waiting until tomorrow still notices a pause or cancel
-// made from another device.
-const JOB_POLL_MAX_SECONDS = 10 * 60;
-// After a failed check, or from a worker that sends no `nextRunAt`.
-const JOB_POLL_FALLBACK_SECONDS = 60;
-// How often the countdown and the poll deadline are re-evaluated.
-const JOB_CLOCK_TICK_MS = 15 * 1000;
-
-function clockTime(sec: number): string {
-  return new Date(sec * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-}
-
-/** "4:25 PM", "12:20 AM tomorrow" or "12:20 AM on Friday", in local time. */
-function runTimeLabel(sec: number, nowSec: number): string {
-  const at = new Date(sec * 1000);
-  const now = new Date(nowSec * 1000);
-  if (at.toDateString() === now.toDateString()) {
-    return clockTime(sec);
-  }
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-  if (at.toDateString() === tomorrow.toDateString()) {
-    return `${clockTime(sec)} tomorrow`;
-  }
-  return `${clockTime(sec)} on ${at.toLocaleDateString([], { weekday: 'long' })}`;
-}
 /** Shown when the bearer token for the worker has expired, wherever that is detected. */
-const SESSION_EXPIRED_NOTICE = 'You need to refresh your connection to the scrobble worker.';
-const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach the background service to sign in. Please try again in a few minutes.';
+const SESSION_EXPIRED_NOTICE = 'Sign in again so we can check your scrobbling progress.';
+const REAUTH_UNREACHABLE_NOTICE = 'Couldn\'t reach our server. Try again in a few minutes.';
 /**
  * Hidden while the worker can't be reached: refreshing the connection needs
  * the worker, so the unreachable banner is the only one worth showing.
  */
 const NEEDS_WORKER_NOTICES = [SESSION_EXPIRED_NOTICE, REAUTH_UNREACHABLE_NOTICE];
+/**
+ * The worker's sign-in came back refused (`?signin=failed`). Carried to Home,
+ * as Home's own wording, when a job the old session can still see sends the
+ * page there.
+ */
+const WORKER_SIGNIN_FAILED_NOTICE = 'Signing in to our server didn\'t work. Try again.';
+const WORKER_SIGNIN_FAILED_STATUS = 'Signing in to the background service didn\'t work. Please try again.';
 /**
  * A handoff that named nobody came back refused: the Last.fm account that
  * authorised it already has a job. Signing in to the worker shows that job.
@@ -480,6 +379,18 @@ function returningToCarryOn(query: Record<string, unknown>): boolean {
   const intent = peekSignInIntent(true);
   return !!intent && (intent.kind === 'send' || intent.kind === 'resume');
 }
+
+/**
+ * This load is for Home's "Scrobble the rest locally": a `takeBack` intent
+ * for this sign-in, in-app or back from Last.fm (`token`).
+ */
+function arrivingToTakeBack(query: Record<string, unknown>): boolean {
+  const intent = peekSignInIntent(!!query.token);
+  return !!intent && intent.kind === 'takeBack';
+}
+
+/** Job states a take-back can export from (the worker pauses an active one first). */
+const TAKE_BACK_STATES = ['active', 'paused', 'needs_attention', 'needs_reauth', 'dormant'];
 
 interface ProgressSnapshot {
   scrobbledTracks: number;
@@ -665,16 +576,24 @@ export default defineComponent({
       checkingDuplicates: false,
       /** Plays it dropped; shown until the user starts sending. */
       skippedDuplicates: 0,
-      /** Wall clock for the job card's countdown; ticks only while a job is active. */
-      nowSec: Math.floor(Date.now() / 1000),
-      /** When the job card last heard from the server, for "Last checked". */
-      jobCheckedAtSec: null as number | null,
-      /** When the job card next asks the server for the latest count. */
-      jobPollDueSec: 0,
-      jobPolling: false,
-      jobClockTimer: null as number | null,
-      /** Retained so the listener can be removed again. Not reactive state. */
-      onVisibilityChange: null as (() => void) | null,
+      /**
+       * Here for Home's "Scrobble the rest locally" (a `takeBack` intent),
+       * until `continueSignInIntent` has dealt with it. Keeps the page from
+       * sending itself back to Home meanwhile. Set before the first render.
+       */
+      takingBack: arrivingToTakeBack(this.$route.query),
+      /**
+       * `mounted` has settled, so a shown server job may now send the page
+       * to Home's status page (`leaveForStatusPage`). Not before: the mount
+       * still reports what it found (the worker lookup, a reconnect).
+       */
+      statusPageArmed: false,
+      /**
+       * This load's handover upload failed and was withdrawn at the worker:
+       * the page stays here with its notice and the selection, even if the
+       * worker (not told in time) still lists the `pending` job it made.
+       */
+      uploadFailed: false,
     };
   },
   created() {
@@ -773,7 +692,7 @@ export default defineComponent({
       this.authorityPending = true;
       await this.enforceServerAuthority().catch(() => this.onAuthorityUnanswered());
 
-      this.releaseOwnershipListener = background.onServerOwnershipChange((next) => {
+      this.releaseOwnershipListener = background.onServerOwnershipChange((next, fromThisPage) => {
         this.ownershipBlocked = next !== null;
         const step = this.$refs.scrobbleStep as any;
         if (next) {
@@ -783,6 +702,18 @@ export default defineComponent({
             // Deliberately not awaited: this is an event handler, and the halt
             // resolves only once the in-flight batch finishes.
             Promise.resolve(step.haltForHandoff()).catch(() => { /* best effort */ });
+          }
+        } else if (fromThisPage && (this as any)._takeBackRelease) {
+          /*
+            This tab's own take-back released it (#148). The queue it just
+            restored and saved is the current one, while the scrobble step's
+            in-memory count predates the handover, so the check below would
+            call this tab out of date and hide the Resume the take-back just
+            offered. Only the halt is lifted; siblings still revalidate.
+          */
+          (this as any)._takeBackRelease = false;
+          if (step && step.releaseHandoffHalt) {
+            step.releaseHandoffHalt();
           }
         } else {
           /*
@@ -864,7 +795,7 @@ export default defineComponent({
       if (reauthed) {
         trackEvent('background_reauth_completed', { resolved: String(!this.ownershipBlocked) });
       } else if (signInRefused) {
-        this.backgroundNotice = 'Signing in to the background service didn\'t work. Please try again.';
+        this.backgroundNotice = WORKER_SIGNIN_FAILED_NOTICE;
         this.showReauth = true;
         this.stripQuery();
         trackEvent('background_reauth_failed');
@@ -905,6 +836,15 @@ export default defineComponent({
       window.addEventListener('pageshow', this.onPageShow);
     } finally {
       (this as any)._resolveMountSettled();
+      // A take-back from Home needs a Last.fm session here. Back from Last.fm
+      // the sign-in handler settles it either way; in-app there is no sign-in
+      // to wait for if the session has gone meanwhile.
+      if (this.takingBack && !returningFromSignIn
+        && !(this.$store.state.lfmApi as LastFm).isAuthenticated()) {
+        takeSignInIntent(false);
+        this.takingBack = false;
+      }
+      this.statusPageArmed = true;
     }
   },
   beforeUnmount() {
@@ -933,7 +873,6 @@ export default defineComponent({
       window.clearTimeout(this.authorityRetryTimer);
       this.authorityRetryTimer = null;
     }
-    this.stopJobClock();
   },
   watch: {
     currentStep(step: number) {
@@ -966,23 +905,23 @@ export default defineComponent({
       }
     },
     /*
-      Every assignment of a job is a fresh answer from the server, from
-      whichever path fetched it, so this is the one place that records when it
-      was checked, schedules the next check and starts or stops the clock.
+      While a server job is shown, Home is its status page, so the page goes
+      there: once the mount has settled, and whenever a later check first finds
+      one. A `replace`, so Back doesn't return here only to be sent on again.
+
+      The job goes along, so Home shows it rather than asking again with its
+      shorter budget, which a slow worker can miss: Home would then show the
+      start page, whose Start comes straight back here. So does a refused
+      worker sign-in's notice, which this page won't be showing.
     */
-    backgroundJob(job: background.JobStatus | null) {
-      this.nowSec = Math.floor(Date.now() / 1000);
-      if (!job) {
-        this.jobCheckedAtSec = null;
-        this.stopJobClock();
-        return;
-      }
-      this.jobCheckedAtSec = this.nowSec;
-      if (job.state === 'active') {
-        this.jobPollDueSec = this.nextJobPollSec(job);
-        this.startJobClock();
-      } else {
-        this.stopJobClock();
+    leaveForStatusPage(go: boolean) {
+      if (go && !(this as any)._unmounted) {
+        this.$store.commit('setStatusHandover', {
+          job: this.backgroundJob,
+          atMs: (this as any)._backgroundJobAtMs || 0,
+          notice: this.backgroundNotice === WORKER_SIGNIN_FAILED_NOTICE ? WORKER_SIGNIN_FAILED_STATUS : '',
+        });
+        this.$router.replace({ name: 'home' }).catch(() => undefined);
       }
     },
   },
@@ -1022,36 +961,51 @@ export default defineComponent({
      * The one banner shown above the stepper, most important first.
      *
      *   outage — the worker can't be asked, and that blocks everything else.
-     *   job    — a server-side job outranks local progress: offering Resume
-     *            beside it would invite sending the tracks it is sending.
      *   signIn — a resume was held back for want of a Last.fm session.
      *   retry  — a trip to Last.fm to send or resume came back without a
      *            session; it offers the same trip again. Above `resume`
      *            because it is about the same saved progress.
-     *   resume — saved progress; never while anything might own the queue.
+     *   resume — saved progress; never while anything might own the queue,
+     *            nor while a server job is shown (the page is on its way to
+     *            Home's status page, or taking that job back).
      *   notice — `backgroundNotice` on its own. Below the resume prompt
      *            because a notice that leaves Resume available is a "nothing
      *            happened" report (a handoff that didn't go through), and the
      *            prompt is what the user acts on; it shows as its first line.
      */
-    banner(): 'outage' | 'job' | 'signIn' | 'retry' | 'resume' | 'notice' | null {
+    banner(): 'outage' | 'signIn' | 'retry' | 'resume' | 'notice' | null {
       if (this.authorityUnknown) { return 'outage'; }
-      if (this.backgroundJob) { return 'job'; }
       if (this.resumeSignInMessage) { return 'signIn'; }
       if (this.signInRetry && this.currentStep <= 2) { return 'retry'; }
       if (this.hasResumableState && !this.heldForSignIn && !this.settlingSignIn && this.currentStep <= 2
-        && !this.ownershipBlocked && !this.authorityPending) {
+        && !this.ownershipBlocked && !this.authorityPending && !this.jobShown) {
         return 'resume';
       }
       if (this.showBackgroundNotice) { return 'notice'; }
       return null;
     },
     bannerType(): string {
-      switch (this.banner) {
-        case 'job': return this.jobAlertType;
-        case 'resume': return 'info';
-        default: return 'warning';
+      return this.banner === 'resume' ? 'info' : 'warning';
+    },
+    /**
+     * A server job Home would show as its status page (not cancelled, not
+     * dismissed). Not the `pending` job of this load's failed upload, which
+     * the worker wasn't told about in time: nothing will send it.
+     */
+    jobShown(): boolean {
+      if (this.uploadFailed && this.backgroundJob && this.backgroundJob.state === 'pending') {
+        return false;
       }
+      return isJobShown(this.backgroundJob);
+    },
+    /**
+     * Whether to send the page to Home's status page now: a shown job, the
+     * mount settled, and no take-back under way or about to start. Not over
+     * an open error dialog either; closing it goes.
+     */
+    leaveForStatusPage(): boolean {
+      return this.statusPageArmed && this.jobShown && !this.takingBack && !this.backgroundBusy
+        && !this.showError && !this.uploadFailed;
     },
     /**
      * Whether `backgroundNotice` is shown at all, as the banner or inside it.
@@ -1069,79 +1023,7 @@ export default defineComponent({
       }
       return this.reauthFixNow
         ? 'Fix now'
-        : 'Sign in to the background service';
-    },
-    jobAlertType(): string {
-      if (!this.backgroundJob) { return 'info'; }
-      if (this.backgroundJob.state === 'completed') { return 'success'; }
-      if (this.backgroundJob.state === 'active') { return 'info'; }
-      return 'warning';
-    },
-    jobHeadline(): string {
-      if (!this.backgroundJob) { return ''; }
-      switch (this.backgroundJob.state) {
-        case 'active':
-          return 'Scrobblify is finishing your import in the background.';
-        case 'paused':
-          return 'Your background import is paused.';
-        case 'completed':
-          return 'Your background import has finished.';
-        case 'needs_reauth':
-          return 'Your background import needs you to reconnect Last.fm.';
-        case 'needs_attention':
-          return 'Your background import has stopped and needs a look.';
-        case 'dormant':
-          return 'Your background import is on hold.';
-        default:
-          return 'Your background import has stopped.';
-      }
-    },
-    inactivityDate(): string {
-      const job = this.backgroundJob;
-      const sec = job ? job.inactivityDeadline : null;
-      return sec ? new Date(sec * 1000).toLocaleDateString() : '';
-    },
-    jobEta(): string {
-      const job = this.backgroundJob;
-      if (!job || job.state !== 'active' || !job.estimatedCompletionSec) { return ''; }
-      /*
-        An absolute second, not a duration. The worker sends
-        `nowSec + ceil(daysLeft * 86400)` (worker/src/api.ts), and the
-        completed case sends `completed_at` — both epoch seconds. Dividing the
-        field by a day directly reported every active job as finishing in
-        about 20,677 days, which is simply the epoch expressed in days.
-
-        Recomputes on every poll because `backgroundJob` is replaced with a
-        fresh object each time; `Date.now()` on its own is not a reactive
-        dependency and could not drive this by itself.
-      */
-      const secondsLeft = job.estimatedCompletionSec - Math.floor(Date.now() / 1000);
-      if (secondsLeft <= 0) { return ''; }
-      const days = Math.ceil(secondsLeft / 86400);
-      if (days <= 1) { return 'Should finish within a day.'; }
-      return `Should finish in about ${days} days.`;
-    },
-    /**
-     * When the next batch goes out. The scheduler only runs every five
-     * minutes, so without this a count that sits still looks like a stall.
-     */
-    jobNextRun(): string {
-      const job = this.backgroundJob;
-      if (!job || job.state !== 'active' || !job.nextRunAt) { return ''; }
-      const secondsLeft = job.nextRunAt - this.nowSec;
-      if (secondsLeft <= 0) {
-        return 'Sending a batch now; the count updates in a minute or so.';
-      }
-      const at = runTimeLabel(job.nextRunAt, this.nowSec);
-      if (secondsLeft >= 3600) {
-        return `Next batch around ${at}.`;
-      }
-      const minutes = Math.ceil(secondsLeft / 60);
-      const inWords = minutes <= 1 ? 'under a minute' : `${minutes} minutes`;
-      return `Next batch around ${at} (in ${inWords}).`;
-    },
-    jobCheckedAt(): string {
-      return this.jobCheckedAtSec ? clockTime(this.jobCheckedAtSec) : '';
+        : 'Sign in to our server';
     },
   },
   methods: {
@@ -1265,15 +1147,16 @@ export default defineComponent({
         this.ownershipBlocked = true;
         this.hasResumableState = false;
         this.sawServerOwnership = true;
-        // With a valid session this renders the real status card, with pause,
-        // resume and take-back. Without one there is nothing to show but the
-        // block itself, so offer the sign-in that turns it into a status card.
+        // With a valid session the job is fetched, and the page goes to Home's
+        // status page (pause, resume, scrobble the rest locally). Without one
+        // there is nothing to show but the block itself, so offer the sign-in
+        // that leads there.
         await this.refreshBackgroundJob();
         if (!this.backgroundJob) {
           this.showReauth = true;
           this.reauthFixNow = false;
           this.reauthLabelText = '';
-          this.backgroundNotice = 'Your import is still running on the server, so scrobbling from this browser is switched off to stop the same tracks being sent twice. Sign in to check on it or bring it back here.';
+          this.backgroundNotice = 'Your import is running on our server, so this tab won\'t send anything.';
         }
         trackEvent('background_authority_check', { result: 'live', signed_in: String(!!this.backgroundJob) });
         return;
@@ -1479,8 +1362,8 @@ export default defineComponent({
         this.reauthFixNow = false;
         this.reauthLabelText = '';
         const p = this.handedOverProgress;
-        const detail = p ? ` It has scrobbled ${p.scrobbled} of ${p.total} tracks.` : '';
-        this.backgroundNotice = `This import was handed over to the background service, so scrobbling it from this browser is switched off — the tracks it already sent would be sent again and silently discarded.${detail} Sign in to check on it or bring it back here.`;
+        const detail = p ? ` It has sent ${p.scrobbled} of ${p.total}.` : '';
+        this.backgroundNotice = `These tracks are now being scrobbled by scrobblify's servers.${detail} Sign in to check on it.`;
       }
       trackEvent('background_authority_check', { result: 'handed_over', signed_in: String(!!this.backgroundJob) });
     },
@@ -1588,7 +1471,7 @@ export default defineComponent({
       */
       this.hasResumableState = false;
       this.ownershipBlocked = true;
-      this.backgroundNotice = 'This tab is holding an out-of-date copy of your import — the queue on disk has moved on. Reload this page to pick up where it actually got to; resuming here would send tracks that have already been scrobbled.';
+      this.backgroundNotice = 'This tab is out of date. Reload to continue.';
       trackEvent('background_stale_tab_blocked', {
         had_disk_id: String(!!diskId),
         disk_readable: String(diskReadable),
@@ -1729,7 +1612,7 @@ export default defineComponent({
           Left alone and reconciled on a later load instead.
         */
         if (background.freezeAttemptIsFresh(owner)) {
-          this.backgroundNotice = 'A handover is starting in another tab, so scrobbling here is paused for a moment.';
+          this.backgroundNotice = 'Another tab is moving this import to our server. One moment.';
           return;
         }
         // No handoff id means it never got as far as preflight, so nothing was
@@ -1761,7 +1644,7 @@ export default defineComponent({
           && !background.freezeHandoffHasExpired(owner);
         this.backgroundNotice = waitsForExpiry
           ? 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until it does. If that tab was closed, the handover expires within the hour: refresh then.'
-          : 'A handover started in another tab and didn\'t finish, so scrobbling here is on hold until we can tell whether it took effect. Please refresh in a few minutes.';
+          : 'A handover in another tab didn\'t finish. Refresh in a few minutes.';
         return;
       }
 
@@ -1787,13 +1670,15 @@ export default defineComponent({
 
     /**
      * Whether the worker took the queue this browser froze for its own
-     * handoff, asked with the public import check, for a browser with no
-     * worker session to ask about the handoff itself.
+     * handoff, asked with the public import check.
      *
      * That is every browser that left for Last.fm and came back without
      * approving (Back, a refresh after it): a session is only issued by a
      * successful callback, so `isHandoffActive` and `hasLiveJob` can only say
-     * "unknown", and without a username nothing else is asked either. The
+     * "unknown", and without a username nothing else is asked either. A
+     * worker session left over from an earlier handoff or sign-in doesn't
+     * change that: neither sees a handoff nobody approved, so this tab's own
+     * is asked about by its queue all the same (#166). The
      * import id was minted before the preflight and only reaches a job at the
      * callback, so "not known" means it never did. A late approval can't
      * change that once the freeze is released: the caller withdraws the
@@ -1816,7 +1701,8 @@ export default defineComponent({
      * every later tab for good (#168). Only a queue the worker doesn't know
      * releases it then: a jobless `pending` this late is a handoff not yet
      * reaped, so it is still waited on, and `releaseOwnHandoff` withdraws
-     * nothing for it.
+     * nothing for it. A browser with a worker session asks about that one
+     * with `isHandoffActive` instead, which sees it once reaped.
      */
     async ownHandoffWasTaken(
       owner: background.QueueOwner | null,
@@ -1825,7 +1711,7 @@ export default defineComponent({
       const thisTabs = background.isThisTabsHandoffFreeze(owner);
       const expired = !thisTabs && background.isOwnHandoffFreeze(owner)
         && background.freezeHandoffHasExpired(owner as background.QueueOwner);
-      if ((!thisTabs && !expired) || background.getSession()) {
+      if (!thisTabs && (!expired || background.getSession())) {
         return unsettled;
       }
       let importId = '';
@@ -1929,14 +1815,14 @@ export default defineComponent({
           trackError('background.resolveOwnershipClear', e);
           this.hasResumableState = false;
           await this.refreshBackgroundJob();
-          this.backgroundNotice = 'Your import is running on the server. This browser could not clear its old copy, so scrobbling here stays off to avoid sending anything twice.';
+          this.backgroundNotice = 'Your import is running on our server. This tab won\'t send anything.';
           trackEvent('background_ownership_resolved', { outcome: 'server_owns_clear_failed' });
           return;
         }
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         await this.refreshBackgroundJob();
-        this.backgroundNotice = 'Your import was handed over successfully and is running on the server.';
+        this.backgroundNotice = 'Your import is now running on our server.';
         trackEvent('background_ownership_resolved', { outcome: 'server_owns' });
         return;
       }
@@ -1968,7 +1854,7 @@ export default defineComponent({
       this.reauthLabelText = '';
       this.backgroundNotice = background.isSessionExpired()
         ? SESSION_EXPIRED_NOTICE
-        : 'We couldn\'t reach the background service to check whether it took over your import, so scrobbling in this tab is on hold to avoid sending anything twice. Your progress is safe — please refresh in a few minutes.';
+        : 'We couldn\'t check with our server, so this tab is on hold. Refresh in a few minutes.';
       trackEvent('background_ownership_unresolved', { session_expired: background.isSessionExpired() });
     },
 
@@ -2095,7 +1981,7 @@ export default defineComponent({
           this.backgroundBusy = false;
           this.showBackgroundOffer = false;
           step.releaseHandoffHalt();
-          this.backgroundNotice = 'Couldn\'t pause this tab\'s scrobbling in time, so the handover was cancelled to avoid sending anything twice. Nothing has changed — try again in a moment.';
+          this.backgroundNotice = 'Couldn\'t pause this tab in time, so nothing was moved. Try again in a moment.';
           trackEvent('background_handoff_failed', { reason: 'halt_timeout' });
           return false;
         }
@@ -2169,8 +2055,8 @@ export default defineComponent({
           step.releaseHandoffHalt();
         }
         this.backgroundNotice = result.reason === 'at_capacity'
-          ? 'The background service is full right now — it is limited during the beta. Your progress is saved; try again later or keep scrobbling in this tab.'
-          : 'Couldn\'t hand this over to the background service. Your progress is saved and nothing has changed — keep scrobbling in this tab.';
+          ? 'Our server is full right now. Keep going in this tab, or try later.'
+          : 'Couldn\'t move this to our server. Nothing changed.';
         return false;
       }
       // On success the tab is navigating to Last.fm; leave `busy` set so the
@@ -2216,10 +2102,17 @@ export default defineComponent({
         owned = await background.resolveOwnershipMarker(marker);
       } else if (pendingId) {
         owned = await background.isHandoffActive(pendingId);
-      } else if (!background.getSession()) {
-        // Nothing to ask about the job with; the queue can still be asked about.
+      } else if (!background.getSession() || background.isThisTabsHandoffFreeze(observed)) {
+        /*
+          Nothing to ask about the job with, or this tab's own handoff, which
+          a leftover worker session can't see until it is approved (#166):
+          the queue can still be asked about.
+        */
         const own = await this.ownHandoffWasTaken(observed);
         owned = own.taken;
+        if (owned === null && background.getSession()) {
+          owned = await background.hasLiveJob();
+        }
         if (owned === false && observed) {
           ownSettled = true;
           const settled = await this.releaseOwnHandoff(observed, own.pendingImportId);
@@ -2256,8 +2149,8 @@ export default defineComponent({
         this.ownershipBlocked = true;
         await this.refreshBackgroundJob();
         this.backgroundNotice = owned === true
-          ? 'Your import was handed over and is running on the server, so scrobbling in this tab is switched off.'
-          : 'We couldn\'t check whether the background service took over your import, so scrobbling in this tab is on hold. Please refresh in a few minutes.';
+          ? 'Your import is running on our server, so this tab won\'t send anything.'
+          : 'We couldn\'t check with our server, so this tab is on hold. Refresh in a few minutes.';
         if (owned === true && !this.backgroundJob) {
           // Known only by its queue: signing in to the worker shows the job.
           this.showReauth = true;
@@ -2292,7 +2185,7 @@ export default defineComponent({
         step.releaseHandoffHalt();
       }
 
-      this.backgroundNotice = 'The handover wasn\'t completed, so nothing was started. Your progress is still here — carry on in this tab, or try handing it over again.';
+      this.backgroundNotice = 'The move wasn\'t finished, so nothing changed.';
       if (this.pendingEntryPoint === 'confirm') {
         // The selection was saved for the trip, so it is what there is to carry on with.
         await this.exposeSavedStateUnlessStale('bfcache_restore');
@@ -2316,7 +2209,8 @@ export default defineComponent({
 
     /**
      * The return from Home's "Re-connect" sign-in to the worker: says what it
-     * found. A job shows its own banner and saved progress the resume prompt;
+     * found. A job sends the page on to Home's status page once the mount
+     * settles, and saved progress gets the resume prompt;
      * with neither, a dialog says so rather than leaving a bare upload step.
      * On the mock worker's shim the name arrives in localStorage
      * instead of the fragment, so it is already remembered.
@@ -2326,7 +2220,7 @@ export default defineComponent({
       if (signInRefused || !background.getSession()) {
         // The "didn't work" notice, if any, is already up.
         result = 'failed';
-      } else if (this.backgroundJob) {
+      } else if (this.jobShown) {
         result = 'job';
       } else if (this.hasResumableState) {
         result = 'saved';
@@ -2366,7 +2260,7 @@ export default defineComponent({
           this.reauthFixNow = false;
           this.reauthLabelText = 'Sign in to see it';
         } else {
-          this.backgroundNotice = 'Last.fm didn\'t complete the handoff, so nothing was started. Your progress is still saved here.';
+          this.backgroundNotice = 'Last.fm didn\'t finish the approval, so nothing changed.';
         }
         trackEvent('background_handoff_failed', { reason });
         this.stripQuery();
@@ -2384,23 +2278,23 @@ export default defineComponent({
       const workerUser = (fragment && fragment.user)
         || (this.$store.state.lfmApi as LastFm).getUserName() || '';
       if (!handoffId) {
-        this.backgroundNotice = 'The handoff came back without a session, so nothing was started. Your progress is still saved here.';
+        this.backgroundNotice = 'Last.fm didn\'t finish the approval, so nothing changed.';
         return false;
       }
 
       this.backgroundBusy = true;
-      this.backgroundNotice = 'Uploading your remaining tracks…';
+      this.backgroundNotice = 'Uploading your tracks…';
       let result;
       try {
         result = await completeHandoff(this.stateManager, handoffId, (done, total) => {
-          this.backgroundNotice = `Uploading your remaining tracks… ${done} of ${total}`;
+          this.backgroundNotice = `Uploading your tracks… ${done} of ${total}`;
         }, workerUser);
       } catch (e) {
         trackError('background.completeHandoff', e);
         // An unexpected throw tells us nothing about whether the job started,
         // so this must not fall through to "resume locally".
         this.backgroundBusy = false;
-        this.backgroundNotice = 'Something went wrong finishing the handoff, and we can\'t tell whether the background import started. Reload this page in a minute — don\'t resume here in the meantime, or your tracks could be scrobbled twice.';
+        this.backgroundNotice = 'We can\'t tell if the move worked. Reload in a minute, and don\'t resume here until then.';
         return true;
       }
       this.backgroundBusy = false;
@@ -2409,11 +2303,11 @@ export default defineComponent({
         this.backgroundNotice = '';
         this.hasResumableState = false;
         /*
-          Home's welcome-back card says the job is running and that the tab can
-          be closed, which is all there is to do now. Only when it can show
-          this job: a handover recorded for someone other than the user this
-          browser knows (or not recorded at all) would get a card about the
-          wrong thing, so it stays here with the job banner.
+          Home's status page says the job is running and that the tab can be
+          closed, which is all there is to do now. Without a matching record
+          (a handover recorded for someone other than the user this browser
+          knows, or none) the job is fetched first, and the page goes there
+          once the mount settles if it is shown (`leaveForStatusPage`).
         */
         const api = this.$store.state.lfmApi as LastFm;
         if (background.handedOverImport(api.getUserName())) {
@@ -2425,11 +2319,13 @@ export default defineComponent({
       }
 
       if (result.safeToResumeLocally) {
-        this.backgroundNotice = 'The upload didn\'t finish, so nothing is running on the server. Your progress is exactly where you left it.';
+        // `completeHandoff` has withdrawn the job Last.fm's approval made.
+        this.uploadFailed = true;
+        this.backgroundNotice = 'The upload didn\'t finish. Nothing changed.';
         return false;
       }
 
-      this.backgroundNotice = 'We can\'t tell whether the background import started. Reload this page in a minute — don\'t resume here in the meantime, or your tracks could be scrobbled twice.';
+      this.backgroundNotice = 'We can\'t tell if the move worked. Reload in a minute, and don\'t resume here until then.';
       return true;
     },
 
@@ -2445,94 +2341,10 @@ export default defineComponent({
     },
 
     async refreshBackgroundJob() {
-      this.backgroundJob = await background.fetchJob();
-    },
-
-    /**
-     * When the card should next ask: just after the job's next tick, within
-     * the bounds above.
-     */
-    nextJobPollSec(job: background.JobStatus): number {
-      const now = Math.floor(Date.now() / 1000);
-      if (!job.nextRunAt) {
-        return now + JOB_POLL_FALLBACK_SECONDS;
-      }
-      return Math.min(
-        now + JOB_POLL_MAX_SECONDS,
-        Math.max(now + JOB_POLL_MIN_SECONDS, job.nextRunAt + JOB_POLL_AFTER_RUN_SECONDS),
-      );
-    },
-
-    startJobClock() {
-      if (this.jobClockTimer !== null) { return; }
-      this.jobClockTimer = window.setInterval(() => this.onJobClockTick(false), JOB_CLOCK_TICK_MS);
-      // A tab coming back to the front checks at once rather than showing a
-      // count from whenever it was hidden.
-      this.onVisibilityChange = () => {
-        if (document.visibilityState === 'visible') {
-          this.onJobClockTick(true);
-        }
-      };
-      document.addEventListener('visibilitychange', this.onVisibilityChange);
-    },
-
-    stopJobClock() {
-      if (this.jobClockTimer !== null) {
-        window.clearInterval(this.jobClockTimer);
-        this.jobClockTimer = null;
-      }
-      if (this.onVisibilityChange) {
-        document.removeEventListener('visibilitychange', this.onVisibilityChange);
-        this.onVisibilityChange = null;
-      }
-    },
-
-    onJobClockTick(returning: boolean) {
-      this.nowSec = Math.floor(Date.now() / 1000);
-      // A hidden tab asks nobody; it catches up when it is shown again.
-      if (document.visibilityState !== 'visible') { return; }
-      if (returning || this.nowSec >= this.jobPollDueSec) {
-        this.pollBackgroundJob();
-      }
-    },
-
-    /**
-     * Refreshes the job card without letting a slow or failed answer undo
-     * anything newer.
-     *
-     * Unlike `refreshBackgroundJob`, a failed check keeps the card: dropping
-     * it would bring back the Resume prompt it replaces, for a queue the server
-     * still holds. "Last checked" says how old the card is instead.
-     */
-    async pollBackgroundJob() {
-      const before = this.backgroundJob;
-      if (this.jobPolling || this.backgroundBusy || !before) { return; }
-      this.jobPolling = true;
       const job = await background.fetchJob();
-      this.jobPolling = false;
-      // A pause, resume or take-back that happened meanwhile owns the card now.
-      if (this.backgroundBusy || this.backgroundJob !== before) { return; }
-      if (job) {
-        this.backgroundJob = job;
-      } else {
-        this.jobPollDueSec = Math.floor(Date.now() / 1000) + JOB_POLL_FALLBACK_SECONDS;
-      }
-    },
-
-    async pauseBackgroundJob() {
-      if (!this.backgroundJob) { return; }
-      this.backgroundBusy = true;
-      await background.jobAction(this.backgroundJob.id, 'pause');
-      await this.refreshBackgroundJob();
-      this.backgroundBusy = false;
-    },
-
-    async resumeBackgroundJob() {
-      if (!this.backgroundJob) { return; }
-      this.backgroundBusy = true;
-      await background.jobAction(this.backgroundJob.id, 'resume');
-      await this.refreshBackgroundJob();
-      this.backgroundBusy = false;
+      // When it was fetched, for Home (`leaveForStatusPage`). Not reactive.
+      (this as any)._backgroundJobAtMs = Date.now();
+      this.backgroundJob = job;
     },
 
     /**
@@ -2554,7 +2366,7 @@ export default defineComponent({
      * what decides it; the client only retries until it gets an answer.
      */
     async takeBackProgress() {
-      if (!this.backgroundJob) { return; }
+      if (!this.backgroundJob || this.backgroundBusy) { return; }
       this.backgroundBusy = true;
       const jobId = this.backgroundJob.id;
       /*
@@ -2566,7 +2378,9 @@ export default defineComponent({
         the server refuses a cancel during an active export unless the caller
         can prove it owns that export.
       */
-      const exportClaim = background.newExportClaim();
+      // A retry of this tab's own failed take-back presents its claim, which
+      // the worker may still be holding the job `exporting` under (#173).
+      const exportClaim = background.failedTakeBackClaim(jobId) || background.newExportClaim();
       try {
         if (!await background.jobAction(jobId, 'pause')) {
           throw new Error('The background import could not be paused.');
@@ -2715,13 +2529,18 @@ export default defineComponent({
           }
           this.hasResumableState = false;
           trackEvent('background_takeback_cancel_refused', { job_id: jobId });
-          this.backgroundNotice = 'Your tracks were copied back, but the background import could not be stopped, so this browser will not resume them yet. Use "Take my progress back" again in a moment.';
+          background.recordFailedTakeBack(jobId, exportClaim);
           await this.refreshBackgroundJob();
+          // Home's status page is where to try again, once this is read.
+          this.errorMessage = 'Your tracks were copied back, but the background import could not be stopped, so this browser will not resume them yet. Use "Scrobble the rest locally" again in a moment.';
+          this.errorDetails = '';
+          this.showError = true;
           this.backgroundBusy = false;
           return;
         }
 
         this.backgroundJob = null;
+        background.clearFailedTakeBack();
         this.hasResumableState = true;
         this.ownershipBlocked = false;
         /*
@@ -2738,8 +2557,12 @@ export default defineComponent({
         );
         // The cancel is confirmed, so the record naming this job is ours to
         // clear — but a freeze another tab is holding for a *different*
-        // handover is not.
-        background.releaseQueueOwnerIfUnclaimed(jobId);
+        // handover is not. This tab hears its own release too, and must not
+        // take it for a sibling's (#148; see the ownership listener).
+        (this as any)._takeBackRelease = true;
+        if (!background.releaseQueueOwnerIfUnclaimed(jobId)) {
+          (this as any)._takeBackRelease = false;
+        }
         background.clearOwnershipUnresolved();
         background.clearPendingHandoff();
         background.clearHandoffLineage(carriedLineage.ranges, carriedLineage.knownFromSec);
@@ -2756,15 +2579,21 @@ export default defineComponent({
         */
         const uncertain = Number(exported.uncertainCount) || 0;
         this.backgroundNotice = uncertain > 0
-          ? `Your remaining tracks are back in this browser. Choose "Resume" to carry on here. Note that ${uncertain.toLocaleString()} track(s) were sent without a confirmed reply too long ago to repeat exactly, so they go out again under a new time — if they did arrive, Last.fm may end up with a second copy of them.`
-          : 'Your remaining tracks are back in this browser. Choose "Resume" to carry on here.';
+          ? `Your tracks are back in this tab. ${uncertain.toLocaleString()} may show up twice on Last.fm because we couldn't confirm them.`
+          : 'Your tracks are back in this tab. Press Resume to carry on.';
         trackEvent('background_job_reclaimed', { job_id: jobId, uncertain });
       } catch (e) {
         trackError('background.takeBackProgress', e);
+        /*
+          The export may have claimed the job, which then stays `exporting`
+          for the claim's ten minutes. Home's status page offers to try again
+          from this tab, which can present that claim.
+        */
+        background.recordFailedTakeBack(jobId, exportClaim);
         // The job may have been left paused. Say so, and re-read its real
         // state rather than leaving a stale banner on screen.
         await this.refreshBackgroundJob();
-        this.errorMessage = 'Couldn\'t bring your progress back. Your tracks are still safe on the server — nothing has been lost or scrobbled twice.';
+        this.errorMessage = 'Couldn\'t move your progress back. It\'s safe on our server.';
         this.errorDetails = (e as Error).message || String(e);
         this.showError = true;
       }
@@ -2971,6 +2800,10 @@ export default defineComponent({
           return;
         }
         const intent = takeSignInIntent(fresh);
+        if (intent && intent.kind === 'takeBack') {
+          await this.takeBackFromIntent(intent.jobId);
+          return;
+        }
         if (!intent || intent.kind === 'reconnect') {
           return;
         }
@@ -3011,13 +2844,49 @@ export default defineComponent({
       }
     },
     /**
+     * Home's "Scrobble the rest locally" (a `takeBack` intent), once signed
+     * in and the authority check has answered: takes job `jobId`'s progress
+     * back, if that job is still the one listed and can still be exported.
+     * Otherwise nothing happens, and a job still shown sends the page back to
+     * Home's status page.
+     */
+    async takeBackFromIntent(jobId: string) {
+      try {
+        if (!this.backgroundJob) {
+          await this.refreshBackgroundJob();
+        }
+        const job = this.backgroundJob;
+        // `exporting` only after this tab's own take-back failed: a retry
+        // presents its claim. Anyone else's would be refused until it lapses.
+        const exportable = !!job && (TAKE_BACK_STATES.includes(job.state)
+          || (job.state === 'exporting' && !!background.failedTakeBackClaim(job.id)));
+        if ((this as any)._unmounted || !job || job.id !== jobId || !exportable) {
+          return;
+        }
+        await this.takeBackProgress();
+      } finally {
+        this.takingBack = false;
+      }
+    },
+    /**
      * The token exchange failed, so nothing will carry the selection on. When
      * the trip was to send or resume, the page offers the same trip again in
      * one banner (AuthenticateStep's own prompts are off, `quietFailure`).
+     * A take-back says it didn't happen instead.
      */
     async onAuthFailed() {
       this.signInFailed = true;
       this.heldForSignIn = false;
+      if (this.takingBack) {
+        // Nothing to take the progress back with; it stays on the server, and
+        // closing the dialog goes back to Home's status page to try again.
+        takeSignInIntent(true);
+        this.errorMessage = 'Couldn\'t move your progress back. It\'s safe on our server.';
+        this.errorDetails = '';
+        this.showError = true;
+        this.takingBack = false;
+        return;
+      }
       if (!this.settlingSignIn) {
         return;
       }
@@ -3200,8 +3069,8 @@ export default defineComponent({
       */
       if (this.sendingBlocked) {
         this.backgroundNotice = background.isBetaOptedIn()
-          ? 'Hold on — still checking whether an import is already running on the server for your account.'
-          : 'Hold on, still getting ready. Try again in a moment.';
+          ? 'One moment, still checking our server.'
+          : 'One moment, still getting ready.';
         return null;
       }
       if (!this.savedProgress) {
@@ -3315,8 +3184,8 @@ export default defineComponent({
       */
       if (this.authorityPending || this.authorityUnknown || this.ownershipBlocked) {
         this.backgroundNotice = background.isBetaOptedIn()
-          ? 'Hold on — still checking whether an import is already running on the server for your account.'
-          : 'Hold on, still getting ready. Try again in a moment.';
+          ? 'One moment, still checking our server.'
+          : 'One moment, still getting ready.';
         return;
       }
       try {

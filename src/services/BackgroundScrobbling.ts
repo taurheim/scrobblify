@@ -47,6 +47,8 @@ const IN_FLIGHT_STORAGE_KEY = 'scrobblify.background.inflightSecond';
 const SERVER_OWNS_STORAGE_KEY = 'scrobblify.background.serverOwns';
 const STALE_SNAPSHOT_STORAGE_KEY = 'scrobblify.background.staleSnapshot';
 const OWNERSHIP_CHANNEL = 'scrobblify.ownership';
+/** Tags this page's ownership broadcasts, which reach its own listener too. */
+const PAGE_ID = `${Date.now()}.${Math.random().toString(36).slice(2)}`;
 
 export interface Capacity {
   available: boolean;
@@ -87,6 +89,12 @@ export interface JobStatus {
    * when reconnecting would be refused because the service is full.
    */
   reconnectAvailable?: boolean;
+  /**
+   * For a `dormant` job, the parked state it went on hold from (`paused`,
+   * `needs_reauth`, `needs_attention`). Null otherwise, for jobs that went
+   * dormant before the worker recorded it, and absent from older workers.
+   */
+  dormantFrom?: string | null;
 }
 
 export interface UploadTrack {
@@ -202,6 +210,27 @@ export function setBetaOptIn(on: boolean): void {
 }
 
 const HANDED_OVER_IMPORT_KEY = 'scrobblify.background.handedOverImport';
+const DISMISSED_JOB_KEY = 'scrobblify.background.dismissedJob';
+
+/**
+ * Hides a finished job from the status page for good ("Start a new import").
+ * One id: the worker lists one job per user, and a new one has a new id.
+ */
+export function dismissJob(jobId: string): void {
+  try {
+    window.localStorage.setItem(DISMISSED_JOB_KEY, jobId);
+  } catch {
+    // Private browsing: the job shows again on the next visit to Home.
+  }
+}
+
+export function isJobDismissed(jobId: string): boolean {
+  try {
+    return !!jobId && window.localStorage.getItem(DISMISSED_JOB_KEY) === jobId;
+  } catch {
+    return false;
+  }
+}
 
 export function clearHandedOverImport(): void {
   try {
@@ -265,6 +294,19 @@ export function handedOverImport(
     const total = record.originalTotal;
     const originalTotal = typeof total === 'number' && Number.isFinite(total) && total > 0 ? total : 0;
     return { importId: record.importId, originalTotal };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The Last.fm user the handed-over record names, whoever that is; null when
+ * there is none.
+ */
+export function handedOverImportUser(): string | null {
+  try {
+    const record = JSON.parse(window.localStorage.getItem(HANDED_OVER_IMPORT_KEY) || 'null');
+    return record && typeof record.username === 'string' && record.username ? record.username : null;
   } catch {
     return null;
   }
@@ -1320,7 +1362,7 @@ export function setQueueOwner(record: QueueOwner | null): void {
   try {
     if (typeof BroadcastChannel !== 'undefined') {
       const channel = new BroadcastChannel(OWNERSHIP_CHANNEL);
-      channel.postMessage({ queueOwner: record });
+      channel.postMessage({ queueOwner: record, from: PAGE_ID });
       channel.close();
     }
   } catch {
@@ -2161,12 +2203,17 @@ export async function freezeOtherTabs(attempt: string): Promise<boolean> {
  * Calls back when another tab takes or releases the queue, so a loop already
  * running here stops before its next send rather than at its next reload.
  *
+ * A change this page made itself reaches it too, through the channel, with
+ * `fromThisPage` set; `storage` events only ever come from other tabs.
+ *
  * Returns a teardown function.
  */
-export function onServerOwnershipChange(handler: (owner: QueueOwner | null) => void): () => void {
+export function onServerOwnershipChange(
+  handler: (owner: QueueOwner | null, fromThisPage: boolean) => void,
+): () => void {
   const onStorage = (event: StorageEvent) => {
     if (event.key === SERVER_OWNS_STORAGE_KEY) {
-      handler(queueOwner());
+      handler(queueOwner(), false);
     }
   };
   window.addEventListener('storage', onStorage);
@@ -2177,7 +2224,7 @@ export function onServerOwnershipChange(handler: (owner: QueueOwner | null) => v
       channel = new BroadcastChannel(OWNERSHIP_CHANNEL);
       channel.onmessage = (event: MessageEvent) => {
         if (event.data && 'queueOwner' in event.data) {
-          handler(event.data.queueOwner || null);
+          handler(event.data.queueOwner || null, event.data.from === PAGE_ID);
         }
       };
     }
@@ -2478,14 +2525,16 @@ export async function hasLiveJob(jobId = ''): Promise<boolean | null> {
   }
 }
 
-export async function fetchJob(): Promise<JobStatus | null> {
+export async function fetchJobAnswer(
+  timeoutMs = STATUS_TIMEOUT_MS,
+): Promise<{ answered: boolean; job: JobStatus | null }> {
   if (!isBackgroundConfigured() || !getSession()) {
-    return null;
+    return { answered: true, job: null };
   }
   try {
-    const res = await getWithTimeout('/scrobblify/job', true);
+    const res = await getWithTimeout('/scrobblify/job', true, timeoutMs);
     if (!res) {
-      return null;
+      return { answered: false, job: null };
     }
     if (res.status === 401) {
       // Recorded before the token is dropped. Without this the ownership
@@ -2493,15 +2542,65 @@ export async function fetchJob(): Promise<JobStatus | null> {
       // has no re-authentication button to offer.
       sessionExpired = true;
       clearSession();
-      return null;
+      return { answered: true, job: null };
     }
     if (!res.ok) {
-      return null;
+      return { answered: false, job: null };
     }
     const body = await res.json();
-    return body.job ?? null;
+    return { answered: true, job: body.job ?? null };
   } catch {
-    return null;
+    return { answered: false, job: null };
+  }
+}
+
+export async function fetchJob(timeoutMs = STATUS_TIMEOUT_MS): Promise<JobStatus | null> {
+  return (await fetchJobAnswer(timeoutMs)).job;
+}
+
+const FAILED_TAKE_BACK_KEY = 'scrobblify.background.failedTakeBack';
+/*
+  How long a failed take-back's record is kept: the worker's export claim
+  (`EXPORT_CLAIM_SECONDS` in worker/src/api.ts, 600 s) plus a sweep (5 min).
+  After that the job has gone back to where it was, so an `exporting` job is
+  someone else's take-back.
+*/
+const FAILED_TAKE_BACK_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Records a take-back from this tab that failed with job `jobId`, possibly
+ * left `exporting` under `claim`. The worker lets only that claim back in
+ * until it lapses, so a retry presents it (`failedTakeBackClaim`). Per tab
+ * (sessionStorage): two tabs retrying with one claim could both read the
+ * export, which is what the claim exists to prevent.
+ */
+export function recordFailedTakeBack(jobId: string, claim: string): void {
+  try {
+    window.sessionStorage.setItem(FAILED_TAKE_BACK_KEY, JSON.stringify({ jobId, claim, atMs: Date.now() }));
+  } catch {
+    // Storage refused: a retry waits for the claim to lapse instead.
+  }
+}
+
+/** The claim of this tab's failed take-back of job `jobId`, while it may still hold; else null. */
+export function failedTakeBackClaim(jobId: string): string | null {
+  try {
+    const record = JSON.parse(window.sessionStorage.getItem(FAILED_TAKE_BACK_KEY) || 'null');
+    if (record && record.jobId === jobId && typeof record.claim === 'string' && record.claim
+      && Date.now() - Number(record.atMs) < FAILED_TAKE_BACK_TTL_MS) {
+      return record.claim;
+    }
+  } catch {
+    // Unreadable: no record.
+  }
+  return null;
+}
+
+export function clearFailedTakeBack(): void {
+  try {
+    window.sessionStorage.removeItem(FAILED_TAKE_BACK_KEY);
+  } catch {
+    // Nothing to clear.
   }
 }
 
@@ -2783,6 +2882,43 @@ export async function abandonOwnHandoff(
     return null;
   }
   return releaseAbandonedHandoff(expected, abandoned === true ? '' : pendingImportId);
+}
+
+/**
+ * Withdraws this browser's approved handoff after its upload failed for good
+ * (`POST /scrobblify/handoff/:id/fail`, with the worker session the return
+ * brought). Last.fm's approval already made a `pending` job holding the
+ * user's key; nothing sends from it, but until withdrawn it read as running
+ * (`/job/live`, the status page) until reaped, up to an hour later.
+ *
+ * True when withdrawn; false when the worker had nothing to withdraw (already
+ * ended, or past the upload); null when unanswered. Best effort with a short
+ * timeout: an unanswered one leaves the job to the reaper.
+ */
+export async function withdrawUpload(
+  handoffId: string,
+  timeoutMs = ABANDON_TIMEOUT_MS,
+): Promise<boolean | null> {
+  if (!handoffId || !isBackgroundConfigured() || !getSession()) {
+    return null;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await request(`/scrobblify/handoff/${encodeURIComponent(handoffId)}/fail`, {
+      method: 'POST',
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const body = await res.json();
+    return body && body.ok === true ? body.withdrawn === true : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

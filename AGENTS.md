@@ -162,7 +162,8 @@ date the order was `step_viewed` (step 1) → `auth_*` → `upload_*`. A browser
 with a stored session still emits `auth_success` (`returning: true`) on every
 `/scrobble` load and skips `sign_in_started` and
 `selection_resumed_after_sign_in`. `sign_in_started` carries `intent` (`send`,
-`resume` or `reconnect`); `selection_resumed_after_sign_in` carries
+`resume`, `reconnect`, or since 2026-11-22 `takeBack`: the status page's
+"Scrobble the rest locally"); `selection_resumed_after_sign_in` carries
 `track_count` and `duplicates_skipped`, and replaces `session_resumed` for a
 selection coming back from Last.fm, which is not a resume.
 `upload_parse_completed` carries `duplicates_deferred` (true when "Check for
@@ -178,16 +179,28 @@ choosing"). Since 2026-11-21 too: `background_handoff_return_rejected` (a
 handoff return for a handoff this browser didn't preflight, #157),
 `background_freeze_released` gains `reason: handoff_not_taken`, and
 `background_handoff_failed` gains the worker's `already_live`, `replay` and
-`abandoned` reasons (see "Handing over without signing in").
+`abandoned` reasons (see "Handing over without signing in"). A server job's
+own page is Home since 2026-11-22 (see "Home is the status page"), with
+`move_back_explainer_shown` / `move_back_explainer_choice` and
+`background_reauth_started` `source: home`.
 
 Home emits `home_choice` (`choice`: `have_export`, `get_export` or `resume`;
 `resume` is the "Already scrobbling on scrobblify?" link) on first visits
 (`get_export` also from the welcome-back card's "Show me how"), and
-`home_returning_shown` (`state`: `saved_signed_in`, `saved_signed_out`,
-`server_job` or `username_only`) when it shows the welcome-back card instead
-(`src/services/ReturningVisitor.ts`). The card appears when this browser has a
-remembered username, saved progress (welcomed under the progress's own
-`userName`), or a live job it handed over. "Not you?" on the card signs out
+`home_returning_shown` when it shows something else
+(`src/services/ReturningVisitor.ts`). Its `state`:
+
+| `state` | Shown |
+| --- | --- |
+| `saved_signed_in` / `saved_signed_out` | The welcome-back card for saved progress, signed in as its owner or not |
+| `username_only` | The welcome-back card for a remembered username |
+| `server_job` | The status page for a server job. Since 2026-11-22 it carries `source` (`job`, `import` or `other`, see "Home is the status page") and, for `source: job`, `job_state` (the worker's job state). Before, it was the welcome-back card for a *live* job this browser handed over, with no other properties |
+| `checking` | "Checking for active scrobbling..." with **Try again**: a worker session whose job lookup went unanswered (since 2026-11-22) |
+
+`server_job` and `checking` are emitted whatever "Not you?" said; the cards
+only while not dismissed. The card appears when this browser has a
+remembered username or saved progress (welcomed under the progress's own
+`userName`); a server job gets the status page instead. "Not you?" on the card signs out
 (`user_logged_out`) only when the card was about the stored user, never deletes
 saved progress, and hides the card for the rest of the tab (`sessionStorage`
 `scrobblify.home.dismissedReturning`; a fresh Last.fm sign-in, one that
@@ -198,8 +211,8 @@ signed in as the progress's owner, it records an in-app `resume` intent
 it starts a `resume` sign-in through Last.fm (`startSignIn`) that resumes on
 the way back. **Re-connect to last.fm** when signed out signs in to the
 *worker* if one is configured (see "Signing in after choosing"), else starts a
-`reconnect` sign-in (landing on `/scrobble`, where the job or resume banner
-takes over); signed in, it just opens `/scrobble`. Home reads
+`reconnect` sign-in (landing on `/scrobble`, where the resume banner takes
+over, or a server job sends it on to Home's status page); signed in, it just opens `/scrobble`. Home reads
 the stored user itself (`LastFm.loadStoredUser()`), since only `/scrobble`'s
 sign-in handler (`AuthenticateStep`) runs `init()`.
 
@@ -270,9 +283,9 @@ them. The gate and the confirmation use `backgroundCanFinish` (fed by
 off or a server job is listed), and point at the stop screen's "Scrobble the
 rest for me". The stop reasons and the paused panel use `canOfferBackground`, since the
 offer sits right under them. The Complete step uses `backgroundTrackLimit > 0`.
-Home's welcome-back card shows a live server job ("Scrobbling remotely, it's
-safe to close this tab.") to any browser that handed it over, whatever its beta status,
-and the header shows the BETA tag while it does (`showingServerJob` in the
+Home's status page shows a server job to any browser that can learn of it,
+whatever its beta status (it reads the job through recovery paths, see
+below), and the header shows the BETA tag while it does (`showingServerJob` in the
 store), besides the opt-in and flag. Otherwise Home and About have no
 background-specific copy (About's "Where does my data go?" answer mentions the
 background service to everyone).
@@ -446,7 +459,8 @@ reached in-app by a user who is already signed in records an intent with
 | --- | --- | --- |
 | `send` (`importId`, `checkDuplicates`) | Confirming "Scrobble N tracks?" while signed out, on the tab path ("Start scrobbling", "scrobble locally") | The saved selection is restored onto Send |
 | `resume` | Home's Continue: through Last.fm when not signed in as the progress's owner, in-app when signed in; the sign-in banner's button after a refused *saved* resume | `resumeFromSaved`, which refuses by itself while sending is withheld |
-| `reconnect` | Home's "Re-connect to last.fm" while signed out, only when no worker is configured or its sign-in couldn't start; the sign-in banner's button after a refused progress file (#153) | Nothing; the job or resume banner takes over |
+| `reconnect` | Home's "Re-connect to last.fm" while signed out, only when no worker is configured or its sign-in couldn't start; the sign-in banner's button after a refused progress file (#153) | Nothing; the resume banner takes over, or a server job sends the page to Home's status page |
+| `takeBack` (`jobId`) | The status page's "Scrobble the rest locally" (since 2026-11-22): in-app when this browser has a Last.fm session, else through Last.fm after the explainer | `takeBackFromIntent`: the job's progress is taken back if that job is still listed and can be exported; otherwise nothing (see "Home is the status page") |
 
 The server path records no intent and never signs in to the browser
 application: it goes to Last.fm through the handoff (the worker's
@@ -463,7 +477,8 @@ flag on mount and on a bfcache restore (Back from Last.fm). On the return,
 `/scrobble` remembers the worker's name for the account (`rememberWorkerUser`)
 before the authority check asks by name, and once the job and saved state
 have settled `reportWorkerLookup` takes the flag and emits
-`worker_lookup_result`: `job` (the job banner shows), `saved` (the resume
+`worker_lookup_result`: `job` (a server job Home would show: the page goes on
+to Home's status page), `saved` (the resume
 prompt), `nothing`, or `failed` (refused, or no worker session; the "didn't
 work" notice is up). `nothing` opens a dialog (`.nothing-to-resume`): "We
 weren't able to find an active scrobblify session for you." with a single
@@ -515,7 +530,7 @@ Last.fm, a closed tab) leaves the selection as ordinary saved progress**, and
 the next visit offers it through the resume prompt and Home's card; a
 `session_resumed` (`source: saved`) at 0 progress can be this. Because that
 save replaces whatever is saved, it applies #102 itself: it refuses while
-`sendingBlocked` (the "Hold on…" notice), and when the confirmation didn't know
+`sendingBlocked` (the "One moment, still…" notice), and when the confirmation didn't know
 of saved progress (`savedProgress` null: the resume prompt was withheld, or
 another tab saved since) it reads the disk and refuses any saved state for a
 different import (or with no id) with "You have saved progress that would be
@@ -789,7 +804,8 @@ once per UTC day per run, then advanced by what it sends) and sends only what
 fits under `importBudget`. Re-tagged seconds stay on today (`assignTimestamps`'
 `dayFloorSec`); once today is full the job waits until
 `DAY_RESUME_OFFSET_SECONDS` (20 min) past the next UTC midnight, with
-`DAY_FULL_REASON` on the job card. The offset exists because the worker's
+`DAY_FULL_REASON` as its reason (in `src/shared/lastfm/dailyCap.ts`, since
+Home's status page recognises it too). The offset exists because the worker's
 allocator marches *down* from the present and never below midnight, so at
 00:01 it would have a minute of seconds to spend. A real-dated play on a full
 day is failed without being sent (`DAY_FULL_FAILURE`); repeats (pinned retries,
@@ -980,8 +996,9 @@ flag answering for a browser PostHog hasn't identified yet, from 2026-11-21)
 and `entry_point` (`scrobble_step`, `resume`, `sign_in` for a selection
 restored after signing in, or `confirm` for the confirm dialog's server
 choice, both from 2026-11-21), which its decline and opt-in events repeat.
-`background_offer_declined` from `confirm` always carries `all_re_tagged:
-false` (#163), so split decline rates by it only for the other entry points.
+`background_offer_declined` from `confirm` carried `all_re_tagged: false`
+whatever was selected until #163 was fixed (2026-11-22), so split decline
+rates by it only for later events or the other entry points.
 
 `App.vue` applies `?beta=` once per page load (`consumeBetaParam`, in
 `created()`), so an invite link works on any page (in dev's hash mode, editing
@@ -1004,18 +1021,24 @@ over (`originalTotal` is the import's `originalTotalTracks`). It is written in
 `completeHandoff` when a handover goes live, under the queue's `userName` or,
 for a selection saved signed out, the account the worker named in the return,
 and cleared after a confirmed
-take-back; when a handover has no import id or user (so it never names an
+take-back; after the status page's Cancel; when a handover has no import id or user (so it never names an
 older one); when `completeHandoff` finds no local state while the handoff is
 active (its import id can't be known); and when Home sees the job ended or
 unknown to the worker.
-Home uses it, only for the same Last.fm user (case-insensitive) and only while
-the job is live, to show progress through the public `/scrobblify/import/:id`
-route; a signed-out or on-hold job gets the plain card. That route counts only
+Home uses it only for the same Last.fm user (case-insensitive). Without a
+worker session, it is how the status page finds the job at all, through the
+public `/scrobblify/import/:id` route (`source: import`), for any job not
+ended and not a `pending` handoff. With one, the job doesn't name its import,
+so the record is applied only when that route's `totalTracks` equals the
+job's. Either way it gives the bar the whole import: the route counts only
 the tracks the worker was handed, so `overallProgress`
-(`src/services/ReturningVisitor.ts`) shows the whole import as
+(`src/services/JobStatus.ts`) shows the whole import as
 `originalTotal - (totalTracks - scrobbledCount)` of `originalTotal`; plays this
 browser gave up on before the handover count as done there. A record without
-`originalTotal` (older ones) falls back to the server's own numbers. It is display-only and
+`originalTotal` (older ones) falls back to the server's own numbers. A record
+naming another account than the remembered user (a signed-out handover
+approved as someone else) titles the status page "Scrobbling to Last.fm"
+rather than with the wrong name (`handedOverImportUser`). It is display-only and
 deliberately **not** handover evidence.
 
 Two functions in `src/services/BackgroundScrobbling.ts`, and the split is
@@ -1049,11 +1072,10 @@ The accepted gap: a browser that lost its localStorage but kept a leftover
 handed-over queue in IndexedDB, while the worker is unreachable. A successful
 handover clears the saved queue, so this needs a stale copy as well.
 
-**A blocked browser can choose to carry on.** The "We can't reach the
-background scrobble worker" banner offers "Continue in this browser anyway"
-next to "Try again", warning of double scrobbles if the worker is also
-scrobbling
-(`continueWithoutAuthority`). Without it, an opted-in browser, or one with a
+**A blocked browser can choose to carry on.** The "Can't reach scrobblify
+servers right now." banner offers "Continue locally anyway" next to "Try
+again", with the warning "If scrobblify server is also sending, you may get
+duplicates on last.fm." (`continueWithoutAuthority`). Without it, an opted-in browser, or one with a
 trace of a handover, was blocked for as long as the worker was unreachable.
 The choice lasts for the page load only. It lifts only the no-answer gate: a
 later `live: true` answer still blocks, and it is **never offered over a
@@ -1064,13 +1086,18 @@ answer. It emits `background_authority_overridden` (`opted_in`,
 duplicates are actually possible.
 
 **The page shows one banner at a time**, picked by the `banner` computed in
-`Scrobblify.vue`: outage, then a server job, then the Last.fm sign-in prompt,
+`Scrobblify.vue`: outage, then the Last.fm sign-in prompt,
 then the sign-in `retry`, then the resume
 prompt, then a `backgroundNotice` on its own. A
 `backgroundNotice` that isn't the banner shows as the winning
 banner's first line. While the worker is unreachable, notices that need the
 worker to act on (`NEEDS_WORKER_NOTICES`, the expired-connection "Fix now")
-are dropped entirely, and so is the scrobble step's "Checking…" text.
+are dropped entirely, and so is the scrobble step's "Checking…" text. A
+server job is not a banner any more (since 2026-11-22): while one Home would
+show is listed (`jobShown`), the resume prompt stays off and the stepper is
+hidden, and the page goes to Home's status page (see "Home is the status
+page"). Before, a `job` banner with the job's controls outranked everything
+but the outage.
 
 **An imported progress file is a queue from somewhere else**, so the local
 evidence above says nothing about it. `importProgressFile` asks
@@ -1211,15 +1238,15 @@ instead (see `tests/backgroundMock.js`). Once `completeHandoff` answers
 `active` (the point that records the `server` queue owner and
 `handedOverImport`) and that record names the user this browser knows (the
 worker's name when it knew no one), the page `$router.replace`s to Home, whose
-welcome-back card shows "Scrobbling to {user}" / "Scrobbling remotely, it's
-safe to close this tab." `stripQuery` has already removed the query and
+status page shows "Scrobbling to {user}", the job's line and "Scrobbling
+remotely, it's safe to close this tab." `stripQuery` has already removed the query and
 fragment; dev's hash router keeps the load's query in its base but writes
-hash-only URLs, so it doesn't come back. Everything else stays on `/scrobble`
-as before: failures, `already_live`, an unresolved or unknown outcome, a
-take-back, and a handover recorded for someone other than the known user (or
-not recorded, e.g. no import id), where Home's card would be about the wrong
-thing. `/scrobble` afterwards still shows the job banner (Pause, Take my
-progress back).
+hash-only URLs, so it doesn't come back. Without such a record (a handover
+recorded for someone other than the known user, or not recorded, e.g. no
+import id) the job is fetched first, and the page goes to Home once its
+mount has settled, like any shown job (see "Home is the status page").
+Everything else stays on `/scrobble`: failures, `already_live`, an unresolved
+or unknown outcome, and a take-back.
 
 **A handoff return is accepted only for a handoff this browser preflighted**
 (#157). `preflight` records the id in localStorage
@@ -1241,22 +1268,26 @@ URL and calling `resumeHandoffIfReturning`.
 **A handoff that never reaches the worker unfreezes this browser.** Handing
 over writes a `freezing` queue-owner record naming the preflighted handoff, and
 a worker session only comes with a *successful* callback, so a browser that
-came back any other way could never ask about it and stayed blocked ("A
-handover is starting in another tab…", then "…on hold", for good):
+came back any other way could never ask about it and stayed blocked ("Another
+tab is moving this import…", then "…didn't finish", for good):
 
 - Any `?handoff=failed` return (denied, `exchange_failed`, `already_live`, …)
   withdraws this browser's preflighted handoff at the worker (below, in case
   the refusal left it waiting) and then calls `releaseAbandonedHandoff()`,
   which lifts only a freeze naming that handoff, and forgets the preflight
   (#160), whatever the withdrawal answers.
-- Back from Last.fm without approving (a reload, or a bfcache restore), with no
-  worker session: `ownHandoffWasTaken` asks `/scrobblify/import/:id` about the
+- Back from Last.fm without approving (a reload, or a bfcache restore), with or
+  without a worker session left over from an earlier handoff or sign-in
+  (#166; neither `isHandoffActive` nor `/job` sees a handoff nobody approved,
+  so a browser with one stayed blocked, "running on our server", until
+  the reaper failed the handoff an hour later): `ownHandoffWasTaken` asks `/scrobblify/import/:id` about the
   saved queue. `known: false`, or `known: true, pending: true` (the worker
   still holds this very handoff, unapproved), withdraws and releases it
   (`abandonOwnHandoff`) and offers the saved selection again (on a reload,
   `background_freeze_released` `reason: handoff_not_taken`); any other `known: true`
   blocks as a handed-over queue, with the worker sign-in; no answer changes
-  nothing. Only in the tab that preflighted it (`isThisTabsHandoffFreeze`:
+  nothing (on a bfcache restore with a session, `hasLiveJob` is asked
+  instead). Only in the tab that preflighted it (`isThisTabsHandoffFreeze`:
   `preflight` keeps a sessionStorage copy of the id, which survives the
   same-tab round trip and Back), and before the 3-minute freshness rule, since
   that tab is the one that came back. The localStorage record is every tab's,
@@ -1275,8 +1306,10 @@ handover is starting in another tab…", then "…on hold", for good):
   older than the worker's handoff TTL plus 5 minutes (`freezeHandoffHasExpired`;
   the client's `HANDOFF_TTL_SECONDS` mirrors the worker's). Then `known: false`
   releases (`background_freeze_released` `reason: handoff_not_taken`), a job
-  blocks, and `pending` (not yet reaped) or no answer keeps "…on hold… Please
-  refresh in a few minutes." Nothing is withdrawn from such a tab. Before the
+  blocks, and `pending` (not yet reaped) or no answer keeps "A handover in
+  another tab didn't finish. Refresh in a few minutes." A browser with a worker session asks about
+  another tab's handoff with `isHandoffActive` instead, which sees it once
+  reaped. Nothing is withdrawn from such a tab. Before the
   hour is up, a tab that can't ask (no worker session) says the handover
   "expires within the hour: refresh then", since an earlier refresh changes
   nothing unless the other tab finishes. Before this, those tabs stayed on hold
@@ -1310,6 +1343,35 @@ handed over for good (#165). The client (`abandonOwnHandoff` →
 `abandonHandoff`, 3s timeout, best effort) only ever sends this browser's own
 preflighted id, and is awaited before the page-load authority check.
 
+**A browser whose upload failed withdraws the job its approval made**
+(since 2026-11-22). The callback creates the job `pending`, holding the
+user's key and `live_username`, before the browser uploads. When the upload
+then fails for good (a chunk refused or unreachable, a finalize refused, or a
+lost finalize the worker says is inactive: `completeHandoff`'s
+`safeToResumeLocally`), the browser first calls `POST
+/scrobblify/handoff/:id/fail` (`withdrawUpload`, 3s timeout, best effort).
+The worker (`withdrawUpload` in `worker/src/handoff.ts`, through
+`failHandoff`'s new `onlyFrom` compare-and-set) fails a `pending_upload`
+handoff as `upload_failed` and cancels its `pending` job in the same batch:
+key nulled, `live_username` cleared on both, slot freed, and with no
+`manifest_key` `/import/:id` leaves it out (#167). It answers `{ ok: true,
+withdrawn }`; `finalizing` and later answer `false`, since they may be
+activating. Unlike `/abandon` it needs the handoff user's worker session
+(someone else's handoff is a 404): past `issued` there is a job to lose, and
+the handoff id is readable from the signed state in the Last.fm authorise URL,
+while the session only reaches the browser the callback returned to.
+`/abandon` stays public and `issued`-only. The status page's **Cancel** of a
+`pending` job likewise fails its `pending_upload` handoff (`cancelled`), so
+the user stops reading as live at once and a finalize still on its way is
+refused rather than "activating" a cancelled job. Before this, the job sat
+`pending` until reaped (up to an hour): `/scrobble` found it, sent the page
+to Home (dropping "The upload didn't finish…") and Home called it running
+("This will finish around…", "safe to close"), with Pause and "Scrobble the
+rest locally" doing nothing. `/scrobble` now stays put on that path
+(`uploadFailed`), even if the withdrawal went unanswered: its own failed
+upload's `pending` job doesn't count as shown there, though `/job/live` still
+holds sending back until the reaper ends it.
+
 **`/import/:id` counts a handoff only while it can still become a job**
 (#162). Jobless handoffs that ended (`failed`, `reaped`: Back or a denial on
 Last.fm, a failed exchange, the reaper) are left out, since chunks are only
@@ -1317,8 +1379,8 @@ accepted once the callback has made a job. A jobless one still in flight
 (`issued`, `exchanging`) answers `known: true` with `pending: true` (not when a
 job row carries the id too). `importStatus` exposes it, and every check but one
 treats it like any other `known: true` (a handover may be on its way from
-another tab or device): Home's welcome-back card (`detectReturning`, which only
-reads `live` and `state`), the page-load authority check and the progress-file
+another tab or device): Home (`detectReturning` neither shows such a record as
+a job nor drops it), the page-load authority check and the progress-file
 check (both through `queueWasHandedOver`). The exception is the queue whose own
 pending handoff this browser abandoned *without the worker confirming the
 withdrawal* (no answer, or a worker without the route): releasing that freeze
@@ -1331,28 +1393,244 @@ The mock worker records handoffs at preflight (`pending`), fails them on a
 shim `fail` return (`authoriseFail` option, and the anonymous `already_live`
 refusal) or a withdrawal, refuses a shim approval of a failed one, counts a
 named in-flight handoff as live in `/job/live` as the real worker does, and
-gives them a job at finalize. An unanswered withdrawal still leaves the old
+makes the job at the shim's approval (`pending`, like the callback) and turns
+it `active` at finalize. It implements `/fail` (without checking sessions,
+which it doesn't model), refuses chunks and finalize for a failed handoff,
+and leaves a job cancelled before finalize out of `/import/:id`. An unanswered withdrawal still leaves the old
 behaviour: the user live in `/job/live` until reaped, and a late approval's
-job marking the queue `known` for good.
+job marking the queue `known` for good, unless that job is never finalised
+(next paragraph).
 
-### The job card refreshes itself
+**Nor does it count a job cancelled before it was finalised** (#167). The
+callback makes the job (`pending`), and `finalize` sets `manifest_key` as it
+goes `active`. A handoff reaped in between (an approval after the withdrawal
+went unanswered, a tab closed mid-upload, an upload that failed for good and
+whose `/fail` went unanswered) has
+its job cancelled by `failHandoff`, with the import id kept. The scheduler
+only runs `active` jobs, so it never sent anything, but the lookup answered
+`known: true, state: 'cancelled'` for good and the browser holding the queue
+blocked it as handed over, with no job to take back. Rows with `state =
+'cancelled' AND manifest_key IS NULL` are now left out of the lookup (and of
+the jobless handoff's "a job carries the id" check); a job cancelled after it
+went active still counts, since it may have sent.
 
-The scheduler only runs every five minutes (`TICK_INTERVAL_SECONDS`, which must
-match the cron in `worker/wrangler.toml`), so a count that sits still looks like
-a stall. `/scrobblify/job` therefore carries `nextRunAt` for active jobs: the
-next cron boundary at or after `next_eligible_at`, or now while a tick holds the
-lease. The card shows it ("Next batch around 4:25 PM (in 3 minutes)", then
-"Sending a batch now") with "Last checked", and re-fetches the job
-`JOB_POLL_AFTER_RUN_SECONDS` (45s) after each `nextRunAt`, clamped to 15s–10min.
-It only polls while the job is `active` and the tab is visible, and checks at
-once when the tab is shown again, so expect one `/scrobblify/job` request per open
-tab per tick. A failed check keeps the last card rather than clearing it: a
-null `backgroundJob` would bring back the Resume prompt for a queue the server
-still holds. A poll that resolves after a pause, resume or take-back is
-discarded.
+### Home is the status page
+
+Since 2026-11-22 a server job's page is Home (`src/views/Home.vue`, with
+`src/components/BackgroundStatus.vue` drawing it and the pure
+`src/services/JobStatus.ts` deciding what it says). `/scrobble` no longer has
+a job banner, a job card or job polling; it sends the user to Home instead.
+
+**What Home shows** is decided by `detectReturning`
+(`src/services/ReturningVisitor.ts`), most specific first. It starts the
+IndexedDB read, the job lookup and the handed-over record's
+`/scrobblify/import/:id` lookup together, on Home's 3s budget
+(`RETURNING_STATUS_TIMEOUT_MS`), so a stalled worker costs one timeout:
+
+1. A worker session whose `/scrobblify/job` names a *shown* job (it exists,
+   isn't `cancelled` and isn't dismissed, `isJobShown`) → the status page,
+   `source: job`.
+2. A worker session whose job lookup went unanswered (timeout, network, a
+   non-401 error; `fetchJobAnswer` tells this apart from "no job") →
+   `checking`: "Checking for active scrobbling..." with **Try again**. Home
+   asks again once by itself, and Try again does too, with `/scrobble`'s 8s
+   budget (`fetchJob`'s default), so the two agree on a slow worker. The start
+   page would be wrong there: its Start opens `/scrobble`, which may find the
+   job and send the user straight back.
+3. No job from a session, and a handed-over record for this user whose import
+   the lookup knows, not ended and not a `pending` handoff → the status page,
+   `source: import` (numbers and state from the public route; no controls but
+   Sign in). A record the worker doesn't know, or whose job ended, is cleared.
+4. No session and no record, a remembered username, and `/job/live` says it
+   has a live job → the status page, `source: other` (no numbers). `/job/live`
+   is only asked without a worker session (or once the job lookup's 401 has
+   cleared it), in parallel with the others, so an unanswered job lookup is
+   never read as "another device".
+5. Otherwise the welcome-back card or the first-visit page, as before.
+
+**States** (`viewFromJob`, `viewFromImport`, `viewOtherDevice`; copy is the
+strings file's `status.*`). The card is titled "Scrobbling to {username}"
+("Scrobbling to Last.fm" when no one is known, or the handed-over record names
+another account) over a labelled bar, `{done} / {total} · {pct}%`, over the
+whole import when the record applies (see `handedOverImport` above). Pause and
+Resume sit beside the bar; any other main action is a block button under the
+line. "Scrobble the rest locally" and **Cancel** are text buttons under it in
+every state that has them (marked "+ manage"):
+
+| Job | Line | Main action |
+| --- | --- | --- |
+| `pending` | "Uploading your tracks…" (approved, the browser's upload not finished; nothing sends yet) | Cancel only |
+| `active` | "This will finish around {date}" (`estimatedCompletionSec`), then "Scrobbling remotely, it's safe to close this tab." | Pause, + manage |
+| `active`, reason `DAY_FULL_REASON` | "Can't upload any more due to last.fm rules. Will continue at {time}" (`nextRunAt`, else `waitingUntil`; the day is named past local midnight), same second line | Pause, + manage |
+| `paused` | "Paused" | Resume, + manage |
+| `needs_reauth` | "Last.fm signed us out" | Sign in again (disabled when `reconnectAvailable === false`), + manage |
+| `needs_attention` | "Scrobblify stopped after repeated errors." (the worker's reason in a tooltip) | Try again (the resume route, which accepts `needs_attention`), + manage |
+| `dormant`, `dormantFrom` `paused` or null | "You paused your scrobbling. We'll delete your progress from our servers after {date}…" (`inactivityDeadline`) | Reconnect, + manage |
+| `dormant`, `dormantFrom` `needs_reauth` | "Your sign-in to scrobblify expired. If you don't sign in before {date}…" | Reconnect, + manage |
+| `dormant`, `dormantFrom` `needs_attention` | "Scrobblify stopped after repeated errors. Please let me know at niko@savas.ca" | Reconnect, + manage |
+| `dormant`, `reconnectAvailable === false` | "Paused by scrobblify. A lot of people are scrobbling!…" with a coffee link and "scrobble locally" (the take-back) | Reconnect, disabled, + manage |
+| `exporting` | "Downloading progress from scrobblify servers..." | none |
+| `exporting`, this tab's take-back of it failed | "Couldn't move your progress back. It's safe on our server." | Scrobble the rest locally |
+| `completed` | "Done", or "Done · {n} rejected by Last.fm (if this is unexpected please email niko@savas.ca)" | **Check it out!** (`last.fm/user/{username}`, new tab), and Start a new import |
+| `failed` | "Scrobbling stopped." (reason in a tooltip) | Start a new import |
+| `cancelled` | never shown | |
+| a state added later | "Scrobblify is scrobbling for you!" | + manage |
+| no session, `source: import`, sending | "Scrobblify is scrobbling for you, expecting to finish around {date}" (now + remaining ÷ 700 days), then "Sign in to manage it" | Sign in |
+| no session, `source: import`, `paused` | "Paused", then "Sign in to manage it" | Sign in |
+| no session, `source: import`, anything else | "Your import is waiting on Scrobblify. Sign in to see why." (the public route can't say why) | Sign in |
+| no session, `source: other` | "Scrobblify is scrobbling for you!", then "Sign in to manage it" | Sign in |
+
+The actions:
+
+- **Pause**, **Resume** and **Try again** call `jobAction` and re-read the job.
+  **Cancel** asks first ("Stop scrobbling", warning that the remaining tracks
+  are deleted from the server), then cancels, clears the handed-over record
+  and decides again, so Home falls back to its cards. An action that can't
+  reach the worker says "Couldn't reach our server. Try again in a few
+  minutes." under the line.
+- **Reconnect**, **Sign in again** and **Sign in** sign in to the *worker*
+  (`startReauth`, under the remembered username or none) and emit
+  `background_reauth_started` `source: home` (`/scrobble`'s own worker
+  sign-in button emits it with no `source`). The callback re-attaches a
+  parked job's Last.fm access (below), or just gives this browser a session
+  to manage the job with. It returns to `/scrobble`, which sends a shown job
+  back here; a refused sign-in's notice ("Signing in to the background
+  service didn't work. Please try again.") travels with it and shows under the
+  card.
+- **Start a new import** dismisses the finished job for this browser
+  (`dismissJob`: localStorage `scrobblify.background.dismissedJob`, one id,
+  since the worker lists one job per user and a new one has a new id) and
+  opens `/scrobble`, which then stays on Upload.
+- **Scrobble the rest locally** is the take-back, below. It needs the worker
+  session, so only `source: job` offers it.
+
+**It refreshes itself** (`jobPollDueSec`), only for `source: job`, only
+while the tab is visible, and at once when the tab is shown again. A clock
+re-evaluates every 15s (`JOB_CLOCK_TICK_MS`):
+
+- An `active` job is re-fetched `JOB_POLL_AFTER_RUN_SECONDS`
+  (45s) after each `nextRunAt`, clamped to 15s–10min, or every 60s from a
+  worker that sends none. The scheduler only runs every five minutes
+  (`TICK_INTERVAL_SECONDS`, which must match the cron in
+  `worker/wrangler.toml`), so `/scrobblify/job` carries `nextRunAt` for active
+  jobs: the next cron boundary at or after `next_eligible_at`, or now while a
+  tick holds the lease. Expect one `/scrobblify/job` request per open tab per
+  tick.
+- A `dormant` job with `reconnectAvailable === false` every 5 minutes
+  (`DORMANT_FULL_RECHECK_SECONDS`), so Reconnect enables itself when a place
+  opens up. Nothing re-checked it before.
+- An `exporting` job every 30s (`EXPORTING_RECHECK_SECONDS`, #173), so the
+  page moves on when a take-back finishes, or when a failed one's claim lapses
+  and the job goes back where it was. It used to say "Downloading progress"
+  with no actions until reloaded. So is a `pending` one (since 2026-11-22),
+  which goes `active` at finalize or is withdrawn, cancelled or reaped, with
+  no tick to wait for.
+
+A failed check keeps the page as it was and asks again in 60s. A job that is
+gone or no longer shown (cancelled elsewhere), or a session the worker
+refused, sends Home back through the whole decision. A poll that lands after
+an action (`statusSeq`) or while one is busy is discarded. The header's BETA
+tag shows while the status page does (`showingServerJob`).
+
+**`/scrobble` sends you there.** Once its `mounted` has settled (the handoff
+return, the job lookup, the worker lookup's report, a reconnect;
+`statusPageArmed`), a shown job sends the page to Home
+(`leaveForStatusPage`, a `$router.replace`, so Back doesn't bounce), and so
+does a later check that first finds one. Not while a take-back is starting or
+running (`takingBack`, `backgroundBusy`), nor over an open error dialog:
+closing it goes, nor after this load's own handover upload failed
+(`uploadFailed`, see "A browser whose upload failed withdraws the job its
+approval made"). Meanwhile the stepper is hidden and the resume prompt is off
+(`jobShown`). `backgroundJob` stays, since the authority and offer logic read
+it. The page leaves Home the job it found (`statusHandover` in the store:
+the job, when it was fetched, and the refused worker sign-in's notice), and
+Home shows that job instead of asking again if it is under 30s old
+(`HANDOVER_FRESH_MS`): a worker answering in 3–8s used to make Home show the
+start page while `/scrobble` found the job and sent the user back (#173's
+review). The worker lookup's `result: 'job'` and the "Sign in to see it"
+return reach Home this way.
+
+**Scrobble the rest locally** (the take-back) stays in `Scrobblify.vue`,
+since it restores the scrobble state. Home records a `takeBack` sign-in
+intent naming the job and opens `/scrobble`: in-app (`setSignInIntent`) when
+this browser has its own Last.fm session, or through Last.fm (`startSignIn`,
+`sign_in_started` `intent: takeBack`) after an explainer
+(`MoveBackExplainer.vue`, `moveBack.explain.*`: Last.fm will ask to approve
+Scrobblify a second time, since the worker's sign-in can't scrobble from the
+browser). The explainer emits `move_back_explainer_shown` and
+`move_back_explainer_choice` (`choice`: `continue` / `cancel`; closing it any
+other way counts as `cancel`).
+
+On `/scrobble`, `takingBack` is set before the first render
+(`arrivingToTakeBack`): it keeps the page from going back to Home, quiets
+`AuthenticateStep`'s own failure prompts and shows "Downloading progress from
+scrobblify servers...". An in-app intent whose Last.fm session has gone by the
+end of the mount is dropped. Once signed in and the authority check has
+answered, `continueSignInIntent` runs `takeBackFromIntent`: the take-back
+runs if the listed job is still that one and in a state it can export from
+(`active`, `paused`, `needs_attention`, `needs_reauth`, `dormant`, or
+`exporting` with this tab's failed claim), else nothing happens and a shown
+job sends the page back to Home. Success cancels the job, so it is never
+shown again: the page stays, with the tracks restored, "Your remaining tracks
+are back in this browser. Choose "Resume" to carry on here." and Resume
+(`background_job_reclaimed`, `job_id`, `uncertain`).
+
+**The take-back's tab ignores its own ownership release** (#148). Releasing
+the queue-owner record posts on a `BroadcastChannel`, which also reaches the
+posting tab, whose listener then revalidated the queue it had just restored
+against the scrobble step's in-memory count from before the handover, called
+itself out of date and hid the Resume the take-back had just offered (likely
+every take-back from the UI since #85). Ownership broadcasts now carry the
+page's id (`from`), `onServerOwnershipChange` passes `fromThisPage`, and a
+release this page made during its take-back (`_takeBackRelease`) only lifts
+the scrobble step's halt. Sibling tabs still revalidate and are still told
+they are out of date.
+
+**A failed take-back can be tried again from the status page** (#173).
+Either failure, a refused cancel (`background_takeback_cancel_refused`: "Your
+tracks were copied back, but the background import could not be stopped…
+Use "Scrobble the rest locally" again in a moment.") or anything else
+(`background.takeBackProgress`: "Couldn't move your progress back. It's safe
+on our server."), shows
+an error dialog, and closing it goes back to Home. The export may have
+claimed the job, which the worker then holds `exporting` for its claim's 10
+minutes (`EXPORT_CLAIM_SECONDS`), letting only that claim back in. So the
+failure records it (`recordFailedTakeBack`: sessionStorage
+`scrobblify.background.failedTakeBack`, `{ jobId, claim, atMs }`, kept 15
+minutes, the claim plus a sweep), Home shows that job's `exporting` row as
+"Couldn't move your progress back. It's safe on our server." with Scrobble the
+rest locally, and the retry presents the same claim (`failedTakeBackClaim`).
+It is per tab because two tabs retrying with one claim could both read the
+export, which the claim exists to prevent. Success clears it. A take-back
+whose Last.fm sign-in fails shows "Couldn't move your progress back. It's
+safe on our server." and goes back to Home the same way. The mock worker
+refuses an export under another claim (409 `not_claimable`), as the worker
+does.
+
+**Why a job went on hold, and reconnecting.** A job parked in `paused`,
+`needs_reauth` or `needs_attention` for 14 days goes `dormant` (housekeeping's
+`markDormant`: its Last.fm key is deleted and its place freed), and is
+cancelled if still dormant 30 days later. `markDormant` now records the state
+it left in `dormant_from` (migration `007_dormant_from.sql`), and
+`describeJob` returns it as `dormantFrom` (null unless `dormant`). The status
+page words a dormant job by it. Jobs that went dormant before the migration
+have it null: worded as paused, reconnected to `active`. A worker sign-in by
+the job's user (Home's Reconnect / Sign in again / Sign in, or the "Already
+scrobbling on scrobblify?" lookup) re-attaches its credential
+(`reattachCredential`) and now restores it to **`active`**, since signing in
+again should be the only step for a job the user never chose to stop; a job
+dormant from `paused` comes back `paused`. It clears `dormant_from`, and the
+`credential_reattached` audit row's detail gains `to`. The update is a
+compare-and-set on the state and `dormant_from` it read. **Before
+2026-11-22 every reconnect restored `paused`**, so a reconnected job didn't
+send until someone pressed Resume.
 
 `dev:mock:bg` ticks every 20s (`tickSeconds` in `createMockWorker`) in steps
-like the real worker, so the countdown and refresh can be watched.
+like the real worker, so the refresh can be watched. Drive the status page's
+states with `POST /mock/worker/scrobblify/__mock/job` (`state`, and
+`dormantFrom`; entering `dormant` from a parked state sets it, as
+`markDormant` does). The mock's sign-in re-attaches to `active`, or `paused`
+when dormant from `paused`.
 
 ## Linting
 

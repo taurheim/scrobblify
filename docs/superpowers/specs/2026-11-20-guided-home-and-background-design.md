@@ -202,6 +202,8 @@ prompt, and otherwise the "Nothing to resume" banner. It emits
 `worker_lookup_started` and `worker_lookup_result` (`job`, `saved`, `nothing`
 or `failed`). When the worker's sign-in can't start, or no worker is
 configured, it falls back to Plan 2's browser sign-in (`reconnect`).
+**Plan 4:** a job now lands on Home's status page (section 6, As built), so
+step 2 is done too.
 
 ### 4.5 The server-authority check after the new sign-in
 
@@ -291,8 +293,8 @@ Existing `background_offer_shown` / `background_offer_declined` /
   and some plays older than 2 weeks), not merely because the box is ticked.
 - `background_offer_shown` / `background_offer_declined` carry `entry_point:
   confirm` from the dialog, and `tracks_selected` carries `path` (`tab` or
-  `server`). The confirm dialog's decline always reports `all_re_tagged:
-  false` (#163, open).
+  `server`). The confirm dialog's decline reported `all_re_tagged: false`
+  for every selection until #163 was fixed (2026-11-22).
 - Mid-run, "Scrobble the rest for me →" replaces the old alert, and the
   stopped panel's saved hint links to the same offer. Every entry point is
   offered only when the remaining plays are within the worker's limit
@@ -379,6 +381,65 @@ rules: page-load only, never over a local ownership record,
 The `backgroundNotice` messages keep their triggers and their single-alert
 behaviour (`banner` precedence), with the shortened `notice.*` copy.
 
+### As built (Plan 4)
+
+- **The status page is Home, not `/scrobble`.** `BackgroundStatus.vue`
+  renders on Home whenever this user has a server job Home can learn of
+  (`detectReturning` returns `kind: 'job'`), in place of the returning card,
+  whose server-job branch is gone. `/scrobble` sends a shown job (not
+  cancelled, not dismissed) to Home with a `$router.replace` once its mount
+  has settled, and whenever a later check first finds one, except while a
+  take-back is starting or running or an error dialog is open. Its job
+  banner, job card and job polling are removed, and the stepper and resume
+  prompt are hidden while it is on its way. 6.5 and 6.6 (the outage banner
+  and notices) stay on `/scrobble`: only a refused worker sign-in's notice is
+  carried to Home (`statusHandover`, with the job `/scrobble` found, which
+  Home uses if under 30 s old rather than asking again on its own 3 s
+  budget).
+- **Sources** (6.3), in order: the job with a worker session (`source: job`);
+  a session whose job lookup went unanswered gets `status.checking` with a
+  Try again (asked again once by itself, on `/scrobble`'s 8 s budget), not the
+  start page; without a job, the public lookup of the import this browser
+  handed over (`source: import`); with neither a session nor a record,
+  `/job/live` for the remembered username (`source: other`), asked only
+  then, in parallel. Without a session only `source: import` has numbers,
+  and only a sending job gets the finish date: paused says Paused, anything
+  else `status.noSession.stopped`. Every no-session row's only action is
+  **Sign in** (the worker's sign-in).
+- **Title and lines** (6.1, 6.2): the card keeps "Scrobbling to {username}"
+  ("Scrobbling to Last.fm" when no one is known or the handover was approved
+  as another account), and active and day-full jobs keep "Scrobbling remotely,
+  it's safe to close this tab." under the line. The rejected count is part of
+  the completed line. The last.fm / Last.fm in `status.dayFull` and
+  `status.rejected` link to last.fm, `{time}` names the day past local
+  midnight, and a state the client doesn't know shows "Scrobblify is
+  scrobbling for you!" with the manage buttons. Pause/Resume sit beside the
+  bar; other main actions are block buttons; **Scrobble the rest locally** and
+  **Cancel** are text buttons. `DAY_FULL_REASON` moved to
+  `src/shared/lastfm/dailyCap.ts` so the page can match it.
+- **Exporting** (6.2): an `exporting` job whose take-back failed in this tab
+  shows `notice.moveBackFailed` with **Scrobble the rest locally**, and the
+  retry presents the export claim the worker still holds the job under
+  (recorded in sessionStorage for 15 minutes) (#173).
+- **Refreshing** (6.4): as specified, plus an `exporting` job every 30 s, so
+  the page moves on when a take-back ends or its claim lapses (#173). The old
+  card's "Next batch around…" and "Last checked" lines are gone.
+- **Move back** (6.3): Home records a `takeBack` sign-in intent (job id) and
+  opens `/scrobble`, in-app or through Last.fm after the explainer; the
+  take-back itself stays in `Scrobblify.vue`, which shows "Downloading
+  progress from scrobblify servers..." meanwhile and runs it once signed in
+  and the authority check has answered, if the job is still listed and
+  exportable. A refused cancel or failed sign-in shows an error dialog and
+  closing it goes back to Home. The take-back's own tab no longer marks
+  itself out of date (#148, so the out-of-scope note below no longer holds).
+- **Cancel** (6.1) clears the handover record and Home falls back to its
+  normal cards. **Start a new import** dismisses the job for this browser
+  (localStorage, one job id) and opens `/scrobble`, which then stays on
+  Upload.
+- Reconnect, Sign in again and Sign in emit `background_reauth_started`
+  `source: home`; `home_returning_shown` `server_job` carries `source` and
+  `job_state`, and gains the `checking` state.
+
 ## 7. Server changes (`worker/`)
 
 ### 7.1 Larger jobs
@@ -409,6 +470,13 @@ restores it to `active` instead, so signing in again is the only step. A job the
 user had explicitly paused before going dormant is the exception: it returns to
 `paused` (its `dormant_from`, below, is `paused`).
 
+**As built (Plan 4):** as specified. A job with no `dormant_from` (dormant
+before the migration) returns to `active`. The update is a compare-and-set on
+the state and `dormant_from` it read, it clears `dormant_from`, and the
+`credential_reattached` audit row records `to`. The resume route already
+accepted `needs_attention` (the status page's **Try again**); a test now
+covers it.
+
 ### 7.3 Recording why a job went on hold
 
 `markDormant` (`worker/src/housekeeping.ts`) overwrites both `state` and
@@ -417,6 +485,12 @@ user had explicitly paused before going dormant is the exception: it returns to
 `needs_reauth`, `needs_attention`) in the same update, and returned by the job
 status API as `dormantFrom`. Rows made dormant before the migration have it
 null and use the default copy.
+
+**As built (Plan 4):** migration `007_dormant_from.sql`; `describeJob` returns
+`dormantFrom` only while the job is `dormant` (null otherwise). Shipped with
+it, #167: the import lookup (`/scrobblify/import/:id`) no longer counts a job
+cancelled before it was finalised (`state = 'cancelled' AND manifest_key IS
+NULL`), which had blocked its browser's queue as handed over for good.
 
 ## 8. Telemetry and docs
 
@@ -475,4 +549,5 @@ Background surfaces show only to beta browsers, as today.
 
 - Restyling the upload, choose, send and done steps (later design).
 - A waiting list for on-hold jobs when the server is full.
-- #148 (take-back blocks its own tab), fixed separately.
+- #148 (take-back blocks its own tab), fixed separately. (As built: fixed in
+  Plan 4 after all.)

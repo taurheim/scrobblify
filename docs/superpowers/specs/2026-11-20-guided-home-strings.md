@@ -272,3 +272,54 @@ automatically — just come back to this page later and choose "Resume"."
 rather than `scrobble.savedHint`. No longer shown: `notice.reauthNeedsLastfm`
 (the server sign-in works without a Last.fm user now), and the old offer
 dialog's consent copy and "Not now".
+
+## Added in Plan 4 (drafts)
+
+New strings shipped with the status page. Placeholder copy; rewrite in place.
+
+| ID | When | Draft |
+| --- | --- | --- |
+| `status.noSession.stopped` | No server sign-in, this browser handed the import over, and the job isn't sending (needs a sign-in, stopped by errors, on hold, being handed back) | Your import is waiting on Scrobblify. Sign in to see why. |
+| `status.checking.retry` | Under `status.checking`, once Home's job lookup went unanswered with a worker session (it asks again by itself first) | Try again |
+| `status.checking.label` | Same, screen-reader label of the spinner while it asks again | Checking |
+| `status.title.unknown` | Status page title when no username is known, or the handover was approved as another account than the one remembered (otherwise `returning.title`) | Scrobbling to Last.fm |
+| `status.dayFull.tomorrow` | `status.dayFull` when the worker gave no next-run time | Can't upload any more due to [last.fm](https://www.last.fm) rules. Will continue tomorrow |
+| `status.dormant.noDate` | `status.dormant` when the job has no deletion date | You paused your scrobbling. We'll delete your progress from our servers later (any tracks you've scrobbled will stay on last.fm) |
+| `status.dormant.signedOut.noDate` | `status.dormant.signedOut` when the job has no deletion date | Your sign-in to scrobblify expired. If you don't sign in soon we'll delete your progress from our servers (any tracks already scrobbled will stay on last.fm). |
+| `status.unknown` | A job state this build doesn't know (one the worker adds later); keeps "Scrobble the rest locally" and Cancel | Scrobblify is scrobbling for you! |
+| `status.reason.label` | Screen-reader label of the tooltip icon holding the server's reason (`needs_attention`, `failed`) | Why? |
+| `status.actionUnreachable` | Under the status line, when Pause, Resume, Try again, Cancel or a sign-in couldn't reach the server | Couldn't reach our server. Try again in a few minutes. |
+| `status.signInFailed` | Under the status line, back from a refused server sign-in (Reconnect, Sign in again, Sign in) | Signing in to the background service didn't work. Please try again. |
+| `takeBack.downloading` | `/scrobble`, while "Scrobble the rest locally" takes the progress back (spinner line above the steps) | Downloading progress from scrobblify servers... |
+| `takeBack.downloading.label` | Same, screen-reader label of the spinner | Downloading progress |
+| `takeBack.stuck` | Take-back copied the tracks back but the server job couldn't be stopped (error dialog, then back to the status page) | Your tracks were copied back, but the background import could not be stopped, so this browser will not resume them yet. Use "Scrobble the rest locally" again in a moment. |
+| `takeBack.signInFailed` | "Scrobble the rest locally" through Last.fm, and the sign-in failed (error dialog, then back to the status page) | Couldn't move your progress back. It's safe on our server. |
+| `status.pending` | `pending`: approved on Last.fm, the browser's upload not finished (nothing sends yet; Cancel is the only button, and it rechecks every 30 seconds) | Uploading your tracks… |
+
+Reused: `status.checking` is now shown (with `status.checking.retry`) when
+Home can't get an answer about the job, rather than the start page.
+`notice.moveBackFailed` is the line of an `exporting` job whose take-back
+failed in this tab, with "Scrobble the rest locally" to try again, and
+`takeBack.signInFailed` is its text too. `takeBack.downloading` is
+`status.exporting`'s text. `status.noSession` (with `status.noSession.hint` under it) is now
+only shown while the job is sending; a paused job gets `status.paused` with
+the same hint. `status.dayFull`'s `{time}` names the day when the next run
+is past local midnight ("12:20 AM tomorrow", "12:20 AM on Friday"). The
+"last.fm" in `status.dayFull` and the "Last.fm" in `status.rejected` link to
+https://www.last.fm.
+
+Changed from the tables above: the title is `returning.title` ("Scrobbling
+to {username}"), and `active` and day-full jobs show
+`returning.server` ("Scrobbling remotely, it's safe to close this tab.")
+under the line instead of `status.safeToClose`; a `pending` job shows
+`status.pending` with nothing under it. `status.rejected` is part of
+the completed line ("Done · {n} rejected by Last.fm…"). `status.noSession.otherDevice`
+gets `status.noSession.hint` under it. `takeBack.stuck` replaces
+`notice.movedBackStuck` (today's wording, with the new button name), and
+`status.actionUnreachable` and `status.signInFailed` are today's
+`notice.reauthUnreachable` and server sign-in failure texts, now shown on
+the status page. Not shown any more: the `/scrobble` job banner's copy (its
+headlines, "{done} of {total} scrobbled", "Should finish in about {n} days",
+"Next batch around…", "Last checked", the on-hold explanation, and the
+Pause, "Resume on the server", "Reconnect Last.fm", "Take my progress back"
+and Refresh buttons).

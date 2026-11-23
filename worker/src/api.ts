@@ -20,6 +20,7 @@ import {
   handleCallback,
   finalize,
   abandonHandoff,
+  withdrawUpload,
   reapExpiredHandoffs,
   HandoffRow,
   MAX_TRACKS_PER_JOB,
@@ -194,9 +195,10 @@ function authoriseUrl(env: ApiEnv, state: string): string {
  * cannot: this is a bonus on a flow whose actual job is to prove identity, and
  * failing the sign-in would strand the user worse than the parked job does.
  *
- * Restored to `paused` rather than `active` so continuing stays the user's
- * explicit choice, and because `paused` is what the status card offers a
- * Resume button for.
+ * Restored to `active`: signing in again is the only step the user should
+ * have to take, since they never chose to stop the job. The exception is a
+ * job that went dormant while the user had it paused (`dormant_from =
+ * 'paused'`), which comes back `paused` so carrying on stays their choice.
  */
 async function reattachCredential(
   env: ApiEnv,
@@ -211,6 +213,7 @@ async function reattachCredential(
       [username],
     );
     if (!job) { return; }
+    const to = job.state === 'dormant' && job.dormant_from === 'paused' ? 'paused' : 'active';
     /*
       `live_username` carries a unique index, so a job started since this one
       was parked already owns the slot. Taking it would fail the write; racing
@@ -252,26 +255,32 @@ async function reattachCredential(
     const updated = await env.sql.run(
       `UPDATE jobs
           SET session_key_ct = ?, session_key_iv = ?, live_username = ?,
-              state = 'paused', state_reason = NULL, consecutive_failures = 0,
-              credential_expires_at = ?,
+              state = ?, state_reason = NULL, consecutive_failures = 0,
+              dormant_from = NULL, credential_expires_at = ?,
               next_eligible_at = ?, locked_until = 0, updated_at = ?
-        WHERE id = ? AND locked_until <= ?
+        WHERE id = ? AND locked_until <= ? AND state = ? AND dormant_from IS ?
           AND (state = 'needs_reauth' OR (state = 'dormant' AND ${SLOT_AVAILABLE_SQL}))`,
       [
         credential.ciphertext,
         credential.iv,
         username,
+        to,
         nowSec + CREDENTIAL_TTL_SECONDS,
         nowSec,
         nowSec,
         job.id,
         nowSec,
+        job.state,
+        job.dormant_from ?? null,
       ],
     );
     if (updated.changes > 0) {
       await env.sql.run(
         'INSERT INTO audit (id, job_id, generation, event, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        [randomId(), job.id, job.generation, 'credential_reattached', JSON.stringify({ from: job.state }), nowSec],
+        [
+          randomId(), job.id, job.generation, 'credential_reattached',
+          JSON.stringify({ from: job.state, to }), nowSec,
+        ],
       );
     }
   } catch {
@@ -349,6 +358,11 @@ function describeJob(job: JobRow, nowSec: number) {
       rows parked before migration 005, whose deadline is only a fallback.
     */
     inactivityDeadline: PARKED_STATES.includes(job.state) ? job.inactivity_deadline : null,
+    /*
+      Why a dormant job was on hold, so the status page can say so. Null for
+      jobs that went dormant before migration 007.
+    */
+    dormantFrom: job.state === 'dormant' ? (job.dormant_from ?? null) : null,
   };
 }
 
@@ -679,6 +693,13 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       the same id and better numbers, and counting both would let the older,
       emptier handoff row win the ordering.
 
+      So are jobs cancelled before they were finalised (`manifest_key` is only
+      set by `finalize`, together with `active`): the callback made the job but
+      the upload never finished, and the reaper cancelled it. The scheduler
+      only runs `active` jobs, so it never sent anything, and counting it
+      blocked the browser's queue for good with no job to take back (#167).
+      A job cancelled after it went active is still counted: it may have sent.
+
       So are jobless handoffs that have ended (`failed`, `reaped`): one that
       never got past Last.fm can never become a job, and chunks are only
       accepted once the callback has created one, so the worker never had the
@@ -706,11 +727,15 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
               total_tracks AS total_tracks, created_at AS created_at,
               0 AS pending
          FROM jobs WHERE import_id = ?
+          AND NOT (state = 'cancelled' AND manifest_key IS NULL)
        UNION ALL
        SELECT state,
               CASE WHEN live_username IS NULL THEN 0 ELSE 1 END,
               0, 0, track_count, created_at,
-              CASE WHEN EXISTS (SELECT 1 FROM jobs WHERE import_id = ?) THEN 0 ELSE 1 END
+              CASE WHEN EXISTS (
+                SELECT 1 FROM jobs WHERE import_id = ?
+                   AND NOT (state = 'cancelled' AND manifest_key IS NULL)
+              ) THEN 0 ELSE 1 END
          FROM handoffs
         WHERE import_id = ? AND job_id IS NULL AND state NOT IN (${ended})
        ORDER BY is_live DESC, created_at DESC
@@ -748,7 +773,8 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
     most anyone holding its id can do is cancel an approval still pending. The
     id is 128 random bits (`randomId`) and reaches only the browser that
     preflighted it (and the authorise URL it was sent to), so it isn't
-    guessable.
+    guessable. An approved handoff whose upload failed is withdrawn through
+    `/fail` below instead, which needs the session.
 
     Answers the same for an unknown id as for one past `issued`
     (`abandoned: false`, 200), so it says nothing about which ids exist. A
@@ -764,6 +790,37 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
   const username = await authenticate(request, env.signingKey, nowSec);
   if (!username) {
     return json(env, { ok: false, reason: 'unauthenticated' }, 401);
+  }
+
+  /*
+    ---- withdrawing an approved handoff whose upload failed ----
+
+    The callback made a `pending` job holding the user's key; the browser then
+    couldn't upload or finalize, and resumes locally. Without this the job sat
+    `pending` until reaped, an hour, telling `/job/live` and the status page
+    the user's import was running when nothing ever would send it.
+
+    A separate route from `/abandon` rather than widening it, and behind the
+    handoff user's session, because past `issued` there is something to lose:
+    the handoff id is readable from the signed state in the Last.fm authorise
+    URL (so Last.fm, browser history and anyone the link was sent to hold it),
+    and cancelling a pending job breaks an upload still in progress. The
+    session only reaches the browser the callback returned to, which is the
+    one uploading. `/abandon` stays public and `issued`-only.
+
+    Only from `pending_upload` (`withdrawUpload`); later states answer
+    `withdrawn: false`. Someone else's handoff is a 404, as for the chunks.
+  */
+  const withdrawMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/fail$/);
+  if (withdrawMatch && request.method === 'POST') {
+    const handoff = await env.sql.first<HandoffRow>(
+      'SELECT * FROM handoffs WHERE id = ?', [withdrawMatch[1]],
+    );
+    if (!handoff || handoff.username !== username) {
+      return json(env, { ok: false, reason: 'unknown' }, 404);
+    }
+    const withdrawn = await withdrawUpload(env.sql, handoff.id, nowSec);
+    return json(env, { ok: true, withdrawn });
   }
 
   // ---- step 4: upload chunks ----
@@ -1011,6 +1068,20 @@ export async function handleRequest(env: ApiEnv, request: Request): Promise<Resp
       }
 
       await deleteJobBlobs(env.sql, env.blobs, job.id);
+      /*
+        A job cancelled before its upload finished (`pending`, from the status
+        page) ends its handoff too. Otherwise the handoff kept the user's name
+        live and a slot until reaped, and a finalize still under way would
+        report success for a job that never sends.
+      */
+      if (job.state === 'pending') {
+        await env.sql.run(
+          `UPDATE handoffs
+              SET state = 'failed', live_username = NULL, failure_reason = 'cancelled', updated_at = ?
+            WHERE job_id = ? AND state = 'pending_upload'`,
+          [nowSec, job.id],
+        );
+      }
       return json(env, { ok: true });
     }
 

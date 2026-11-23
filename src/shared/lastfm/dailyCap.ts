@@ -25,6 +25,13 @@ export const LASTFM_DAILY_CAP = 750;
 // so filling the day to 750 would cost them the rest of that day's real plays.
 export const OWN_LISTENING_HEADROOM = 50;
 
+/**
+ * The worker's `state_reason` while a job waits for the next UTC day because
+ * today's share is sent. The status page matches on it to say so.
+ */
+export const DAY_FULL_REASON = `Last.fm keeps at most ${LASTFM_DAILY_CAP} scrobbles a day and today's are used up. `
+  + 'Scrobbling continues after midnight UTC.';
+
 const SECONDS_PER_DAY = 24 * 60 * 60;
 
 /** Unix seconds of the UTC midnight that starts the day containing `sec`. */

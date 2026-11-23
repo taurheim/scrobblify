@@ -12,7 +12,9 @@ import {
   encryptCredential, sha256Hex, randomId, signPayload, signHandoffState,
 } from '../src/crypto';
 import { issueSession, SESSION_TTL_SECONDS } from '../src/session';
-import { ALGORITHM_VERSION, TRACKS_PER_DAY } from '../src/handoff';
+import {
+  ALGORITHM_VERSION, TRACKS_PER_DAY, HANDOFF_TTL_SECONDS, failHandoff, reapExpiredHandoffs,
+} from '../src/handoff';
 import { handleRequest, ApiEnv, MIN_TRACKS_FOR_BACKGROUND, collapseToRanges } from '../src/api';
 import { assignTimestamps } from '../src/timestamps';
 
@@ -567,6 +569,194 @@ async function main() {
     const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [kept.job_id]);
     check('so is its job', job.state === 'pending' && job.session_key_ct !== null, job.state);
     check('which still reads as live', await isLive() === true);
+  }
+
+  console.log('\n-- a job cancelled before its upload finished never had the queue (#167) --');
+  {
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs, {
+      getSession: async () => ({ sessionKey: 'sk', username: 'Listener' }),
+    });
+    const lookup = async (id: string) => (await (await handleRequest(
+      env, req(`/scrobblify/import/${id}`),
+    )).json()) as any;
+
+    for (const ending of ['failHandoff', 'reaper'] as const) {
+      const IMPORT = `never-finalised-${ending}-0123456789`;
+      // eslint-disable-next-line no-await-in-loop
+      const pre: any = await (await handleRequest(env, req('/scrobblify/handoff/preflight', {
+        method: 'POST',
+        body: JSON.stringify({
+          username: 'Listener', payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000,
+          importId: IMPORT,
+        }),
+      }))).json();
+      const state = new URL(new URL(pre.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+      // eslint-disable-next-line no-await-in-loop
+      await handleRequest(env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`));
+      // eslint-disable-next-line no-await-in-loop
+      const pending = await sql.first<any>('SELECT state FROM jobs WHERE import_id = ?', [IMPORT]);
+      check(`the callback made a pending job (${ending})`, pending?.state === 'pending', pending);
+
+      if (ending === 'failHandoff') {
+        // eslint-disable-next-line no-await-in-loop
+        await failHandoff(sql, pre.handoffId, 'reaped', NOW);
+      } else {
+        // eslint-disable-next-line no-await-in-loop
+        await reapExpiredHandoffs(sql, NOW + HANDOFF_TTL_SECONDS + 1);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const ended = await sql.first<any>('SELECT state FROM jobs WHERE import_id = ?', [IMPORT]);
+      check(`and ending the handoff cancelled it (${ending})`, ended?.state === 'cancelled', ended);
+      // eslint-disable-next-line no-await-in-loop
+      const answer = await lookup(IMPORT);
+      check(`the queue is not known as handed over (${ending})`,
+        answer.known === false && answer.live === false, answer);
+    }
+
+    // Trying again: the new attempt is only on its way, not a handover.
+    const RETRY = 'never-finalised-failHandoff-0123456789';
+    await handleRequest(env, req('/scrobblify/handoff/preflight', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: 'Listener', payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000,
+        importId: RETRY,
+      }),
+    }));
+    const retry = await lookup(RETRY);
+    check('a new attempt for that queue is pending',
+      retry.known === true && retry.pending === true, retry);
+
+    // A job that went active had the queue, and may have sent from it.
+    const SENT = 'finalised-then-cancelled-0123456789';
+    const id = await seedJob(sql, blobs, 'third', { importId: SENT, cursor: 300, scrobbled: 300 });
+    await sql.run(
+      "UPDATE jobs SET manifest_key = 'manifest', state = 'cancelled', live_username = NULL WHERE id = ?",
+      [id],
+    );
+    const sent = await lookup(SENT);
+    check('a job cancelled after it went active is still known',
+      sent.known === true && sent.state === 'cancelled' && sent.cursor === 300, sent);
+  }
+
+  console.log('\n-- a browser whose upload failed withdraws its pending job --');
+  {
+    const sql = freshSql();
+    const env = makeEnv(sql, new MemoryBlobs(), {
+      getSession: async () => ({ sessionKey: 'sk', username: 'Listener' }),
+    });
+    let n = 0;
+    // Preflights and approves a handoff, returning its id, job and session.
+    const approve = async () => {
+      n += 1;
+      const importId = `upload-failed-${n}-0123456789`;
+      const pre: any = await (await handleRequest(env, req('/scrobblify/handoff/preflight', {
+        method: 'POST',
+        body: JSON.stringify({
+          username: 'Listener', payloadDigest: 'abc', trackCount: 40000, chunkCount: 40, declaredBytes: 1000,
+          importId,
+        }),
+      }))).json();
+      const state = new URL(new URL(pre.authoriseUrl).searchParams.get('cb')!).searchParams.get('state')!;
+      const back = new URL((await handleRequest(
+        env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok-${n}`),
+      )).headers.get('Location')!);
+      return {
+        handoffId: pre.handoffId as string,
+        jobId: back.searchParams.get('job')!,
+        session: new URLSearchParams(back.hash.slice(1)).get('session')!,
+        importId,
+      };
+    };
+    const withdraw = (id: string, token?: string) => handleRequest(env, req(
+      `/scrobblify/handoff/${id}/fail`, { method: 'POST', token },
+    ));
+    const isLive = async () => ((await (await handleRequest(
+      env, req('/scrobblify/job/live?username=listener'),
+    )).json()) as any).live;
+    const job = (id: string) => sql.first<any>('SELECT * FROM jobs WHERE id = ?', [id]);
+    const handoff = (id: string) => sql.first<any>('SELECT * FROM handoffs WHERE id = ?', [id]);
+
+    const a = await approve();
+    check('before: the callback made a pending job', (await job(a.jobId)).state === 'pending');
+    check('before: the user reads as live', await isLive() === true);
+
+    check('withdrawing needs a session', (await withdraw(a.handoffId)).status === 401);
+    const stranger = await withdraw(a.handoffId, await issueSession('attacker', SIGNING, NOW));
+    check('and is a 404 for someone else\'s handoff', stranger.status === 404, stranger.status);
+    check('which leaves the job pending', (await job(a.jobId)).state === 'pending');
+
+    const res = await withdraw(a.handoffId, a.session);
+    const body: any = await res.json();
+    check('the owner withdraws it', res.status === 200 && body.ok === true && body.withdrawn === true, body);
+    const failed = await handoff(a.handoffId);
+    check('the handoff is failed as upload_failed',
+      failed.state === 'failed' && failed.failure_reason === 'upload_failed' && failed.live_username === null,
+      failed);
+    const cancelled = await job(a.jobId);
+    check('its job is cancelled', cancelled.state === 'cancelled' && cancelled.live_username === null,
+      cancelled.state);
+    check('with no credential left', cancelled.session_key_ct === null && cancelled.session_key_iv === null);
+    check('the user no longer reads as live', await isLive() === false);
+    const lookup: any = await (await handleRequest(env, req(`/scrobblify/import/${a.importId}`))).json();
+    check('the queue is not known as handed over (#167)', lookup.known === false, lookup);
+    check('the slot is free again',
+      ((await (await handleRequest(env, req('/scrobblify/capacity'))).json()) as any).used === 0);
+
+    const again: any = await (await withdraw(a.handoffId, a.session)).json();
+    check('withdrawing it again says no', again.ok === true && again.withdrawn === false, again);
+    const late = await handleRequest(env, req(`/scrobblify/handoff/${a.handoffId}/finalize`, {
+      method: 'POST', token: a.session,
+    }));
+    check('a late finalize is refused', late.status === 409, late.status);
+    check('and the job stays cancelled', (await job(a.jobId)).state === 'cancelled');
+
+    // Past the upload, the job is (about to be) sending: not the browser's to withdraw.
+    for (const state of ['finalizing', 'active'] as const) {
+      // eslint-disable-next-line no-await-in-loop
+      const b = await approve();
+      // eslint-disable-next-line no-await-in-loop
+      await sql.run('UPDATE handoffs SET state = ? WHERE id = ?', [state, b.handoffId]);
+      if (state === 'active') {
+        // eslint-disable-next-line no-await-in-loop
+        await sql.run("UPDATE jobs SET state = 'active', manifest_key = 'm' WHERE id = ?", [b.jobId]);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const refused: any = await (await withdraw(b.handoffId, b.session)).json();
+      check(`a ${state} handoff is not withdrawn`, refused.ok === true && refused.withdrawn === false, refused);
+      // eslint-disable-next-line no-await-in-loop
+      const kept = await job(b.jobId);
+      check(`and its job keeps its state and credential (${state})`,
+        kept.state === (state === 'active' ? 'active' : 'pending') && kept.session_key_ct !== null, kept.state);
+      // eslint-disable-next-line no-await-in-loop
+      check(`and the handoff is left ${state}`, (await handoff(b.handoffId)).state === state);
+      // eslint-disable-next-line no-await-in-loop
+      await sql.run("UPDATE jobs SET state = 'cancelled', live_username = NULL WHERE id = ?", [b.jobId]);
+      // eslint-disable-next-line no-await-in-loop
+      await sql.run("UPDATE handoffs SET state = 'failed', live_username = NULL WHERE id = ?", [b.handoffId]);
+    }
+
+    // The no-session withdrawal still stops at `issued`.
+    const c = await approve();
+    const publicTry: any = await (await handleRequest(env, req(
+      `/scrobblify/handoff/${c.handoffId}/abandon`, { method: 'POST' },
+    ))).json();
+    check('abandon (no session) still refuses a pending upload', publicTry.abandoned === false, publicTry);
+    check('which keeps its job', (await job(c.jobId)).state === 'pending');
+
+    // Cancel, the status page's one button for a pending job, ends the handoff too.
+    const cancel = await handleRequest(env, req(`/scrobblify/job/${c.jobId}/cancel`, {
+      method: 'POST', token: c.session,
+    }));
+    check('a pending job can be cancelled', cancel.status === 200, cancel.status);
+    const ended = await handoff(c.handoffId);
+    check('which fails its handoff', ended.state === 'failed' && ended.live_username === null, ended);
+    check('so the user no longer reads as live', await isLive() === false);
+    const finalizeLate = await handleRequest(env, req(`/scrobblify/handoff/${c.handoffId}/finalize`, {
+      method: 'POST', token: c.session,
+    }));
+    check('and a finalize still on its way is refused', finalizeLate.status === 409, finalizeLate.status);
   }
 
   console.log('\n-- the import id survives preflight --');
@@ -1377,14 +1567,18 @@ async function main() {
     );
     check('the sign-in still succeeds', res.status === 302, res.status);
     const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [jobId]);
-    check('the job can send again', job.state === 'paused', job.state);
+    // Signing in again is the only step: the user never chose to stop it.
+    check('the job carries on sending', job.state === 'active', job.state);
+    check('straight away', job.next_eligible_at === NOW, job.next_eligible_at);
     check('it has a credential', !!job.session_key_ct, job.session_key_ct);
     check('and it holds the account slot', job.live_username === 'listener', job.live_username);
-    const logged = await sql.first<{ n: number }>(
-      "SELECT COUNT(*) AS n FROM audit WHERE job_id = ? AND event = 'credential_reattached'",
+    const logged = await sql.first<{ detail: string }>(
+      "SELECT detail FROM audit WHERE job_id = ? AND event = 'credential_reattached'",
       [jobId],
     );
-    check('and it is recorded', logged!.n === 1, logged!.n);
+    const detail = JSON.parse(logged?.detail ?? '{}');
+    check('and it is recorded, with where it went',
+      detail.from === 'needs_reauth' && detail.to === 'active', logged);
   }
 
   console.log('\n-- but never over a job that already holds the slot --');
@@ -1453,7 +1647,7 @@ async function main() {
     check('the expired deadline is not inherited',
       job.credential_expires_at > NOW, job.credential_expires_at);
     check('and the next tick would not re-park it',
-      job.state === 'paused' && job.credential_expires_at > NOW, job);
+      job.state === 'active' && job.credential_expires_at > NOW, job);
   }
 
   const signInAs = async (env: ApiEnv, username: string) => {
@@ -1467,10 +1661,13 @@ async function main() {
       env, req(`/scrobblify/auth/callback?state=${encodeURIComponent(state)}&token=tok`),
     );
   };
-  const seedDormant = async (sql: Sql, blobs: BlobStore, username: string) => {
+  const seedDormant = async (
+    sql: Sql, blobs: BlobStore, username: string, from: string | null = null,
+  ) => {
     const id = await seedJob(sql, blobs, username, { state: 'dormant', live: false });
     await sql.run(
-      'UPDATE jobs SET session_key_ct = NULL, session_key_iv = NULL WHERE id = ?', [id],
+      'UPDATE jobs SET session_key_ct = NULL, session_key_iv = NULL, dormant_from = ? WHERE id = ?',
+      [from, id],
     );
     return id;
   };
@@ -1487,20 +1684,78 @@ async function main() {
     const env = makeEnv(sql, blobs, {
       getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'listener' }),
     });
-    const jobId = await seedDormant(sql, blobs, 'listener');
+    const jobId = await seedDormant(sql, blobs, 'listener', 'needs_attention');
     const res = await signInAs(env, 'listener');
     check('the sign-in succeeds', res.status === 302, res.status);
     const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [jobId]);
-    check('the job is paused, ready to resume', job.state === 'paused', job.state);
+    check('a job on hold for errors carries on sending', job.state === 'active', job.state);
+    check('with a clean slate', job.consecutive_failures === 0 && job.state_reason === null, job);
     check('with a credential', !!job.session_key_ct);
     check('holding the account slot', job.live_username === 'listener', job.live_username);
-    check('its inactivity clock restarted', job.inactivity_deadline > NOW, job.inactivity_deadline);
+    check('and no longer dormant from anything', job.dormant_from === null, job.dormant_from);
     const logged = await sql.first<{ detail: string }>(
       "SELECT detail FROM audit WHERE job_id = ? AND event = 'credential_reattached'",
       [jobId],
     );
+    const detail = JSON.parse(logged?.detail ?? '{}');
     check('recorded as coming back from dormant',
-      JSON.parse(logged?.detail ?? '{}').from === 'dormant', logged);
+      detail.from === 'dormant' && detail.to === 'active', logged);
+
+    for (const [from, expected] of [
+      ['needs_reauth', 'active'], [null, 'active'], ['paused', 'paused'],
+    ] as const) {
+      const sqlN = freshSql();
+      const blobsN = new MemoryBlobs();
+      const envN = makeEnv(sqlN, blobsN, {
+        getSession: async () => ({ sessionKey: 'fresh-session-key', username: 'listener' }),
+      });
+      // eslint-disable-next-line no-await-in-loop
+      const id = await seedDormant(sqlN, blobsN, 'listener', from);
+      // eslint-disable-next-line no-await-in-loop
+      await signInAs(envN, 'listener');
+      // eslint-disable-next-line no-await-in-loop
+      const back = await sqlN.first<any>('SELECT * FROM jobs WHERE id = ?', [id]);
+      check(`dormant from ${from} comes back ${expected}`,
+        back.state === expected && back.dormant_from === null && back.live_username === 'listener', back);
+      if (expected === 'paused') {
+        check('a paused job restarts its inactivity clock',
+          back.inactivity_deadline > NOW, back.inactivity_deadline);
+      }
+    }
+  }
+
+  console.log('\n-- the status says why a dormant job was on hold --');
+  {
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const token = await issueSession('listener', SIGNING, NOW);
+    const id = await seedDormant(sql, blobs, 'listener', 'needs_reauth');
+    const dormant: any = await (await handleRequest(env, req('/scrobblify/job', { token }))).json();
+    check('a dormant job reports what it left', dormant.job?.dormantFrom === 'needs_reauth', dormant.job);
+
+    await sql.run("UPDATE jobs SET state = 'needs_reauth' WHERE id = ?", [id]);
+    const other: any = await (await handleRequest(env, req('/scrobblify/job', { token }))).json();
+    check('any other state reports none', other.job?.dormantFrom === null, other.job);
+  }
+
+  console.log('\n-- "Try again" resumes a job stopped on errors --');
+  {
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const token = await issueSession('listener', SIGNING, NOW);
+    const id = await seedJob(sql, blobs, 'listener', { state: 'needs_attention' });
+    await sql.run(
+      "UPDATE jobs SET consecutive_failures = 10, state_reason = 'Last.fm kept failing', next_eligible_at = ? WHERE id = ?",
+      [NOW + 3600, id],
+    );
+    const res = await handleRequest(env, req(`/scrobblify/job/${id}/resume`, { method: 'POST', token }));
+    check('resume accepts needs_attention', res.status === 200, res.status);
+    const job = await sql.first<any>('SELECT * FROM jobs WHERE id = ?', [id]);
+    check('the job is active again', job.state === 'active', job.state);
+    check('with its failures forgotten', job.consecutive_failures === 0 && job.state_reason === null, job);
+    check('and due now', job.next_eligible_at === NOW, job.next_eligible_at);
   }
 
   console.log('\n-- but not into a slot that is not there --');
@@ -1541,7 +1796,7 @@ async function main() {
     await signInAs(env2, 'listener');
     const kept = await sql2.first<any>('SELECT state FROM jobs WHERE id = ?', [reauth]);
     check('a re-auth job at full capacity is still restored: it held its slot',
-      kept.state === 'paused', kept.state);
+      kept.state === 'active', kept.state);
   }
 
   console.log('\n-- a job waiting on the user is reported even without a live slot --');

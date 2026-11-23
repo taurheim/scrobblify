@@ -69,7 +69,8 @@ const EXPIRE_AFTER_SEC = 30 * 86400;
 /**
  * Changes a job's state the way the worker's `jobs_inactivity_deadline`
  * trigger sees it: entering a parked state starts a 14-day clock, entering
- * `dormant` a 30-day one, and anything else clears it.
+ * `dormant` a 30-day one, and anything else clears it. Going dormant from a
+ * parked state remembers it in `dormantFrom`, as `markDormant` does.
  */
 function setState(job, state, nowMs) {
   const nowSec = Math.floor(nowMs / 1000);
@@ -77,6 +78,11 @@ function setState(job, state, nowMs) {
   if (state !== job.state) {
     if (state === 'dormant') {
       job.inactivityDeadlineSec = nowSec + EXPIRE_AFTER_SEC;
+      if (PARKED.includes(job.state)) {
+        job.dormantFrom = job.state;
+      } else if (job.state !== 'exporting') {
+        job.dormantFrom = null;
+      }
     } else if (PARKED.includes(state)) {
       job.inactivityDeadlineSec = nowSec + DORMANT_AFTER_SEC;
     } else {
@@ -88,6 +94,10 @@ function setState(job, state, nowMs) {
   }
   if (TERMINAL.includes(state) && !job.completedAtMs) {
     job.completedAtMs = nowMs;
+  }
+  // A forced finish looks like a real one: everything not rejected was sent.
+  if (state === 'completed') {
+    job.scrobbled = Math.max(0, job.totalTracks - job.failed);
   }
   job.state = state;
   /* eslint-enable no-param-reassign */
@@ -317,6 +327,7 @@ function createMockWorker(options = {}) {
       // by accident.
       credentialExpiresAt: nowSec + 14 * 86400,
       inactivityDeadline: PARKED.includes(job.state) ? job.inactivityDeadlineSec : null,
+      dormantFrom: job.state === 'dormant' ? (job.dormantFrom ?? null) : null,
       ...(KEYLESS.includes(job.state) ? { reconnectAvailable: reconnectAvailable() } : {}),
     };
   }
@@ -340,7 +351,12 @@ function createMockWorker(options = {}) {
   }
 
   function handleImport(importId) {
-    const rec = world.imports.get(importId);
+    let rec = world.imports.get(importId);
+    const { job } = world;
+    if (rec && job && job.importId === importId && job.state === 'cancelled' && job.finalized === false) {
+      // Cancelled before its upload finished, so it never had the queue (#167).
+      rec = undefined;
+    }
     if (!rec) {
       /*
         The real worker also counts a jobless handoff still on its way
@@ -439,37 +455,65 @@ function createMockWorker(options = {}) {
     });
   }
 
+  /**
+   * What the worker's callback does on approval: a `pending` job holding the
+   * user's key, which only starts sending at finalize (`handleFinalize`).
+   */
+  function createPendingJob(rec, nowMs) {
+    /* eslint-disable no-param-reassign */
+    rec.jobId = `j-${hex(16)}`;
+    rec.state = 'pending_upload';
+    /* eslint-enable no-param-reassign */
+    world.job = {
+      id: rec.jobId,
+      username: rec.username,
+      importId: rec.importId,
+      state: 'pending',
+      reason: null,
+      totalTracks: rec.trackCount,
+      scrobbled: 0,
+      failed: 0,
+      waitingUntil: null,
+      createdAtMs: nowMs,
+      lastTickMs: nowMs,
+      completedAtMs: null,
+      inactivityDeadlineSec: null,
+      exportClaim: '',
+      // No manifest yet: cancelled now, it never had the queue (#167).
+      finalized: false,
+    };
+    if (rec.importId) {
+      world.imports.set(rec.importId, { trackCount: rec.trackCount, jobId: rec.jobId });
+    }
+  }
+
   function handleFinalize(handoffId, nowMs) {
     const rec = world.handoffs.get(handoffId);
     if (!rec) {
       return json({ ok: false, reason: 'unknown_handoff' }, 404);
     }
+    if (rec.state === 'failed') {
+      // Withdrawn (`/fail`) or refused: never becomes a job, as in the worker.
+      return json({ ok: false, reason: 'bad_state' }, 409);
+    }
     if (!rec.jobId) {
-      rec.jobId = `j-${hex(16)}`;
-      rec.state = 'active';
-      world.job = {
-        id: rec.jobId,
-        username: rec.username,
-        importId: rec.importId,
-        state: 'active',
-        reason: null,
-        totalTracks: rec.trackCount,
-        scrobbled: 0,
-        failed: 0,
-        waitingUntil: null,
-        createdAtMs: nowMs,
-        lastTickMs: nowMs,
-        completedAtMs: null,
-        inactivityDeadlineSec: null,
-        exportClaim: '',
-      };
-      if (rec.importId) {
-        world.imports.set(rec.importId, { trackCount: rec.trackCount, jobId: rec.jobId });
-      }
+      // Approved without the shim (a test writing the session itself).
+      createPendingJob(rec, nowMs);
+    }
+    const { job } = world;
+    if (job && job.id === rec.jobId && job.state === 'cancelled' && job.finalized === false) {
+      // Cancelled from the status page mid-upload: the worker fails its handoff.
+      return json({ ok: false, reason: 'bad_state' }, 409);
+    }
+    if (job && job.id === rec.jobId && job.state === 'pending') {
+      // The job only starts sending once its upload is complete.
+      setState(job, 'active', nowMs);
+      job.finalized = true;
       if (verbose) {
         console.log(`[worker-mock] job ${rec.jobId} is live with ${rec.trackCount} tracks`);
       }
     }
+    rec.state = 'active';
     return json({ ok: true, jobId: rec.jobId });
   }
 
@@ -482,6 +526,17 @@ function createMockWorker(options = {}) {
         ok: true, active: false, resolved: true, jobId: '',
       });
     }
+    if (rec.state === 'failed') {
+      return json({
+        ok: true, active: false, resolved: true, jobId: rec.jobId || '',
+      });
+    }
+    if (rec.state === 'pending_upload') {
+      // Approved, upload unfinished: not active, and not over either.
+      return json({
+        ok: true, active: false, resolved: false, jobId: rec.jobId,
+      });
+    }
     return json({
       ok: true,
       active: !!rec.jobId && isLive(),
@@ -492,6 +547,11 @@ function createMockWorker(options = {}) {
 
   function handleExport(body, nowMs) {
     const { job } = world;
+    // As in the worker, an export under way can only be re-entered with its
+    // own claim until that claim lapses.
+    if (job.state === 'exporting' && job.exportClaim && body.claim !== job.exportClaim) {
+      return json({ ok: false, reason: 'not_quiescent', detail: 'not_claimable' }, 409);
+    }
     const scrobbled = Math.floor(job.scrobbled);
     const remaining = Math.max(0, job.totalTracks - scrobbled - job.failed);
     setState(job, 'exporting', nowMs);
@@ -605,8 +665,31 @@ function createMockWorker(options = {}) {
       if (!rec) {
         return json({ ok: false, reason: 'unknown_handoff' }, 404);
       }
+      if (rec.state === 'failed') {
+        return json({ ok: false, reason: 'bad_state', state: rec.state }, 409);
+      }
       rec.chunksSeen.add(Number(chunkMatch[2]));
       return json({ ok: true });
+    }
+
+    // The browser gave up on its upload: an approved handoff and its pending
+    // job end here, as `withdrawUpload` does. The worker also requires the
+    // handoff user's session; the mock doesn't model sessions.
+    const withdrawMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/fail$/);
+    if (withdrawMatch && method === 'POST') {
+      const rec = world.handoffs.get(withdrawMatch[1]);
+      if (!rec) {
+        return json({ ok: false, reason: 'unknown' }, 404);
+      }
+      const withdrawn = rec.state === 'pending_upload';
+      if (withdrawn) {
+        rec.state = 'failed';
+        rec.failureReason = 'upload_failed';
+        if (world.job && world.job.id === rec.jobId && world.job.state === 'pending') {
+          setState(world.job, 'cancelled', nowMs);
+        }
+      }
+      return json({ ok: true, withdrawn });
     }
 
     const finalizeMatch = path.match(/^\/scrobblify\/handoff\/([\w-]+)\/finalize$/);
@@ -640,10 +723,12 @@ function createMockWorker(options = {}) {
       // worker names them in the return.
       const adopted = body.username ? '' : `&user=${encodeURIComponent(lastFmUser)}`;
       // The real worker re-attaches in the sign-in *callback*; the shim has no
-      // server side, so it happens here instead. Same outcome either way.
+      // server side, so it happens here instead. Same outcome either way: back
+      // to sending, or to `paused` for a job the user had paused.
       const { job } = world;
       if (job && KEYLESS.includes(job.state) && reconnectAvailable()) {
-        setState(job, 'paused', nowMs);
+        setState(job, job.state === 'dormant' && job.dormantFrom === 'paused' ? 'paused' : 'active', nowMs);
+        job.dormantFrom = null;
       }
       return json({
         ok: true,
@@ -664,6 +749,9 @@ function createMockWorker(options = {}) {
       if (body.state) {
         setState(world.job, String(body.state), nowMs);
       }
+      if (body.dormantFrom !== undefined) {
+        world.job.dormantFrom = body.dormantFrom === null ? null : String(body.dormantFrom);
+      }
       return json({ ok: true, job: jobView() });
     }
 
@@ -676,7 +764,8 @@ function createMockWorker(options = {}) {
    * real callback does, so it no longer counts in `/import/:id`. An approval
    * of a handoff that has already failed (withdrawn, say) is refused the way
    * the real callback refuses it, and makes no job (#165); any other approval
-   * puts it past withdrawing.
+   * puts it past withdrawing, and makes the `pending` job the real callback
+   * makes (it starts sending at finalize).
    */
   function authorise(searchParams) {
     const fail = searchParams.get('fail') || '';
@@ -688,6 +777,9 @@ function createMockWorker(options = {}) {
       rec.state = 'failed';
     } else if (rec) {
       rec.approved = true;
+      if (!rec.jobId) {
+        createPendingJob(rec, Date.now());
+      }
     }
     return shimFromQuery(searchParams);
   }

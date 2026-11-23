@@ -12,11 +12,14 @@ import { trackEvent } from '@/services/Analytics';
  *   resume    saved progress should resume once signed in
  *   reconnect the user asked to sign in (Home's "Re-connect to last.fm", or
  *             the sign-in banner after a refused progress file)
+ *   takeBack  Home's "Scrobble the rest locally": take server job `jobId`'s
+ *             remaining tracks back into this browser
  */
 export type SignInPurpose =
   | { kind: 'send'; importId: string; checkDuplicates: boolean }
   | { kind: 'resume' }
-  | { kind: 'reconnect' };
+  | { kind: 'reconnect' }
+  | { kind: 'takeBack'; jobId: string };
 
 /**
  * A recorded purpose. `inApp` says how the page acting on it is reached:
@@ -50,6 +53,9 @@ function parseIntent(raw: string | null): SignInIntent | null {
       return {
         kind: 'send', importId: parsed.importId, checkDuplicates: parsed.checkDuplicates === true, ...meta,
       };
+    }
+    if (parsed.kind === 'takeBack' && typeof parsed.jobId === 'string' && parsed.jobId) {
+      return { kind: 'takeBack', jobId: parsed.jobId, ...meta };
     }
   } catch {
     // Not ours, or damaged: no intent.
