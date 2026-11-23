@@ -2377,6 +2377,31 @@ test.describe('Choosing the server in the confirm dialog', () => {
     expect(scrobbles).toEqual([]);
   });
 
+  /*
+    A worker session left over from an earlier handoff or sign-in can't ask
+    about an unapproved handoff (`GET /handoff/:id` answers "unknown" and
+    `/job` sees no job), so the page has to ask about the queue as a browser
+    without one does. It used to keep the freeze, and `/job/live` kept the
+    signed-in user live, until the handoff was reaped an hour later (#166).
+  */
+  test('going back from Last.fm without approving keeps the selection with a leftover worker session', async ({ page, baseURL }) => {
+    const { scrobbles, mock } = await openWithWorker(page, baseURL, {
+      signedIn: true,
+      seed: { 'scrobblify.background.session': 's-old' },
+    });
+    const { handoff } = await waitAtLastFm(page, baseURL, mock);
+    const liveFor = () => JSON.parse(mock.handle('GET', '/scrobblify/job/live', new URLSearchParams({ username: 'testuser' }), '').body).live;
+    expect(liveFor()).toBe(true);
+
+    await page.goBack();
+    await expectSelectionOffered(page);
+    expect(handoff).toMatchObject({ state: 'failed', failureReason: 'abandoned' });
+    expect(liveFor()).toBe(false);
+    await page.reload();
+    await expectSelectionOffered(page);
+    expect(scrobbles).toEqual([]);
+  });
+
   test('going back from Last.fm after the worker dropped the handover still offers the selection', async ({ page, baseURL }) => {
     const { mock } = await openWithWorker(page, baseURL);
     const { handoff } = await waitAtLastFm(page, baseURL, mock);

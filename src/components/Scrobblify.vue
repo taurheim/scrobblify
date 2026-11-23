@@ -1662,13 +1662,15 @@ export default defineComponent({
 
     /**
      * Whether the worker took the queue this browser froze for its own
-     * handoff, asked with the public import check, for a browser with no
-     * worker session to ask about the handoff itself.
+     * handoff, asked with the public import check.
      *
      * That is every browser that left for Last.fm and came back without
      * approving (Back, a refresh after it): a session is only issued by a
      * successful callback, so `isHandoffActive` and `hasLiveJob` can only say
-     * "unknown", and without a username nothing else is asked either. The
+     * "unknown", and without a username nothing else is asked either. A
+     * worker session left over from an earlier handoff or sign-in doesn't
+     * change that: neither sees a handoff nobody approved, so this tab's own
+     * is asked about by its queue all the same (#166). The
      * import id was minted before the preflight and only reaches a job at the
      * callback, so "not known" means it never did. A late approval can't
      * change that once the freeze is released: the caller withdraws the
@@ -1691,7 +1693,8 @@ export default defineComponent({
      * every later tab for good (#168). Only a queue the worker doesn't know
      * releases it then: a jobless `pending` this late is a handoff not yet
      * reaped, so it is still waited on, and `releaseOwnHandoff` withdraws
-     * nothing for it.
+     * nothing for it. A browser with a worker session asks about that one
+     * with `isHandoffActive` instead, which sees it once reaped.
      */
     async ownHandoffWasTaken(
       owner: background.QueueOwner | null,
@@ -1700,7 +1703,7 @@ export default defineComponent({
       const thisTabs = background.isThisTabsHandoffFreeze(owner);
       const expired = !thisTabs && background.isOwnHandoffFreeze(owner)
         && background.freezeHandoffHasExpired(owner as background.QueueOwner);
-      if ((!thisTabs && !expired) || background.getSession()) {
+      if (!thisTabs && (!expired || background.getSession())) {
         return unsettled;
       }
       let importId = '';
@@ -2091,10 +2094,17 @@ export default defineComponent({
         owned = await background.resolveOwnershipMarker(marker);
       } else if (pendingId) {
         owned = await background.isHandoffActive(pendingId);
-      } else if (!background.getSession()) {
-        // Nothing to ask about the job with; the queue can still be asked about.
+      } else if (!background.getSession() || background.isThisTabsHandoffFreeze(observed)) {
+        /*
+          Nothing to ask about the job with, or this tab's own handoff, which
+          a leftover worker session can't see until it is approved (#166):
+          the queue can still be asked about.
+        */
         const own = await this.ownHandoffWasTaken(observed);
         owned = own.taken;
+        if (owned === null && background.getSession()) {
+          owned = await background.hasLiveJob();
+        }
         if (owned === false && observed) {
           ownSettled = true;
           const settled = await this.releaseOwnHandoff(observed, own.pendingImportId);
