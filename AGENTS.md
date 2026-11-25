@@ -664,6 +664,20 @@ threw — so coercion goes through `toError()`, which guards `String(value)`
 guard loses the report *and* throws a fresh error out of a `catch` block or a
 global handler, which is exactly where it does the most damage.
 
+**Page URLs are stripped before they leave the browser** (#176). posthog-js
+puts the page URL on *every* event (`$current_url`, plus `$referrer`,
+`$pathname`, the `$initial_*` person properties and our own `path`), and two
+redirects land on `/scrobble` carrying secrets: the worker's return
+(`#session=…`, a 14-day bearer token that can pause, cancel and export a job)
+and Last.fm's `?token=`. Both used to be stored in PostHog, because the app only
+cleans the address bar after the first render. `src/services/AnalyticsSanitize.ts`
+is the `before_send` hook in `posthog.init`: it drops everything after `?` and any
+fragment that isn't a hash-router route, on every event. Don't capture
+`window.location.href` yourself, and never put a URL or request params in an
+event property or error message. **PostHog events from before this shipped
+(2026-11-25) can still hold those tokens**, so treat `$current_url` / `path` in
+old events as sensitive.
+
 Outside production builds, `trackEvent` also logs each event to the console as
 `[scrobblify:event] <name> <json>`. Nothing is captured from localhost, so this
 is how Playwright asserts on telemetry (see `captureEvents` in the "Browser

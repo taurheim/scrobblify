@@ -6,6 +6,7 @@ import path from 'path';
 import JSZip from 'jszip';
 import LastFm from '../src/api/LastFm';
 import Scrobble from '../src/models/Scrobble';
+import { sanitizeCapture, sanitizeUrl } from '../src/services/AnalyticsSanitize';
 // Shared Last.fm mock, also used by the `npm run dev:mock` interactive script.
 import {
   interceptLastFm, mockLastFmAuth, MockLibrary, routeLastFmSignIn,
@@ -3234,6 +3235,54 @@ test.describe('Authentication - clearUser', () => {
     // Verify localStorage was cleared
     const authKey = await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'));
     expect(authKey).toBeNull();
+  });
+});
+
+// The worker's return pages carry a 14-day bearer token in the URL, and
+// posthog-js puts the page URL on every event (#176).
+test.describe('Analytics URL sanitizing', () => {
+  const SECRET = 'SECRET-VALUE';
+
+  test('drops credentials from the return pages', () => {
+    const base = 'https://savas.ca/scrobblify/scrobble';
+    expect(sanitizeUrl(`${base}?handoff=ok&job=${SECRET}#session=${SECRET}&handoff=${SECRET}&user=someone`))
+      .toBe(base);
+    expect(sanitizeUrl(`${base}?signin=ok#session=${SECRET}&nonce=${SECRET}`)).toBe(base);
+    expect(sanitizeUrl(`${base}?token=${SECRET}`)).toBe(base);
+    expect(sanitizeUrl(`/scrobble?token=${SECRET}`)).toBe('/scrobble');
+    expect(sanitizeUrl('https://savas.ca/scrobblify/')).toBe('https://savas.ca/scrobblify/');
+  });
+
+  test("keeps dev's hash-router route but not its query", () => {
+    expect(sanitizeUrl(`http://192.168.1.5:8090/scrobblify/#/scrobble?token=${SECRET}`))
+      .toBe('http://192.168.1.5:8090/scrobblify/#/scrobble');
+  });
+
+  test('cleans every URL property on the event and its person properties', () => {
+    const url = `https://savas.ca/scrobblify/scrobble?signin=ok#session=${SECRET}&nonce=${SECRET}`;
+    const cleaned = sanitizeCapture({
+      properties: {
+        $current_url: url,
+        $referrer: `https://www.last.fm/api/auth/?api_key=k&cb=${SECRET}`,
+        $pathname: '/scrobblify/scrobble',
+        path: `/scrobble?token=${SECRET}`,
+        step: 3,
+        app: 'scrobblify',
+      },
+      $set: { $initial_current_url: url },
+      $set_once: { $initial_referrer: `https://www.last.fm/?x=${SECRET}` },
+    });
+    expect(JSON.stringify(cleaned)).not.toContain(SECRET);
+    expect(cleaned?.properties).toMatchObject({
+      $current_url: 'https://savas.ca/scrobblify/scrobble',
+      path: '/scrobble',
+      step: 3,
+      app: 'scrobblify',
+    });
+  });
+
+  test('passes a null capture through', () => {
+    expect(sanitizeCapture(null)).toBeNull();
   });
 });
 
