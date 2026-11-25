@@ -24,7 +24,7 @@
     "vuex": "^4.1.0"
   },
   "devDependencies": {
-    "@playwright/test": "^1.59.1",
+    "@playwright/test": "^1.65.1",
     "@typescript-eslint/eslint-plugin": "^5.62.0",
     "@typescript-eslint/parser": "^5.62.0",
     "@vue/cli-plugin-babel": "^5.0.9",
