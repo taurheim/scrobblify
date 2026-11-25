@@ -1,5 +1,6 @@
 import posthog from 'posthog-js';
 import { BUILD_NUMBER, GIT_SHA } from '../buildInfo';
+import { sanitizeCapture } from './AnalyticsSanitize';
 
 /*
   Lightweight wrapper around PostHog. Its purpose is to give visibility into
@@ -36,6 +37,8 @@ export function initAnalytics(): void {
       autocapture: false,
       capture_pageview: false,
       persistence: 'localStorage+cookie',
+      // Return pages carry bearer credentials in their URL; see AnalyticsSanitize.
+      before_send: sanitizeCapture,
     });
     posthog.register({ app: APP_NAME, build_sha: GIT_SHA, build_number: BUILD_NUMBER });
     initialized = true;
@@ -70,7 +73,7 @@ export function trackPageView(path: string): void {
     return;
   }
   try {
-    posthog.capture('$pageview', { $current_url: window.location.href, path });
+    posthog.capture('$pageview', { path });
   } catch (e) {
     // ignore
   }

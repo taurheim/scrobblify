@@ -24,7 +24,7 @@ app.config.errorHandler = (err, vm, info) => {
 
 // SPA page-view tracking (autocapture is disabled).
 router.afterEach((to) => {
-  trackPageView(to.fullPath);
+  trackPageView(to.path);
 });
 
 installChunkReload(router);
