@@ -22,6 +22,12 @@ import type { Sql } from './store';
 export interface BlobStore {
   put(key: string, value: ArrayBuffer | Uint8Array): Promise<void>;
   get(key: string): Promise<ArrayBuffer | null>;
+  /**
+   * Several blobs in as few store queries as the backend allows. Keys with no
+   * blob are absent from the result. The export reads a whole job, and one
+   * query per chunk exceeded Workers Free's 50 queries per invocation.
+   */
+  getMany(keys: string[]): Promise<Map<string, ArrayBuffer>>;
   delete(keys: string[]): Promise<void>;
 }
 
@@ -344,6 +350,32 @@ export async function readChunkFor(
   }
   const decompressed = await gunzipBounded(bytes, MAX_UNCOMPRESSED_BYTES);
   return { chunk, tracks: parseChunk(decompressed, chunk.entry_count) };
+}
+
+/**
+ * Reads and validates the given chunks' entries, in the order given, with the
+ * store queries bounded by `blobs.getMany` rather than growing two per chunk.
+ *
+ * `chunks` are rows the caller already holds; looking each one up again, as
+ * `readChunkFor` does, doubled the cost. Returns null when any blob is
+ * missing: a partial queue must never be mistaken for a complete one.
+ */
+export async function readChunkTracks(
+  blobs: BlobStore,
+  chunks: ChunkRow[],
+): Promise<JobTrack[][] | null> {
+  const found = await blobs.getMany(chunks.map((c) => c.r2_key));
+  const out: JobTrack[][] = [];
+  for (const chunk of chunks) {
+    const bytes = found.get(chunk.r2_key);
+    if (!bytes) {
+      return null;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const decompressed = await gunzipBounded(bytes, MAX_UNCOMPRESSED_BYTES);
+    out.push(parseChunk(decompressed, chunk.entry_count));
+  }
+  return out;
 }
 
 /**

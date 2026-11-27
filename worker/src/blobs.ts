@@ -38,6 +38,13 @@ function toArrayBuffer(value: unknown): ArrayBuffer | null {
   return null;
 }
 
+/**
+ * Keys per read. A job holds at most 8 MB of chunks (`MAX_JOB_COMPRESSED_BYTES`),
+ * so this bounds a read at ~163 chunks to 5 queries and each response well
+ * below D1's limits, while staying far under the 100-parameter cap.
+ */
+export const MAX_KEYS_PER_READ = 40;
+
 export class SqlBlobs implements BlobStore {
   constructor(
     private readonly sql: Sql,
@@ -58,6 +65,25 @@ export class SqlBlobs implements BlobStore {
       [key],
     );
     return row ? toArrayBuffer(row.data) : null;
+  }
+
+  async getMany(keys: string[]): Promise<Map<string, ArrayBuffer>> {
+    const out = new Map<string, ArrayBuffer>();
+    for (let i = 0; i < keys.length; i += MAX_KEYS_PER_READ) {
+      const group = keys.slice(i, i + MAX_KEYS_PER_READ);
+      // eslint-disable-next-line no-await-in-loop
+      const rows = await this.sql.all<{ key: string; data: unknown }>(
+        `SELECT key, data FROM blobs WHERE key IN (${group.map(() => '?').join(', ')})`,
+        group,
+      );
+      rows.forEach((row) => {
+        const bytes = toArrayBuffer(row.data);
+        if (bytes) {
+          out.set(row.key, bytes);
+        }
+      });
+    }
+    return out;
   }
 
   async delete(keys: string[]): Promise<void> {
