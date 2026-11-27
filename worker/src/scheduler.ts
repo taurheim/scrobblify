@@ -462,6 +462,7 @@ async function reconcile(
     await commitBatch(env, lease, nowSec, {
       batchId: batch.id,
       batchState: 'reconciled',
+      assigned,
       outcomes,
       acceptedInBatch: outcomes.filter((o) => o.s === 'accepted').length,
       ignoredInBatch: outcomes.filter((o) => o.s !== 'accepted').length,
@@ -558,9 +559,37 @@ export function matchOutcomes(
   });
 }
 
+/**
+ * What a settled batch row keeps of what it sent.
+ *
+ * Every reader of a settled row needs only an entry's index and second: the
+ * export reserves every second the job spent, and `unresolvedSeconds` repeats
+ * the entries recorded `unknown`. Only those carry on needing their names, to
+ * check a repeat against the track it lands on. Dropping the names from the
+ * rest cuts a 50-play row with long names from ~12 KB to a few, which is what
+ * keeps a big job's batch rows from filling the main database (#159).
+ *
+ * An entry with no outcome of its own keeps everything, so nothing a reader
+ * could still ask about is lost.
+ */
+function compactSettledAssignment(
+  assigned: AssignedTrack[],
+  outcomes: EntryOutcome[],
+): Partial<AssignedTrack>[] {
+  const answered = new Set<number>();
+  outcomes.forEach((o) => {
+    if (o.s !== 'unknown') { answered.add(o.i); }
+  });
+  return assigned.map((a) => (answered.has(a.index)
+    ? { index: a.index, timestampSec: a.timestampSec }
+    : a));
+}
+
 interface BatchCommit {
   batchId: string;
   batchState: 'settled' | 'reconciled';
+  /** What the batch sent, so its row can drop what settled entries no longer need. */
+  assigned: AssignedTrack[];
   outcomes: EntryOutcome[];
   acceptedInBatch: number;
   ignoredInBatch: number;
@@ -599,11 +628,13 @@ async function commitBatch(
   const statements: { query: string; params?: unknown[] }[] = [
     {
       query: `UPDATE batches
-                 SET state = ?, outcomes = ?, accepted_count = ?, ignored_count = ?, settled_at = ?
+                 SET state = ?, outcomes = ?, assigned_timestamps = ?,
+                     accepted_count = ?, ignored_count = ?, settled_at = ?
                WHERE id = ? AND state = 'sending' AND ${FENCE_PREDICATE}`,
       params: [
         c.batchState,
         JSON.stringify(c.outcomes),
+        JSON.stringify(compactSettledAssignment(c.assigned, c.outcomes)),
         c.acceptedInBatch,
         c.ignoredInBatch,
         nowSec,
@@ -822,6 +853,7 @@ async function failUnsendable(
   await commitBatch(env, lease, nowSec, {
     batchId,
     batchState: 'settled',
+    assigned: entries,
     outcomes,
     acceptedInBatch: 0,
     ignoredInBatch: outcomes.length,
@@ -1061,6 +1093,7 @@ async function sendBatch(
   await commitBatch(env, lease, nowSec, {
     batchId,
     batchState: 'settled',
+    assigned,
     outcomes,
     acceptedInBatch: outcomes.filter((o) => o.s === 'accepted').length,
     ignoredInBatch: outcomes.filter((o) => o.s !== 'accepted').length,

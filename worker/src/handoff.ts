@@ -113,10 +113,13 @@ export const TRACKS_PER_DAY = importBudget(0);
  * The blob store would hold more. test/jobsize.test.ts measures the worst-case
  * upload (every play distinct) at about 80 KB per 1,000 plays, so 89,000 fit
  * `MAX_JOB_COMPRESSED_BYTES` with 10% headroom. The limit stays here because
- * other costs grow with job size and are not bounded yet: a take-back's export
- * exceeds Workers Free's 50 D1 queries past ~21,000 tracks left (#158), and
- * settled batch rows fill the main database (#159). Raise it once both are
- * fixed; the client already warns about imports longer than 60 days.
+ * other costs grow with job size: a take-back's export exceeded Workers Free's
+ * 50 D1 queries past ~21,000 tracks left (#158, fixed), and batch rows fill the
+ * main database (#159): a settled row now keeps an index and a second per
+ * answered entry, about 84 bytes a play, so 50 maximum jobs hold ~180 MB
+ * against D1's 500 MB (test/scheduler.test.ts). Whether to raise it is a
+ * decision about that margin; the client already warns about imports longer
+ * than 60 days.
  */
 export const MAX_TRACKS_PER_JOB = TRACKS_PER_DAY * 60;
 

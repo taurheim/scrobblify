@@ -1318,6 +1318,43 @@ async function main() {
       body.usedRangesFloorSec === 0, body.usedRangesFloorSec);
   }
 
+  console.log('\n-- the export reads seconds from compact settled rows too (#159) --');
+  {
+    // Settled rows keep only an index and a second for the entries Last.fm
+    // answered; the export reserves every second regardless of the format.
+    const sql = freshSql();
+    const blobs = new MemoryBlobs();
+    const env = makeEnv(sql, blobs);
+    const id = await seedJob(sql, blobs, 'listener', { total: 100, cursor: 40, state: 'paused' });
+    const legacy = assignTimestamps(
+      [{ artist: 'A', track: 'T0', originalTimestampSec: 0 }], NOW, 0,
+    ).assigned;
+    const compact = [
+      { index: 1, timestampSec: NOW - 5000 },
+      { index: 2, timestampSec: NOW - 5001 },
+    ];
+    await sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, created_at)
+       VALUES (?, ?, 0, 0, 1, 'settled', ?, ?)`,
+      [randomId(), id, JSON.stringify(legacy), NOW],
+    );
+    await sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, outcomes, created_at)
+       VALUES (?, ?, 0, 1, 2, 'settled', ?, ?, ?)`,
+      [randomId(), id, JSON.stringify(compact),
+        JSON.stringify(compact.map((c) => ({ i: c.index, s: 'accepted', t: c.timestampSec }))), NOW],
+    );
+    const token = await issueSession('listener', SIGNING, NOW);
+    const body: any = await (await handleRequest(env,
+      req(`/scrobblify/job/${id}/export`, { method: 'POST', token, body: JSON.stringify({ claim: EXPORT_CLAIM }) }))).json();
+    const covered = (ts: number) => body.usedRanges.some((r: any) => ts >= r.from && ts <= r.to);
+    check('seconds from both row formats are reported',
+      [legacy[0].timestampSec, ...compact.map((c) => c.timestampSec)].every(covered), body.usedRanges);
+    check('and the list is complete', body.usedRangesIncomplete === false && body.usedRangesTruncated === false);
+  }
+
   console.log('\n-- truncation drops the oldest ranges, not the newest --');
   {
     /*

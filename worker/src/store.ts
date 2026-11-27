@@ -592,6 +592,16 @@ export async function unresolvedSeconds(
         return;
       }
       /*
+        A settled row keeps names only for entries it recorded `unknown`. One
+        picked out here without them (its outcomes are unreadable) cannot be
+        checked against the track it would land on, and a repeat that cannot
+        be checked is exactly what the name check exists to refuse.
+      */
+      if (typeof v.artist !== 'string' || typeof v.track !== 'string') {
+        stale.add(idx);
+        return;
+      }
+      /*
         Keyed per index, and the earliest survives.
 
         One index legitimately appears in more than one row now: the batch that

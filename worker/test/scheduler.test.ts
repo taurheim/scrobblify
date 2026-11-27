@@ -14,7 +14,7 @@ import {
 } from '../src/store';
 import { BlobStore, gzip, uploadChunk } from '../src/chunks';
 import { encryptCredential, sha256Hex, randomId } from '../src/crypto';
-import { ALGORITHM_VERSION } from '../src/handoff';
+import { ALGORITHM_VERSION, MAX_TRACKS_PER_JOB } from '../src/handoff';
 import { assignTimestamps } from '../src/timestamps';
 import { utcDayStartSec, nextUtcDayStartSec } from '../../src/shared/lastfm/dailyCap';
 import {
@@ -238,14 +238,16 @@ function freshSql(): Sql {
 
 function trackLines(count: number, originalTimestampSec: number, pin?: {
   index: number; sec: number;
-}): Uint8Array {
+}, nameLength = 0): Uint8Array {
   const lines: string[] = [];
+  // Worst-case names, as test/jobsize.test.ts seeds them for the blob store.
+  const pad = (s: string) => (nameLength > 0 ? s.padEnd(nameLength, 'x') : s);
   for (let i = 0; i < count; i += 1) {
     const pinned = pin !== undefined && pin.index === i;
     lines.push(JSON.stringify({
-      artist: `Artist ${i}`,
-      track: `Track ${i}`,
-      album: 'An Album',
+      artist: pad(`Artist ${i}`),
+      track: pad(`Track ${i}`),
+      album: nameLength > 0 ? pad(`Album ${i}`) : 'An Album',
       originalTimestampSec: pinned ? pin.sec : originalTimestampSec,
       ...(pinned ? { reTagged: true } : {}),
     }));
@@ -269,6 +271,8 @@ async function harness(options: {
   originalDaysAgo?: number;
   /** A re-tagged track carrying an idempotency pin, at this blob index. */
   pin?: { index: number; sec: number };
+  /** Pad artist, track and album to this many characters (0 keeps them short). */
+  nameLength?: number;
   job?: Partial<Record<string, unknown>>;
 } = {}): Promise<Harness> {
   const total = options.total ?? 120;
@@ -299,7 +303,7 @@ async function harness(options: {
     names.map((n) => columns[n]),
   );
 
-  const raw = trackLines(total, NOW - (options.originalDaysAgo ?? 400) * 86400, options.pin);
+  const raw = trackLines(total, NOW - (options.originalDaysAgo ?? 400) * 86400, options.pin, options.nameLength);
   const compressed = await gzip(raw);
   const buf = compressed.buffer.slice(
     compressed.byteOffset,
@@ -1102,6 +1106,100 @@ async function main() {
       { got: sent[0].timestampSec, want: spent.assigned[0].timestampSec });
   }
 
+  console.log('\n-- a settled batch row does not keep the names it sent (#159) --');
+  {
+    const h = await harness({ total: 100, originalDaysAgo: 4000, nameLength: 40 });
+    await runTick(h.env, NOW);
+    const rows = await h.sql.all<any>(
+      "SELECT assigned_timestamps, outcomes FROM batches WHERE job_id = ? AND state = 'settled'", [h.jobId],
+    );
+    const bytes = rows.map((r) => r.assigned_timestamps.length + r.outcomes.length);
+    check('both batches settled', rows.length === 2, rows.length);
+    // A 50-play batch with these names took ~12 KB before.
+    check('a settled 50-play row with long names is a fraction of its old size',
+      bytes.every((b) => b < 5000), bytes);
+    check('no name survives on an entry Last.fm answered',
+      rows.every((r) => !/Artist|Track|Album/.test(r.assigned_timestamps)), rows[0].assigned_timestamps.slice(0, 200));
+    const perPlay = bytes.reduce((a, b) => a + b, 0) / 100;
+    const worstCase = perPlay * MAX_TRACKS_PER_JOB * 50;
+    check('a full house of maximum jobs stays well inside the main database',
+      worstCase < 250_000_000, Math.round(worstCase));
+    const kept = JSON.parse(rows[0].assigned_timestamps);
+    check('each entry still names its index and second',
+      kept.length === 50 && kept.every((a: any) => Number.isInteger(a.index) && a.timestampSec > 0), kept[0]);
+  }
+
+  console.log('\n-- an entry left unknown keeps its name, and still repeats its second --');
+  {
+    const h = await harness({ total: 50, originalDaysAgo: 4000, script: [{ kind: 'truncate', entries: 10 }] });
+    await runTick(h.env, NOW);
+    const first = await h.sql.first<any>(
+      "SELECT assigned_timestamps FROM batches WHERE job_id = ? AND state = 'settled' ORDER BY created_at, start_index",
+      [h.jobId],
+    );
+    const kept = JSON.parse(first.assigned_timestamps);
+    check('answered entries are compact and unanswered ones keep their names',
+      kept.slice(0, 10).every((a: any) => a.artist === undefined)
+      && kept.slice(10).every((a: any) => a.artist === `Artist ${a.index}` && a.track === `Track ${a.index}`),
+      kept.slice(8, 12));
+    const resent = h.fake.sent.slice(1).flatMap((s) => s.entries).find((e) => e.track === 'Track 10');
+    check('the unanswered entry went out again', !!resent);
+    check('under the second it first rode on',
+      resent?.timestampSec === h.fake.sent[0].entries[10].timestampSec,
+      { got: resent?.timestampSec, want: h.fake.sent[0].entries[10].timestampSec });
+    const job = await h.job();
+    check('and the job finishes without a duplicate second',
+      job.state === 'completed'
+      && new Set(h.fake.sent.flatMap((s) => s.entries.map((e) => `${e.track}@${e.timestampSec}`))).size
+        === h.fake.sent.flatMap((s) => s.entries).length - 40,
+      { state: job.state, sent: h.fake.sent.map((s) => s.entries.length) });
+  }
+
+  console.log('\n-- a reconciled batch is compacted the same way --');
+  {
+    const h = await harness({ total: 50, originalDaysAgo: 4000,     script: [{ kind: 'throw', message: 'Network request failed' }] });
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    // Last.fm stored the first 30 only.
+    h.fake.recent = sent.slice(0, 30).map((e) => ({
+      artist: e.artist, track: e.track, timestampSec: e.timestampSec,
+    }));
+    await h.sql.run(
+      "UPDATE jobs SET state = 'active', locked_until = 0, next_eligible_at = 0 WHERE id = ?", [h.jobId],
+    );
+    await runTick(h.env, NOW + RECONCILE_GRACE_SECONDS + 600);
+    const row = await h.sql.first<any>(
+      "SELECT state, assigned_timestamps FROM batches WHERE job_id = ? AND state = 'reconciled'", [h.jobId],
+    );
+    check('the batch was reconciled', !!row, await h.sql.all('SELECT state FROM batches'));
+    const kept = row ? JSON.parse(row.assigned_timestamps) : [];
+    check('recovered entries drop their names; the rest keep them',
+      kept.length === 50
+      && kept.slice(0, 30).every((a: any) => a.artist === undefined)
+      && kept.slice(30).every((a: any) => a.artist === `Artist ${a.index}`),
+      kept.slice(28, 32));
+    const resent = h.fake.sent.slice(1).flatMap((s) => s.entries).find((e) => e.track === 'Track 30');
+    check('an entry that never landed repeats its second after the reconcile',
+      resent?.timestampSec === sent[30].timestampSec, { got: resent?.timestampSec, want: sent[30].timestampSec });
+  }
+
+  console.log('\n-- a compact row whose outcomes are unreadable cannot be repeated --');
+  {
+    // Nameless entries cannot be checked against the track they would land on.
+    const h = await harness({ total: 50, originalDaysAgo: 4000 });
+    const kept = [{ index: 0, timestampSec: NOW - 3600 }];
+    await h.sql.run(
+      `INSERT INTO batches (id, job_id, generation, start_index, entry_count, state,
+          assigned_timestamps, outcomes, sent_at, settled_at, created_at)
+       VALUES (?, ?, 0, 0, 1, 'settled', ?, ?, ?, ?, ?)`,
+      [randomId(), h.jobId, JSON.stringify(kept), '{not json', NOW - 3600, NOW - 3600, NOW - 3600],
+    );
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent[0].entries;
+    check('the entry takes a fresh second rather than a wrong pin',
+      sent[0].timestampSec !== NOW - 3600, sent[0].timestampSec);
+  }
+
   console.log('\n-- control switches --');
   {
     const h = await harness({ total: 50 });
@@ -1302,7 +1400,7 @@ async function main() {
     );
     await h.sql.run("UPDATE batches SET state = 'sending' WHERE id = ?", [first.id]);
     h.fake.recent = JSON.parse(first.assigned_timestamps).map((a: any) => ({
-      artist: a.artist, track: a.track, timestampSec: a.timestampSec,
+      artist: `Artist ${a.index}`, track: `Track ${a.index}`, timestampSec: a.timestampSec,
     }));
 
     await runTick(h.env, NOW + RECONCILE_GRACE_SECONDS + 600);
