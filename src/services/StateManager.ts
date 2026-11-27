@@ -1,6 +1,7 @@
 import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
 import ProgressFileUnreadableError from '@/services/ProgressFileUnreadableError';
+import StorageTimeoutError, { STORAGE_WRITE_TIMEOUT_MS } from '@/services/StorageTimeoutError';
 
 export interface SerializedScrobble {
   track: string;
@@ -328,13 +329,10 @@ export default class StateManager {
     }
   }
 
-  public async saveState(state: ScrobbleState): Promise<void> {
-    const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      tx.objectStore(STORE_NAME).put(state, STATE_KEY);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error); };
+  public saveState(state: ScrobbleState): Promise<void> {
+    return this.transact((store) => {
+      store.put(state, STATE_KEY);
+      return () => undefined;
     });
   }
 
@@ -372,11 +370,8 @@ export default class StateManager {
    *
    * Returns whether the write happened.
    */
-  public async saveStateIfAhead(state: ScrobbleState): Promise<boolean> {
-    const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
+  public saveStateIfAhead(state: ScrobbleState): Promise<boolean> {
+    return this.transact((store) => {
       const req = store.get(STATE_KEY);
       let wrote = false;
       let mismatch = false;
@@ -443,15 +438,12 @@ export default class StateManager {
           wrote = true;
         }
       };
-      tx.oncomplete = () => {
-        db.close();
+      return () => {
         if (mismatch) {
-          reject(new Error('saved state belongs to a different import'));
-          return;
+          throw new Error('saved state belongs to a different import');
         }
-        resolve(wrote);
+        return wrote;
       };
-      tx.onerror = () => { db.close(); reject(tx.error); };
     });
   }
 
@@ -465,13 +457,10 @@ export default class StateManager {
     });
   }
 
-  public async clearState(): Promise<void> {
-    const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      tx.objectStore(STORE_NAME).delete(STATE_KEY);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error); };
+  public clearState(): Promise<void> {
+    return this.transact((store) => {
+      store.delete(STATE_KEY);
+      return () => undefined;
     });
   }
 
@@ -497,13 +486,10 @@ export default class StateManager {
    * Returns what the disk holds afterwards, so a caller can tell "the queue I
    * condemned is gone" from "something else is there now, leave it alone".
    */
-  public async clearStateIfMatching(
+  public clearStateIfMatching(
     matches: (saved: ScrobbleState | null) => boolean,
   ): Promise<{ removed: boolean; remaining: ScrobbleState | null }> {
-    const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
+    return this.transact((store) => {
       const req = store.get(STATE_KEY);
       let removed = false;
       let remaining: ScrobbleState | null = null;
@@ -527,15 +513,12 @@ export default class StateManager {
         }
         remaining = existing;
       };
-      tx.oncomplete = () => {
-        db.close();
+      return () => {
         if (thrown) {
-          reject(thrown);
-          return;
+          throw thrown;
         }
-        resolve({ removed, remaining });
+        return { removed, remaining };
       };
-      tx.onerror = () => { db.close(); reject(tx.error); };
     });
   }
 
@@ -612,6 +595,57 @@ export default class StateManager {
       originalSucceededCount: data.originalSucceededCount
         ?? (Array.isArray(data.completedIndices) ? data.completedIndices.length : 0),
     } as ScrobbleState;
+  }
+
+  /**
+   * Runs one `readwrite` transaction and settles on whichever of commit, error,
+   * abort or the timeout comes first.
+   *
+   * `work` queues the requests and returns a function that builds the result
+   * once the transaction has committed (and may throw to reject). A write that
+   * times out is abandoned: if its open request answers late, the transaction
+   * is never created, so a stale snapshot cannot land after a newer save. A
+   * transaction already created commits in order with the ones queued after
+   * it, so it cannot overtake them either.
+   */
+  private transact<T>(work: (store: IDBObjectStore) => () => T): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      let db: IDBDatabase | null = null;
+      let timer = 0;
+      const closeDb = () => {
+        try { db?.close(); } catch { /* already closed */ }
+      };
+      const settle = (finish: () => void) => {
+        if (settled) { return; }
+        settled = true;
+        clearTimeout(timer);
+        closeDb();
+        finish();
+      };
+      timer = window.setTimeout(
+        () => settle(() => reject(new StorageTimeoutError(STORAGE_WRITE_TIMEOUT_MS))),
+        STORAGE_WRITE_TIMEOUT_MS,
+      );
+      this.openDB().then((opened) => {
+        db = opened;
+        if (settled) {
+          closeDb();
+          return;
+        }
+        try {
+          const tx = opened.transaction(STORE_NAME, 'readwrite');
+          const finish = work(tx.objectStore(STORE_NAME));
+          tx.oncomplete = () => settle(() => {
+            try { resolve(finish()); } catch (e) { reject(e); }
+          });
+          tx.onerror = () => settle(() => reject(tx.error));
+          tx.onabort = () => settle(() => reject(tx.error || new Error('The save was aborted.')));
+        } catch (e) {
+          settle(() => reject(e));
+        }
+      }, (e) => settle(() => reject(e)));
+    });
   }
 
   private openDB(): Promise<IDBDatabase> {

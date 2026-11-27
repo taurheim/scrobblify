@@ -4610,6 +4610,89 @@ test.describe('Browser storage unavailable', () => {
     expect(events.find((e) => e.name === 'session_saved')?.props).toMatchObject({ saved_in_browser: false });
   });
 
+  test('a save that never settles is reported, does not wedge later saves, and the stop still says so', async ({ page }) => {
+    test.setTimeout(150000);
+    const events = captureEvents(page);
+    const errors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error' && msg.text().startsWith('[scrobblify:scrobblify.onCheckpoint]')) {
+        errors.push(msg.text());
+      }
+    });
+    await interceptLastFm(page);
+    // Slow enough that the run is still going when the stuck checkpoint times out.
+    await page.route('https://ws.audioscrobbler.com/**', async (route: Route) => {
+      const body = route.request().method() === 'POST'
+        ? route.request().postData() || ''
+        : new URL(route.request().url()).search;
+      if (new URLSearchParams(body).get('method') === 'track.scrobble') {
+        await new Promise((resolve) => { setTimeout(resolve, 700); });
+      }
+      await route.fallback();
+    });
+    const tracks = Array.from({ length: 80 }, (_, n) => ({
+      track: `Track ${n}`,
+      artist: `Artist ${n}`,
+      album: `Album ${n}`,
+      timestamp: Date.UTC(2024, 0, 1) + n * 1000,
+      reTagged: true,
+    }));
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await seedSavedState(page, {
+      userName: 'testuser',
+      importId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      totalTracks: 80,
+      completedIndices: [],
+      failedIndices: [],
+      tracks,
+      originalTotalTracks: 80,
+      originalSucceededCount: 0,
+      sendTimestamps: [],
+      burstCount: 0,
+      dailyCount: 0,
+      dailyCountDate: new Date().toISOString().split('T')[0],
+      savedAt: new Date().toISOString(),
+    });
+    await page.reload();
+    await expect(page.locator('text=Resume previous session?')).toBeVisible({ timeout: 10000 });
+    await page.getByRole('button', { name: 'Resume', exact: true }).click();
+    await expect(page.locator('text=80 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+
+    // From here on a save is accepted by IndexedDB and never answered.
+    await page.evaluate(() => {
+      const original = IDBFactory.prototype.open;
+      (window as any).__restoreIndexedDb = () => { IDBFactory.prototype.open = original; };
+      IDBFactory.prototype.open = function open() {
+        return {} as IDBOpenDBRequest;
+      };
+    });
+    await page.getByRole('button', { name: 'Scrobble', exact: true }).click();
+
+    // Past the first checkpoint (every 25 tracks) the run says its progress
+    // isn't landing, and the report names the checkpoint.
+    await expect(page.locator(SAVE_FAILED)).toBeVisible({ timeout: 60000 });
+    await expect.poll(() => errors.length).toBe(1);
+    expect(errors[0]).toContain('StorageTimeoutError');
+
+    // The stop that follows is not swallowed by the stuck checkpoint ahead of it.
+    await page.getByRole('button', { name: 'Pause & Save' }).click();
+    await expect.poll(() => stopEvent(events)?.props, { timeout: 60000 }).toMatchObject({
+      reason: 'manual',
+      auto_saved: false,
+    });
+    await expect(page.locator(SAVE_FAILED)).toBeVisible();
+    expect(errors).toHaveLength(1);
+
+    // And once IndexedDB answers again, the next save lands.
+    await page.evaluate(() => (window as any).__restoreIndexedDb());
+    const download = page.waitForEvent('download');
+    await page.getByRole('button', { name: 'Save Progress & Leave' }).click();
+    await download;
+    await expect.poll(async () => (await readSavedState(page))?.originalSucceededCount).toBeGreaterThan(0);
+    expect(events.find((e) => e.name === 'session_saved')?.props).toMatchObject({ saved_in_browser: true });
+  });
+
   test('a queue with no identity that cannot be given one is not sent', async ({ page }) => {
     test.setTimeout(90000);
     const events = captureEvents(page);
