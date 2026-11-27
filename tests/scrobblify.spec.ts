@@ -2028,6 +2028,43 @@ test.describe('Session Resume', () => {
     await expect(dialog).not.toContainText('Progress files are named like');
   });
 
+  test('a progress .json that is not valid JSON is called damaged, not the wrong file (#170)', async ({ page }) => {
+    await goToUploadStep(page);
+    const truncated = JSON.stringify(buildState()).slice(0, 60);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(truncated),
+    });
+
+    const dialog = page.locator('.v-dialog.v-overlay--active');
+    await expect(dialog).toContainText('damaged', { timeout: 5000 });
+    await expect(dialog).not.toContainText('not a valid Scrobblify progress file');
+    await expect(dialog).not.toContainText('Progress files are named like');
+  });
+
+  test('a progress .json the browser cannot read says so, not that it is invalid (#170)', async ({ page }) => {
+    await page.addInitScript(() => {
+      FileReader.prototype.readAsText = function failingRead(this: FileReader) {
+        Object.defineProperty(this, 'error', {
+          value: new DOMException('The I/O read operation failed.', 'NotReadableError'),
+        });
+        setTimeout(() => this.dispatchEvent(new ProgressEvent('error')), 0);
+      };
+    });
+    await goToUploadStep(page);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'scrobblify-progress-2026-09-07.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(buildState())),
+    });
+
+    const dialog = page.locator('.v-dialog.v-overlay--active');
+    await expect(dialog).toContainText('Couldn\'t read this file', { timeout: 5000 });
+    await expect(dialog).toContainText('download it to this device');
+    await expect(dialog).not.toContainText('not a valid Scrobblify progress file');
+  });
+
   test('a ZIP holding only a progress file resumes as soon as it is chosen', async ({ page }) => {
     // What the reporter did once the .json was refused: zipped it together
     // with their (account-data) Spotify export and uploaded that.

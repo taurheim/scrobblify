@@ -291,6 +291,7 @@ import ScrobbleStepVue from '@/components/ScrobbleStep.vue';
 import CompleteStepVue from '@/components/CompleteStep.vue';
 import StateManager, { ScrobbleState } from '@/services/StateManager';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
+import ProgressFileUnreadableError from '@/services/ProgressFileUnreadableError';
 import {
   peekSignInIntent, SignInPurpose, startSignIn, takeSignInIntent,
 } from '@/services/SignInIntent';
@@ -3231,6 +3232,17 @@ export default defineComponent({
           trackEvent('upload_no_matching_files', { detected: e.detected, file_type: 'json', source });
           this.errorMessage = e.message;
           this.errorDetails = '';
+          this.showError = true;
+          return;
+        }
+        if (e instanceof ProgressFileUnreadableError) {
+          // The file's own problem, not a wrong-file mistake and not an app
+          // bug. Reported under its own contexts so these don't bury real
+          // import failures, and without the JSON.parse message, which quotes
+          // the file's content.
+          trackError(`scrobblify.onImportFile.${e.problem === 'read' ? 'unreadable' : 'damaged'}`, new Error(e.trackingMessage), { source });
+          this.errorMessage = e.message;
+          this.errorDetails = e.detail;
           this.showError = true;
           return;
         }

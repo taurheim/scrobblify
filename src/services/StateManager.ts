@@ -1,5 +1,6 @@
 import Scrobble, { PendingScrobble } from '@/models/Scrobble';
 import NotAProgressFileError from '@/services/NotAProgressFileError';
+import ProgressFileUnreadableError from '@/services/ProgressFileUnreadableError';
 
 export interface SerializedScrobble {
   track: string;
@@ -569,10 +570,15 @@ export default class StateManager {
     const text = await new Promise<string>((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(reader.error);
+      reader.onerror = () => reject(new ProgressFileUnreadableError('read', reader.error));
       reader.readAsText(file);
     });
-    const data = JSON.parse(text);
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      throw new ProgressFileUnreadableError('parse', e);
+    }
     StateManager.assertIsProgressFile(data);
 
     // Only the fields needed to actually restore scrobbles are required.
