@@ -2,7 +2,13 @@
   <div class="scrobblify">
     <div v-if="signedIn">
       Currently authenticated as: {{ this.$store.state.lfmApi.userName }}.
-      <a role="button" tabindex="0" @click="clearToken" @keydown.enter="clearToken">Not you?</a>
+      <a
+        role="button"
+        tabindex="0"
+        @click="clearToken"
+        @keydown.enter="clearToken"
+        @keydown.space.prevent="clearToken"
+      >Not you?</a>
     </div>
 
     <!--

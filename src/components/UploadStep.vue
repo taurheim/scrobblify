@@ -46,7 +46,13 @@
       </div>
       <v-alert v-if="embeddedProgress" type="info" variant="tonal" density="compact" class="mt-2">
         This ZIP also contains a Scrobblify progress file.
-        <a role="button" tabindex="0" @click="resumeEmbeddedProgress" @keydown.enter="resumeEmbeddedProgress">
+        <a
+          role="button"
+          tabindex="0"
+          @click="resumeEmbeddedProgress"
+          @keydown.enter="resumeEmbeddedProgress"
+          @keydown.space.prevent="resumeEmbeddedProgress"
+        >
           Resume from it instead
         </a>
       </v-alert>

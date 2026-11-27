@@ -40,6 +40,17 @@ async function goToUploadStep(page: Page): Promise<MockLibrary> {
   return library;
 }
 
+// A Space keydown a handler didn't preventDefault() scrolls the page, so the
+// pressed key is observed after the element's own handlers have run.
+async function recordSpacePrevented(page: Page) {
+  await page.evaluate(() => {
+    (window as any).__spacePrevented = null;
+    document.addEventListener('keydown', (e) => {
+      if (e.key === ' ') (window as any).__spacePrevented = e.defaultPrevented;
+    });
+  });
+}
+
 // The scrobble button opens a confirmation with a time estimate; starting
 // needs the dialog's own button.
 async function scrobbleSelection(page: Page) {
@@ -2106,6 +2117,31 @@ test.describe('Session Resume', () => {
     await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
   });
 
+  test('"Resume from it instead" answers the Space key without scrolling (#161)', async ({ page }) => {
+    await goToUploadStep(page);
+    const zip = new JSZip();
+    zip.file('Spotify Extended Streaming History/Streaming_History_Audio_2024.json', JSON.stringify([{
+      ts: '2024-01-15T10:30:00Z',
+      master_metadata_track_name: 'Bohemian Rhapsody',
+      master_metadata_album_artist_name: 'Queen',
+      master_metadata_album_album_name: 'A Night at the Opera',
+      ms_played: 300000,
+    }]));
+    zip.file('scrobblify-progress-2026-09-07.json', JSON.stringify(buildState()));
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: 'my_spotify_data.zip',
+      mimeType: 'application/zip',
+      buffer: await zip.generateAsync({ type: 'nodebuffer' }),
+    });
+    await expect(page.locator('text=1 audio history file(s)')).toBeVisible({ timeout: 10000 });
+
+    await recordSpacePrevented(page);
+    await page.getByRole('button', { name: 'Resume from it instead' }).focus();
+    await page.keyboard.press('Space');
+    await expect(page.locator('text=2 tracks ready to scrobble')).toBeVisible({ timeout: 5000 });
+    expect(await page.evaluate(() => (window as any).__spacePrevented)).toBe(true);
+  });
+
   test('preventive pacing keeps scrobbling, it does not pause per track', async ({ page }) => {
     // Regression: `msUntilBurstSafe()` frees exactly one slot at a time, so once
     // the rolling window is full *every* remaining track waits a fraction of a
@@ -3273,9 +3309,25 @@ test.describe('Authentication - clearUser', () => {
     const authKey = await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'));
     expect(authKey).toBeNull();
   });
-});
 
-// The worker's return pages carry a 14-day bearer token in the URL, and
+  test('"Not you?" answers the Space key without scrolling (#161)', async ({ page }) => {
+    await interceptLastFm(page);
+    await page.goto('/#/scrobble');
+    await mockLastFmAuth(page);
+    await page.reload();
+    await expect(page.locator('.upload-step')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('text=Currently authenticated as')).toBeVisible();
+
+    await recordSpacePrevented(page);
+    await page.getByRole('button', { name: 'Not you?' }).focus();
+    await page.keyboard.press('Space');
+
+    await expect(page.locator('text=Currently authenticated as')).toHaveCount(0, { timeout: 5000 });
+    expect(await page.evaluate(() => (window as any).__spacePrevented)).toBe(true);
+    const authKey = await page.evaluate(() => localStorage.getItem('scrobblifyLfmAuthKey'));
+    expect(authKey).toBeNull();
+  });
+});
 // posthog-js puts the page URL on every event (#176).
 test.describe('Analytics URL sanitizing', () => {
   const SECRET = 'SECRET-VALUE';

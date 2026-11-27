@@ -1709,6 +1709,11 @@ reactive and tank performance on big histories.
 
 Warnings (mostly `no-explicit-any`) do not fail the build; only errors do.
 
+Every `role="button"` link must answer Enter **and** Space: `tabindex="0"
+@click @keydown.enter @keydown.space.prevent` with the same handler (a native
+`<a>` activates on neither, and without `.prevent` Space scrolls the page). Two
+were missing Space until #161.
+
 ## Local servers and ports
 
 Several worktrees of this repo are often checked out and running at once, so
