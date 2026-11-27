@@ -37,7 +37,7 @@
       type="info"
       variant="tonal"
       density="compact"
-      class="mx-auto mb-4"
+      class="mx-auto mb-4 flex-0-0"
       max-width="720"
     >
       <div class="d-flex align-center flex-wrap">
