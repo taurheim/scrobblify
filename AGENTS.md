@@ -824,7 +824,16 @@ allocator marches *down* from the present and never below midnight, so at
 00:01 it would have a minute of seconds to spend. A real-dated play on a full
 day is failed without being sent (`DAY_FULL_FAILURE`); repeats (pinned retries,
 reused seconds) go through unchecked; a count that can't be read sends nothing
-and counts as a failed attempt. Estimates (`describeJob`, `ServerChoice`)
+and counts as a failed attempt, emitting `scrobble_library_unreadable`
+(`lastfm_error`, `consecutive_failures`). Those attempts back off (to an hour)
+but park the job as `needs_attention` only after
+`LIBRARY_UNREADABLE_MAX_FAILURES` (48, about two days), not the usual
+`MAX_CONSECUTIVE_FAILURES` (10): on 2026-11-26 Last.fm's read API answered
+error 8 (HTTP 500) for about ten hours (browsers saw it as
+`scrobble_verify_failed`), and at ten failures every job was parked about five
+hours in, with nothing sent. **Jobs that parked that day (about 3, on
+2026-11-26 around 04:40 UTC) stay in `needs_attention` until the user presses
+Try again on Home's status page.** Estimates (`describeJob`, `ServerChoice`)
 use `importBudget(0)`, 700 a day. What it still lacks is the read-back:
 `scrobbled_count` counts accepted replies, so the user's own scrobbler landing
 between the count and the send can still tip a day over, and pending browser

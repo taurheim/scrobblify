@@ -27,6 +27,8 @@ import {
   DAY_FULL_FAILURE,
   PROBE_BATCH_SIZE,
   MAX_BATCHES_PER_JOB_PER_TICK,
+  MAX_CONSECUTIVE_FAILURES,
+  LIBRARY_UNREADABLE_MAX_FAILURES,
   MAX_RECORDED_FAILURES_PER_JOB,
   RECONCILE_GRACE_SECONDS,
   matchOutcomes,
@@ -1665,6 +1667,28 @@ async function main() {
     const job = await h.job();
     check('the attempt counts towards backoff', job.consecutive_failures === 1, job.consecutive_failures);
     check('nothing advances', job.cursor === 0, job.cursor);
+    const unreadable = h.analytics.events.find((event) => event.event === 'scrobble_library_unreadable');
+    check('the unreadable library is reported with its Last.fm error code only',
+      unreadable?.properties.lastfm_error === '8' && unreadable?.properties.consecutive_failures === 1,
+      unreadable);
+  }
+
+  console.log('\n-- a Last.fm read outage does not park the job at ten failures --');
+  {
+    const h = await harness({ total: 50, job: { consecutive_failures: MAX_CONSECUTIVE_FAILURES - 1 } });
+    h.fake.countThrows = true;
+    await runTick(h.env, NOW);
+    const job = await h.job();
+    check('the tenth failed read keeps it running', job.state === 'active', job.state);
+    check('and it keeps backing off', job.next_eligible_at > NOW && job.consecutive_failures === MAX_CONSECUTIVE_FAILURES,
+      { next: job.next_eligible_at, failures: job.consecutive_failures });
+  }
+  {
+    const h = await harness({ total: 50, job: { consecutive_failures: LIBRARY_UNREADABLE_MAX_FAILURES - 1 } });
+    h.fake.countThrows = true;
+    await runTick(h.env, NOW);
+    const job = await h.job();
+    check('a read that stays down for days still needs a human', job.state === 'needs_attention', job.state);
   }
 
   console.log('\n-- just after midnight it waits for room, not for tomorrow --');
