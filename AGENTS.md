@@ -839,8 +839,9 @@ accepted, including ones a test answers with its own route. `hiddenProfile`
 **The background worker budgets the same way, but does not verify.** Before
 each batch the scheduler reads the day's count (`LastFmClient.countScrobbles`,
 once per UTC day per run, then advanced by what it sends) and sends only what
-fits under `importBudget`. Re-tagged seconds stay on today (`assignTimestamps`'
-`dayFloorSec`); once today is full the job waits until
+fits under `importBudget`. Re-tagged seconds stay on today (`assignTimestamps'`
+`dayFloorSec`; since #175 only for jobs from before `day_bands`, see "Spare
+days" below); once today is full the job waits until
 `DAY_RESUME_OFFSET_SECONDS` (20 min) past the next UTC midnight, with
 `DAY_FULL_REASON` as its reason (in `src/shared/lastfm/dailyCap.ts`, since
 Home's status page recognises it too). The offset exists because the worker's
@@ -864,6 +865,113 @@ between the count and the send can still tip a day over, and pending browser
 plays handed over in a handoff are never verified. **Jobs before 2026-11-15
 paced to 2,700 a day: everything past ~750 on a day was lost and counted as
 scrobbled.**
+
+### Spare days (worker, #175)
+
+**A job made after migration `008_day_bands.sql` places re-tagged plays on the
+earlier UTC days Last.fm still accepts, not only on today.** `jobs.day_bands`
+(JSON, `src/daybands.ts`) is non-NULL for such a job and NULL for every job
+from before it, which **keeps the one-day behaviour until it ends**: nothing
+converts a running job, because the bands it spent on earlier days were never
+recorded. `SPARE_DAYS_FOR_NEW_JOBS` in `handoff.ts` is the switch for jobs made
+from now on (false makes them behave as before; it is not a runtime setting).
+The browser is **unchanged**: see "What the browser still does" below.
+
+How it allocates:
+
+- **One band per UTC day, descending, no wrap.** `day_bands.floors[<midnight>]`
+  is the lowest second the job has spent that day; the next second on that day
+  is strictly below it and nothing raises it (`afterSend`). A day with no floor
+  has spent nothing. It is written in the same transaction as the batch row
+  that spends the seconds, like `synthetic_floor`, and from the seconds
+  *assigned* to the sent prefix, so it can only err downwards (a play a repeat
+  replaced still lowers it). A band that reaches its day's bottom marks the day
+  full (`day_bands.full`), as does a count at or over `importBudget`; full days
+  are never read again, which keeps a running job to about two Last.fm reads a
+  tick instead of one per day.
+- **Newest day first.** `chooseSlot` walks today, yesterday, … down to the day
+  holding `now - SPARE_DAY_WINDOW_SECONDS` and takes the first with room and
+  seconds, so a job that fits in one day behaves as before and today never
+  gets more than its own `importBudget` (the headroom stays on every day). A
+  batch never spans two days (`assignTimestamps`' `slot` stops where the day
+  does), which keeps its reconciliation window to ~50 seconds.
+- **The window is 10 days, not 14.** `SPARE_DAY_WINDOW_SECONDS` is well inside
+  `WINDOW_SECONDS` (13) because a second near the edge keeps ageing while its
+  request sits in a retry, and a repeat must stay inside
+  `REPEATABLE_WINDOW_SECONDS` (13) and the handoff's 12 days. That is 11 UTC
+  days (today and 10 earlier, the oldest only from its edge), about 7,700 plays
+  at 700 a day, not 14 × 700.
+- **Today opens late.** Today's band hangs from `now - 120s`, and a band never
+  goes back up, so just after midnight it would have a handful of seconds and
+  waste the day's budget. `dayBounds` does not open a fresh today until it can
+  hold `importBudget(0)` seconds (about 20 min in, `DAY_RESUME_OFFSET_SECONDS`
+  on the one-day path). Meanwhile the job places plays on yesterday instead of
+  waiting. It only waits (`DAY_START_REASON` / `DAY_FULL_REASON`, resuming at
+  midnight + 20 min as before) when *every* day in the window is full.
+- **Seconds somebody else holds are skipped.** A band only knows what this job
+  spent. A browser run on an earlier day, the user's own scrobbler or another
+  tool may hold the same (artist, track) at a second the band reaches (the top
+  of a past day is where a band from the end of it starts, and a browser's band
+  from a US-afternoon run sits there), and Last.fm would discard ours. So each
+  day the job places on is listed once per run (`occupiedOnDay`, up to 6 pages
+  of 200) and its occupied seconds are never handed out. A listing that can't
+  be read sends nothing, like an unreadable count (`lookupFailure`).
+- **Repeats are untouched.** A pinned retry, or an index with an unresolved
+  earlier batch, still re-sends its identical second on its own day, unchecked
+  against the budget (`unresolvedSeconds`), however many days ago or however
+  full that day is by now. The slot only supplies seconds for fresh plays.
+- **Unreadable bands fail closed.** A job whose `day_bands` is not valid parks
+  as `needs_attention` with nothing sent (`DayBandsUnreadableError`); reading
+  them as empty would reuse spent seconds.
+- **A rolling send ceiling, as a precaution.** Such a job sends at most
+  `IMPORT_SEND_CEILING_PER_24H` (2,300) plays in any rolling 24 hours (its own
+  `batches.sent_at`). **This is not a measured Last.fm limit.** #175 reports
+  about 2,800 per rolling 24h of *sending*; neither this repository nor the
+  telemetry confirms or refutes it. The only measured limit is 750 per UTC day
+  of the timestamp. The worker never reads its sends back, so if a rolling
+  limit exists everything past it would be discarded and still counted as
+  scrobbled, and a job can place far more than a day's budget now. Over the
+  60 days to 2026-11-27, PostHog has no ignore code 5 and no
+  `lastfm_daily_limit` stop at all, but no run ever sent that much in 24 hours
+  either (a browser's re-tagged plays were capped at 700 a day, and the worker's
+  too), so the data cannot say. At the ceiling the job waits like a full day
+  (`DAY_FULL_REASON`, resuming when a tick's worth of its oldest sends is 24
+  hours old; `scrobble_rate_limited` `reason: send_ceiling`, audit
+  `daily_budget_reached` with `sendCeiling`). Raise the constant once someone
+  has measured it (send a job's worth to a throwaway account and compare
+  `getrecenttracks` with the batches).
+- **Take-back.** The export still reports every second the job spent exactly
+  (`usedRanges`, from the batch rows, so the earlier days' bands are in it).
+  `syntheticFloorSec`, which the client reads as "everything from here to now
+  may be ours", is **today's floor only** for such a job: a lowest-of-all floor
+  would push the client's reservation below the oldest band, where it ages out
+  within days. Unreadable bands make the export report its history incomplete,
+  so the client holds its plays back instead of guessing.
+- **Estimates are upper bounds.** `describeJob`'s `estimatedCompletionSec`,
+  `JobStatus`' "finish around" and `ServerChoice`'s days all still divide by
+  `importBudget(0)` (700 a day). A spare-day job finishes sooner, by an amount
+  nobody can know without reading each day's count, so they were left alone.
+
+What the browser still does: every re-tagged play on today, an ascending cursor
+that is one persisted high-water mark (`reTagCursorSec`), and (after a take-back
+or a worker session) a reserved range that may reach an earlier day. A
+per-day browser allocator needs per-day cursors in the saved state, progress
+file, lineage and journal, and a way to know what earlier runs spent on past
+days (their seconds are only a high-water mark): the library listing above
+would do it, but the browser's resume/identity/journal guards (`retag_*`) all
+assume one cursor, so it is a separate change. Every place that assumes
+re-tagged plays stay on today: `ScrobbleStep.vue` (`RETAG_BACKFILL_SECONDS`,
+the `todaySec` floor, `stopDailyLimit`), `ScrobbleEstimate.ts` (today's budget,
+`laterDays`), `UploadStep` / `LargeHistoryGate` (`IMPORT_DAILY_BUDGET`),
+`ScrobbleConfirmDialog`, `ServerChoice`, `JobStatus.ts`, `describeJob`,
+`TRACKS_PER_DAY` / `MAX_TRACKS_PER_JOB` in `handoff.ts`, the worker's one-day
+path (kept for old jobs) and `DAY_RESUME_OFFSET_SECONDS`.
+
+Tests: `worker/test/scheduler.test.ts` ("spare days: …"),
+`daybands.test.ts`, `timestamps.test.ts` ("a day slot"),
+`client-spare-days.test.ts` (the export fed to the browser's reservation) and
+`handoff.test.ts` (a new job's `day_bands`). The scheduler harness' fake
+`getRecentTracks` now filters by `from`/`to` like Last.fm.
 
 ## Import robustness
 

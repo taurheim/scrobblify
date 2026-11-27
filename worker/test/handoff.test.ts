@@ -214,6 +214,8 @@ async function main() {
     )) === 'sk-for-Alice-tok');
   check('credential TTL recorded', job.credential_expires_at > NOW);
   check('algorithm version pinned', job.algorithm_version === 1);
+  check('a new job starts with no seconds spent on any day',
+    job.day_bands === JSON.stringify({ floors: {}, full: [] }), job.day_bands);
   /*
     Copied onto the job rather than read back through the handoff. The handoff
     row is reaped, but "was this queue handed over, and how far did it get" has

@@ -1,0 +1,21 @@
+-- 008: per-day synthetic bands, for jobs that place re-tagged plays on earlier
+-- UTC days (spare-day placement, #175).
+--
+-- A job used to keep every re-tagged play on today's UTC day, whose single
+-- descending band `synthetic_floor` describes. A job that spreads plays over
+-- the days Last.fm still accepts needs one band per day, and the lowest second
+-- already spent on each day is what keeps a later batch, tick or resume from
+-- reusing it. Last.fm discards a repeated (artist, track, second) while still
+-- reporting it accepted, so a reused second is a silently lost play.
+--
+-- JSON: `{ "floors": { "<UTC midnight>": <lowest second spent that day> },
+--          "full": [<UTC midnight>, ...] }`
+-- where `full` lists days known to hold no more room, so a later tick does not
+-- read their counts again. Written in the same transaction as the batch row
+-- that spends the seconds, like `synthetic_floor`.
+--
+-- NULL means the job predates spare-day placement and keeps the old behaviour
+-- (every re-tagged play on today, described by `synthetic_floor`) until it
+-- ends. Nothing converts a running job: its earlier days' bands were never
+-- recorded, so there is nothing safe to continue from.
+ALTER TABLE jobs ADD COLUMN day_bands TEXT;

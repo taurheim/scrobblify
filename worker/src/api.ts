@@ -32,7 +32,8 @@ import { drainJobOnDemand, nextRunAt } from './scheduler';
 import {
   normalizeUsername, randomId, signHandoffState, verifyHandoffState, encryptCredential,
 } from './crypto';
-import { LASTFM_DAILY_CAP } from '../../src/shared/lastfm/dailyCap';
+import { LASTFM_DAILY_CAP, utcDayStartSec } from '../../src/shared/lastfm/dailyCap';
+import { DayBandsUnreadableError, parseDayBands } from './daybands';
 
 /**
  * Remaining tracks below which background mode is not worth the trade-offs:
@@ -1495,6 +1496,30 @@ async function exportJob(
   });
   const usedRanges = collapseToRanges(usedSeconds, MAX_EXPORTED_RANGES);
 
+  /*
+    The floor the client treats as "everything from here to the present may be
+    ours". For a job that placed plays on earlier days it is today's band only:
+    a lowest-of-all floor would claim every day above its oldest band, so the
+    client's reservation could only land below it, in the oldest part of the
+    window, where it expires within days and blocks the resume again. The
+    earlier days' bands are in `usedRanges` exactly, which is what the client
+    searches.
+
+    Bands that cannot be read say nothing about where seconds went, so the
+    export reports its history as incomplete, which makes the client abandon
+    the reservation rather than guess.
+  */
+  let floorForClient: number = claimedJob.synthetic_floor ?? 0;
+  if (claimedJob.day_bands !== null && claimedJob.day_bands !== undefined) {
+    try {
+      const bands = parseDayBands(claimedJob.day_bands);
+      floorForClient = (bands && bands.floors[String(utcDayStartSec(nowSec))]) || 0;
+    } catch (error) {
+      if (!(error instanceof DayBandsUnreadableError)) { throw error; }
+      floorForClient = 0;
+      usedIncomplete = true;
+    }
+  }
   return json(env, {
     ok: true,
     exportedAt: nowSec,
@@ -1504,7 +1529,7 @@ async function exportJob(
       know where our range starts in order to reserve one below it rather than
       walking through ours. See `stateFromExport`.
     */
-    syntheticFloorSec: claimedJob.synthetic_floor ?? 0,
+    syntheticFloorSec: floorForClient,
     usedRanges: usedRanges.ranges,
     /*
       Kept as the union of both failure modes so that a cached older bundle,

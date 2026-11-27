@@ -15,7 +15,10 @@ import {
 import { BlobStore, gzip, uploadChunk } from '../src/chunks';
 import { encryptCredential, sha256Hex, randomId } from '../src/crypto';
 import { ALGORITHM_VERSION, MAX_TRACKS_PER_JOB } from '../src/handoff';
-import { assignTimestamps } from '../src/timestamps';
+import {
+  assignTimestamps, SPARE_DAY_WINDOW_SECONDS, PRESENT_MARGIN_SECONDS,
+} from '../src/timestamps';
+import { emptyDayBandsJson } from '../src/daybands';
 import { utcDayStartSec, nextUtcDayStartSec } from '../../src/shared/lastfm/dailyCap';
 import {
   runTick,
@@ -25,6 +28,7 @@ import {
   DAY_FULL_REASON,
   DAY_START_REASON,
   DAY_FULL_FAILURE,
+  IMPORT_SEND_CEILING_PER_24H,
   PROBE_BATCH_SIZE,
   MAX_BATCHES_PER_JOB_PER_TICK,
   MAX_CONSECUTIVE_FAILURES,
@@ -208,7 +212,13 @@ class FakeLastFm {
     return this.stored.get(utcDayStartSec(fromSec)) ?? 0;
   }
 
-  async getRecentTracks() {
+  async getRecentTracks(
+    _username?: string,
+    fromSec = Number.NEGATIVE_INFINITY,
+    toSec = Number.POSITIVE_INFINITY,
+    _sessionKey?: string,
+    limit = 200,
+  ) {
     this.recentCalls += 1;
     if (this.recentThrowsRevoked) {
       throw new Error('Last.fm API error 9 (HTTP 403)');
@@ -216,7 +226,11 @@ class FakeLastFm {
     if (this.recentThrows) {
       throw new Error('Last.fm API error 8 (HTTP 200)');
     }
-    return this.recent;
+    // Strictly between the bounds and newest first, as Last.fm answers.
+    return this.recent
+      .filter((r) => r.timestampSec > fromSec && r.timestampSec < toSec)
+      .sort((a, b) => b.timestampSec - a.timestampSec)
+      .slice(0, limit);
   }
 }
 
@@ -303,22 +317,34 @@ async function harness(options: {
     names.map((n) => columns[n]),
   );
 
-  const raw = trackLines(total, NOW - (options.originalDaysAgo ?? 400) * 86400, options.pin, options.nameLength);
-  const compressed = await gzip(raw);
-  const buf = compressed.buffer.slice(
-    compressed.byteOffset,
-    compressed.byteOffset + compressed.byteLength,
-  ) as ArrayBuffer;
-  const up = await uploadChunk(sql, blobs, {
-    jobId,
-    chunkIndex: 0,
-    startIndex: 0,
-    digest: await sha256Hex(compressed),
-    entryCount: total,
-    compressed: buf,
-  }, NOW);
-  if (!up.ok) {
-    throw new Error(`seed upload failed: ${JSON.stringify(up)}`);
+  // One chunk holds at most CHUNK_TRACKS plays; a bigger job is uploaded in several.
+  for (let start = 0; start < total; start += 1000) {
+    const count = Math.min(1000, total - start);
+    const raw = trackLines(
+      count,
+      NOW - (options.originalDaysAgo ?? 400) * 86400,
+      start === 0 ? options.pin : undefined,
+      options.nameLength,
+    );
+    // eslint-disable-next-line no-await-in-loop
+    const compressed = await gzip(raw);
+    const buf = compressed.buffer.slice(
+      compressed.byteOffset,
+      compressed.byteOffset + compressed.byteLength,
+    ) as ArrayBuffer;
+    // eslint-disable-next-line no-await-in-loop
+    const up = await uploadChunk(sql, blobs, {
+      jobId,
+      chunkIndex: start / 1000,
+      startIndex: start,
+      // eslint-disable-next-line no-await-in-loop
+      digest: await sha256Hex(compressed),
+      entryCount: count,
+      compressed: buf,
+    }, NOW);
+    if (!up.ok) {
+      throw new Error(`seed upload failed: ${JSON.stringify(up)}`);
+    }
   }
 
   const env: SchedulerEnv = {
@@ -1831,6 +1857,242 @@ async function main() {
     check('it resumes later the same day',
       job.next_eligible_at === midnight + DAY_RESUME_OFFSET_SECONDS, job.next_eligible_at);
     check('and says so', job.state_reason === DAY_START_REASON, job.state_reason);
+  }
+
+  console.log('\n-- spare days: a full today spills onto yesterday --');
+  {
+    const today = utcDayStartSec(NOW);
+    const yesterday = today - 86400;
+    const h = await harness({ total: 1000, job: { day_bands: emptyDayBandsJson() } });
+    h.fake.stored.set(today, 700);
+    await runTick(h.env, NOW);
+    const first = h.fake.sent.flatMap((s) => s.entries);
+    check('it sends a whole tick instead of waiting for tomorrow',
+      first.length === MAX_BATCHES_PER_JOB_PER_TICK * 50, first.length);
+    check('every second is on yesterday and in the past',
+      first.every((e) => e.timestampSec >= yesterday && e.timestampSec < today), first.length);
+    check('and unique', new Set(first.map((e) => e.timestampSec)).size === first.length);
+    const job = await h.job();
+    const bands = JSON.parse(job.day_bands);
+    const lowest = Math.min(...first.map((e) => e.timestampSec));
+    check('yesterday\'s floor is the lowest second spent there',
+      bands.floors[String(yesterday)] === lowest, bands);
+    check('today is remembered as full', bands.full.includes(today), bands);
+    check('the one-day floor is not used', job.synthetic_floor === 0, job.synthetic_floor);
+    check('and it is not waiting', job.state_reason === null && job.state === 'active', job.state_reason);
+
+    // The next tick resumes below what was spent, and does not read today again.
+    h.fake.sent = [];
+    const callsBefore = h.fake.countCalls;
+    await runTick(h.env, NOW + 300);
+    const second = h.fake.sent.flatMap((s) => s.entries);
+    check('the next tick sends again', second.length === MAX_BATCHES_PER_JOB_PER_TICK * 50, second.length);
+    check('every second is below everything already spent',
+      second.every((e) => e.timestampSec < lowest), { lowest, max: Math.max(...second.map((e) => e.timestampSec)) });
+    check('no second is ever used twice',
+      new Set([...first, ...second].map((e) => e.timestampSec)).size === first.length + second.length);
+    check('a day found full is not read again', h.fake.countCalls - callsBefore === 1,
+      h.fake.countCalls - callsBefore);
+  }
+
+  console.log('\n-- spare days: today still gets only its own budget, and goes first --');
+  {
+    const today = utcDayStartSec(NOW);
+    const yesterday = today - 86400;
+    const h = await harness({ total: 1000, job: { day_bands: emptyDayBandsJson() } });
+    h.fake.stored.set(today, 690);
+    await runTick(h.env, NOW);
+    const [first, second] = h.fake.sent;
+    check('the first batch is what today has room for', first.entries.length === 10, first.entries.length);
+    check('on today, below the present margin',
+      first.entries.every((e) => e.timestampSec >= today && e.timestampSec <= NOW - PRESENT_MARGIN_SECONDS),
+      first.entries.map((e) => e.timestampSec));
+    check('the next batch is on yesterday: a batch never spans two days',
+      second.entries.every((e) => e.timestampSec >= yesterday && e.timestampSec < today));
+    check('today is left with its headroom', h.fake.stored.get(today) === 700, h.fake.stored.get(today));
+  }
+
+  console.log('\n-- spare days: a full earlier day is skipped --');
+  {
+    const today = utcDayStartSec(NOW);
+    const h = await harness({ total: 100, job: { day_bands: emptyDayBandsJson() } });
+    h.fake.stored.set(today, 700);
+    h.fake.stored.set(today - 86400, 700);
+    h.fake.stored.set(today - 2 * 86400, 695);
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent.flatMap((s) => s.entries);
+    const byDay = new Map<number, number>();
+    sent.forEach((e) => byDay.set(utcDayStartSec(e.timestampSec), (byDay.get(utcDayStartSec(e.timestampSec)) ?? 0) + 1));
+    check('the day with 5 left takes 5', byDay.get(today - 2 * 86400) === 5, [...byDay]);
+    check('the rest goes to the next day with room', byDay.get(today - 3 * 86400) === 95, [...byDay]);
+    check('nothing lands on the full days', !byDay.has(today) && !byDay.has(today - 86400), [...byDay]);
+    const bands = JSON.parse((await h.job()).day_bands);
+    check('both full days are recorded', bands.full.includes(today) && bands.full.includes(today - 86400), bands);
+  }
+
+  console.log('\n-- spare days: seconds somebody else already holds are never handed out --');
+  {
+    /*
+      A browser run on an earlier day, the user's own scrobbler or another tool
+      may hold the same (artist, track) at a second the band reaches. Last.fm
+      would discard ours, so the allocator reads the day and steps over them.
+      300 rows also make the read take two pages.
+    */
+    const today = utcDayStartSec(NOW);
+    const yesterday = today - 86400;
+    const h = await harness({ total: 100, job: { day_bands: emptyDayBandsJson() } });
+    h.fake.stored.set(today, 700);
+    const held = Array.from({ length: 300 }, (_v, i) => ({
+      artist: 'Artist 0', track: 'Track 0', timestampSec: today - 1 - i,
+    }));
+    h.fake.recent = held;
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent.flatMap((s) => s.entries);
+    const heldSeconds = new Set(held.map((r) => r.timestampSec));
+    check('every play still goes out', sent.length === 100, sent.length);
+    check('none lands on a second the library holds', sent.every((e) => !heldSeconds.has(e.timestampSec)),
+      sent.filter((e) => heldSeconds.has(e.timestampSec)).length);
+    check('the band starts just below them',
+      Math.max(...sent.map((e) => e.timestampSec)) === today - 301, Math.max(...sent.map((e) => e.timestampSec)));
+    check('on yesterday', sent.every((e) => e.timestampSec >= yesterday));
+  }
+
+  console.log('\n-- spare days: a lost response is repeated on its own day, after midnight --');
+  {
+    /*
+      The request reached Last.fm and the answer was lost just before midnight
+      UTC. Whatever the resume does, the identical (artist, track, second) must
+      go out again — a different second would put a second copy of every play
+      that landed on a public profile. It must go out even though that day is by
+      now full, and even though a new day with room has opened.
+    */
+    const dayN = utcDayStartSec(NOW);
+    const midnight = nextUtcDayStartSec(NOW);
+    const h = await harness({
+      total: 50,
+      job: { day_bands: emptyDayBandsJson() },
+      script: [{ kind: 'throw', message: 'Network request failed' }],
+    });
+    await runTick(h.env, midnight - 300);
+    const lost = h.fake.sent[0].entries;
+    check('the first attempt is on the old day', lost.every((e) => utcDayStartSec(e.timestampSec) === dayN));
+    h.fake.stored.set(dayN, 700);
+    const later = midnight + 3600;
+    await runTick(h.env, later);
+    const retry = h.fake.sent[1].entries;
+    check('the repeat carries the identical second for every track',
+      retry.length === 50 && retry.every((e, i) => e.timestampSec === lost[i].timestampSec
+        && e.artist === lost[i].artist && e.track === lost[i].track),
+      retry.slice(0, 3).map((e) => e.timestampSec));
+    check('though the day it belongs to has since filled up', h.fake.stored.get(dayN) === 750,
+      h.fake.stored.get(dayN));
+    const job = await h.job();
+    check('and the job finishes', job.state === 'completed', job.state);
+  }
+
+  console.log('\n-- spare days: no second is in the future or past the window --');
+  {
+    const midnight = utcDayStartSec(NOW);
+    const times = [
+      midnight + 60,
+      midnight + DAY_RESUME_OFFSET_SECONDS - 1,
+      midnight + DAY_RESUME_OFFSET_SECONDS,
+      NOW,
+      nextUtcDayStartSec(NOW) - 1,
+    ];
+    for (const now of times) {
+      // eslint-disable-next-line no-await-in-loop
+      const h = await harness({ total: 400, job: { day_bands: emptyDayBandsJson() } });
+      // eslint-disable-next-line no-await-in-loop
+      await runTick(h.env, now);
+      // eslint-disable-next-line no-await-in-loop
+      await runTick(h.env, now + 300);
+      const sent = h.fake.sent.flatMap((s) => s.entries);
+      const stamps = sent.map((e) => e.timestampSec);
+      const label = `at ${now - utcDayStartSec(now)}s into the day`;
+      check(`${label}: it sends`, sent.length > 0, sent.length);
+      check(`${label}: none in the future`, stamps.every((t) => t <= now + 300 - PRESENT_MARGIN_SECONDS), Math.max(...stamps) - now);
+      check(`${label}: none past the window`, stamps.every((t) => t >= now - SPARE_DAY_WINDOW_SECONDS),
+        now - Math.min(...stamps));
+      check(`${label}: unique`, new Set(stamps).size === stamps.length);
+    }
+    // Just after midnight today holds too few seconds to open: it goes on yesterday.
+    const h = await harness({ total: 50, job: { day_bands: emptyDayBandsJson() } });
+    await runTick(h.env, midnight + 60);
+    const sent = h.fake.sent.flatMap((s) => s.entries);
+    check('just after midnight it sends onto yesterday instead of waiting',
+      sent.length === 50 && sent.every((e) => e.timestampSec < midnight), sent.length);
+  }
+
+  console.log('\n-- spare days: the oldest day is only used from the edge of the window --');
+  {
+    const today = utcDayStartSec(NOW);
+    const h = await harness({ total: 400, job: { day_bands: emptyDayBandsJson() } });
+    for (let d = 0; d < 10; d += 1) {
+      h.fake.stored.set(today - d * 86400, 700);
+    }
+    await runTick(h.env, NOW);
+    const sent = h.fake.sent.flatMap((s) => s.entries);
+    check('it reaches the oldest day in the window', sent.length === 200
+      && sent.every((e) => utcDayStartSec(e.timestampSec) === today - 10 * 86400), sent.length);
+    check('and no second is older than the window',
+      sent.every((e) => e.timestampSec >= NOW - SPARE_DAY_WINDOW_SECONDS),
+      NOW - Math.min(...sent.map((e) => e.timestampSec)));
+    h.fake.stored.set(today - 10 * 86400, 700);
+    h.fake.sent = [];
+    await runTick(h.env, NOW + 300);
+    const job = await h.job();
+    check('with every day in the window full, it waits for the next UTC day',
+      h.fake.sent.length === 0 && job.state_reason === DAY_FULL_REASON
+      && job.next_eligible_at === nextUtcDayStartSec(NOW) + DAY_RESUME_OFFSET_SECONDS,
+      { sent: h.fake.sent.length, reason: job.state_reason, next: job.next_eligible_at });
+  }
+
+  console.log('\n-- spare days: a run stays under the rolling send ceiling --');
+  {
+    const h = await harness({ total: 3000, job: { day_bands: emptyDayBandsJson() } });
+    for (let tick = 0; tick < 14; tick += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await runTick(h.env, NOW + tick * 300);
+    }
+    const sent = h.fake.sent.flatMap((s) => s.entries);
+    check('it stops at the ceiling', sent.length === IMPORT_SEND_CEILING_PER_24H, sent.length);
+    check('no day is filled past its import budget',
+      [...h.fake.stored.values()].every((n) => n <= 700), [...h.fake.stored]);
+    check('and it spans several days', new Set(sent.map((e) => utcDayStartSec(e.timestampSec))).size >= 4);
+    const job = await h.job();
+    check('it says why it is waiting', job.state_reason === DAY_FULL_REASON, job.state_reason);
+    check('until the first tick\'s sends are a day old', job.next_eligible_at === NOW + 86400 + 1, job.next_eligible_at);
+    h.fake.sent = [];
+    await runTick(h.env, NOW + 86400 + 1);
+    check('then it sends again', h.fake.sent.length > 0, h.fake.sent.length);
+  }
+
+  console.log('\n-- spare days: unreadable bands send nothing --');
+  {
+    const h = await harness({ total: 50, job: { day_bands: '{not json' } });
+    await runTick(h.env, NOW);
+    const job = await h.job();
+    check('nothing is sent', h.fake.sent.length === 0, h.fake.sent.length);
+    check('the job asks for a human rather than guessing', job.state === 'needs_attention', job.state);
+  }
+
+  console.log('\n-- spare days: real listen dates need no day, and no library read --');
+  {
+    const h = await harness({ total: 1, originalDaysAgo: 2, job: { day_bands: emptyDayBandsJson() } });
+    await runTick(h.env, NOW);
+    check('the play is sent', h.fake.sent.length === 1, h.fake.sent.length);
+    check('without listing any day', h.fake.recentCalls === 0, h.fake.recentCalls);
+  }
+
+  console.log('\n-- spare days: an unreadable library sends nothing --');
+  {
+    const h = await harness({ total: 50, job: { day_bands: emptyDayBandsJson() } });
+    h.fake.recentThrows = true;
+    await runTick(h.env, NOW);
+    check('nothing is sent blind', h.fake.sent.length === 0, h.fake.sent.length);
+    const job = await h.job();
+    check('the attempt counts towards backoff', job.consecutive_failures === 1, job.consecutive_failures);
   }
 
   console.log('\n-- when a job next sends --');

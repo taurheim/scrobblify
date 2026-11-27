@@ -44,10 +44,22 @@ import { decryptCredential, randomId } from './crypto';
 import {
   assignTimestamps,
   floorAfter,
+  lowestSyntheticSec,
   reconciliationWindow,
   normalizeForMatch,
   AssignedTrack,
+  AssignmentResult,
+  DaySlot,
 } from './timestamps';
+import {
+  DayBands,
+  DayBandsUnreadableError,
+  afterSend,
+  dayBounds,
+  ladderDays,
+  parseDayBands,
+  serializeDayBands,
+} from './daybands';
 import {
   MAX_SCROBBLES_PER_BATCH,
   IgnoreCode,
@@ -160,6 +172,23 @@ export const DAY_START_REASON = 'Scrobbling resumes a few minutes after midnight
 
 /** Recorded on a play whose real date falls on a day Last.fm already holds in full. */
 export const DAY_FULL_FAILURE = `Last.fm already holds its daily limit of ${LASTFM_DAILY_CAP} scrobbles for the day this was played`;
+
+/**
+ * Most plays a job that places re-tagged plays on earlier days sends in any
+ * rolling 24 hours.
+ *
+ * **A precaution, not a measurement.** The only limit measured is Last.fm's
+ * `LASTFM_DAILY_CAP` per UTC day of the timestamp. #175 reports a second limit
+ * of about 2,800 per rolling 24 hours of *sending*; nothing in this repository
+ * or in the telemetry confirms or rules it out (no run has been able to send
+ * that much: see "Spare days" in AGENTS.md). The worker never reads its sends
+ * back, so if such a limit exists the plays past it would be discarded and
+ * still counted as scrobbled. Staying under the reported figure costs speed
+ * only, and it is one number to raise once someone has measured it.
+ */
+export const IMPORT_SEND_CEILING_PER_24H = 2300;
+
+const ROLLING_WINDOW_SECONDS = 24 * 60 * 60;
 
 export interface SchedulerEnv {
   sql: Sql;
@@ -685,6 +714,8 @@ interface BatchResult {
     reason: string;
     nextEligibleAt?: number;
     storedThatDay?: number;
+    /** The wait is the rolling send ceiling, not a full day. */
+    sendCeiling?: boolean;
     /** The day's count could not be read: nothing was sent, so waiting is safe. */
     libraryUnreadable?: boolean;
   };
@@ -722,6 +753,134 @@ type CapPlan =
   | { kind: 'send'; count: number }
   | { kind: 'fail'; count: number }
   | { kind: 'wait'; storedToday: number };
+
+/** Pages read for one day's timestamps; a day holds at most 750 plays, 200 to a page. */
+const MAX_DAY_PAGES = 6;
+
+/**
+ * The seconds of one UTC day at which the library already holds a scrobble.
+ *
+ * A band only knows what this job spent. Everything else on a past day is
+ * invisible to it: an earlier browser run, the user's own scrobbler, another
+ * tool. Handing out one of those seconds loses the play when the same
+ * (artist, track) is stored there, and it is not rare: a browser's band sits
+ * wherever its run happened to be that day, and the top of a past day is
+ * exactly where a band from the end of it would start. Read once per day per
+ * run; what this run then sends is covered by the day's floor.
+ *
+ * A page is 200 rows and the next one starts at the oldest second seen, which
+ * is included again so that rows sharing it are not stepped over.
+ */
+async function occupiedOnDay(
+  env: SchedulerEnv,
+  job: JobRow,
+  sessionKey: string,
+  daySec: number,
+  cache: Map<number, Set<number>>,
+): Promise<Set<number>> {
+  const known = cache.get(daySec);
+  if (known) {
+    return known;
+  }
+  const seconds = new Set<number>();
+  const from = daySec - 1;
+  let to = nextUtcDayStartSec(daySec);
+  for (let page = 0; page < MAX_DAY_PAGES; page += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const rows = await env.lastfm.getRecentTracks(job.username, from, to, sessionKey);
+    const before = seconds.size;
+    rows.forEach((r) => seconds.add(r.timestampSec));
+    if (rows.length < 200 || seconds.size === before) {
+      break;
+    }
+    const oldest = Math.min(...rows.map((r) => r.timestampSec));
+    if (oldest <= from + 1) {
+      break;
+    }
+    to = oldest + 1;
+  }
+  cache.set(daySec, seconds);
+  return seconds;
+}
+
+/**
+ * The day the next synthetic seconds come from: the newest one inside the
+ * spare-day window that still has room and seconds, or null when none does.
+ *
+ * Newest first, so today fills before anything earlier and a job that fits in
+ * one day behaves as it always did. Days found full are added to `bands.full`
+ * (the caller persists them with the batch) so no later tick reads them again.
+ * A day is full when the library holds `importBudget` plays for it, which only
+ * grows, or when its band has run out of seconds.
+ */
+async function chooseSlot(
+  env: SchedulerEnv,
+  job: JobRow,
+  sessionKey: string,
+  bands: DayBands,
+  nowSec: number,
+  dayUsage: Map<number, number>,
+  dayOccupied: Map<number, Set<number>>,
+): Promise<DaySlot | null> {
+  for (const day of ladderDays(nowSec)) {
+    if (!bands.full.includes(day)) {
+      const bounds = dayBounds(day, nowSec, bands.floors[String(day)]);
+      if (bounds.exhausted) {
+        bands.full.push(day);
+      } else if (!bounds.notYetOpen) {
+        // eslint-disable-next-line no-await-in-loop
+        const used = await usedOnDay(env, job, sessionKey, day, dayUsage);
+        const budget = importBudget(used);
+        if (budget <= 0) {
+          bands.full.push(day);
+        } else {
+          // eslint-disable-next-line no-await-in-loop
+          const occupied = await occupiedOnDay(env, job, sessionKey, day, dayOccupied);
+          return {
+            daySec: day,
+            startSec: bounds.startSec,
+            bottomSec: bounds.bottomSec,
+            capacity: Math.min(budget, bounds.seconds),
+            occupied,
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * How much more this job may send now, under `IMPORT_SEND_CEILING_PER_24H`,
+ * and when that changes. Room under a whole batch counts as none: trickling a
+ * few plays every tick is no faster and costs a tick each.
+ */
+async function sendCeilingRoom(
+  sql: Sql,
+  jobId: string,
+  nowSec: number,
+): Promise<{ room: number; freesAt: number }> {
+  const rows = await sql.all<{ sent_at: number; entry_count: number }>(
+    `SELECT sent_at, entry_count FROM batches
+      WHERE job_id = ? AND sent_at > ? ORDER BY sent_at ASC`,
+    [jobId, nowSec - ROLLING_WINDOW_SECONDS],
+  );
+  const sent = rows.reduce((sum, r) => sum + (r.entry_count || 0), 0);
+  const room = IMPORT_SEND_CEILING_PER_24H - sent;
+  if (room >= MAX_SCROBBLES_PER_BATCH) {
+    return { room, freesAt: nowSec };
+  }
+  // Wake when a tick's worth has aged out of the window, oldest sends first.
+  const needed = MAX_SCROBBLES_PER_BATCH * MAX_BATCHES_PER_JOB_PER_TICK - Math.max(0, room);
+  let freed = 0;
+  for (const r of rows) {
+    freed += r.entry_count || 0;
+    if (freed >= needed) {
+      return { room: 0, freesAt: r.sent_at + ROLLING_WINDOW_SECONDS + 1 };
+    }
+  }
+  return { room: 0, freesAt: nowSec + ROLLING_WINDOW_SECONDS };
+}
 
 /**
  * Decides how much of an assigned batch Last.fm's daily cap lets through.
@@ -888,28 +1047,94 @@ async function sendBatch(
   env: SchedulerEnv,
   lease: JobLease,
   sessionKey: string,
-  tracks: JobTrack[],
+  offered: JobTrack[],
   startIndex: number,
   nowSec: number,
   lineage: RunLineage,
   dayUsage: Map<number, number>,
+  dayOccupied: Map<number, Set<number>>,
 ): Promise<BatchResult> {
   const job = lease.job;
-  const assignment = assignTimestamps(
-    tracks.map((t) => ({
-      artist: t.artist,
-      track: t.track,
-      album: t.album,
-      originalTimestampSec: t.originalTimestampSec,
-      // Carried so `assignTimestamps` can tell a pinned retry from a listen
-      // date and hold it for the full collision window.
-      reTagged: t.reTagged,
-    })),
-    nowSec,
-    job.synthetic_floor ?? 0,
-    // Re-tagged plays stay on today, the one day whose cap is checked for them.
-    utcDayStartSec(nowSec),
-  );
+  let bands: DayBands | null = null;
+  try {
+    bands = parseDayBands(job.day_bands);
+  } catch (error) {
+    if (error instanceof DayBandsUnreadableError) {
+      // Fail closed. Reading unreadable bands as empty ones is how a spent
+      // second gets handed out again.
+      return {
+        sent: 0,
+        accepted: 0,
+        failed: 0,
+        stop: { state: 'needs_attention', reason: `Per-day timestamp bands could not be read: ${error.message}` },
+      };
+    }
+    throw error;
+  }
+
+  let tracks = offered;
+  if (bands) {
+    const ceilingRoom = await sendCeilingRoom(env.sql, job.id, nowSec);
+    if (ceilingRoom.room <= 0) {
+      return {
+        sent: 0,
+        accepted: 0,
+        failed: 0,
+        stop: {
+          state: 'day_full',
+          reason: DAY_FULL_REASON,
+          nextEligibleAt: ceilingRoom.freesAt,
+          sendCeiling: true,
+        },
+      };
+    }
+    tracks = offered.slice(0, ceilingRoom.room);
+  }
+
+  const forAssignment = tracks.map((t) => ({
+    artist: t.artist,
+    track: t.track,
+    album: t.album,
+    originalTimestampSec: t.originalTimestampSec,
+    // Carried so `assignTimestamps` can tell a pinned retry from a listen
+    // date and hold it for the full collision window.
+    reTagged: t.reTagged,
+  }));
+  let slot: DaySlot | undefined;
+  let assignment: AssignmentResult;
+  if (bands) {
+    /*
+      Spare days. Whether the batch needs a day at all is found out first, with
+      a slot that has no room: a batch of real listen dates, or of pins, has no
+      synthetic second to place and should not read any day's library.
+    */
+    const noRoom: DaySlot = {
+      daySec: utcDayStartSec(nowSec),
+      startSec: nowSec,
+      bottomSec: nowSec,
+      capacity: 0,
+      occupied: new Set<number>(),
+    };
+    assignment = assignTimestamps(forAssignment, nowSec, 0, Number.NEGATIVE_INFINITY, noRoom);
+    if (assignment.assigned.length < tracks.length) {
+      try {
+        slot = (await chooseSlot(env, job, sessionKey, bands, nowSec, dayUsage, dayOccupied)) ?? undefined;
+      } catch (error) {
+        return lookupFailure(env, job, lineage, error);
+      }
+      assignment = assignTimestamps(
+        forAssignment, nowSec, 0, Number.NEGATIVE_INFINITY, slot ?? noRoom,
+      );
+    }
+  } else {
+    assignment = assignTimestamps(
+      forAssignment,
+      nowSec,
+      job.synthetic_floor ?? 0,
+      // Re-tagged plays stay on today, the one day whose cap is checked for them.
+      utcDayStartSec(nowSec),
+    );
+  }
 
   // Rebase the in-batch indices onto the job's blob so outcomes survive
   // independently of where the batch started.
@@ -985,14 +1210,38 @@ async function sendBatch(
   }
 
   const assigned = candidates.slice(0, plan.count);
-  // Only the seconds actually sent are spent; the rest of today's band stays free.
-  const syntheticFloor = floorAfter(assignment.assigned.slice(0, plan.count), job.synthetic_floor ?? 0);
+  /*
+    Only the seconds actually sent are spent; the rest of the band stays free.
+
+    A spare-day job records them per day, in the transaction that writes the
+    batch. Its band for the day it placed on is lowered to the lowest second
+    handed out, even for a play that a repeat then replaced: the floor may only
+    ever err downwards, never upwards.
+  */
+  const sentAssignment = assignment.assigned.slice(0, plan.count);
+  const nextBands = bands && slot
+    ? afterSend(bands, slot.daySec, lowestSyntheticSec(sentAssignment), bands.full, nowSec)
+    : null;
+  const syntheticFloor = bands ? 0 : floorAfter(sentAssignment, job.synthetic_floor ?? 0);
   const batchId = randomId();
 
   // Step 1: the mapping is durable *before* the send, and in the same
   // transaction as the synthetic floor it consumed. Splitting them lets a
   // crash in between hand the same seconds to a later batch, at which point
   // reconciliation can match one batch against another's scrobbles.
+  const floorUpdate = bands
+    ? (nextBands && {
+      query: `UPDATE jobs SET day_bands = ?, updated_at = ?
+               WHERE id = ? AND generation = ?
+                 AND state NOT IN ('completed', 'failed', 'cancelled')`,
+      params: [serializeDayBands(nextBands), nowSec, job.id, lease.generation],
+    })
+    : {
+      query: `UPDATE jobs SET synthetic_floor = ?, updated_at = ?
+               WHERE id = ? AND generation = ?
+                 AND state NOT IN ('completed', 'failed', 'cancelled')`,
+      params: [syntheticFloor, nowSec, job.id, lease.generation],
+    };
   await fencedBatch(env.sql, lease, nowSec, [
     {
       query: `INSERT INTO batches
@@ -1001,14 +1250,13 @@ async function sendBatch(
       params: [batchId, job.id, lease.generation, startIndex, assigned.length,
         JSON.stringify(assigned), nowSec, nowSec],
     },
-    {
-      query: `UPDATE jobs SET synthetic_floor = ?, updated_at = ?
-               WHERE id = ? AND generation = ?
-                 AND state NOT IN ('completed', 'failed', 'cancelled')`,
-      params: [syntheticFloor, nowSec, job.id, lease.generation],
-    },
+    ...(floorUpdate ? [floorUpdate] : []),
   ]);
-  lease.job.synthetic_floor = syntheticFloor;
+  if (nextBands) {
+    lease.job.day_bands = serializeDayBands(nextBands);
+  } else if (!bands) {
+    lease.job.synthetic_floor = syntheticFloor;
+  }
 
   // Step 2: send.
   let result;
@@ -1362,7 +1610,8 @@ async function runJob(
   const batchSize = lease.job.probing ? PROBE_BATCH_SIZE : MAX_SCROBBLES_PER_BATCH;
   // Per UTC day, what Last.fm holds plus what this run has sent there.
   const dayUsage = new Map<number, number>();
-
+  // Per UTC day, the seconds the library already holds scrobbles at.
+  const dayOccupied = new Map<number, Set<number>>();
   for (let n = 0; n < budget; n += 1) {
     if (lease.job.cursor >= lease.job.total_tracks) {
       break;
@@ -1410,6 +1659,7 @@ async function runJob(
       nowSec,
       lineage,
       dayUsage,
+      dayOccupied,
     );
     batchesSent += result.sent > 0 ? 1 : 0;
     scrobbled += result.accepted;
@@ -1467,10 +1717,11 @@ async function runJob(
         await audit(env.sql, lease.job.id, lease.generation, 'daily_budget_reached', {
           storedToday: result.stop.storedThatDay ?? null,
           resumesAt: nextEligibleAt ?? null,
+          ...(result.stop.sendCeiling ? { sendCeiling: IMPORT_SEND_CEILING_PER_24H } : {}),
         }, nowSec);
         // eslint-disable-next-line no-await-in-loop
         await capture(env, lease.job, 'scrobble_rate_limited', lineage, {
-          reason: 'daily_budget',
+          reason: result.stop.sendCeiling ? 'send_ceiling' : 'daily_budget',
           stored_today: result.stop.storedThatDay ?? null,
         });
         // eslint-disable-next-line no-await-in-loop

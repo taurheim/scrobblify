@@ -56,6 +56,42 @@ export const PRESENT_MARGIN_SECONDS = 120;
  */
 export const SYNTHETIC_FLOOR_LIMIT_SECONDS = WINDOW_SECONDS - 3600;
 
+/**
+ * How far back a spare-day placement may reach.
+ *
+ * Deliberately well inside `WINDOW_SECONDS`. A second chosen near the edge
+ * keeps ageing while the request that carries it sits in a retry, and a
+ * repeat must stay both acceptable to Last.fm and inside
+ * `REPEATABLE_WINDOW_SECONDS` (13 days) and the handoff's 12 days, or the
+ * play it may already represent can only be re-sent under another second.
+ * Three days of margin covers a batch stuck for the longest backoff.
+ */
+export const SPARE_DAY_WINDOW_SECONDS = 10 * 86400;
+
+/**
+ * One UTC day's share of a batch's synthetic seconds.
+ *
+ * The caller (the scheduler) has already decided, from Last.fm's own counts,
+ * that this day has room, so `assignTimestamps` only has to hand out seconds.
+ */
+export interface DaySlot {
+  /** UTC midnight of the day. */
+  daySec: number;
+  /** The highest second it may hand out. Below it, everything is unspent. */
+  startSec: number;
+  /** The lowest second it may hand out. */
+  bottomSec: number;
+  /** Most synthetic seconds one call may take: the day's remaining import budget. */
+  capacity: number;
+  /**
+   * Seconds at which the library already holds a scrobble that day, whoever
+   * sent it. Never handed out: an earlier import, the user's own scrobbler or
+   * another tool may hold the same (artist, track) there, and Last.fm would
+   * discard ours.
+   */
+  occupied: ReadonlySet<number>;
+}
+
 export interface TrackForSend {
   artist: string;
   track: string;
@@ -200,6 +236,14 @@ export function isPinReplaceable(pinnedSec: number, nowSec: number): boolean {
  * `dayFloorSec`, assignment stops and only the tracks before that point are
  * returned — the caller sends that prefix and waits for the next day.
  *
+ * `slot`, when given, replaces all of the above for synthetic seconds: they
+ * come from that one UTC day, from `slot.startSec` downwards, never below
+ * `slot.bottomSec`, never onto an occupied second, and at most
+ * `slot.capacity` of them. `syntheticFloor` and `dayFloorSec` are ignored (the
+ * caller tracks each day's floor), and there is no wrap, so a band can never
+ * come back to seconds it has spent. The batch ends where the slot does: a
+ * batch never spans two days, which keeps its reconciliation window small.
+ *
  * Guarantees the caller depends on:
  *  - every timestamp in the returned batch is unique
  *  - every timestamp is inside Last.fm's window and not in the future, with
@@ -210,16 +254,18 @@ export function isPinReplaceable(pinnedSec: number, nowSec: number): boolean {
  *    reason to stall the job
  *  - a preserved original is never overwritten by a synthetic value, and a
  *    synthetic value never collides with a preserved one in the same batch
- *  - no synthetic timestamp is below `dayFloorSec`
+ *  - no synthetic timestamp is below `dayFloorSec` (or `slot.bottomSec`)
  */
 export function assignTimestamps(
   tracks: TrackForSend[],
   nowSec: number,
   syntheticFloor: number,
   dayFloorSec = Number.NEGATIVE_INFINITY,
+  slot?: DaySlot,
 ): AssignmentResult {
   const ceiling = nowSec - PRESENT_MARGIN_SECONDS;
   const hardFloor = nowSec - SYNTHETIC_FLOOR_LIMIT_SECONDS;
+  const lowestAllowed = slot ? slot.bottomSec : dayFloorSec;
 
   // Wrap when the recorded floor is unusable: unset (new job), so old that
   // continuing downwards would fall out of the window, or left on an earlier
@@ -229,11 +275,14 @@ export function assignTimestamps(
   // `syntheticFloor` is one below the last second handed out, so a band that
   // used today's midnight itself records `dayFloorSec - 1`. That is today's
   // band, exhausted, not yesterday's: only below it is the band an old one.
-  let next = syntheticFloor > hardFloor
-    && syntheticFloor <= ceiling
-    && syntheticFloor >= dayFloorSec - 1
-    ? syntheticFloor - 1
-    : ceiling;
+  let next = slot
+    ? Math.min(slot.startSec, ceiling)
+    : (syntheticFloor > hardFloor
+      && syntheticFloor <= ceiling
+      && syntheticFloor >= dayFloorSec - 1
+      ? syntheticFloor - 1
+      : ceiling);
+  let syntheticTaken = 0;
 
   // Originals we are preserving are reserved up front. Assigning them as we go
   // would let a synthetic value for track 3 take the second that track 40's
@@ -283,16 +332,21 @@ export function assignTimestamps(
     let ts = preserved[i];
     const keptPin = preserved[i] !== null && isPinnedRetry(t);
     if (ts === null) {
-      while (taken.has(next) || next > ceiling) {
+      if (slot && syntheticTaken >= slot.capacity) {
+        // The day's import budget is spent. The rest waits for another slot.
+        break;
+      }
+      while (taken.has(next) || next > ceiling || (slot !== undefined && slot.occupied.has(next))) {
         next -= 1;
       }
-      if (next < dayFloorSec) {
+      if (next < lowestAllowed) {
         // Today's band is used up. Everything from here waits for tomorrow.
         break;
       }
       ts = next;
       taken.add(ts);
       next -= 1;
+      syntheticTaken += 1;
     } else {
       preservedCount += 1;
     }
@@ -333,6 +387,20 @@ export function floorAfter(assigned: AssignedTrack[], previousFloor: number): nu
     }
   });
   return Number.isFinite(lowest) ? lowest - 1 : previousFloor;
+}
+
+/**
+ * The lowest synthetic second in `assigned`, or null when it used none. A
+ * spare-day batch lies on one day, so this is that day's new floor.
+ */
+export function lowestSyntheticSec(assigned: AssignedTrack[]): number | null {
+  let lowest = Number.POSITIVE_INFINITY;
+  assigned.forEach((a) => {
+    if (!a.preservedOriginal && a.timestampSec < lowest) {
+      lowest = a.timestampSec;
+    }
+  });
+  return Number.isFinite(lowest) ? lowest : null;
 }
 
 /**
