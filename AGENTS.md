@@ -132,7 +132,7 @@ Errors arrive two ways: a filterable `scrobblify_error` event (properties:
 | Upload / parsing | `upload.loadZip`, `upload.extractFile`, `upload.parseJson`, `upload.removeInvalidListens`, `upload.filterDuplicates` |
 | Auth | `auth.init`, `auth.strip_token_url` |
 | Scrobbling | `scrobble.repeatedFailures` |
-| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load), `scrobblify.onDownloadProgress`, `scrobblify.saveBeforeSignIn` (a signed-out selection couldn't be saved before the Last.fm redirect) |
+| Session state | `scrobblify.resumeFromSaved`, `scrobblify.onImportFile`, `scrobblify.onImportFile.unreadable` (the browser couldn't read a chosen progress file), `scrobblify.onImportFile.damaged` (its text isn't valid JSON), `scrobblify.onSaveAndExit`, `scrobblify.onAutoSave`, `scrobblify.onCheckpoint` (reported once per page load), `scrobblify.onDownloadProgress`, `scrobblify.saveBeforeSignIn` (a signed-out selection couldn't be saved before the Last.fm redirect) |
 | Sign-in | `scrobblify.deferredDuplicates` (the duplicate check deferred to after sign-in failed, and the queue is sent unfiltered; or saving its result failed, and the filtered queue is sent from memory) |
 | Uncaught | `vue.errorHandler`, `window.onerror`, `unhandledrejection` |
 
@@ -893,6 +893,20 @@ moment it's chosen** (`classifyZip`, by entry names only), not on "Find tracks":
   `failedIndices`, and `tracks` alone doesn't count, because `YourLibrary.json`
   has one. So a `missing required field` error now means a genuinely damaged
   progress file.
+  A file that can't be turned into JSON at all gets its own message rather
+  than "not a valid Scrobblify progress file", since neither says the wrong
+  file was chosen (#170): a `ProgressFileUnreadableError` from
+  `importFromFile`, `read` when the browser couldn't read it (`NotReadableError`
+  / `NotFoundError`: an undownloaded iCloud or Drive placeholder, a file moved
+  since it was chosen; "download it to this device first") or `parse` when the
+  text isn't valid JSON ("damaged… try another copy"). They are reported as
+  `scrobblify.onImportFile.unreadable` and `scrobblify.onImportFile.damaged`,
+  not `scrobblify.onImportFile`, which is left for everything else (a missing
+  required field, a failure after the file was read). The `damaged` message is
+  fixed: `JSON.parse`'s own quotes the file's content, which stays in the
+  user's "Technical details". **Before 2026-11-27 both were
+  `scrobblify.onImportFile` with `The I/O read operation failed.` or a
+  `JSON.parse` message.**
 - ZIP with `Streaming_History_Audio_*` → ready; if it *also* holds a
   `scrobblify-progress*.json`, a "Resume from it instead" link is offered but
   not forced.
