@@ -89,6 +89,18 @@ export const MAX_BATCHES_PER_JOB_PER_TICK = 4;
 /** Consecutive failures before a job is parked for a human. */
 export const MAX_CONSECUTIVE_FAILURES = 10;
 
+/**
+ * Consecutive failures to read the day's scrobble count before a job is parked.
+ *
+ * Far above `MAX_CONSECUTIVE_FAILURES` on purpose. A failed read sends nothing
+ * and leaves no batch to reconcile, so waiting costs the user only time, and
+ * the usual cause is Last.fm's read API being down: on 2026-11-26 it answered
+ * error 8 (HTTP 500) for about ten hours, which at the one-hour backoff cap
+ * parked every job at ten failures, about five hours in, for a human to
+ * restart. At the cap this is roughly two days.
+ */
+export const LIBRARY_UNREADABLE_MAX_FAILURES = 48;
+
 /** Base backoff when the shared egress IP is throttled (error 29). */
 export const BREAKER_BASE_BACKOFF_SECONDS = 300;
 export const BREAKER_MAX_BACKOFF_SECONDS = 3600;
@@ -637,7 +649,14 @@ interface BatchResult {
   accepted: number;
   failed: number;
   /** Set when the job must stop for a reason of its own. */
-  stop?: { state: string; reason: string; nextEligibleAt?: number; storedThatDay?: number };
+  stop?: {
+    state: string;
+    reason: string;
+    nextEligibleAt?: number;
+    storedThatDay?: number;
+    /** The day's count could not be read: nothing was sent, so waiting is safe. */
+    libraryUnreadable?: boolean;
+  };
   /** Set when every job must stop. */
   global?: { kind: 'breaker' | 'halt'; reason: string };
 }
@@ -766,11 +785,19 @@ async function lookupFailure(
     };
   }
   // Never send blind: without the day's count the play may be discarded.
+  await capture(env, job, 'scrobble_library_unreadable', lineage, {
+    lastfm_error: /Last\.fm API error (\d+)/.exec(message)?.[1] ?? null,
+    consecutive_failures: job.consecutive_failures + 1,
+  });
   return {
     sent: 0,
     accepted: 0,
     failed: 0,
-    stop: { state: 'retry', reason: `Couldn't read the day's scrobble count: ${message}` },
+    stop: {
+      state: 'retry',
+      reason: `Couldn't read the day's scrobble count: ${message}`,
+      libraryUnreadable: true,
+    },
   };
 }
 
@@ -1423,7 +1450,13 @@ async function runJob(
         );
       } else {
         // eslint-disable-next-line no-await-in-loop
-        await failJobAttempt(env.sql, lease, reason, nowSec);
+        await failJobAttempt(
+          env.sql,
+          lease,
+          reason,
+          nowSec,
+          result.stop.libraryUnreadable ? LIBRARY_UNREADABLE_MAX_FAILURES : MAX_CONSECUTIVE_FAILURES,
+        );
       }
       return { batchesSent, scrobbled, failed };
     }
@@ -1523,9 +1556,10 @@ async function failJobAttempt(
   lease: JobLease,
   reason: string,
   nowSec: number,
+  maxFailures: number = MAX_CONSECUTIVE_FAILURES,
 ): Promise<void> {
   const failures = lease.job.consecutive_failures + 1;
-  if (failures >= MAX_CONSECUTIVE_FAILURES) {
+  if (failures >= maxFailures) {
     await fencedJobUpdate(
       sql,
       lease,
