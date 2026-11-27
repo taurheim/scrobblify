@@ -186,12 +186,12 @@
             :worker-unreachable="authorityUnknown"
             :persist-progress="onAutoSave"
             :persist-progress-if-ahead="onAutoSaveIfAhead"
+            :persist-checkpoint="onCheckpoint"
             v-on:complete="onScrobbleComplete"
             v-on:save-and-exit="onSaveAndExit"
             v-on:download-progress="onDownloadProgress"
             v-on:auto-save="onAutoSaveBestEffort"
             v-on:background="onBackgroundRequested"
-            v-on:checkpoint="onCheckpoint"
           ></scrobble-step>
         </v-stepper-window-item>
         <v-stepper-window-item :value="5" eager>
@@ -3704,7 +3704,8 @@ export default defineComponent({
      * Periodic mid-run save, so closing the tab costs at most a few tracks
      * instead of everything since the last stop. Deliberately silent: it runs
      * every few dozen tracks, so it reports neither `session_saved` nor more
-     * than one error per page load.
+     * than one error per page load. It does reject, so the scrobble step can
+     * tell the user the run is not being saved.
      */
     async onCheckpoint(info: ProgressSnapshot) {
       try {
@@ -3717,6 +3718,7 @@ export default defineComponent({
           self._checkpointErrorReported = true;
           trackError('scrobblify.onCheckpoint', e);
         }
+        throw e;
       }
     },
     async onSaveAndExit(info: ProgressSnapshot) {

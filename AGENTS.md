@@ -588,6 +588,30 @@ which serializes them. Each save opens its own IndexedDB connection, so without
 the queue a checkpoint issued just before completion could land after the
 completion's clear and resurrect a finished import as resumable.
 
+**A save that never settles must not wedge that queue** (#144). One run
+(Safari/macOS, build 62) stopped landing checkpoints after an early one and
+reported nothing, not even its `daily_limit` stop; 12 hours later the resume
+restored the older snapshot and re-sent ~375 plays. `saveState` waited only for
+`oncomplete`/`onerror`, so one IndexedDB write that stalled (WebKit stalls it
+in throttled tabs) left `persist()`'s chain pending forever: every later
+checkpoint, and every stop's awaited `autoSave()` before `trackStopped()`,
+queued behind it. The trigger itself was never seen (n = 1); the wedge is the
+mechanism the evidence fits. Now every write (`saveState`, `saveStateIfAhead`,
+`clearState`, `clearStateIfMatching`) goes through `StateManager.transact`,
+which settles on commit, error, **abort** or a 15s timeout
+(`STORAGE_WRITE_TIMEOUT_MS`, `StorageTimeoutError`, opening the database
+included). A write that times out before its open answers never creates its
+transaction, so a stale snapshot can't land after a newer one. The checkpoint
+is no longer a fire-and-forget emit: `ScrobbleStep` gets `persistCheckpoint`
+(the parent's `onCheckpoint`, which still reports `scrobblify.onCheckpoint`
+once per page load but now rethrows) and shows the `.save-failed` alert in the
+*scrobbling* view too, with "Pause & Save" and "Download progress file" as the
+way out, until a later save lands. Only the newest checkpoint's outcome counts
+(`checkpointSeq`). A stop whose save times out emits `scrobble_stopped` with
+`auto_saved: false`. A `scrobblify_error` with `message` "Saving progress in
+this browser did not finish within 15 seconds." (`name` `StorageTimeoutError`)
+is this. Reads (`loadState`, `hasSavedState`) still have no timeout.
+
 `burst_limit` is **preventive pacing, not a stoppage**, and it is emitted once
 per *stretch* of throttled sends — paired with a `scrobble_pacing_ended` event
 carrying `paced_tracks`, `paced_wait_ms` and `pacing_duration_ms`. Do not read

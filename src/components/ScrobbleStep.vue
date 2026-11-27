@@ -50,6 +50,18 @@
         <div v-if="storedToday !== null">Today on Last.fm (UTC): {{ storedToday }} / {{ dailyCap }}</div>
       </v-card>
 
+      <v-alert
+        v-if="saveFailed"
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-4 text-left save-failed"
+      >
+        Scrobblify couldn't save your progress in this browser. If you close this page,
+        plays sent since the last save will be sent again. Press "Pause &amp; Save", then
+        "Download progress file", to keep it.
+      </v-alert>
+
       <v-btn variant="outlined" @click="manualPause">Pause &amp; Save</v-btn>
     </div>
 
@@ -426,6 +438,16 @@ export default defineComponent({
       type: Function,
       default: null,
     },
+    /**
+     * Awaitable mid-run checkpoint save. Rejects when the write fails or times
+     * out, which is how the loop learns that its progress is not landing: the
+     * `checkpoint` emit confirms nothing, and a run that could not save used to
+     * carry on with no word to the user (#144).
+     */
+    persistCheckpoint: {
+      type: Function,
+      default: null,
+    },
   },
   emits: ['complete', 'auto-save', 'save-and-exit', 'download-progress', 'checkpoint', 'background'],
   data() {
@@ -508,6 +530,8 @@ export default defineComponent({
       // Why a storage write the run depended on failed, for telemetry.
       storageFailure: '',
       tracksSinceCheckpoint: 0,
+      // Counts checkpoints issued, so only the newest one's outcome is shown.
+      checkpointSeq: 0,
       pauseReason: '',
       countdown: 0,
       countdownTimer: null as number | null,
@@ -1299,6 +1323,7 @@ export default defineComponent({
       this.sessionInvalid = false;
       this.autoSaved = false;
       this.saveFailed = false;
+      this.checkpointSeq += 1;
       this.storageFailure = '';
       this.tracksSinceCheckpoint = 0;
       this.pauseReason = '';
@@ -2374,6 +2399,7 @@ export default defineComponent({
           this.progressDirty = false;
           this.autoSaved = true;
           this.saveFailed = false;
+          this.checkpointSeq += 1;
         } catch {
           // The parent reports it. Swallowed here so a failed save cannot
           // leave the loop holding its lock — but not hidden: an earlier save
@@ -2472,7 +2498,22 @@ export default defineComponent({
      */
     checkpoint() {
       this.tracksSinceCheckpoint = 0;
-      this.$emit('checkpoint', this.progressSnapshot());
+      const snapshot = this.progressSnapshot();
+      if (!this.persistCheckpoint) {
+        this.$emit('checkpoint', snapshot);
+        return;
+      }
+      // Not awaited: a slow save must not hold up the sends. Only the latest
+      // checkpoint's outcome counts, so a late failure of an older one can't
+      // override a newer save that landed.
+      this.checkpointSeq += 1;
+      const seq = this.checkpointSeq;
+      this.persistCheckpoint(snapshot).then(() => {
+        if (seq === this.checkpointSeq) { this.saveFailed = false; }
+      }, () => {
+        // The parent reports it.
+        if (seq === this.checkpointSeq) { this.saveFailed = true; }
+      });
     },
 
     /**
