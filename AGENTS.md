@@ -1187,9 +1187,26 @@ limit got the offer and a trip to Last.fm before the worker refused it as
 `worker/test/jobsize.test.ts` measures the worst-case upload (every play
 distinct, seeded 24/40/40-character names, all re-tagged) at about 80 KB per
 1,000 plays, so 89,000 would fit `MAX_JOB_COMPRESSED_BYTES` (8 MB) with 10%
-headroom, and briefly was the limit. It went back because other costs grow
-with job size and aren't bounded yet: settled batch rows can fill the main
-database (#159). Raise it once that is fixed. A take-back's export used to
+headroom, and briefly was the limit. It went back because other costs grew
+with job size: a take-back's export (#158) and settled batch rows (#159).
+Both are bounded now, so the limit can be raised; it just hasn't been. A
+settled `batches` row keeps, per entry Last.fm answered, only its index and
+second (`compactSettledAssignment`, written by `commitBatch` as the batch
+settles) plus the small `outcomes` array: ~84 bytes a play, ~3.5 MB for a
+42,000-play job, ~180 MB for 50 of them against the main database's 500 MB
+(`worker/test/scheduler.test.ts` checks it with 40-character names). Before,
+`assigned_timestamps` held every entry's artist, track and album, ~12 KB per
+50-play batch with long names (~10 MB a job, ~520 MB for 50). Names stay only
+on entries recorded `unknown`, the ones `unresolvedSeconds` may still repeat
+and must check against the track they land on, and on `sending` /
+`abandoned` rows, which haven't been answered. The readers need nothing more:
+the export reserves every row's seconds, and `unresolvedSeconds` repeats only
+`unknown` entries (a selected entry with no names, from a compact row whose
+outcomes are unreadable, counts as stale rather than repeated). No migration:
+rows written before this are full-format, both formats are read the same way,
+and they are only compacted by being settled again. Raise the limit
+against that arithmetic, since batch rows still grow linearly with it. A
+take-back's export used to
 exceed Workers Free's 50 D1 queries past ~21,000 tracks left, two per chunk
 (#158); `readChunkTracks` now reads the already-listed chunk rows' blobs with
 `BlobStore.getMany` (at most 40 keys per `IN (...)` query, since a batch
