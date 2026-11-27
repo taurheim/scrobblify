@@ -10,7 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { schemaSql } from './schema';
 import {
   Sql, SqlResult, JobRow, readControl,
-  REPEATABLE_WINDOW_SECONDS, REPEATABLE_HANDOFF_WINDOW_SECONDS,
+  REPEATABLE_WINDOW_SECONDS, REPEATABLE_HANDOFF_WINDOW_SECONDS, unresolvedSeconds,
 } from '../src/store';
 import { BlobStore, gzip, uploadChunk } from '../src/chunks';
 import { encryptCredential, sha256Hex, randomId } from '../src/crypto';
@@ -1194,6 +1194,11 @@ async function main() {
        VALUES (?, ?, 0, 0, 1, 'settled', ?, ?, ?, ?, ?)`,
       [randomId(), h.jobId, JSON.stringify(kept), '{not json', NOW - 3600, NOW - 3600, NOW - 3600],
     );
+    const { repeatable, stale } = await unresolvedSeconds(
+      h.env.sql, h.jobId, NOW, REPEATABLE_WINDOW_SECONDS,
+    );
+    check('the nameless entry is reported stale, not repeatable',
+      stale.has(0) && !repeatable.has(0), { stale: [...stale], repeatable: [...repeatable.keys()] });
     await runTick(h.env, NOW);
     const sent = h.fake.sent[0].entries;
     check('the entry takes a fresh second rather than a wrong pin',
@@ -1394,16 +1399,31 @@ async function main() {
     const first = await h.sql.first<any>(
       'SELECT * FROM batches WHERE job_id = ? ORDER BY start_index ASC', [h.jobId],
     );
+    // Completion deleted the credential; reconcile needs one to read the library.
+    const cred = await encryptCredential('sk-abc', SECRET, h.jobId);
     await h.sql.run(
-      "UPDATE jobs SET state = 'active', cursor = 200, locked_until = 0, next_eligible_at = 0 WHERE id = ?",
-      [h.jobId],
+      `UPDATE jobs SET state = 'active', cursor = 200, locked_until = 0, next_eligible_at = 0,
+              live_username = 'listener', session_key_ct = ?, session_key_iv = ?, completed_at = NULL
+        WHERE id = ?`,
+      [cred.ciphertext, cred.iv, h.jobId],
     );
-    await h.sql.run("UPDATE batches SET state = 'sending' WHERE id = ?", [first.id]);
-    h.fake.recent = JSON.parse(first.assigned_timestamps).map((a: any) => ({
-      artist: `Artist ${a.index}`, track: `Track ${a.index}`, timestampSec: a.timestampSec,
+    // The settled row is compact (answered entries lost their names), so a
+    // `sending` row needs the full names back or reconcile cannot match anything.
+    const full = h.fake.sent[0].entries.map((e, i) => ({
+      index: first.start_index + i, timestampSec: e.timestampSec, artist: e.artist, track: e.track,
     }));
+    check('the first batch sent entries to rebuild from',
+      full.length === first.entry_count && full.length > 0, [full.length, first.entry_count]);
+    await h.sql.run(
+      "UPDATE batches SET state = 'sending', outcomes = NULL, assigned_timestamps = ? WHERE id = ?",
+      [JSON.stringify(full), first.id],
+    );
+    h.fake.recent = full.map((a) => ({ artist: a.artist, track: a.track, timestampSec: a.timestampSec }));
 
     await runTick(h.env, NOW + RECONCILE_GRACE_SECONDS + 600);
+    const rebuilt = await h.sql.first<any>('SELECT state FROM batches WHERE id = ?', [first.id]);
+    check('reconciliation genuinely ran on the re-armed batch',
+      rebuilt?.state === 'reconciled', rebuilt?.state);
     const after = await h.job();
     check('the cursor is not rewound', after.cursor >= 200, after.cursor);
     check('and the count does not exceed the track total',
