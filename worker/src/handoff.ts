@@ -38,6 +38,7 @@ import {
   verifyHandoffState,
 } from './crypto';
 import { importBudget } from '../../src/shared/lastfm/dailyCap';
+import { emptyDayBandsJson } from './daybands';
 
 /** How long a user has to complete the Last.fm round trip and upload. */
 export const HANDOFF_TTL_SECONDS = 60 * 60;
@@ -105,6 +106,14 @@ export type PreflightResult =
  * sends into a day (see `shared/lastfm/dailyCap.ts`).
  */
 export const TRACKS_PER_DAY = importBudget(0);
+
+/**
+ * Whether a job made now places re-tagged plays on earlier UTC days (#175).
+ * The switch for the whole feature: false makes new jobs behave exactly as
+ * before, and jobs already running are unaffected either way, since each
+ * carries its own `day_bands`.
+ */
+export const SPARE_DAYS_FOR_NEW_JOBS = true;
 
 /**
  * The largest import one job accepts: what finishes inside the credential's
@@ -382,8 +391,8 @@ export async function handleCallback(
                 total_tracks, cursor, scrobbled_count, failed_count,
                 last_run_at, next_eligible_at, consecutive_failures,
                 daily_window_count, probing, import_id, created_at, updated_at,
-                credential_expires_at
-              ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?, 1, ?, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
+                credential_expires_at, day_bands
+              ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?, 1, ?, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?)`,
       params: [
         jobId,
         username,
@@ -399,6 +408,10 @@ export async function handleCallback(
         nowSec,
         nowSec,
         nowSec + CREDENTIAL_TTL_SECONDS,
+        // A job made now places re-tagged plays on any day Last.fm still
+        // accepts (see `daybands.ts`). `jobs` rows from before this column have
+        // none and keep the one-day behaviour.
+        SPARE_DAYS_FOR_NEW_JOBS ? emptyDayBandsJson() : null,
       ],
     },
     {

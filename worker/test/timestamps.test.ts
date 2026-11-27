@@ -7,6 +7,7 @@
  */
 import {
   assignTimestamps,
+  lowestSyntheticSec,
   isWithinWindow,
   isPinUsable,
   isPinReplaceable,
@@ -259,6 +260,54 @@ function main() {
   check('while the re-tagged plays get what is left of today',
     rMixed.assigned.length === 3 && rMixed.assigned.slice(1).every((a) => a.timestampSec >= NOW - 121),
     rMixed.assigned);
+
+  console.log('\n-- a day slot --');
+  {
+    const day = NOW - (NOW % 86400) - 3 * 86400;
+    const slot = {
+      daySec: day,
+      startSec: day + 86399,
+      bottomSec: day,
+      capacity: 5,
+      occupied: new Set([day + 86399, day + 86397]),
+    };
+    const r = assignTimestamps(tracks([0, 0, 0, 0, 0, 0, 0, 0]), NOW, 0, Number.NEGATIVE_INFINITY, slot);
+    const secs = r.assigned.map((a) => a.timestampSec);
+    check('it stops at the slot\'s capacity', secs.length === 5, secs);
+    check('it hands out seconds from the top of the day, downwards',
+      secs[0] === day + 86398 && secs[1] === day + 86396, secs);
+    check('never a second the library already holds',
+      secs.every((s) => !slot.occupied.has(s)), secs);
+    check('and unique', new Set(secs).size === secs.length);
+    check('all on the slot\'s day', secs.every((s) => s >= day && s <= day + 86399), secs);
+    check('the lowest one is the day\'s new floor',
+      lowestSyntheticSec(r.assigned) === Math.min(...secs), lowestSyntheticSec(r.assigned));
+
+    const tight = assignTimestamps(
+      tracks([0, 0, 0]), NOW, 0, Number.NEGATIVE_INFINITY,
+      { ...slot, capacity: 10, startSec: day + 2, occupied: new Set([day + 1]) },
+    );
+    check('it never goes below the slot\'s bottom',
+      tight.assigned.map((a) => a.timestampSec).join() === `${day + 2},${day}`, tight.assigned);
+
+    const today = assignTimestamps(
+      tracks([0, 0]), NOW, 0, Number.NEGATIVE_INFINITY,
+      { ...slot, daySec: NOW - (NOW % 86400), startSec: NOW + 500, bottomSec: NOW - (NOW % 86400), occupied: new Set() },
+    );
+    check('a slot cannot hand out a second in the future',
+      today.assigned.every((a) => a.timestampSec <= NOW - PRESENT_MARGIN_SECONDS), today.assigned);
+
+    const kept = assignTimestamps(
+      tracks([NOW - 3600, 0]), NOW, 0, Number.NEGATIVE_INFINITY, { ...slot, capacity: 1 },
+    );
+    check('a play with a usable real date does not use the slot',
+      kept.assigned[0].timestampSec === NOW - 3600 && kept.assigned[0].preservedOriginal
+      && kept.assigned.length === 2, kept.assigned);
+    check('and is not the day\'s floor',
+      lowestSyntheticSec(kept.assigned) === kept.assigned[1].timestampSec);
+    check('a batch of real dates has no floor to record',
+      lowestSyntheticSec(assignTimestamps(tracks([NOW - 3600]), NOW, 0).assigned) === null);
+  }
 
   console.log('\n-- reconciliation window --');
   check('no timestamps, no window', reconciliationWindow([]) === null);

@@ -134,6 +134,12 @@ export interface JobRow {
   probing: number;
   /** Lowest synthetic scrobble second used so far. See `002_synthetic_floor.sql`. */
   synthetic_floor: number;
+  /**
+   * Per-UTC-day bands for a job that places re-tagged plays on earlier days
+   * (see `008_day_bands.sql` and `daybands.ts`). NULL for jobs created before
+   * it, which keep every re-tagged play on today.
+   */
+  day_bands: string | null;
   /** Token identifying the take-back holding an `exporting` claim. */
   export_claim: string | null;
   /** State to restore when an `exporting` claim lapses or completes. */
