@@ -4442,6 +4442,18 @@ test.describe('Stale build detection', () => {
     await expect(banner).toHaveCount(0);
   });
 
+  test('keeps the banner at its natural height on a short page (#151)', async ({ page }) => {
+    await serveVersion(page, () => '0000000');
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto('/#/');
+
+    const banner = page.locator('#update-available');
+    await expect(banner).toBeVisible({ timeout: 10000 });
+    const box = await banner.boundingBox();
+    expect(box!.height).toBeGreaterThan(40);
+    expect(box!.height).toBeLessThan(150);
+  });
+
   test('stays quiet when version.json is missing or unreadable', async ({ page }) => {
     await page.route(VERSION_JSON, (route) => route.fulfill({ status: 404, body: 'Not found' }));
     await page.goto('/');
