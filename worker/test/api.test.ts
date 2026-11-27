@@ -63,6 +63,16 @@ class MemoryBlobs implements BlobStore {
     return v ? (v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) as ArrayBuffer) : null;
   }
 
+  async getMany(ks: string[]) {
+    const out = new Map<string, ArrayBuffer>();
+    for (const k of ks) {
+      // eslint-disable-next-line no-await-in-loop
+      const v = await this.get(k);
+      if (v) { out.set(k, v); }
+    }
+    return out;
+  }
+
   async delete(ks: string[]) {
     ks.forEach((k) => this.data.delete(k));
   }

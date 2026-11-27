@@ -12,7 +12,7 @@ import {
   REPEATABLE_HANDOFF_WINDOW_SECONDS, SLOT_AVAILABLE_SQL, TERMINAL_HANDOFF_STATES,
 } from './store';
 import {
-  BlobStore, uploadChunk, deleteJobBlobs, readChunkFor, CHUNK_TRACKS,
+  BlobStore, uploadChunk, deleteJobBlobs, readChunkTracks, CHUNK_TRACKS,
 } from './chunks';
 import { LastFmClient } from './lastfm';
 import {
@@ -1323,22 +1323,26 @@ async function exportJob(
   );
 
   const tracks: unknown[] = [];
-  for (const chunk of chunks) {
-    // eslint-disable-next-line no-await-in-loop
-    const found = await readChunkFor(
-      env.sql, env.blobs, claimedJob.id, Math.max(chunk.start_index, claimedJob.cursor),
-    );
-    if (!found) {
-      /*
-        A chunk that cannot be read is not a gap to skip over.
+  /*
+    Every chunk's tracks in one go, from the rows listed above. Reading them
+    one by one cost two D1 queries each (the row again, then the blob), which
+    put a take-back of ~21,000 tracks over Workers Free's 50 per invocation.
+  */
+  const chunkTracks = await readChunkTracks(env.blobs, chunks);
+  if (!chunkTracks) {
+    /*
+      A chunk that cannot be read is not a gap to skip over.
 
-        Skipping it silently drops every track it held from the exported
-        queue, and the client saves that queue over its own complete state
-        before cancelling the job — so the tracks are lost from both sides at
-        once. Refusing leaves the job intact and the client retrying.
-      */
-      return json(env, { ok: false, reason: 'export_incomplete' }, 503);
-    }
+      Skipping it silently drops every track it held from the exported
+      queue, and the client saves that queue over its own complete state
+      before cancelling the job — so the tracks are lost from both sides at
+      once. Refusing leaves the job intact and the client retrying.
+    */
+    return json(env, { ok: false, reason: 'export_incomplete' }, 503);
+  }
+  for (let c = 0; c < chunks.length; c += 1) {
+    const chunk = chunks[c];
+    const found = { tracks: chunkTracks[c] };
     const from = Math.max(0, claimedJob.cursor - chunk.start_index);
     found.tracks.slice(from).forEach((t, i) => {
       const absolute = chunk.start_index + from + i;

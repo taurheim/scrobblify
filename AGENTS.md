@@ -1188,9 +1188,13 @@ limit got the offer and a trip to Last.fm before the worker refused it as
 distinct, seeded 24/40/40-character names, all re-tagged) at about 80 KB per
 1,000 plays, so 89,000 would fit `MAX_JOB_COMPRESSED_BYTES` (8 MB) with 10%
 headroom, and briefly was the limit. It went back because other costs grow
-with job size and aren't bounded yet: a take-back's export exceeds Workers
-Free's 50 D1 queries past ~21,000 tracks left (#158), and settled batch rows
-can fill the main database (#159). Raise it once both are fixed.
+with job size and aren't bounded yet: settled batch rows can fill the main
+database (#159). Raise it once that is fixed. A take-back's export used to
+exceed Workers Free's 50 D1 queries past ~21,000 tracks left, two per chunk
+(#158); `readChunkTracks` now reads the already-listed chunk rows' blobs with
+`BlobStore.getMany` (at most 40 keys per `IN (...)` query, since a batch
+counts each statement), so an export costs ~11 queries however big the job
+(`worker/test/export-queries.test.ts` counts them at 120 chunks).
 `ServerChoice` already warns ("That's more than 60 days of scrobbling…") when
 the count needs more than 60 days at 700 a day, which today's limit never
 allows (42,000 is exactly 60 days). The mock worker's `MAX_TRACKS` matches;

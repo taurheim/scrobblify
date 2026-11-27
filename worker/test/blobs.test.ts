@@ -154,6 +154,22 @@ async function main() {
       bytesEqual(await blobs.get('a'), new Uint8Array([9])));
   }
 
+  console.log('\n-- reading many blobs at once --');
+  {
+    const blobs = new SqlBlobs(blobDb(), () => NOW);
+    const keys: string[] = [];
+    for (let i = 0; i < 95; i += 1) {
+      keys.push(`k${i}`);
+      // eslint-disable-next-line no-await-in-loop
+      await blobs.put(`k${i}`, new Uint8Array([i]));
+    }
+    const got = await blobs.getMany([...keys, 'missing']);
+    check('every stored key comes back, across several groups', got.size === 95, got.size);
+    check('each under its own key', keys.every((k, i) => bytesEqual(got.get(k) ?? null, new Uint8Array([i]))));
+    check('a missing key is absent', !got.has('missing'));
+    check('no keys is an empty map', (await blobs.getMany([])).size === 0);
+  }
+
   console.log('\n-- the shapes D1 returns --');
   {
     // D1 hands BLOB columns back as a plain array of numbers.
